@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Tray, Menu, ipcMain, shell, globalShortcut, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -8,7 +8,6 @@ const store = new Store();
 let tray = null;
 let settingsWindow = null;
 let historyWindow = null;
-let visualizerWindow = null;
 let debugWindow = null;
 let pythonProcess = null;
 let logBuffer = [];
@@ -59,41 +58,6 @@ function createTray() {
   
   tray.setToolTip('Local Dictation');
   tray.setContextMenu(contextMenu);
-}
-
-function createVisualizerWindow() {
-  const display = screen.getPrimaryDisplay();
-  const { width, height } = display.workAreaSize;
-  
-  visualizerWindow = new BrowserWindow({
-    width: 120,
-    height: 40,
-    x: Math.floor((width - 120) / 2),
-    y: height - 60,
-    frame: false,
-    transparent: true,
-    alwaysOnTop: true,
-    hasShadow: false,
-    resizable: false,
-    movable: false,
-    focusable: false,
-    skipTaskbar: true,
-    webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false
-    }
-  });
-  
-  visualizerWindow.loadFile('visualizer_realtime.html');
-  visualizerWindow.setVisibleOnAllWorkspaces(true);
-  visualizerWindow.setAlwaysOnTop(true, 'floating');
-  visualizerWindow.setIgnoreMouseEvents(true);
-  visualizerWindow.setFocusable(false);
-  visualizerWindow.hide();
-  
-  visualizerWindow.on('closed', () => {
-    visualizerWindow = null;
-  });
 }
 
 function showSettings() {
@@ -381,7 +345,6 @@ ipcMain.handle('open-transcript-folder', () => {
 
 app.whenReady().then(() => {
   createTray();
-  // createVisualizerWindow(); // Disabled for testing
   startPythonBackend();
   
   app.dock.hide();
