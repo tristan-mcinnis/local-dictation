@@ -23,7 +23,7 @@ def build_argparser() -> argparse.ArgumentParser:
                                description="Electron IPC version of local dictation")
     p.add_argument("--model", default=env_or("MODEL", "medium.en"),
                    help="Whisper model")
-    p.add_argument("--lang", default=env_or("LANG", "en"),
+    p.add_argument("--lang", default=env_or("LANG", "auto"),
                    help="Language code")
     p.add_argument("--chord", default=env_or("CHORD", "CMD,ALT"),
                    help="Chord like 'CMD,ALT' or 'CTRL,SHIFT'")

@@ -104,7 +104,7 @@ function showSettings() {
   
   settingsWindow = new BrowserWindow({
     width: 500,
-    height: 400,
+    height: 520,
     resizable: false,
     titleBarStyle: 'hiddenInset',
     webPreferences: {
@@ -216,9 +216,12 @@ function endTimer(name) {
 
 function startPythonBackend() {
   const model = store.get('model', 'medium.en');
+  // If using an English-only model, force language to 'en'
+  const defaultLang = model.endsWith('.en') ? 'en' : 'auto';
+  const language = store.get('language', defaultLang);
   const chord = store.get('hotkey', 'CMD,ALT');
   
-  addLog(`Starting Python backend with model: ${model}, chord: ${chord}`, 'info');
+  addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}`, 'info');
   
   if (pythonProcess) {
     addLog('Killing existing Python process', 'warning');
@@ -228,8 +231,8 @@ function startPythonBackend() {
   
   try {
     const pythonCmd = isDev 
-      ? ['uv', 'run', 'python', '-m', 'local_dictation.cli_electron', '--model', model, '--chord', chord]
-      : [path.join(pythonPath, 'local-dictation'), '--model', model, '--chord', chord];
+      ? ['uv', 'run', 'python', '-m', 'local_dictation.cli_electron', '--model', model, '--lang', language, '--chord', chord]
+      : [path.join(pythonPath, 'local-dictation'), '--model', model, '--lang', language, '--chord', chord];
     
     const options = {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -330,14 +333,19 @@ function startRecording() {
 }
 
 ipcMain.handle('get-settings', () => {
+  const model = store.get('model', 'medium.en');
+  // If using an English-only model by default, default to 'en' language
+  const defaultLang = model.endsWith('.en') ? 'en' : 'auto';
   return {
-    model: store.get('model', 'medium.en'),
+    model: model,
+    language: store.get('language', defaultLang),
     hotkey: store.get('hotkey', 'CMD,ALT')
   };
 });
 
 ipcMain.handle('save-settings', (event, settings) => {
   store.set('model', settings.model);
+  store.set('language', settings.language);
   store.set('hotkey', settings.hotkey);
   startPythonBackend();
   return true;

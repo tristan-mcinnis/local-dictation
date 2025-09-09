@@ -125,12 +125,55 @@
     <div class="setting-group">
       <label for="model">Whisper Model</label>
       <select id="model">
-        <option value="tiny.en">Tiny (Fastest, ~39MB)</option>
-        <option value="base.en">Base (Fast, ~74MB)</option>
-        <option value="medium.en">Medium (Balanced, ~769MB)</option>
-        <option value="large-v3-turbo">Large Turbo (Best, ~809MB)</option>
+        <option value="tiny.en">tiny.en - 200ms (English only, ~39MB)</option>
+        <option value="tiny">tiny - 200ms (Multilingual, ~39MB)</option>
+        <option value="base.en">base.en - 400ms (English only, ~74MB)</option>
+        <option value="base">base - 400ms (Multilingual, ~74MB)</option>
+        <option value="small.en">small.en - 600ms (English only, ~150MB)</option>
+        <option value="small">small - 600ms (Multilingual, ~150MB)</option>
+        <option value="medium.en">medium.en - 1300ms (English only, ~769MB)</option>
+        <option value="medium">medium - 1300ms (Multilingual, ~769MB)</option>
+        <option value="large-v3-turbo">large-v3-turbo - 1500ms (Multilingual, ~809MB)</option>
+        <option value="large-v3-turbo-q5_0">large-v3-turbo-q5_0 - 1400ms (Quantized, ~547MB)</option>
       </select>
-      <div class="help-text">Larger models are more accurate but slower</div>
+      <div class="help-text">Larger models are more accurate but slower. English-only models are faster for English speech.</div>
+    </div>
+    
+    <div class="setting-group">
+      <label for="language">Input Language</label>
+      <select id="language">
+        <option value="auto">Auto-detect</option>
+        <option value="en">English</option>
+        <option value="es">Spanish</option>
+        <option value="fr">French</option>
+        <option value="de">German</option>
+        <option value="it">Italian</option>
+        <option value="pt">Portuguese</option>
+        <option value="ru">Russian</option>
+        <option value="zh">Chinese</option>
+        <option value="ja">Japanese</option>
+        <option value="ko">Korean</option>
+        <option value="ar">Arabic</option>
+        <option value="hi">Hindi</option>
+        <option value="tr">Turkish</option>
+        <option value="pl">Polish</option>
+        <option value="nl">Dutch</option>
+        <option value="sv">Swedish</option>
+        <option value="da">Danish</option>
+        <option value="no">Norwegian</option>
+        <option value="fi">Finnish</option>
+        <option value="hu">Hungarian</option>
+        <option value="cs">Czech</option>
+        <option value="el">Greek</option>
+        <option value="he">Hebrew</option>
+        <option value="uk">Ukrainian</option>
+        <option value="ro">Romanian</option>
+        <option value="vi">Vietnamese</option>
+        <option value="th">Thai</option>
+        <option value="id">Indonesian</option>
+        <option value="ms">Malay</option>
+      </select>
+      <div class="help-text">Specifying the language avoids auto-detection latency</div>
     </div>
     
     <div class="setting-group">
@@ -155,15 +198,50 @@
   <script>
     const { ipcRenderer } = require('electron');
     
+    // Models that only support English
+    const englishOnlyModels = [
+      'tiny.en', 'base.en', 'small.en', 'medium.en',
+      'tiny.en-q5_1', 'tiny.en-q8_0',
+      'base.en-q5_1', 'base.en-q8_0',
+      'small.en-q5_1', 'small.en-q8_0',
+      'medium.en-q5_0', 'medium.en-q8_0'
+    ];
+    
     async function loadSettings() {
       const settings = await ipcRenderer.invoke('get-settings');
       document.getElementById('model').value = settings.model;
+      document.getElementById('language').value = settings.language || 'auto';
       document.getElementById('hotkey').value = settings.hotkey;
+      
+      // Check if model is English-only and update language accordingly
+      handleModelChange();
+    }
+    
+    function handleModelChange() {
+      const model = document.getElementById('model').value;
+      const languageSelect = document.getElementById('language');
+      
+      if (englishOnlyModels.includes(model)) {
+        // Force English for English-only models
+        languageSelect.value = 'en';
+        languageSelect.disabled = true;
+        // Update help text
+        const helpText = languageSelect.parentElement.querySelector('.help-text');
+        helpText.textContent = 'English-only model selected - language fixed to English';
+      } else {
+        // Enable language selection for multilingual models
+        languageSelect.disabled = false;
+        const helpText = languageSelect.parentElement.querySelector('.help-text');
+        helpText.textContent = 'Specifying the language avoids auto-detection latency';
+        // If it was previously disabled and set to 'en', keep it
+        // This prevents resetting to 'auto' when switching from English-only to multilingual
+      }
     }
     
     async function saveSettings() {
       const settings = {
         model: document.getElementById('model').value,
+        language: document.getElementById('language').value,
         hotkey: document.getElementById('hotkey').value
       };
       
@@ -177,6 +255,9 @@
         }, 1000);
       }
     }
+    
+    // Add event listener for model changes
+    document.getElementById('model').addEventListener('change', handleModelChange);
     
     loadSettings();
   </script>
