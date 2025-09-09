@@ -21,6 +21,9 @@ uv run local-dictation
 # Run with specific options
 uv run local-dictation --model base.en --chord "CMD,SHIFT"
 
+# Run with assistant mode
+uv run local-dictation --assistant-mode
+
 # List available audio devices
 uv run local-dictation --print-devices
 ```
@@ -58,6 +61,27 @@ Typical processing times on Apple Silicon:
 - medium.en: ~800-1200ms (default)
 - large-v3-turbo: ~1500-2000ms
 
+## Assistant Mode
+
+Assistant mode enables voice-controlled text manipulation using on-device MLX language models:
+
+### Features
+- **Grammar Correction**: Select text and say "fix this" or "fix the grammar"
+- **Rewriting**: "Rewrite this formally" or "make this concise"
+- **Translation**: "Translate this to Spanish"
+- **Explanation**: "Explain this"
+- **Summarization**: "Summarize this"
+
+### Models
+- Default: `mlx-community/Llama-3.2-3B-Instruct-4bit` (best for grammar)
+- Alternative: `mlx-community/Llama-3.2-1B-Instruct-4bit` (faster)
+
+### Implementation
+- **Assistant Module** (`src/local_dictation/assistant.py`): MLX model integration
+- **Command Detection**: Parses spoken text for command patterns
+- **Clipboard Integration**: Gets selected text via clipboard operations
+- **Fallback**: When no text is selected, acts as regular dictation
+
 ## Architecture
 
 ### Electron App Structure
@@ -66,6 +90,7 @@ Typical processing times on Apple Silicon:
 - **IPC Communication**: Messages between Electron and Python for state synchronization
 - **Text Insertion**: Uses AppleScript fallback for reliable typing
 - **Logging**: Comprehensive debug logging with error codes
+- **Settings**: Includes assistant mode toggle and model selection
 
 ### CLI Tool Structure
 The CLI version is a standalone push-to-talk dictation tool for macOS that uses Whisper for local speech-to-text transcription.
@@ -74,7 +99,7 @@ The CLI version is a standalone push-to-talk dictation tool for macOS that uses 
 
 **Entry Flow**
 - `src/local_dictation/cli.py`: Main entry point, handles CLI arguments and orchestrates components
-- Initializes hotkey listener, audio recorder, and transcriber
+- Initializes hotkey listener, audio recorder, transcriber, and optionally assistant
 - Uses `pynput.keyboard.Controller` to type transcribed text at cursor position
 
 **Hotkey Detection** (`hotkey.py`)

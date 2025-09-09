@@ -11,6 +11,7 @@ from pynput import keyboard
 from .hotkey import HotkeyListener, parse_chord
 from .audio import VoiceRecorder, list_input_devices
 from .transcribe import Transcriber
+from .assistant import Assistant
 
 def env_or(name: str, default: str):
     return os.getenv(name, default)
@@ -34,6 +35,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--print-devices", action="store_true")
     p.add_argument("--benchmark", action="store_true", 
                    help="Show performance timing for each transcription")
+    p.add_argument("--assistant-mode", action="store_true",
+                   help="Enable assistant mode for processing commands on selected text")
+    p.add_argument("--assistant-model", default=env_or("ASSISTANT_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit"),
+                   help="MLX model to use for assistant mode")
     return p
 
 def main():
@@ -58,7 +63,22 @@ def main():
                         highpass_hz=args.highpass_hz,
                         channels=1)
 
-    tx = Transcriber(model_name=args.model, lang=args.lang)
+    # Force English language for .en models
+    lang = 'en' if args.model.endswith('.en') else args.lang
+    tx = Transcriber(model_name=args.model, lang=lang)
+    
+    # Initialize assistant if in assistant mode
+    assistant = None
+    if args.assistant_mode:
+        print(f"🤖 Initializing Assistant Mode...", file=sys.stderr)
+        assistant = Assistant(model_name=args.assistant_model)
+        assistant.enable()
+        if assistant.enabled:
+            print(f"🤖 Assistant Mode: ON (model: {args.assistant_model})", file=sys.stderr)
+            print(f"   Commands: 'rewrite this...', 'explain this', 'translate to...', etc.", file=sys.stderr)
+        else:
+            print(f"⚠️  Assistant Mode failed to initialize. Running in dictation-only mode.", file=sys.stderr)
+            assistant = None
 
     print(f"🎤 Local Dictation", file=sys.stderr)
     print(f"Model: {args.model}", file=sys.stderr)
@@ -124,8 +144,14 @@ def main():
                             print(f"📊 Avg processing (last 5): {avg_processing*1000:.0f}ms", file=sys.stderr)
                     
                     if text:
-                        # Type the transcribed text at the cursor position
-                        kbd.type(text)
+                        # In assistant mode, try to process as command first
+                        if assistant and assistant.process_transcription(text):
+                            # Command was processed, no need to type
+                            if args.benchmark:
+                                print(f"✅ Command processed", file=sys.stderr)
+                        else:
+                            # Regular dictation - type the transcribed text
+                            kbd.type(text)
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
 

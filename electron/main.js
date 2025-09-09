@@ -184,8 +184,10 @@ function startPythonBackend() {
   const defaultLang = model.endsWith('.en') ? 'en' : 'auto';
   const language = store.get('language', defaultLang);
   const chord = store.get('hotkey', 'CMD,ALT');
+  const assistantMode = store.get('assistantMode', false);
+  const assistantModel = store.get('assistantModel', 'mlx-community/Qwen3-1.7B-4bit');
   
-  addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}`, 'info');
+  addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}, assistant: ${assistantMode}`, 'info');
   
   if (pythonProcess) {
     addLog('Killing existing Python process', 'warning');
@@ -197,6 +199,11 @@ function startPythonBackend() {
     const pythonCmd = isDev 
       ? ['uv', 'run', 'python', '-m', 'local_dictation.cli_electron', '--model', model, '--lang', language, '--chord', chord]
       : [path.join(pythonPath, 'local-dictation'), '--model', model, '--lang', language, '--chord', chord];
+    
+    if (assistantMode) {
+      pythonCmd.push('--assistant-mode');
+      pythonCmd.push('--assistant-model', assistantModel);
+    }
     
     const options = {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -251,6 +258,13 @@ function startPythonBackend() {
         endTimer('typing');
         endTimer('full_cycle');
         addLog(`Failed to type text: ${error} [E005]`, 'error');
+      } else if (message.startsWith('COMMAND_PROCESSED:')) {
+        const command = message.substring(18);
+        const fullCycleTime = endTimer('full_cycle');
+        addLog(`Assistant command processed: ${command}`, 'success', fullCycleTime);
+      } else if (message.startsWith('ASSISTANT_MODE:')) {
+        const status = message.substring(15);
+        addLog(`Assistant mode ${status}`, 'info');
       }
     }
   });
@@ -296,6 +310,12 @@ function startRecording() {
   }
 }
 
+function toggleAssistantMode(enabled) {
+  if (pythonProcess && pythonProcess.stdin) {
+    pythonProcess.stdin.write(`TOGGLE_ASSISTANT:${enabled}\n`);
+  }
+}
+
 ipcMain.handle('get-settings', () => {
   const model = store.get('model', 'medium.en');
   // If using an English-only model by default, default to 'en' language
@@ -303,7 +323,9 @@ ipcMain.handle('get-settings', () => {
   return {
     model: model,
     language: store.get('language', defaultLang),
-    hotkey: store.get('hotkey', 'CMD,ALT')
+    hotkey: store.get('hotkey', 'CMD,ALT'),
+    assistantMode: store.get('assistantMode', false),
+    assistantModel: store.get('assistantModel', 'mlx-community/Llama-3.2-3B-Instruct-4bit')
   };
 });
 
@@ -311,6 +333,8 @@ ipcMain.handle('save-settings', (event, settings) => {
   store.set('model', settings.model);
   store.set('language', settings.language);
   store.set('hotkey', settings.hotkey);
+  store.set('assistantMode', settings.assistantMode);
+  store.set('assistantModel', settings.assistantModel);
   startPythonBackend();
   return true;
 });

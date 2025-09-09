@@ -15,6 +15,7 @@ A fast, local push-to-talk dictation tool for macOS that automatically inserts t
 - **Apple Silicon Optimized** - Leverages Metal acceleration for fast transcription on M1/M2/M3 chips
 - **Push-to-Talk** - Hold a customizable hotkey chord (default: ⌘+⌥) to record, release to transcribe
 - **Auto-Insert** - Transcribed text automatically appears at your cursor position in any application
+- **Assistant Mode** (NEW) - Process spoken commands to manipulate selected text using on-device MLX models
 - **Customizable** - Configure model, language, hotkey, audio device, and more
 - **Clean Output** - Suppresses progress messages for clean piping to other tools
 
@@ -129,6 +130,51 @@ export AUDIO_DEVICE="External Microphone"
 uv run local-dictation  # Uses environment settings
 ```
 
+## Assistant Mode (NEW)
+
+Assistant mode enables voice-controlled text manipulation using on-device MLX language models. When enabled, you can select text and speak commands to process it.
+
+### Enabling Assistant Mode
+
+**CLI:**
+```bash
+# Enable assistant mode with default model
+uv run local-dictation --assistant-mode
+
+# Use a specific model
+uv run local-dictation --assistant-mode --assistant-model "mlx-community/Llama-3.2-1B-Instruct-4bit"
+```
+
+**Electron App:**
+Enable in Settings → Assistant Mode
+
+### Supported Commands
+
+When text is selected, speak commands like:
+- "Rewrite this in formal language"
+- "Make this more concise"
+- "Explain this"
+- "Summarize this"
+- "Translate this to Spanish"
+- "Fix this"
+
+### Available Models
+
+- `mlx-community/Llama-3.2-3B-Instruct-4bit` - Default, best for grammar correction
+- `mlx-community/Llama-3.2-1B-Instruct-4bit` - Smaller, faster
+- `mlx-community/Qwen3-1.7B-4bit` - Alternative small model
+- `mlx-community/Qwen3-3B-4bit` - Alternative medium model  
+- `mlx-community/SmolLM2-1.7B-Instruct-4bit` - Alternative small model
+
+### Pre-downloading Models
+
+To avoid connection issues, pre-download models:
+```bash
+uv run python download_assistant_model.py --model "mlx-community/Llama-3.2-3B-Instruct-4bit"
+```
+
+Models are cached locally after first download.
+
 ## Configuration Tips
 
 ### Hotkey Chords
@@ -180,10 +226,18 @@ local-dictation/
 │   ├── __init__.py
 │   ├── __main__.py        # Entry point
 │   ├── cli.py             # CLI argument parsing and main loop
+│   ├── cli_electron.py    # Electron IPC version
 │   ├── hotkey.py          # Global hotkey detection
 │   ├── audio.py           # Audio recording and resampling
-│   └── transcribe.py      # Whisper transcription
-├── pyproject.toml         # Package configuration
+│   ├── transcribe.py      # Whisper transcription
+│   ├── assistant.py       # MLX assistant mode
+│   └── type_text.py       # Text insertion utilities
+├── electron/              # Electron app files
+│   ├── main.js           # Main process
+│   ├── settings.html     # Settings window
+│   ├── history.html      # Transcript history
+│   └── debug.html        # Debug logs
+├── pyproject.toml        # Package configuration
 └── README.md
 ```
 
@@ -193,6 +247,7 @@ local-dictation/
 - **Audio Recorder**: Records via `sounddevice`, resamples with `scipy` polyphase filter
 - **Transcriber**: Runs whisper.cpp via `pywhispercpp` with Metal acceleration
 - **Auto-typer**: Uses `pynput` to insert text at cursor position
+- **Assistant**: MLX language models for text processing commands (grammar fixing, rewriting, etc.)
 
 ## Contributing
 

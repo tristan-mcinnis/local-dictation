@@ -15,6 +15,8 @@ dependencies = [
   "pywhispercpp", # uses whisper.cpp; will download models on first use
   "orjson>=3.10.7",
   "pillow>=11.3.0",
+  "pyperclip>=1.8.2", # for clipboard access in assistant mode
+  "mlx-lm>=0.21.0", # MLX language models for assistant mode
 ]
 
 [project.scripts]

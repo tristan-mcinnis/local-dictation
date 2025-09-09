@@ -14,6 +14,7 @@ from .hotkey import HotkeyListener, parse_chord
 from .audio import VoiceRecorder, list_input_devices
 from .transcribe import Transcriber
 from .type_text import type_text
+from .assistant import Assistant
 
 def env_or(name: str, default: str):
     return os.getenv(name, default)
@@ -31,6 +32,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max-sec", type=float, default=float(env_or("MAX_SEC", "90")))
     p.add_argument("--highpass-hz", type=float, default=float(env_or("HIGHPASS_HZ", "0")))
     p.add_argument("--device", default=env_or("AUDIO_DEVICE", None))
+    p.add_argument("--assistant-mode", action="store_true",
+                   help="Enable assistant mode")
+    p.add_argument("--assistant-model", default=env_or("ASSISTANT_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit"),
+                   help="MLX model for assistant mode")
     return p
 
 def send_message(msg_type: str, data: str = ""):
@@ -56,14 +61,24 @@ def main():
                         highpass_hz=args.highpass_hz,
                         channels=1)
 
-    tx = Transcriber(model_name=args.model, lang=args.lang)
+    # Force English language for .en models
+    lang = 'en' if args.model.endswith('.en') else args.lang
+    tx = Transcriber(model_name=args.model, lang=lang)
+    
+    # Initialize assistant if enabled
+    assistant = None
+    if args.assistant_mode:
+        assistant = Assistant(model_name=args.assistant_model)
+        assistant.enable()
 
     # Send ready signal
     send_message("READY", json.dumps({
         "model": args.model,
         "chord": args.chord,
         "device_rate": rec.samplerate,
-        "needs_resample": rec.needs_resample
+        "needs_resample": rec.needs_resample,
+        "assistant_mode": args.assistant_mode,
+        "assistant_model": args.assistant_model if args.assistant_mode else None
     }))
 
     # Create a keyboard controller for typing
@@ -85,14 +100,20 @@ def main():
                     if text:
                         # Send transcript to Electron for saving
                         send_message("TRANSCRIPT", text)
-                        # Minimal delay to ensure window focus is back
-                        time.sleep(0.05)
                         
-                        # Type the text at cursor position
-                        if type_text(text, kbd):
-                            send_message("TYPED", "success")
+                        # In assistant mode, try to process as command first
+                        if assistant and assistant.process_transcription(text):
+                            send_message("COMMAND_PROCESSED", text)
                         else:
-                            send_message("TYPE_ERROR", "Failed to type text")
+                            # Regular dictation - type the text
+                            # Minimal delay to ensure window focus is back
+                            time.sleep(0.05)
+                            
+                            # Type the text at cursor position
+                            if type_text(text, kbd):
+                                send_message("TYPED", "success")
+                            else:
+                                send_message("TYPE_ERROR", "Failed to type text")
         except Exception as e:
             send_message("ERROR", str(e))
 
@@ -106,7 +127,16 @@ def main():
             try:
                 if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
                     line = sys.stdin.readline().strip()
-                    if line == "START":
+                    if line.startswith("TOGGLE_ASSISTANT:"):
+                        # Toggle assistant mode from Electron
+                        enabled = line.split(":", 1)[1] == "true"
+                        if assistant:
+                            if enabled:
+                                assistant.enable()
+                            else:
+                                assistant.disable()
+                            send_message("ASSISTANT_MODE", "enabled" if enabled else "disabled")
+                    elif line == "START":
                         # Manual start from Electron menu
                         on_chord(True)
                         time.sleep(0.1)  # Brief delay

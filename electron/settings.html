@@ -19,6 +19,12 @@
       -webkit-app-region: drag;
     }
     
+    .divider {
+      height: 1px;
+      background: #3e3e3e;
+      margin: 25px 0;
+    }
+    
     h1 {
       font-size: 24px;
       margin-bottom: 30px;
@@ -187,6 +193,28 @@
       <div class="help-text">Hold this key combination to record</div>
     </div>
     
+    <div class="divider"></div>
+    
+    <div class="setting-group">
+      <label for="assistantMode">
+        <input type="checkbox" id="assistantMode" style="width: auto; margin-right: 8px;">
+        Enable Assistant Mode
+      </label>
+      <div class="help-text">Process spoken commands to manipulate selected text (e.g., "rewrite this formally", "explain this")</div>
+    </div>
+    
+    <div class="setting-group" id="assistantModelGroup" style="display: none;">
+      <label for="assistantModel">Assistant Model</label>
+      <select id="assistantModel">
+        <option value="mlx-community/Llama-3.2-3B-Instruct-4bit">Llama 3.2 3B (4-bit, recommended)</option>
+        <option value="mlx-community/Llama-3.2-1B-Instruct-4bit">Llama 3.2 1B (4-bit, faster)</option>
+        <option value="mlx-community/Qwen3-1.7B-4bit">Qwen3 1.7B (4-bit)</option>
+        <option value="mlx-community/Qwen3-3B-4bit">Qwen3 3B (4-bit)</option>
+        <option value="mlx-community/SmolLM2-1.7B-Instruct-4bit">SmolLM2 1.7B (4-bit)</option>
+      </select>
+      <div class="help-text">MLX models for on-device processing. Models will be downloaded on first use.</div>
+    </div>
+    
     <div class="button-group">
       <button onclick="saveSettings()">Save Settings</button>
       <button class="secondary" onclick="window.close()">Cancel</button>
@@ -212,6 +240,12 @@
       document.getElementById('model').value = settings.model;
       document.getElementById('language').value = settings.language || 'auto';
       document.getElementById('hotkey').value = settings.hotkey;
+      document.getElementById('assistantMode').checked = settings.assistantMode || false;
+      document.getElementById('assistantModel').value = settings.assistantModel || 'mlx-community/Llama-3.2-3B-Instruct-4bit';
+      
+      // Show/hide assistant model selection
+      document.getElementById('assistantModelGroup').style.display = 
+        settings.assistantMode ? 'block' : 'none';
       
       // Check if model is English-only and update language accordingly
       handleModelChange();
@@ -242,7 +276,9 @@
       const settings = {
         model: document.getElementById('model').value,
         language: document.getElementById('language').value,
-        hotkey: document.getElementById('hotkey').value
+        hotkey: document.getElementById('hotkey').value,
+        assistantMode: document.getElementById('assistantMode').checked,
+        assistantModel: document.getElementById('assistantModel').value
       };
       
       const saved = await ipcRenderer.invoke('save-settings', settings);
@@ -258,6 +294,12 @@
     
     // Add event listener for model changes
     document.getElementById('model').addEventListener('change', handleModelChange);
+    
+    // Add event listener for assistant mode toggle
+    document.getElementById('assistantMode').addEventListener('change', function() {
+      document.getElementById('assistantModelGroup').style.display = 
+        this.checked ? 'block' : 'none';
+    });
     
     loadSettings();
   </script>
