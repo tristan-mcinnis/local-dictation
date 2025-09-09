@@ -1,0 +1,44 @@
+{
+  "name": "local-dictation",
+  "version": "1.0.0",
+  "description": "Local push-to-talk dictation for macOS",
+  "main": "main.js",
+  "scripts": {
+    "start": "NODE_ENV=development electron .",
+    "dev": "NODE_ENV=development electron .",
+    "build": "electron-builder",
+    "dist": "electron-builder --mac"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@electron/notarize": "^2.3.0",
+    "electron": "^28.1.0",
+    "electron-builder": "^24.9.1"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0"
+  },
+  "build": {
+    "appId": "com.local.dictation",
+    "productName": "Local Dictation",
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "assets/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist"
+    },
+    "extraResources": [
+      {
+        "from": "../dist",
+        "to": "python",
+        "filter": ["**/*"]
+      }
+    ]
+  }
+}

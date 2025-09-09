@@ -12,8 +12,9 @@ dependencies = [
   "sounddevice>=0.5.2",
   "soundfile>=0.13.1",
   "pynput>=1.7.7",
-  "pywhispercpp",         # uses whisper.cpp; will download models on first use
+  "pywhispercpp", # uses whisper.cpp; will download models on first use
   "orjson>=3.10.7",
+  "pillow>=11.3.0",
 ]
 
 [project.scripts]
@@ -31,10 +32,10 @@ where = ["src"]
 
 [tool.local-dictation]
 # defaults (also exposed as CLI flags / env):
-# model = "large-v3-turbo-q8_0"
-# lang  = "auto"
+# model = "medium.en"       # good balance of speed and accuracy
+# lang  = "en"              # force English for better accuracy
 # chord = "CMD,ALT"         # hold both to talk
-# debounce_ms = 120
+# debounce_ms = 50          # optimized for responsiveness
 # max_sec = 90
 # highpass_hz = 0           # 0 disables; try 100 in noisy envs
 # output = "text"           # text|lower|json

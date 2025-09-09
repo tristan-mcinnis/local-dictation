@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Settings</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      background: #1e1e1e;
+      color: #e0e0e0;
+      padding: 20px;
+      user-select: none;
+      -webkit-app-region: drag;
+    }
+    
+    h1 {
+      font-size: 24px;
+      margin-bottom: 30px;
+      font-weight: 500;
+      padding-top: 10px;
+    }
+    
+    .settings-container {
+      -webkit-app-region: no-drag;
+    }
+    
+    .setting-group {
+      margin-bottom: 25px;
+    }
+    
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 14px;
+      color: #b0b0b0;
+    }
+    
+    select, input {
+      width: 100%;
+      padding: 10px;
+      background: #2d2d2d;
+      border: 1px solid #3e3e3e;
+      border-radius: 6px;
+      color: #e0e0e0;
+      font-size: 14px;
+      outline: none;
+      transition: all 0.2s;
+    }
+    
+    select:hover, input:hover {
+      border-color: #4a4a4a;
+    }
+    
+    select:focus, input:focus {
+      border-color: #007AFF;
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+    }
+    
+    .button-group {
+      display: flex;
+      gap: 10px;
+      margin-top: 30px;
+    }
+    
+    button {
+      flex: 1;
+      padding: 10px 20px;
+      background: #007AFF;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    
+    button:hover {
+      background: #0066d6;
+    }
+    
+    button:active {
+      transform: scale(0.98);
+    }
+    
+    button.secondary {
+      background: #3e3e3e;
+    }
+    
+    button.secondary:hover {
+      background: #4a4a4a;
+    }
+    
+    .help-text {
+      font-size: 12px;
+      color: #808080;
+      margin-top: 5px;
+    }
+    
+    .status {
+      padding: 10px;
+      background: #2d2d2d;
+      border-radius: 6px;
+      margin-top: 20px;
+      font-size: 13px;
+      display: none;
+    }
+    
+    .status.success {
+      background: #1a3a1a;
+      color: #4ade80;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <h1>Settings</h1>
+  
+  <div class="settings-container">
+    <div class="setting-group">
+      <label for="model">Whisper Model</label>
+      <select id="model">
+        <option value="tiny.en">Tiny (Fastest, ~39MB)</option>
+        <option value="base.en">Base (Fast, ~74MB)</option>
+        <option value="medium.en">Medium (Balanced, ~769MB)</option>
+        <option value="large-v3-turbo">Large Turbo (Best, ~809MB)</option>
+      </select>
+      <div class="help-text">Larger models are more accurate but slower</div>
+    </div>
+    
+    <div class="setting-group">
+      <label for="hotkey">Recording Hotkey</label>
+      <select id="hotkey">
+        <option value="CMD,ALT">⌘ + ⌥ (Cmd + Alt)</option>
+        <option value="CMD,SHIFT">⌘ + ⇧ (Cmd + Shift)</option>
+        <option value="CTRL,ALT">⌃ + ⌥ (Ctrl + Alt)</option>
+        <option value="CTRL,SHIFT">⌃ + ⇧ (Ctrl + Shift)</option>
+      </select>
+      <div class="help-text">Hold this key combination to record</div>
+    </div>
+    
+    <div class="button-group">
+      <button onclick="saveSettings()">Save Settings</button>
+      <button class="secondary" onclick="window.close()">Cancel</button>
+    </div>
+    
+    <div id="status" class="status"></div>
+  </div>
+  
+  <script>
+    const { ipcRenderer } = require('electron');
+    
+    async function loadSettings() {
+      const settings = await ipcRenderer.invoke('get-settings');
+      document.getElementById('model').value = settings.model;
+      document.getElementById('hotkey').value = settings.hotkey;
+    }
+    
+    async function saveSettings() {
+      const settings = {
+        model: document.getElementById('model').value,
+        hotkey: document.getElementById('hotkey').value
+      };
+      
+      const saved = await ipcRenderer.invoke('save-settings', settings);
+      if (saved) {
+        const status = document.getElementById('status');
+        status.textContent = 'Settings saved successfully!';
+        status.className = 'status success';
+        setTimeout(() => {
+          window.close();
+        }, 1000);
+      }
+    }
+    
+    loadSettings();
+  </script>
+</body>
+</html>

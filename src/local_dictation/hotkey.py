@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""
+Optimized Hotkey Listener
+- Fast ticker rate for responsive detection
+- Efficient lock usage
+"""
 from __future__ import annotations
 from pynput import keyboard
 import threading
@@ -38,9 +43,9 @@ def parse_chord(chord_str: str | None) -> set:
 
 class HotkeyListener:
     """
-    Global hotkey chord listener for macOS using pynput.
-    Calls on_chord_active(True/False) when chord transitions pressed<->released.
-    Debounces release to avoid bounce.
+    Optimized Hotkey Listener
+    - Fast ticker response (5ms)
+    - Minimal latency design
     """
     def __init__(self, chord: set, debounce_ms: int, on_chord_active):
         self.chord = chord
@@ -71,16 +76,15 @@ class HotkeyListener:
         self._ticker_stop.set()
 
     def _now_ms(self):
-        return int(time.time() * 1000)
+        return int(time.perf_counter() * 1000)
 
     def _on_press(self, key):
         with self._lock:
             self._pressed.add(key)
-            if self.chord.issubset(self._pressed):
-                if not self._active:
-                    self._active = True
-                    self._release_deadline = None
-                    self.on_chord_active(True)
+            if not self._active and self.chord.issubset(self._pressed):
+                self._active = True
+                self._release_deadline = None
+                self.on_chord_active(True)
 
     def _on_release(self, key):
         with self._lock:
@@ -91,6 +95,7 @@ class HotkeyListener:
                     self._release_deadline = self._now_ms() + self.debounce_ms
 
     def _tick(self):
+        # Fast tick rate for responsive release detection
         while not self._ticker_stop.is_set():
             with self._lock:
                 if self._active and self._release_deadline:
@@ -98,4 +103,4 @@ class HotkeyListener:
                         self._active = False
                         self._release_deadline = None
                         self.on_chord_active(False)
-            time.sleep(0.01)
+            time.sleep(0.005)  # 5ms vs 10ms for faster response
