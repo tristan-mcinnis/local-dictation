@@ -6,10 +6,10 @@ A minimalist macOS menu bar app for local push-to-talk dictation using Whisper.
 
 - 🎙️ Lives in your menu bar for quick access
 - ⚡ Fast local transcription using Whisper
-- 🌊 Real-time audio waveform visualization
 - 📝 Automatic transcript history
 - 🎯 Customizable hotkeys and models
 - 🔒 Fully offline after initial model download
+- 🐛 Built-in debug logging and error tracking
 
 ## Development
 
@@ -59,7 +59,7 @@ The built app will be in `electron/dist/Local Dictation.app`
 
 - **Electron Main Process**: Menu bar management, window creation, IPC
 - **Python Backend**: Audio recording, Whisper transcription, hotkey detection
-- **Renderer Processes**: Settings UI, transcript history, audio visualizer
+- **Renderer Processes**: Settings UI, transcript history, debug logs
 
 ## File Structure
 
@@ -68,7 +68,7 @@ electron/
 ├── main.js           # Main Electron process
 ├── settings.html     # Settings window
 ├── history.html      # Transcript history window
-├── visualizer.html   # Audio waveform visualizer
+├── debug.html        # Debug logs viewer
 ├── assets/          # Icons and resources
 └── package.json     # Electron configuration
 

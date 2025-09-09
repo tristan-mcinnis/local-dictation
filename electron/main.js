@@ -9,7 +9,9 @@ let tray = null;
 let settingsWindow = null;
 let historyWindow = null;
 let visualizerWindow = null;
+let debugWindow = null;
 let pythonProcess = null;
+let logBuffer = [];
 
 const isDev = process.argv.includes('--dev') || process.env.NODE_ENV === 'development';
 const pythonPath = isDev 
@@ -33,6 +35,10 @@ function createTray() {
     {
       label: 'Transcript History',
       click: () => showHistory()
+    },
+    {
+      label: 'Debug Logs',
+      click: () => showDebugLogs()
     },
     { type: 'separator' },
     {
@@ -136,11 +142,68 @@ function showHistory() {
   });
 }
 
+function showDebugLogs() {
+  if (debugWindow) {
+    debugWindow.show();
+    return;
+  }
+  
+  debugWindow = new BrowserWindow({
+    width: 900,
+    height: 600,
+    titleBarStyle: 'hiddenInset',
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false,
+      enableRemoteModule: true
+    }
+  });
+  
+  debugWindow.loadFile('debug.html');
+  
+  debugWindow.on('closed', () => {
+    debugWindow = null;
+  });
+  
+  // Send buffered logs to debug window
+  debugWindow.webContents.on('did-finish-load', () => {
+    logBuffer.forEach(log => {
+      debugWindow.webContents.send('log-message', log);
+    });
+  });
+}
+
+function addLog(message, level = 'info') {
+  const log = {
+    message,
+    level,
+    timestamp: new Date().toISOString()
+  };
+  
+  logBuffer.push(log);
+  
+  // Keep only last 1000 logs in buffer
+  if (logBuffer.length > 1000) {
+    logBuffer.shift();
+  }
+  
+  // Send to debug window if open
+  if (debugWindow && !debugWindow.isDestroyed()) {
+    debugWindow.webContents.send('log-message', log);
+  }
+  
+  // Also log to console for development
+  console.log(`[${level.toUpperCase()}] ${message}`);
+}
+
 function startPythonBackend() {
   const model = store.get('model', 'medium.en');
   const chord = store.get('hotkey', 'CMD,ALT');
   
+  addLog(`Starting Python backend with model: ${model}, chord: ${chord}`, 'info');
+  
   if (pythonProcess) {
+    addLog('Killing existing Python process', 'warning');
     pythonProcess.kill();
     pythonProcess = null;
   }
@@ -156,12 +219,12 @@ function startPythonBackend() {
       env: { ...process.env }
     };
     
-    console.log('Starting Python backend:', pythonCmd[0], pythonCmd.slice(1).join(' '));
-    console.log('Working directory:', options.cwd);
+    addLog(`Command: ${pythonCmd[0]} ${pythonCmd.slice(1).join(' ')}`, 'debug');
+    addLog(`Working directory: ${options.cwd}`, 'debug');
     
     pythonProcess = spawn(pythonCmd[0], pythonCmd.slice(1), options);
   } catch (error) {
-    console.error('Failed to start Python backend:', error);
+    addLog(`Failed to start Python backend: ${error.message} [E001]`, 'error');
     return;
   }
   
@@ -169,54 +232,49 @@ function startPythonBackend() {
     const messages = data.toString().split('\n').filter(m => m.trim());
     
     for (const message of messages) {
-      console.log('Python message:', message);
+      addLog(`Python: ${message}`, 'debug');
       
       if (message.startsWith('RECORDING_START')) {
-        // Visualizer disabled for testing
-        // if (visualizerWindow) {
-        //   visualizerWindow.show();
-        //   visualizerWindow.webContents.send('recording-start');
-        // }
+        addLog('Recording started', 'info');
       } else if (message.startsWith('RECORDING_STOP')) {
-        // Visualizer disabled for testing
-        // if (visualizerWindow) {
-        //   visualizerWindow.webContents.send('recording-stop');
-        // }
+        addLog('Recording stopped', 'info');
       } else if (message.startsWith('TRANSCRIPT:')) {
         const transcript = message.substring(11);
+        addLog(`Transcript: ${transcript}`, 'success');
         saveTranscript(transcript);
-        // Visualizer disabled for testing
-        // if (visualizerWindow) {
-        //   setTimeout(() => visualizerWindow.hide(), 1000);
-        // }
       } else if (message.startsWith('READY:')) {
-        console.log('Python backend ready:', message.substring(6));
+        const info = message.substring(6);
+        addLog(`Python backend ready: ${info}`, 'success');
       } else if (message.startsWith('ERROR:')) {
-        console.error('Python error:', message.substring(6));
-      } else if (message.startsWith('AUDIO_LEVEL:')) {
-        const level = parseFloat(message.substring(12));
-        if (visualizerWindow && !isNaN(level)) {
-          visualizerWindow.webContents.send('audio-level', level);
-        }
+        const error = message.substring(6);
+        addLog(`Python error: ${error} [E004]`, 'error');
       } else if (message.startsWith('TYPED:')) {
-        console.log('Text typed successfully');
+        addLog('Text typed successfully', 'success');
       } else if (message.startsWith('TYPE_ERROR:')) {
-        console.error('Failed to type text:', message.substring(11));
+        const error = message.substring(11);
+        addLog(`Failed to type text: ${error} [E005]`, 'error');
       }
     }
   });
   
   pythonProcess.stderr.on('data', (data) => {
-    console.error(`Python stderr: ${data}`);
+    const message = data.toString().trim();
+    if (message) {
+      addLog(`Python stderr: ${message}`, 'debug');
+    }
   });
   
   pythonProcess.on('error', (error) => {
-    console.error('Python process error:', error);
+    addLog(`Python process error: ${error.message} [E002]`, 'error');
     pythonProcess = null;
   });
   
   pythonProcess.on('close', (code) => {
-    console.log(`Python process exited with code ${code}`);
+    if (code !== 0) {
+      addLog(`Python process exited with code ${code} [E002]`, 'error');
+    } else {
+      addLog(`Python process exited normally`, 'info');
+    }
     pythonProcess = null;
   });
 }

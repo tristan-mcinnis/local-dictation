@@ -2,14 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Project Overview
+
+Local Dictation is a push-to-talk dictation tool for macOS that runs entirely on-device using Whisper. It has two components:
+1. **CLI Tool**: Command-line version for direct terminal use
+2. **Electron App**: Menu bar application with GUI
+
 ## Commands
 
-### Development
+### CLI Development
 ```bash
 # Install dependencies (using uv)
 uv sync
 
-# Run the application
+# Run the CLI application
 uv run local-dictation
 
 # Run with specific options
@@ -17,6 +23,19 @@ uv run local-dictation --model base.en --chord "CMD,SHIFT"
 
 # List available audio devices
 uv run local-dictation --print-devices
+```
+
+### Electron App Development
+```bash
+# Install Electron dependencies
+cd electron
+npm install
+
+# Run in development mode
+npm run dev
+
+# Build for distribution
+npm run dist
 ```
 
 ### Package Management
@@ -41,7 +60,15 @@ Typical processing times on Apple Silicon:
 
 ## Architecture
 
-This is a push-to-talk dictation tool for macOS that uses Whisper for local speech-to-text transcription. The application runs entirely on-device using Apple Silicon acceleration.
+### Electron App Structure
+- **Main Process** (`electron/main.js`): Manages menu bar, windows, and Python subprocess
+- **Python Backend** (`src/local_dictation/cli_electron.py`): Handles recording and transcription
+- **IPC Communication**: Messages between Electron and Python for state synchronization
+- **Text Insertion**: Uses AppleScript fallback for reliable typing
+- **Logging**: Comprehensive debug logging with error codes
+
+### CLI Tool Structure
+The CLI version is a standalone push-to-talk dictation tool for macOS that uses Whisper for local speech-to-text transcription.
 
 ### Core Components
 
