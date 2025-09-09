@@ -12,6 +12,7 @@ let visualizerWindow = null;
 let debugWindow = null;
 let pythonProcess = null;
 let logBuffer = [];
+let performanceTimers = {};
 
 const isDev = process.argv.includes('--dev') || process.env.NODE_ENV === 'development';
 const pythonPath = isDev 
@@ -173,11 +174,14 @@ function showDebugLogs() {
   });
 }
 
-function addLog(message, level = 'info') {
+function addLog(message, level = 'info', metrics = null) {
+  const now = Date.now();
   const log = {
     message,
     level,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    milliseconds: now,
+    metrics: metrics
   };
   
   logBuffer.push(log);
@@ -193,7 +197,21 @@ function addLog(message, level = 'info') {
   }
   
   // Also log to console for development
-  console.log(`[${level.toUpperCase()}] ${message}`);
+  const metricsStr = metrics ? ` [${metrics}ms]` : '';
+  console.log(`[${level.toUpperCase()}] ${message}${metricsStr}`);
+}
+
+function startTimer(name) {
+  performanceTimers[name] = Date.now();
+}
+
+function endTimer(name) {
+  if (performanceTimers[name]) {
+    const elapsed = Date.now() - performanceTimers[name];
+    delete performanceTimers[name];
+    return elapsed;
+  }
+  return null;
 }
 
 function startPythonBackend() {
@@ -235,12 +253,18 @@ function startPythonBackend() {
       addLog(`Python: ${message}`, 'debug');
       
       if (message.startsWith('RECORDING_START')) {
+        startTimer('recording');
+        startTimer('full_cycle');
         addLog('Recording started', 'info');
       } else if (message.startsWith('RECORDING_STOP')) {
-        addLog('Recording stopped', 'info');
+        const recordingTime = endTimer('recording');
+        startTimer('transcription');
+        addLog(`Recording stopped`, 'info', recordingTime);
       } else if (message.startsWith('TRANSCRIPT:')) {
         const transcript = message.substring(11);
-        addLog(`Transcript: ${transcript}`, 'success');
+        const transcriptionTime = endTimer('transcription');
+        startTimer('typing');
+        addLog(`Transcript: ${transcript}`, 'success', transcriptionTime);
         saveTranscript(transcript);
       } else if (message.startsWith('READY:')) {
         const info = message.substring(6);
@@ -249,9 +273,16 @@ function startPythonBackend() {
         const error = message.substring(6);
         addLog(`Python error: ${error} [E004]`, 'error');
       } else if (message.startsWith('TYPED:')) {
-        addLog('Text typed successfully', 'success');
+        const typingTime = endTimer('typing');
+        const fullCycleTime = endTimer('full_cycle');
+        addLog(`Text typed successfully`, 'success', typingTime);
+        if (fullCycleTime) {
+          addLog(`Full cycle completed`, 'info', fullCycleTime);
+        }
       } else if (message.startsWith('TYPE_ERROR:')) {
         const error = message.substring(11);
+        endTimer('typing');
+        endTimer('full_cycle');
         addLog(`Failed to type text: ${error} [E005]`, 'error');
       }
     }

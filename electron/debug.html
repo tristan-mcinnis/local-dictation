@@ -381,11 +381,12 @@
       entry.className = `log-entry ${log.level}`;
       
       const errorCodeText = log.errorCode ? `[${log.errorCode}] ` : '';
+      const metricsText = log.metrics ? ` (${log.metrics}ms)` : '';
       
       entry.innerHTML = `
         <span class="log-time">${log.time}</span>
         <span class="log-level">${log.level}</span>
-        <span class="log-message">${errorCodeText}${escapeHtml(log.message)}</span>
+        <span class="log-message">${errorCodeText}${escapeHtml(log.message)}${metricsText ? '<strong style="color: #ffcc00;">' + metricsText + '</strong>' : ''}</span>
       `;
       
       container.appendChild(entry);
