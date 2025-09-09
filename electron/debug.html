@@ -247,12 +247,12 @@
       <button onclick="toggleAutoScroll()" id="autoscroll-btn" class="primary">Auto-scroll: ON</button>
     </div>
     <div class="filter-group">
-      <button class="filter-btn active" onclick="setFilter('all')">All</button>
-      <button class="filter-btn" onclick="setFilter('error')">Errors</button>
-      <button class="filter-btn" onclick="setFilter('warning')">Warnings</button>
-      <button class="filter-btn" onclick="setFilter('info')">Info</button>
-      <button class="filter-btn" onclick="setFilter('success')">Success</button>
-      <button class="filter-btn" onclick="setFilter('debug')">Debug</button>
+      <button class="filter-btn active" onclick="setFilter('all', event)">All</button>
+      <button class="filter-btn" onclick="setFilter('error', event)">Errors</button>
+      <button class="filter-btn" onclick="setFilter('warning', event)">Warnings</button>
+      <button class="filter-btn" onclick="setFilter('info', event)">Info</button>
+      <button class="filter-btn" onclick="setFilter('success', event)">Success</button>
+      <button class="filter-btn" onclick="setFilter('debug', event)">Debug</button>
     </div>
   </div>
   
@@ -277,6 +277,10 @@
       <span class="stat-value" id="stat-warnings" style="color: #ffcc00;">0</span>
     </div>
     <div class="stat">
+      <span class="stat-label">Avg Cycle:</span>
+      <span class="stat-value" id="avg-cycle" style="color: #4cd964;">-</span>
+    </div>
+    <div class="stat">
       <span class="stat-label">Session:</span>
       <span class="stat-value" id="session-time">00:00:00</span>
     </div>
@@ -299,6 +303,7 @@
       success: 0,
       debug: 0
     };
+    let cycleTimes = [];
     
     // Error code definitions
     const ERROR_CODES = {
@@ -341,7 +346,7 @@
       return null;
     }
     
-    function addLog(message, level = null) {
+    function addLog(message, level = null, metrics = null) {
       const now = new Date();
       const logLevel = level || getLogLevel(message);
       const errorCode = detectErrorCode(message);
@@ -351,12 +356,20 @@
         level: logLevel,
         message: message,
         errorCode: errorCode,
-        timestamp: now.getTime()
+        timestamp: now.getTime(),
+        metrics: metrics
       };
       
       logs.push(log);
       stats.total++;
       stats[logLevel]++;
+      
+      // Track cycle times
+      if (message.includes('Full cycle completed') && metrics) {
+        cycleTimes.push(metrics);
+        if (cycleTimes.length > 10) cycleTimes.shift(); // Keep last 10
+        updateAvgCycle();
+      }
       
       if (currentFilter === 'all' || currentFilter === logLevel) {
         renderLog(log);
@@ -419,13 +432,16 @@
       filteredLogs.forEach(log => renderLog(log));
     }
     
-    function setFilter(filter) {
+    function setFilter(filter, evt) {
       currentFilter = filter;
       
       document.querySelectorAll('.filter-btn').forEach(btn => {
         btn.classList.remove('active');
       });
-      event.target.classList.add('active');
+      
+      if (evt && evt.target) {
+        evt.target.classList.add('active');
+      }
       
       renderAllLogs();
     }
@@ -472,6 +488,13 @@
       document.getElementById('stat-warnings').textContent = stats.warnings;
     }
     
+    function updateAvgCycle() {
+      if (cycleTimes.length > 0) {
+        const avg = Math.round(cycleTimes.reduce((a, b) => a + b, 0) / cycleTimes.length);
+        document.getElementById('avg-cycle').textContent = `${avg}ms`;
+      }
+    }
+    
     function updateSessionTime() {
       const elapsed = Date.now() - sessionStart;
       const hours = Math.floor(elapsed / 3600000);
@@ -487,7 +510,7 @@
     
     // Listen for log messages from main process
     ipcRenderer.on('log-message', (event, data) => {
-      addLog(data.message, data.level);
+      addLog(data.message, data.level, data.metrics);
     });
     
     // Request initial logs
