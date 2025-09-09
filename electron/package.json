@@ -1,7 +1,7 @@
 {
-  "name": "local-dictation",
+  "name": "local-dictation-assistant",
   "version": "1.0.0",
-  "description": "Local push-to-talk dictation for macOS",
+  "description": "Local Dictation & Assistant - Clean, fast dictation for macOS",
   "main": "main.js",
   "scripts": {
     "start": "NODE_ENV=development electron .",
@@ -21,7 +21,7 @@
   },
   "build": {
     "appId": "com.local.dictation",
-    "productName": "Local Dictation",
+    "productName": "Local Dictation & Assistant",
     "directories": {
       "output": "dist"
     },

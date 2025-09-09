@@ -1,31 +1,31 @@
-# Local Dictation 🎤
+# Local Dictation & Assistant
 
 A fast, local push-to-talk dictation tool for macOS that automatically inserts transcribed text at your cursor position. Powered by OpenAI's Whisper running entirely on-device via Apple Silicon acceleration.
 
-## 🚀 Optimized Performance
+## Optimized Performance
 
 - **800-1200ms** processing time with medium.en model
 - **200-400ms** with base.en for ultra-fast response
 - Direct 16kHz recording when supported
 - Pre-allocated buffers for efficiency
 
-## ✨ Features
+## Features
 
-- **🔒 100% Local & Private** - All transcription happens on-device using whisper.cpp. No internet required after model download.
-- **⚡ Apple Silicon Optimized** - Leverages Metal acceleration for fast transcription on M1/M2/M3 chips
-- **🎯 Push-to-Talk** - Hold a customizable hotkey chord (default: ⌘+⌥) to record, release to transcribe
-- **✍️ Auto-Insert** - Transcribed text automatically appears at your cursor position in any application
-- **🎛️ Customizable** - Configure model, language, hotkey, audio device, and more
-- **🔇 Clean Output** - Suppresses progress messages for clean piping to other tools
+- **100% Local & Private** - All transcription happens on-device using whisper.cpp. No internet required after model download.
+- **Apple Silicon Optimized** - Leverages Metal acceleration for fast transcription on M1/M2/M3 chips
+- **Push-to-Talk** - Hold a customizable hotkey chord (default: ⌘+⌥) to record, release to transcribe
+- **Auto-Insert** - Transcribed text automatically appears at your cursor position in any application
+- **Customizable** - Configure model, language, hotkey, audio device, and more
+- **Clean Output** - Suppresses progress messages for clean piping to other tools
 
-## 📋 Requirements
+## Requirements
 
 - macOS (optimized for Apple Silicon M1/M2/M3)
 - Python 3.12+
 - Microphone access permission
 - Accessibility permission (for global hotkey and text insertion)
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Install with uv (Recommended)
 
@@ -34,7 +34,7 @@ A fast, local push-to-talk dictation tool for macOS that automatically inserts t
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install
-git clone https://github.com/yourusername/local-dictation.git
+git clone https://github.com/tristan-mcinnis/local-dictation.git
 cd local-dictation
 uv sync
 
@@ -46,7 +46,7 @@ uv run local-dictation
 
 ```bash
 # Clone and install
-git clone https://github.com/yourusername/local-dictation.git
+git clone https://github.com/tristan-mcinnis/local-dictation.git
 cd local-dictation
 pip install -e .
 
@@ -54,7 +54,7 @@ pip install -e .
 local-dictation
 ```
 
-## 🎮 Usage
+## Usage
 
 ### Basic Usage
 
@@ -129,7 +129,7 @@ export AUDIO_DEVICE="External Microphone"
 uv run local-dictation  # Uses environment settings
 ```
 
-## 🔧 Configuration Tips
+## Configuration Tips
 
 ### Hotkey Chords
 
@@ -172,7 +172,7 @@ This optimized implementation includes:
 - Models are cached in `~/Library/Application Support/pywhispercpp/models/`
 - Delete corrupted models and restart to re-download
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 local-dictation/
@@ -194,7 +194,7 @@ local-dictation/
 - **Transcriber**: Runs whisper.cpp via `pywhispercpp` with Metal acceleration
 - **Auto-typer**: Uses `pynput` to insert text at cursor position
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Feel free to:
 
@@ -202,20 +202,20 @@ Contributions are welcome! Feel free to:
 - Submit pull requests with improvements
 - Share your custom configurations
 
-## 📜 License
+## License
 
 MIT License - see [LICENSE](LICENSE) file for details
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - [OpenAI Whisper](https://github.com/openai/whisper) for the amazing speech recognition model
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) for the efficient C++ implementation
 - [pywhispercpp](https://github.com/abdeladim-s/pywhispercpp) for Python bindings
 
-## 🔒 Privacy
+## Privacy
 
 This tool runs entirely offline after initial model download. No audio or text is sent to any external servers. Your dictation remains completely private on your device.
 
 ---
 
-Made with ❤️ for the macOS community. Optimized for Apple Silicon.
+Made for the macOS community. Optimized for Apple Silicon.

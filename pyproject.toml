@@ -1,7 +1,7 @@
 [project]
 name = "local-dictation"
 version = "0.2.0"
-description = "Fast push-to-talk dictation (macOS-optimized, Apple Silicon)"
+description = "Local Dictation & Assistant - Fast push-to-talk dictation for macOS"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "Tristan (rewrite)", email = "noreply@example.com" }]
