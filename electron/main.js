@@ -24,7 +24,7 @@ if (!fs.existsSync(transcriptsDir)) {
 }
 
 function createTray() {
-  const iconPath = path.join(__dirname, 'assets', 'tray-icon.png');
+  const iconPath = path.join(__dirname, 'assets', 'trayTemplate.png');
   tray = new Tray(iconPath);
   
   const contextMenu = Menu.buildFromTemplate([

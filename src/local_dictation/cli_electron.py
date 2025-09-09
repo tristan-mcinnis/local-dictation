@@ -86,7 +86,23 @@ def main():
                         # Send transcript to Electron for saving
                         send_message("TRANSCRIPT", text)
                         # Small delay to ensure window focus is back
-                        time.sleep(0.2)
+                        time.sleep(0.1)
+                        
+                        # Check if Terminal is the active app (needs special handling)
+                        try:
+                            import subprocess
+                            result = subprocess.run(
+                                ['osascript', '-e', 'tell application "System Events" to get name of first application process whose frontmost is true'],
+                                capture_output=True, text=True, timeout=1
+                            )
+                            active_app = result.stdout.strip()
+                            
+                            # For Terminal, use a longer delay to ensure it's ready
+                            if 'Terminal' in active_app or 'iTerm' in active_app:
+                                time.sleep(0.3)
+                        except:
+                            pass
+                        
                         # Type the text at cursor position
                         if type_text(text, kbd):
                             send_message("TYPED", "success")

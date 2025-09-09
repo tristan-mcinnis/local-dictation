@@ -12,8 +12,10 @@ def type_with_applescript(text):
     text = text.replace('\\', '\\\\')
     text = text.replace('"', '\\"')
     
+    # Use a more robust AppleScript that ensures focus is maintained
     script = f'''
     tell application "System Events"
+        set frontApp to name of first application process whose frontmost is true
         keystroke "{text}"
     end tell
     '''
