@@ -188,7 +188,7 @@ function endTimer(name) {
   return null;
 }
 
-function startPythonBackend() {
+async function startPythonBackend() {
   const model = store.get('model', 'medium.en');
   // If using an English-only model, force language to 'en'
   const defaultLang = model.endsWith('.en') ? 'en' : 'auto';
@@ -202,8 +202,38 @@ function startPythonBackend() {
   addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}, assistant: ${assistantMode}`, 'info');
   
   if (pythonProcess) {
-    addLog('Killing existing Python process', 'warning');
-    pythonProcess.kill();
+    addLog('Gracefully shutting down existing Python process', 'warning');
+    
+    // Send quit signal to Python process for graceful shutdown
+    try {
+      pythonProcess.stdin.write('QUIT\n');
+    } catch (e) {
+      // Ignore if stdin is already closed
+    }
+    
+    // Wait for process to exit gracefully, or force kill after timeout
+    await new Promise((resolve) => {
+      let killed = false;
+      
+      // Set up exit handler
+      pythonProcess.once('exit', () => {
+        if (!killed) {
+          addLog('Python process exited gracefully', 'info');
+        }
+        resolve();
+      });
+      
+      // Force kill after 2 seconds if not exited
+      setTimeout(() => {
+        if (pythonProcess && !pythonProcess.killed) {
+          killed = true;
+          addLog('Force killing Python process after timeout', 'warning');
+          pythonProcess.kill('SIGKILL');
+        }
+        resolve();
+      }, 2000);
+    });
+    
     pythonProcess = null;
   }
   
@@ -349,7 +379,7 @@ ipcMain.handle('get-settings', () => {
   };
 });
 
-ipcMain.handle('save-settings', (event, settings) => {
+ipcMain.handle('save-settings', async (event, settings) => {
   store.set('model', settings.model);
   store.set('language', settings.language);
   store.set('hotkey', settings.hotkey);
@@ -357,7 +387,7 @@ ipcMain.handle('save-settings', (event, settings) => {
   store.set('assistantModel', settings.assistantModel);
   store.set('emailFormatting', settings.emailFormatting);
   store.set('emailSignOff', settings.emailSignOff);
-  startPythonBackend();
+  await startPythonBackend();
   return true;
 });
 
@@ -389,9 +419,9 @@ ipcMain.handle('open-transcript-folder', () => {
   shell.openPath(transcriptsDir);
 });
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   createTray();
-  startPythonBackend();
+  await startPythonBackend();
   
   app.dock.hide();
 });
