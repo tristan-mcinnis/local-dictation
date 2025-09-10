@@ -226,23 +226,33 @@ Return only the corrected text, don't include a preamble:"""
             text: The transcribed text to format
             sign_off: Optional email sign-off (uses config if not provided)
         """
-        # Get the formatting prompt based on active app
-        formatting_prompt = get_formatting_prompt(text, sign_off=sign_off)
+        # Check if we're in an email app and formatting is enabled
+        from .config import is_email_formatting_enabled
         
-        if formatting_prompt:
-            # App-specific formatting needed (e.g., Outlook)
-            formatted = self.generate_response(formatting_prompt)
+        if not is_email_formatting_enabled():
+            return text
             
-            if formatted:
-                # For email apps, add the sign-off
-                app_name = get_active_app()
-                if app_name and any(mail in app_name for mail in ['Outlook', 'Mail']):
-                    if sign_off is None:
-                        sign_off = get_email_sign_off()
-                    formatted = formatted.rstrip() + "\n\n" + sign_off
-                return formatted
+        app_name = get_active_app()
+        if app_name and any(mail in app_name for mail in ['Outlook', 'Mail']):
+            # For email apps, apply minimal formatting and add sign-off
+            if sign_off is None:
+                sign_off = get_email_sign_off()
+            
+            # Simple formatting: ensure proper capitalization and punctuation
+            formatted_text = text.strip()
+            
+            # Capitalize first letter if needed
+            if formatted_text and not formatted_text[0].isupper():
+                formatted_text = formatted_text[0].upper() + formatted_text[1:]
+            
+            # Add period if missing at the end
+            if formatted_text and not formatted_text[-1] in '.!?':
+                formatted_text += '.'
+            
+            # Add sign-off
+            return formatted_text + "\n\n" + sign_off
         
-        # No special formatting needed
+        # No special formatting needed for other apps
         return text
     
     def process_transcription(self, text: str) -> bool:
