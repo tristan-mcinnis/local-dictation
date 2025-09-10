@@ -7,6 +7,7 @@ import argparse
 import os
 import sys
 import time
+import json
 from pynput import keyboard
 from .hotkey import HotkeyListener, parse_chord
 from .audio import VoiceRecorder, list_input_devices
@@ -40,6 +41,12 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Enable assistant mode for processing commands on selected text")
     p.add_argument("--assistant-model", default=env_or("ASSISTANT_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit"),
                    help="MLX model to use for assistant mode")
+    p.add_argument("--use-vad", action="store_true",
+                   help="Enable VAD (Voice Activity Detection) to filter silence")
+    p.add_argument("--idle-timeout", type=int, default=int(env_or("IDLE_TIMEOUT", "60")),
+                   help="Seconds before unloading idle model (0=never)")
+    p.add_argument("--custom-words", type=str, default=env_or("CUSTOM_WORDS", None),
+                   help="JSON file with custom word replacements")
     return p
 
 def main():
@@ -71,11 +78,24 @@ def main():
     rec = VoiceRecorder(device_name=args.device,
                         max_sec=args.max_sec,
                         highpass_hz=args.highpass_hz,
-                        channels=1)
+                        channels=1,
+                        use_vad=args.use_vad)
+
+    # Load custom words if provided
+    custom_words = {}
+    if args.custom_words:
+        try:
+            with open(args.custom_words, 'r') as f:
+                custom_words = json.load(f)
+            print(f"📖 Loaded {len(custom_words)} custom word replacements", file=sys.stderr)
+        except Exception as e:
+            print(f"⚠️ Failed to load custom words: {e}", file=sys.stderr)
 
     # Force English language for .en models
     lang = 'en' if args.model.endswith('.en') else args.lang
-    tx = Transcriber(model_name=args.model, lang=lang)
+    tx = Transcriber(model_name=args.model, lang=lang, 
+                     idle_timeout_seconds=args.idle_timeout,
+                     custom_words=custom_words)
     
     # Initialize assistant if in assistant mode
     assistant = None
@@ -94,6 +114,10 @@ def main():
     print(f"Model: {args.model}", file=sys.stderr)
     print(f"Press and hold {args.chord} to record", file=sys.stderr)
     print(f"Debounce: {args.debounce_ms}ms", file=sys.stderr)
+    if args.use_vad:
+        print(f"🔇 VAD: Enabled (silence filtering)", file=sys.stderr)
+    if args.idle_timeout > 0:
+        print(f"💤 Model unload after: {args.idle_timeout}s idle", file=sys.stderr)
     
     if rec.needs_resample:
         print(f"⚠️  Device rate: {rec.samplerate}Hz (will resample to 16kHz)", file=sys.stderr)

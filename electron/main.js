@@ -198,8 +198,10 @@ async function startPythonBackend() {
   const assistantModel = store.get('assistantModel', 'mlx-community/Qwen3-1.7B-4bit');
   const emailFormatting = store.get('emailFormatting', true);
   const emailSignOff = store.get('emailSignOff', 'Best regards,\n[Your Name]');
+  const useVad = store.get('useVad', false);
+  const idleTimeout = store.get('idleTimeout', 60);
   
-  addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}, assistant: ${assistantMode}`, 'info');
+  addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}, assistant: ${assistantMode}, VAD: ${useVad}`, 'info');
   
   if (pythonProcess) {
     addLog('Gracefully shutting down existing Python process', 'warning');
@@ -250,6 +252,12 @@ async function startPythonBackend() {
       process.env.EMAIL_FORMATTING = emailFormatting ? 'true' : 'false';
       process.env.EMAIL_SIGN_OFF = emailSignOff;
     }
+    
+    if (useVad) {
+      pythonCmd.push('--use-vad');
+    }
+    
+    pythonCmd.push('--idle-timeout', idleTimeout.toString());
     
     const options = {
       stdio: ['pipe', 'pipe', 'pipe'],

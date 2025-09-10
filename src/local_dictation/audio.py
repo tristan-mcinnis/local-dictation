@@ -61,11 +61,14 @@ class VoiceRecorder:
     - Pre-allocated ring buffer for efficiency
     - Cached resampling parameters
     - Direct 16kHz recording when possible
+    - Optional VAD for silence filtering
     """
-    def __init__(self, device_name: str | None, max_sec: float, highpass_hz: float = 0.0, channels: int = 1):
+    def __init__(self, device_name: str | None, max_sec: float, highpass_hz: float = 0.0, channels: int = 1, use_vad: bool = False):
         self.max_sec = max_sec
         self.highpass_hz = highpass_hz
         self.channels = channels
+        self.use_vad = use_vad
+        self.vad = None
 
         self.samplerate, self.device_index = pick_samplerate(device_name)
         sd.default.samplerate = self.samplerate
@@ -95,6 +98,16 @@ class VoiceRecorder:
             self.hp_b, self.hp_a = butter(1, w, "highpass")
         else:
             self.hp_b = self.hp_a = None
+        
+        # Initialize VAD if requested
+        if self.use_vad:
+            try:
+                from .vad import SileroVAD
+                self.vad = SileroVAD(threshold=0.5, min_speech_duration_ms=250, min_silence_duration_ms=100)
+                print("✅ VAD enabled for silence filtering", file=sys.stderr)
+            except Exception as e:
+                print(f"⚠️ VAD initialization failed, continuing without: {e}", file=sys.stderr)
+                self.vad = None
 
     def _callback(self, indata, frames, time, status):
         if status:
@@ -162,5 +175,17 @@ class VoiceRecorder:
         if self.needs_resample:
             print(f"🔄 Resampling {self.samplerate}→{WHISPER_SR}", file=sys.stderr)
             audio = resample_poly(audio, self.resample_up, self.resample_down).astype(np.float32)
+
+        # Apply VAD filtering if enabled
+        if self.vad is not None:
+            original_len = len(audio) / WHISPER_SR
+            audio = self.vad.filter_audio(audio, sample_rate=WHISPER_SR)
+            if len(audio) > 0:
+                filtered_len = len(audio) / WHISPER_SR
+                reduction_pct = (1 - filtered_len / original_len) * 100
+                print(f"🔇 VAD filtered {reduction_pct:.0f}% silence ({original_len:.1f}s → {filtered_len:.1f}s)", file=sys.stderr)
+            else:
+                print("🔇 VAD: No speech detected", file=sys.stderr)
+                return None
 
         return audio
