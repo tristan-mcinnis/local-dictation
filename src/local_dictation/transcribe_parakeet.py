@@ -24,6 +24,11 @@ class ParakeetCoreMLTranscriber:
     
     def __init__(self, custom_words: Optional[Dict[str, str]] = None):
         self.custom_words = custom_words or {}
+        
+        # Temporarily disable Parakeet until Swift CLI is properly implemented
+        # The CoreML model structure is more complex than initially anticipated
+        raise RuntimeError("Parakeet CoreML is not yet fully implemented. Please use --engine whisper for now.")
+        
         self.cli_path = self._find_cli()
         
         if not self.cli_path:
@@ -88,12 +93,13 @@ class ParakeetCoreMLTranscriber:
             sf.write(tmp_path, audio, sample_rate)
         
         try:
-            # Call Swift CLI
+            # Call Swift CLI with shorter timeout to avoid hanging
+            print(f"🔄 Calling Parakeet CLI at: {self.cli_path}", file=sys.stderr)
             result = subprocess.run(
                 [self.cli_path, tmp_path],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=5  # Reduced timeout to avoid hanging
             )
             
             if result.returncode == 0:

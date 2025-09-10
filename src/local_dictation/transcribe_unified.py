@@ -47,7 +47,12 @@ class UnifiedTranscriber:
         if self.engine_type == "whisper":
             self._init_whisper()
         elif self.engine_type == "parakeet":
-            self._init_parakeet()
+            try:
+                self._init_parakeet()
+            except Exception as e:
+                print(f"⚠️ Parakeet initialization failed: {e}", file=sys.stderr)
+                print(f"📝 Falling back to Whisper", file=sys.stderr)
+                self._init_whisper()
         else:  # auto
             # Try Parakeet first for speed, fall back to Whisper
             try:

@@ -1,0 +1,66 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "PackageStructure": ["<PackageStructure>"]
+  "ParakeetCLI-arm64-apple-macosx15.0-release.module": ["<ParakeetCLI-arm64-apple-macosx15.0-release.module>"]
+  "main": ["<ParakeetCLI-arm64-apple-macosx15.0-release.module>","<parakeet-cli-arm64-apple-macosx15.0-release.exe>"]
+  "parakeet-cli-arm64-apple-macosx15.0-release.exe": ["<parakeet-cli-arm64-apple-macosx15.0-release.exe>"]
+  "test": ["<ParakeetCLI-arm64-apple-macosx15.0-release.module>","<parakeet-cli-arm64-apple-macosx15.0-release.exe>"]
+default: "main"
+nodes:
+  "/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Sources/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Sources/ParakeetCLI.swift"]
+    outputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/sources"]
+    description: "Write auxiliary file /Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/sources"
+
+  "/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/ParakeetCLI.swift.o"]
+    outputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli.product/Objects.LinkFileList"
+
+  "/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt"
+
+  "<ParakeetCLI-arm64-apple-macosx15.0-release.module>":
+    tool: phony
+    inputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/ParakeetCLI.swift.o","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/Modules/ParakeetCLI.swiftmodule"]
+    outputs: ["<ParakeetCLI-arm64-apple-macosx15.0-release.module>"]
+
+  "<parakeet-cli-arm64-apple-macosx15.0-release.exe>":
+    tool: phony
+    inputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli"]
+    outputs: ["<parakeet-cli-arm64-apple-macosx15.0-release.exe>"]
+
+  "C.ParakeetCLI-arm64-apple-macosx15.0-release.module":
+    tool: shell
+    inputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Sources/ParakeetCLI.swift","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/sources"]
+    outputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/ParakeetCLI.swift.o","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/Modules/ParakeetCLI.swiftmodule"]
+    description: "Compiling Swift Module 'ParakeetCLI' (1 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","ParakeetCLI","-emit-dependencies","-emit-module","-emit-module-path","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/Modules/ParakeetCLI.swiftmodule","-output-file-map","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/output-file-map.json","-whole-module-optimization","-num-threads","12","-c","@/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/sources","-I","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/Modules","-target","arm64-apple-macosx14.0","-O","-j12","-DSWIFT_PACKAGE","-module-cache-path","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","ParakeetCLI_main","-parse-as-library","-color-diagnostics","-swift-version","5","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","parakeet_coreml"]
+
+  "C.parakeet-cli-arm64-apple-macosx15.0-release.exe":
+    tool: shell
+    inputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/ParakeetCLI.build/ParakeetCLI.swift.o","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli.product/Objects.LinkFileList"]
+    outputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli"]
+    description: "Linking ./.build/arm64-apple-macosx/release/parakeet-cli"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-L","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release","-o","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli","-module-name","parakeet_cli","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-dead_strip","-Xlinker","-alias","-Xlinker","_ParakeetCLI_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/.build/arm64-apple-macosx/release/parakeet-cli.product/Objects.LinkFileList","-target","arm64-apple-macosx14.0","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/PrivateFrameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Sources/","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Package.swift","/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

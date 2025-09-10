@@ -1,8 +1,10 @@
 # Parakeet CoreML Integration
 
-Fast, native transcription using CoreML on Apple Silicon.
+**⚠️ STATUS: Not Yet Functional - Implementation In Progress**
 
-## Features
+The Parakeet CoreML integration is currently incomplete. The Swift CLI needs to be updated to properly handle the multi-model architecture of Parakeet (Melspectrogram, Encoder, Decoder). For now, please use Whisper transcription.
+
+## Features (When Completed)
 
 - **~5x faster than real-time** transcription
 - **Native Apple Silicon performance** via CoreML

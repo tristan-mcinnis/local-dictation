@@ -1,0 +1,6 @@
+version: "Apple Swift version 6.1.2 (swiftlang-6.1.2.1.2 clang-1700.0.13.5)"
+options: "086f645b14aabe886d1a26b996399963a892a6caf9c20a6a3ca956d3a52b71cb"
+build_start_time: [1757492445, 729448000]
+build_end_time: [1757492450, 700442000]
+inputs:
+  "/Users/tristanmcinnis/Documents/L_Code/local-dictation/parakeet-coreml/Sources/ParakeetCLI.swift": [1757491366, 267256280]
