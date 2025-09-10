@@ -63,11 +63,21 @@ def main():
         send_message("ERROR", f"Invalid chord: {args.chord}")
         sys.exit(2)
 
-    rec = VoiceRecorder(device_name=args.device,
-                        max_sec=args.max_sec,
-                        highpass_hz=args.highpass_hz,
-                        channels=1,
-                        use_vad=args.use_vad)
+    # Try to initialize recorder with VAD if requested
+    vad_actually_enabled = False
+    try:
+        rec = VoiceRecorder(device_name=args.device,
+                            max_sec=args.max_sec,
+                            highpass_hz=args.highpass_hz,
+                            channels=1,
+                            use_vad=args.use_vad)
+        # Check if VAD actually initialized when requested
+        vad_actually_enabled = args.use_vad and rec.vad is not None
+        if args.use_vad and not vad_actually_enabled:
+            send_message("LOG", "VAD requested but failed to initialize - continuing without VAD")
+    except Exception as e:
+        send_message("ERROR", f"Failed to initialize audio recorder: {e}")
+        sys.exit(1)
 
     # Load custom words if provided
     custom_words = {}
@@ -93,7 +103,7 @@ def main():
         assistant = Assistant(model_name=args.assistant_model)
         assistant.enable()
 
-    # Send ready signal
+    # Send ready signal with actual VAD status
     send_message("READY", json.dumps({
         "model": args.model,
         "chord": args.chord,
@@ -101,7 +111,7 @@ def main():
         "needs_resample": rec.needs_resample,
         "assistant_mode": args.assistant_mode,
         "assistant_model": args.assistant_model if args.assistant_mode else None,
-        "vad_enabled": args.use_vad,
+        "vad_enabled": vad_actually_enabled,
         "idle_timeout": args.idle_timeout,
         "custom_words_loaded": len(custom_words) if custom_words else 0
     }))
