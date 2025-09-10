@@ -4,7 +4,17 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const Store = require('electron-store');
 
-const store = new Store();
+const store = new Store({
+  defaults: {
+    model: 'medium.en',
+    language: 'en',
+    hotkey: 'CMD,ALT',
+    assistantMode: false,
+    assistantModel: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
+    emailFormatting: true,
+    emailSignOff: 'Best regards,\n[Your Name]'
+  }
+});
 let tray = null;
 let settingsWindow = null;
 let historyWindow = null;
@@ -323,17 +333,19 @@ function toggleAssistantMode(enabled) {
 }
 
 ipcMain.handle('get-settings', () => {
-  const model = store.get('model', 'medium.en');
-  // If using an English-only model by default, default to 'en' language
-  const defaultLang = model.endsWith('.en') ? 'en' : 'auto';
+  const model = store.get('model');
+  // If using an English-only model, ensure language is set to 'en'
+  const language = store.get('language');
+  const adjustedLanguage = model.endsWith('.en') && language === 'auto' ? 'en' : language;
+  
   return {
     model: model,
-    language: store.get('language', defaultLang),
-    hotkey: store.get('hotkey', 'CMD,ALT'),
-    assistantMode: store.get('assistantMode', false),
-    assistantModel: store.get('assistantModel', 'mlx-community/Llama-3.2-3B-Instruct-4bit'),
-    emailFormatting: store.get('emailFormatting', true),
-    emailSignOff: store.get('emailSignOff', 'Best regards,\n[Your Name]')
+    language: adjustedLanguage,
+    hotkey: store.get('hotkey'),
+    assistantMode: store.get('assistantMode'),
+    assistantModel: store.get('assistantModel'),
+    emailFormatting: store.get('emailFormatting'),
+    emailSignOff: store.get('emailSignOff')
   };
 });
 
