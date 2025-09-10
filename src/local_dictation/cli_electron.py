@@ -12,7 +12,7 @@ import threading
 from pynput import keyboard
 from .hotkey import HotkeyListener, parse_chord
 from .audio import VoiceRecorder, list_input_devices
-from .transcribe import Transcriber
+from .transcribe_unified import UnifiedTranscriber
 from .type_text import type_text
 from .assistant import Assistant
 from .app_context import get_formatting_prompt
@@ -43,6 +43,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Seconds before unloading idle model (0=never)")
     p.add_argument("--custom-words", type=str, default=env_or("CUSTOM_WORDS", None),
                    help="JSON file with custom word replacements")
+    p.add_argument("--engine", choices=["whisper", "parakeet", "auto"], default=env_or("ENGINE", "whisper"),
+                   help="Transcription engine (whisper only works currently)")
     return p
 
 def send_message(msg_type: str, data: str = ""):
@@ -90,9 +92,12 @@ def main():
 
     # Force English language for .en models
     lang = 'en' if args.model.endswith('.en') else args.lang
-    tx = Transcriber(model_name=args.model, lang=lang,
-                     idle_timeout_seconds=args.idle_timeout,
-                     custom_words=custom_words)
+    tx = UnifiedTranscriber(
+        engine=args.engine,
+        model_name=args.model, 
+        lang=lang,
+        idle_timeout_seconds=args.idle_timeout,
+        custom_words=custom_words)
     
     # Initialize assistant if enabled
     assistant = None

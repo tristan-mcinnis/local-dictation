@@ -266,6 +266,7 @@ async function startPythonBackend() {
   const emailSignOff = store.get('emailSignOff', 'Best regards,\n[Your Name]');
   const useVad = store.get('useVad', false);
   const idleTimeout = store.get('idleTimeout', 60);
+  const engine = store.get('engine', 'whisper');
   
   addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}, assistant: ${assistantMode}, VAD: ${useVad}`, 'info');
   
@@ -324,6 +325,7 @@ async function startPythonBackend() {
     }
     
     pythonCmd.push('--idle-timeout', idleTimeout.toString());
+    pythonCmd.push('--engine', engine);
     
     const options = {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -467,6 +469,7 @@ ipcMain.handle('get-settings', () => {
 });
 
 ipcMain.handle('save-settings', async (event, settings) => {
+  store.set('engine', settings.engine || 'whisper');
   store.set('model', settings.model);
   store.set('language', settings.language);
   store.set('hotkey', settings.hotkey);
