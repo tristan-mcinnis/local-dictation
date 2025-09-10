@@ -26,6 +26,7 @@ let historyWindow = null;
 let debugWindow = null;
 let visualizerWindow = null;
 let pythonProcess = null;
+let pythonStarting = false;  // Mutex to prevent concurrent starts
 let logBuffer = [];
 let performanceTimers = {};
 let recordingSound = null;
@@ -255,6 +256,13 @@ function endTimer(name) {
 }
 
 async function startPythonBackend() {
+  // Prevent concurrent starts
+  if (pythonStarting) {
+    addLog('Python backend already starting, skipping duplicate call', 'warning');
+    return;
+  }
+  pythonStarting = true;
+  
   const model = store.get('model', 'medium.en');
   // If using an English-only model, force language to 'en'
   const defaultLang = model.endsWith('.en') ? 'en' : 'auto';
@@ -304,6 +312,10 @@ async function startPythonBackend() {
     });
     
     pythonProcess = null;
+    
+    // Add a small delay to ensure the keyboard listener is fully released
+    // This prevents race conditions on macOS when restarting the backend
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
   
   try {
@@ -339,6 +351,7 @@ async function startPythonBackend() {
     pythonProcess = spawn(pythonCmd[0], pythonCmd.slice(1), options);
   } catch (error) {
     addLog(`Failed to start Python backend: ${error.message} [E001]`, 'error');
+    pythonStarting = false;  // Reset flag on error
     return;
   }
   
@@ -424,6 +437,9 @@ async function startPythonBackend() {
     }
     pythonProcess = null;
   });
+  
+  // Reset flag after successful startup
+  pythonStarting = false;
 }
 
 function saveTranscript(text) {
