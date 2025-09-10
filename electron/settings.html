@@ -129,6 +129,16 @@
   
   <div class="settings-container">
     <div class="setting-group">
+      <label for="engine">Transcription Engine</label>
+      <select id="engine">
+        <option value="auto">Auto (Parakeet if available, else Whisper)</option>
+        <option value="parakeet">Parakeet (Fast, English only)</option>
+        <option value="whisper">Whisper (Accurate, multilingual)</option>
+      </select>
+      <div class="help-text">Parakeet is ~5x faster but English-only. Auto selects the best available.</div>
+    </div>
+    
+    <div class="setting-group">
       <label for="model">Whisper Model</label>
       <select id="model">
         <option value="tiny.en">tiny.en - 200ms (English only, ~39MB)</option>
@@ -294,6 +304,7 @@
     
     async function loadSettings() {
       const settings = await ipcRenderer.invoke('get-settings');
+      document.getElementById('engine').value = settings.engine || 'auto';
       document.getElementById('model').value = settings.model;
       document.getElementById('language').value = settings.language || 'auto';
       document.getElementById('hotkey').value = settings.hotkey;
@@ -341,6 +352,7 @@
     
     async function saveSettings() {
       const settings = {
+        engine: document.getElementById('engine').value,
         model: document.getElementById('model').value,
         language: document.getElementById('language').value,
         hotkey: document.getElementById('hotkey').value,

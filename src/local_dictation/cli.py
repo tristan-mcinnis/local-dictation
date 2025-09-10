@@ -12,6 +12,7 @@ from pynput import keyboard
 from .hotkey import HotkeyListener, parse_chord
 from .audio import VoiceRecorder, list_input_devices
 from .transcribe import Transcriber
+from .transcribe_unified import UnifiedTranscriber
 from .assistant import Assistant
 from .config import get_config_path, load_config
 
@@ -47,6 +48,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Seconds before unloading idle model (0=never)")
     p.add_argument("--custom-words", type=str, default=env_or("CUSTOM_WORDS", None),
                    help="JSON file with custom word replacements")
+    p.add_argument("--engine", choices=["whisper", "parakeet", "auto"], default=env_or("ENGINE", "auto"),
+                   help="Transcription engine (whisper, parakeet, auto)")
     return p
 
 def main():
@@ -93,9 +96,15 @@ def main():
 
     # Force English language for .en models
     lang = 'en' if args.model.endswith('.en') else args.lang
-    tx = Transcriber(model_name=args.model, lang=lang, 
-                     idle_timeout_seconds=args.idle_timeout,
-                     custom_words=custom_words)
+    
+    # Use unified transcriber for engine selection
+    tx = UnifiedTranscriber(
+        engine=args.engine,
+        model_name=args.model, 
+        lang=lang, 
+        idle_timeout_seconds=args.idle_timeout,
+        custom_words=custom_words
+    )
     
     # Initialize assistant if in assistant mode
     assistant = None
@@ -111,12 +120,14 @@ def main():
             assistant = None
 
     print(f"🎤 Local Dictation", file=sys.stderr)
-    print(f"Model: {args.model}", file=sys.stderr)
+    print(f"Engine: {tx.get_active_engine()}", file=sys.stderr)
+    if tx.get_active_engine() == "whisper":
+        print(f"Model: {args.model}", file=sys.stderr)
     print(f"Press and hold {args.chord} to record", file=sys.stderr)
     print(f"Debounce: {args.debounce_ms}ms", file=sys.stderr)
     if args.use_vad:
         print(f"🔇 VAD: Enabled (silence filtering)", file=sys.stderr)
-    if args.idle_timeout > 0:
+    if args.idle_timeout > 0 and tx.get_active_engine() == "whisper":
         print(f"💤 Model unload after: {args.idle_timeout}s idle", file=sys.stderr)
     
     if rec.needs_resample:

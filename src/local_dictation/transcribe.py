@@ -6,6 +6,7 @@ Optimized Transcription
 - Fast processing pipeline
 - Model idle unloading
 - Custom word dictionary
+- Multiple engine support (Whisper, Parakeet)
 """
 from __future__ import annotations
 import sys
