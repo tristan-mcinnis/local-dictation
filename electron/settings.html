@@ -241,6 +241,24 @@
     
     <div class="setting-group">
       <label>
+        <input type="checkbox" id="showVisualizer" style="width: auto; margin-right: 8px;">
+        Show Audio Visualizer
+      </label>
+      <div class="help-text">Display a sleek audio level indicator while recording</div>
+    </div>
+    
+    <div class="setting-group">
+      <label>
+        <input type="checkbox" id="playSounds" style="width: auto; margin-right: 8px;">
+        Play Feedback Sounds
+      </label>
+      <div class="help-text">Play subtle ping sounds when starting and stopping recording</div>
+    </div>
+    
+    <div class="divider"></div>
+    
+    <div class="setting-group">
+      <label>
         <input type="checkbox" id="emailFormatting" style="width: auto; margin-right: 8px;">
         Enable Email Formatting
       </label>
@@ -285,6 +303,8 @@
       document.getElementById('emailSignOff').value = settings.emailSignOff || 'Best regards,\n[Your Name]';
       document.getElementById('useVad').checked = settings.useVad || false;
       document.getElementById('idleTimeout').value = settings.idleTimeout || '60';
+      document.getElementById('showVisualizer').checked = settings.showVisualizer !== false; // Default to true
+      document.getElementById('playSounds').checked = settings.playSounds !== false; // Default to true
       
       // Show/hide assistant model selection
       document.getElementById('assistantModelGroup').style.display = 
@@ -329,7 +349,9 @@
         emailFormatting: document.getElementById('emailFormatting').checked,
         emailSignOff: document.getElementById('emailSignOff').value,
         useVad: document.getElementById('useVad').checked,
-        idleTimeout: parseInt(document.getElementById('idleTimeout').value)
+        idleTimeout: parseInt(document.getElementById('idleTimeout').value),
+        showVisualizer: document.getElementById('showVisualizer').checked,
+        playSounds: document.getElementById('playSounds').checked
       };
       
       const saved = await ipcRenderer.invoke('save-settings', settings);

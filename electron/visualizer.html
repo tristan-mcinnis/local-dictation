@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Audio Visualizer</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      background: transparent;
+      overflow: hidden;
+      user-select: none;
+      -webkit-app-region: drag;
+    }
+    
+    #visualizer {
+      position: absolute;
+      bottom: 40px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 200px;
+      height: 40px;
+      background: rgba(0, 0, 0, 0.85);
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      padding: 0 20px;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+      opacity: 0;
+      transition: opacity 0.2s ease-in-out;
+    }
+    
+    #visualizer.active {
+      opacity: 1;
+    }
+    
+    .bar {
+      width: 3px;
+      background: white;
+      border-radius: 1.5px;
+      transition: height 0.05s ease-out;
+      min-height: 4px;
+      max-height: 24px;
+    }
+    
+    /* Pulse animation for idle state */
+    #visualizer.idle .bar {
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    
+    @keyframes pulse {
+      0%, 100% {
+        height: 4px;
+        opacity: 0.3;
+      }
+      50% {
+        height: 8px;
+        opacity: 0.6;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="visualizer">
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+    <div class="bar" style="height: 4px;"></div>
+  </div>
+  
+  <script>
+    const { ipcRenderer } = require('electron');
+    const visualizer = document.getElementById('visualizer');
+    const bars = document.querySelectorAll('.bar');
+    
+    let isRecording = false;
+    let animationFrame = null;
+    
+    // Smooth random animation for audio levels
+    function animateBars() {
+      if (!isRecording) return;
+      
+      bars.forEach((bar, index) => {
+        // Create smooth wave effect
+        const time = Date.now() / 100;
+        const wave = Math.sin(time + index * 0.5) * 0.3 + 0.7;
+        const random = Math.random() * 0.3 + 0.7;
+        const height = Math.min(24, Math.max(4, wave * random * 24));
+        bar.style.height = `${height}px`;
+      });
+      
+      animationFrame = requestAnimationFrame(animateBars);
+    }
+    
+    ipcRenderer.on('recording-started', () => {
+      isRecording = true;
+      visualizer.classList.add('active');
+      visualizer.classList.remove('idle');
+      animateBars();
+    });
+    
+    ipcRenderer.on('recording-stopped', () => {
+      isRecording = false;
+      visualizer.classList.add('idle');
+      
+      // Fade out after a short delay
+      setTimeout(() => {
+        visualizer.classList.remove('active');
+        visualizer.classList.remove('idle');
+        if (animationFrame) {
+          cancelAnimationFrame(animationFrame);
+        }
+        // Reset bars
+        bars.forEach(bar => {
+          bar.style.height = '4px';
+        });
+      }, 500);
+    });
+    
+    // Handle audio levels from backend (if we implement it)
+    ipcRenderer.on('audio-levels', (event, levels) => {
+      if (!isRecording) return;
+      
+      // Map audio levels to bar heights
+      bars.forEach((bar, index) => {
+        if (index < levels.length) {
+          const height = Math.min(24, Math.max(4, levels[index] * 24));
+          bar.style.height = `${height}px`;
+        }
+      });
+    });
+  </script>
+</body>
+</html>

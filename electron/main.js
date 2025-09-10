@@ -12,16 +12,23 @@ const store = new Store({
     assistantMode: false,
     assistantModel: 'mlx-community/Llama-3.2-3B-Instruct-4bit',
     emailFormatting: true,
-    emailSignOff: 'Best regards,\n[Your Name]'
+    emailSignOff: 'Best regards,\n[Your Name]',
+    showVisualizer: true,
+    playSounds: true,
+    useVad: false,
+    idleTimeout: 60
   }
 });
 let tray = null;
 let settingsWindow = null;
 let historyWindow = null;
 let debugWindow = null;
+let visualizerWindow = null;
 let pythonProcess = null;
 let logBuffer = [];
 let performanceTimers = {};
+let recordingSound = null;
+let stopSound = null;
 
 const isDev = process.argv.includes('--dev') || process.env.NODE_ENV === 'development';
 const pythonPath = isDev 
@@ -31,6 +38,64 @@ const pythonPath = isDev
 const transcriptsDir = path.join(app.getPath('userData'), 'transcripts');
 if (!fs.existsSync(transcriptsDir)) {
   fs.mkdirSync(transcriptsDir, { recursive: true });
+}
+
+function createVisualizerWindow() {
+  if (visualizerWindow) return;
+  
+  const { screen } = require('electron');
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const { width, height } = primaryDisplay.workAreaSize;
+  
+  visualizerWindow = new BrowserWindow({
+    width: 240,
+    height: 120,
+    x: Math.floor((width - 240) / 2),
+    y: height - 120,
+    frame: false,
+    transparent: true,
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    movable: false,
+    focusable: false,
+    hasShadow: false,
+    webPreferences: {
+      nodeIntegration: true,
+      contextIsolation: false
+    }
+  });
+  
+  visualizerWindow.loadFile('visualizer.html');
+  visualizerWindow.setIgnoreMouseEvents(true);
+  visualizerWindow.setVisibleOnAllWorkspaces(true);
+  
+  visualizerWindow.on('closed', () => {
+    visualizerWindow = null;
+  });
+}
+
+function loadSounds() {
+  const soundsPath = path.join(__dirname, 'sounds');
+  const startPath = path.join(soundsPath, 'record_start.wav');
+  const stopPath = path.join(soundsPath, 'record_stop.wav');
+  
+  if (fs.existsSync(startPath) && fs.existsSync(stopPath)) {
+    recordingSound = startPath;
+    stopSound = stopPath;
+  }
+}
+
+function playSound(soundPath) {
+  if (!soundPath || !store.get('playSounds', true)) return;
+  
+  // Use afplay on macOS for simple sound playback
+  const { exec } = require('child_process');
+  exec(`afplay "${soundPath}" -v 0.3`, (error) => {
+    if (error) {
+      console.error('Error playing sound:', error);
+    }
+  });
 }
 
 function createTray() {
@@ -284,10 +349,23 @@ async function startPythonBackend() {
         startTimer('recording');
         startTimer('full_cycle');
         addLog('Recording started', 'info');
+        
+        // Show visualizer and play sound
+        if (store.get('showVisualizer', true)) {
+          if (!visualizerWindow) createVisualizerWindow();
+          visualizerWindow?.webContents.send('recording-started');
+        }
+        playSound(recordingSound);
       } else if (message.startsWith('RECORDING_STOP')) {
         const recordingTime = endTimer('recording');
         startTimer('transcription');
         addLog(`Recording stopped`, 'info', recordingTime);
+        
+        // Hide visualizer and play stop sound
+        if (visualizerWindow) {
+          visualizerWindow.webContents.send('recording-stopped');
+        }
+        playSound(stopSound);
       } else if (message.startsWith('TRANSCRIPT:')) {
         const transcript = message.substring(11);
         const transcriptionTime = endTimer('transcription');
@@ -395,6 +473,19 @@ ipcMain.handle('save-settings', async (event, settings) => {
   store.set('assistantModel', settings.assistantModel);
   store.set('emailFormatting', settings.emailFormatting);
   store.set('emailSignOff', settings.emailSignOff);
+  store.set('useVad', settings.useVad);
+  store.set('idleTimeout', settings.idleTimeout);
+  store.set('showVisualizer', settings.showVisualizer);
+  store.set('playSounds', settings.playSounds);
+  
+  // Recreate visualizer window if needed
+  if (settings.showVisualizer && !visualizerWindow) {
+    createVisualizerWindow();
+  } else if (!settings.showVisualizer && visualizerWindow) {
+    visualizerWindow.close();
+    visualizerWindow = null;
+  }
+  
   await startPythonBackend();
   return true;
 });
@@ -429,7 +520,13 @@ ipcMain.handle('open-transcript-folder', () => {
 
 app.whenReady().then(async () => {
   createTray();
+  loadSounds();
   await startPythonBackend();
+  
+  // Create visualizer if enabled
+  if (store.get('showVisualizer', true)) {
+    createVisualizerWindow();
+  }
   
   app.dock.hide();
 });
