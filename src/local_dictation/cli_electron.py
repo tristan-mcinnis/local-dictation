@@ -15,6 +15,7 @@ from .audio import VoiceRecorder, list_input_devices
 from .transcribe import Transcriber
 from .type_text import type_text
 from .assistant import Assistant
+from .app_context import get_formatting_prompt
 
 def env_or(name: str, default: str):
     return os.getenv(name, default)
@@ -67,6 +68,9 @@ def main():
     
     # Initialize assistant if enabled
     assistant = None
+    email_formatting = os.getenv('EMAIL_FORMATTING', 'true').lower() == 'true'
+    email_sign_off = os.getenv('EMAIL_SIGN_OFF', 'Best regards,\n[Your Name]')
+    
     if args.assistant_mode:
         assistant = Assistant(model_name=args.assistant_model)
         assistant.enable()
@@ -105,6 +109,10 @@ def main():
                         if assistant and assistant.process_transcription(text):
                             send_message("COMMAND_PROCESSED", text)
                         else:
+                            # Apply app-aware formatting if assistant is enabled and email formatting is on
+                            if assistant and assistant.enabled and email_formatting:
+                                text = assistant.format_for_app_context(text, sign_off=email_sign_off)
+                            
                             # Regular dictation - type the text
                             # Minimal delay to ensure window focus is back
                             time.sleep(0.05)

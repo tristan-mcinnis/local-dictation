@@ -186,6 +186,8 @@ function startPythonBackend() {
   const chord = store.get('hotkey', 'CMD,ALT');
   const assistantMode = store.get('assistantMode', false);
   const assistantModel = store.get('assistantModel', 'mlx-community/Qwen3-1.7B-4bit');
+  const emailFormatting = store.get('emailFormatting', true);
+  const emailSignOff = store.get('emailSignOff', 'Best regards,\n[Your Name]');
   
   addLog(`Starting Python backend with model: ${model}, language: ${language}, chord: ${chord}, assistant: ${assistantMode}`, 'info');
   
@@ -203,6 +205,10 @@ function startPythonBackend() {
     if (assistantMode) {
       pythonCmd.push('--assistant-mode');
       pythonCmd.push('--assistant-model', assistantModel);
+      
+      // Pass email settings via environment variables to avoid command line escaping issues
+      process.env.EMAIL_FORMATTING = emailFormatting ? 'true' : 'false';
+      process.env.EMAIL_SIGN_OFF = emailSignOff;
     }
     
     const options = {
@@ -325,7 +331,9 @@ ipcMain.handle('get-settings', () => {
     language: store.get('language', defaultLang),
     hotkey: store.get('hotkey', 'CMD,ALT'),
     assistantMode: store.get('assistantMode', false),
-    assistantModel: store.get('assistantModel', 'mlx-community/Llama-3.2-3B-Instruct-4bit')
+    assistantModel: store.get('assistantModel', 'mlx-community/Llama-3.2-3B-Instruct-4bit'),
+    emailFormatting: store.get('emailFormatting', true),
+    emailSignOff: store.get('emailSignOff', 'Best regards,\n[Your Name]')
   };
 });
 
@@ -335,6 +343,8 @@ ipcMain.handle('save-settings', (event, settings) => {
   store.set('hotkey', settings.hotkey);
   store.set('assistantMode', settings.assistantMode);
   store.set('assistantModel', settings.assistantModel);
+  store.set('emailFormatting', settings.emailFormatting);
+  store.set('emailSignOff', settings.emailSignOff);
   startPythonBackend();
   return true;
 });

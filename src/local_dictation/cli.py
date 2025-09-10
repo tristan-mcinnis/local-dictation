@@ -12,6 +12,7 @@ from .hotkey import HotkeyListener, parse_chord
 from .audio import VoiceRecorder, list_input_devices
 from .transcribe import Transcriber
 from .assistant import Assistant
+from .config import get_config_path, load_config
 
 def env_or(name: str, default: str):
     return os.getenv(name, default)
@@ -43,6 +44,15 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main():
     args = build_argparser().parse_args()
+    
+    # Load config (creates default if doesn't exist)
+    config_path = get_config_path()
+    if not config_path.exists():
+        print(f"🔧 Creating config file at: {config_path}", file=sys.stderr)
+        config = load_config()  # This will create default config
+        print(f"📝 Please edit the config to set your email sign-off", file=sys.stderr)
+    else:
+        config = load_config()
 
     if args.print_devices:
         devs = list_input_devices()
@@ -150,6 +160,10 @@ def main():
                             if args.benchmark:
                                 print(f"✅ Command processed", file=sys.stderr)
                         else:
+                            # Apply app-aware formatting if assistant is enabled
+                            if assistant and assistant.enabled:
+                                text = assistant.format_for_app_context(text)  # Will use config for sign-off
+                            
                             # Regular dictation - type the transcribed text
                             kbd.type(text)
         except Exception as e:

@@ -10,6 +10,8 @@ from typing import Optional, Tuple
 from pynput import keyboard
 from pynput.keyboard import Key, Controller
 import pyperclip
+from .app_context import get_formatting_prompt, get_active_app
+from .config import get_email_sign_off
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +216,34 @@ Return only the corrected text, don't include a preamble:"""
             return None
         
         return self.generate_response(prompt)
+    
+    def format_for_app_context(self, text: str, sign_off: Optional[str] = None) -> str:
+        """
+        Apply app-specific formatting to transcribed text.
+        Returns formatted text or original if no formatting needed.
+        
+        Args:
+            text: The transcribed text to format
+            sign_off: Optional email sign-off (uses config if not provided)
+        """
+        # Get the formatting prompt based on active app
+        formatting_prompt = get_formatting_prompt(text, sign_off=sign_off)
+        
+        if formatting_prompt:
+            # App-specific formatting needed (e.g., Outlook)
+            formatted = self.generate_response(formatting_prompt)
+            
+            if formatted:
+                # For email apps, add the sign-off
+                app_name = get_active_app()
+                if app_name and any(mail in app_name for mail in ['Outlook', 'Mail']):
+                    if sign_off is None:
+                        sign_off = get_email_sign_off()
+                    formatted = formatted.rstrip() + "\n\n" + sign_off
+                return formatted
+        
+        # No special formatting needed
+        return text
     
     def process_transcription(self, text: str) -> bool:
         """

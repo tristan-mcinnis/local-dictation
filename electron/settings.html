@@ -215,6 +215,23 @@
       <div class="help-text">MLX models for on-device processing. Models will be downloaded on first use.</div>
     </div>
     
+    <div class="divider"></div>
+    
+    <div class="setting-group">
+      <label>
+        <input type="checkbox" id="emailFormatting" style="width: auto; margin-right: 8px;">
+        Enable Email Formatting
+      </label>
+      <div class="help-text">Automatically format dictation as professional emails when using Outlook or Mail apps</div>
+    </div>
+    
+    <div class="setting-group" id="emailSignOffGroup" style="display: none;">
+      <label for="emailSignOff">Email Sign-off</label>
+      <textarea id="emailSignOff" style="width: 100%; padding: 10px; background: #2d2d2d; border: 1px solid #3e3e3e; border-radius: 6px; color: #e0e0e0; font-size: 14px; outline: none; transition: all 0.2s; resize: vertical; min-height: 80px; font-family: inherit;">Best regards,
+[Your Name]</textarea>
+      <div class="help-text">This sign-off will be automatically added to your emails</div>
+    </div>
+    
     <div class="button-group">
       <button onclick="saveSettings()">Save Settings</button>
       <button class="secondary" onclick="window.close()">Cancel</button>
@@ -242,10 +259,16 @@
       document.getElementById('hotkey').value = settings.hotkey;
       document.getElementById('assistantMode').checked = settings.assistantMode || false;
       document.getElementById('assistantModel').value = settings.assistantModel || 'mlx-community/Llama-3.2-3B-Instruct-4bit';
+      document.getElementById('emailFormatting').checked = settings.emailFormatting !== false; // Default to true
+      document.getElementById('emailSignOff').value = settings.emailSignOff || 'Best regards,\n[Your Name]';
       
       // Show/hide assistant model selection
       document.getElementById('assistantModelGroup').style.display = 
         settings.assistantMode ? 'block' : 'none';
+      
+      // Show/hide email sign-off
+      document.getElementById('emailSignOffGroup').style.display = 
+        settings.emailFormatting !== false ? 'block' : 'none';
       
       // Check if model is English-only and update language accordingly
       handleModelChange();
@@ -278,7 +301,9 @@
         language: document.getElementById('language').value,
         hotkey: document.getElementById('hotkey').value,
         assistantMode: document.getElementById('assistantMode').checked,
-        assistantModel: document.getElementById('assistantModel').value
+        assistantModel: document.getElementById('assistantModel').value,
+        emailFormatting: document.getElementById('emailFormatting').checked,
+        emailSignOff: document.getElementById('emailSignOff').value
       };
       
       const saved = await ipcRenderer.invoke('save-settings', settings);
@@ -298,6 +323,12 @@
     // Add event listener for assistant mode toggle
     document.getElementById('assistantMode').addEventListener('change', function() {
       document.getElementById('assistantModelGroup').style.display = 
+        this.checked ? 'block' : 'none';
+    });
+    
+    // Add event listener for email formatting toggle
+    document.getElementById('emailFormatting').addEventListener('change', function() {
+      document.getElementById('emailSignOffGroup').style.display = 
         this.checked ? 'block' : 'none';
     });
     
