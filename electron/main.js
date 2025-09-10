@@ -16,7 +16,8 @@ const store = new Store({
     showVisualizer: true,
     playSounds: true,
     useVad: false,
-    idleTimeout: 60
+    idleTimeout: 60,
+    engine: 'whisper'  // Default to Whisper since Parakeet is not ready
   }
 });
 let tray = null;

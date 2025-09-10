@@ -24,7 +24,7 @@ class UnifiedTranscriber:
     
     def __init__(
         self, 
-        engine: EngineType = "auto",
+        engine: EngineType = "whisper",
         model_name: str = "medium.en", 
         lang: str = "auto",
         idle_timeout_seconds: int = 60,
