@@ -28,8 +28,29 @@ A fast, local push-to-talk dictation tool for macOS that automatically inserts t
 
 ## Quick Start
 
-### Install with uv (Recommended)
+### Development Setup (Recommended for Latest Features)
 
+**For the menubar app with GUI:**
+```bash
+# Install uv if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone the repository
+git clone https://github.com/tristan-mcinnis/local-dictation.git
+cd local-dictation
+
+# Run the development script
+./dev-run.sh
+```
+
+The development script will:
+1. Sync Python dependencies with uv
+2. Install Electron dependencies
+3. Launch the menubar app in development mode
+
+### CLI-Only Installation
+
+**With uv (Recommended):**
 ```bash
 # Install uv if you haven't already
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -39,19 +60,18 @@ git clone https://github.com/tristan-mcinnis/local-dictation.git
 cd local-dictation
 uv sync
 
-# Run
+# Run CLI version
 uv run local-dictation
 ```
 
-### Install with pip
-
+**With pip:**
 ```bash
 # Clone and install
 git clone https://github.com/tristan-mcinnis/local-dictation.git
 cd local-dictation
 pip install -e .
 
-# Run
+# Run CLI version
 local-dictation
 ```
 
