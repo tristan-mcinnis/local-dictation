@@ -18,10 +18,12 @@ dependencies = [
   "pyperclip>=1.8.2", # for clipboard access in assistant mode
   "mlx-lm>=0.21.0", # MLX language models for assistant mode
   "silero-vad>=6.0.0",
+  "webrtcvad>=2.0.10", # WebRTC VAD for ultra-low latency voice detection
 ]
 
 [project.scripts]
 local-dictation = "local_dictation.cli:main"
+local-dictation-optimized = "local_dictation.cli_optimized:main"
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]

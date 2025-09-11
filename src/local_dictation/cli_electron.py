@@ -43,8 +43,8 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Seconds before unloading idle model (0=never)")
     p.add_argument("--custom-words", type=str, default=env_or("CUSTOM_WORDS", None),
                    help="JSON file with custom word replacements")
-    p.add_argument("--engine", choices=["whisper", "parakeet", "auto"], default=env_or("ENGINE", "whisper"),
-                   help="Transcription engine (whisper only works currently)")
+    p.add_argument("--engine", choices=["whisper", "auto"], default=env_or("ENGINE", "whisper"),
+                   help="Transcription engine")
     return p
 
 def send_message(msg_type: str, data: str = ""):
