@@ -12,6 +12,9 @@ import math
 import numpy as np
 import sounddevice as sd
 from scipy.signal import resample_poly, butter, lfilter
+from typing import Callable, Optional
+
+from .endpoint_manager import EndpointManager, EndpointDecision
 
 WHISPER_SR = 16000
 
@@ -63,12 +66,17 @@ class VoiceRecorder:
     - Direct 16kHz recording when possible
     - Optional VAD for silence filtering
     """
-    def __init__(self, device_name: str | None, max_sec: float, highpass_hz: float = 0.0, channels: int = 1, use_vad: bool = False):
+    def __init__(self, device_name: str | None, max_sec: float, highpass_hz: float = 0.0, channels: int = 1,
+                 use_vad: bool = False,
+                 endpoint_manager: Optional[EndpointManager] = None,
+                 on_auto_stop: Optional[Callable[[], None]] = None):
         self.max_sec = max_sec
         self.highpass_hz = highpass_hz
         self.channels = channels
         self.use_vad = use_vad
         self.vad = None
+        self.endpoint_manager = endpoint_manager
+        self.on_auto_stop = on_auto_stop
 
         self.samplerate, self.device_index = pick_samplerate(device_name)
         sd.default.samplerate = self.samplerate
@@ -109,6 +117,10 @@ class VoiceRecorder:
                 print(f"⚠️ VAD initialization failed, continuing without: {e}", file=sys.stderr)
                 self.vad = None
 
+        if self.endpoint_manager is not None:
+            self._vad_frame_samples = int(WHISPER_SR * 0.02)
+            self._vad_buffer = np.empty(0, dtype=np.float32)
+
     def _callback(self, indata, frames, time, status):
         if status:
             print(f"[audio] {status}", file=sys.stderr)
@@ -118,6 +130,9 @@ class VoiceRecorder:
         # Extract mono, avoid copy when possible
         x = indata[:, 0] if indata.ndim > 1 else indata
         x = x.astype(np.float32, copy=False)
+
+        if self.endpoint_manager is not None and self.samplerate == WHISPER_SR:
+            self._handle_endpoint(x)
         
         # Write to circular buffer efficiently
         n = len(x)
@@ -132,6 +147,16 @@ class VoiceRecorder:
             self._write_pos = n - split
         
         self._frames_written = min(self._frames_written + n, self.max_frames)
+
+    def _handle_endpoint(self, samples: np.ndarray):
+        self._vad_buffer = np.concatenate([self._vad_buffer, samples])
+        while len(self._vad_buffer) >= self._vad_frame_samples:
+            frame = self._vad_buffer[:self._vad_frame_samples]
+            self._vad_buffer = self._vad_buffer[self._vad_frame_samples:]
+            decision = self.endpoint_manager.on_frame(frame.tolist())
+            if decision == EndpointDecision.SHOULD_STOP and self.on_auto_stop:
+                self.on_auto_stop()
+                break
 
     def start(self):
         if self._active:

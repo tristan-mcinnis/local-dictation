@@ -150,6 +150,30 @@ export AUDIO_DEVICE="External Microphone"
 uv run local-dictation  # Uses environment settings
 ```
 
+### Building whisper.cpp with Metal/CoreML
+
+For best performance on Apple Silicon, build `whisper.cpp` with Metal and CoreML enabled:
+
+```bash
+cmake -B build -S . \
+  -DGGML_METAL=ON \
+  -DWHISPER_COREML=ON \
+  -DGGML_ACCELERATE=ON
+cmake --build build -j
+```
+
+At runtime, enable the accelerated paths:
+
+```c
+struct whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+p.use_gpu = true;          // Metal backend
+p.coreml_encode = true;    // CoreML encoder
+p.no_timestamps = true;    // no token timestamps
+p.temperature = 0.0f;
+```
+
+Greedy sampling or a small beam size (1-2) gives the lowest latency for dictation.
+
 ## Assistant Mode (NEW)
 
 Assistant mode enables voice-controlled text manipulation using on-device MLX language models. When enabled, you can select text and speak commands to process it.
