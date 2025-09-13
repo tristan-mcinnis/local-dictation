@@ -25,6 +25,57 @@ KEY_MAP = {
     "RCTRL": keyboard.Key.ctrl,
     "LSHIFT": keyboard.Key.shift,
     "RSHIFT": keyboard.Key.shift,
+    # Single modifier keys (for single-key hotkeys)
+    "FN": keyboard.Key.f13,  # F13 is often used as FN key on Mac
+    "CAPS": keyboard.Key.caps_lock,
+    "TAB": keyboard.Key.tab,
+    "ESC": keyboard.Key.esc,
+    "SPACE": keyboard.Key.space,
+    "ENTER": keyboard.Key.enter,
+    "BACKSPACE": keyboard.Key.backspace,
+    "DELETE": keyboard.Key.delete,
+    # Arrow keys
+    "UP": keyboard.Key.up,
+    "DOWN": keyboard.Key.down,
+    "LEFT": keyboard.Key.left,
+    "RIGHT": keyboard.Key.right,
+    # Navigation keys
+    "HOME": keyboard.Key.home,
+    "END": keyboard.Key.end,
+    "PAGEUP": keyboard.Key.page_up,
+    "PAGEDOWN": keyboard.Key.page_down,
+    # All Function keys
+    "F1": keyboard.Key.f1,
+    "F2": keyboard.Key.f2,
+    "F3": keyboard.Key.f3,
+    "F4": keyboard.Key.f4,
+    "F5": keyboard.Key.f5,
+    "F6": keyboard.Key.f6,
+    "F7": keyboard.Key.f7,
+    "F8": keyboard.Key.f8,
+    "F9": keyboard.Key.f9,
+    "F10": keyboard.Key.f10,
+    "F11": keyboard.Key.f11,
+    "F12": keyboard.Key.f12,
+    "F13": keyboard.Key.f13,
+    "F14": keyboard.Key.f14,
+    "F15": keyboard.Key.f15,
+    "F16": keyboard.Key.f16,
+    "F17": keyboard.Key.f17,
+    "F18": keyboard.Key.f18,
+    "F19": keyboard.Key.f19,
+    "F20": keyboard.Key.f20,
+    # Special characters that people might want
+    "GRAVE": keyboard.KeyCode.from_char('`'),  # Backtick
+    "TILDE": keyboard.KeyCode.from_char('~'),
+    "MINUS": keyboard.KeyCode.from_char('-'),
+    "EQUALS": keyboard.KeyCode.from_char('='),
+    "SEMICOLON": keyboard.KeyCode.from_char(';'),
+    "QUOTE": keyboard.KeyCode.from_char("'"),
+    "COMMA": keyboard.KeyCode.from_char(','),
+    "PERIOD": keyboard.KeyCode.from_char('.'),
+    "SLASH": keyboard.KeyCode.from_char('/'),
+    "BACKSLASH": keyboard.KeyCode.from_char('\\'),
 }
 
 def parse_chord(chord_str: str | None) -> set:

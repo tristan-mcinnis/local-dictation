@@ -196,12 +196,68 @@
     <div class="setting-group">
       <label for="hotkey">Recording Hotkey</label>
       <select id="hotkey">
-        <option value="CMD,ALT">⌘ + ⌥ (Cmd + Alt)</option>
-        <option value="CMD,SHIFT">⌘ + ⇧ (Cmd + Shift)</option>
-        <option value="CTRL,ALT">⌃ + ⌥ (Ctrl + Alt)</option>
-        <option value="CTRL,SHIFT">⌃ + ⇧ (Ctrl + Shift)</option>
+        <optgroup label="Key Combinations (Recommended)">
+          <option value="CMD,ALT">⌘ + ⌥ (Cmd + Alt)</option>
+          <option value="CMD,SHIFT">⌘ + ⇧ (Cmd + Shift)</option>
+          <option value="CTRL,ALT">⌃ + ⌥ (Ctrl + Alt)</option>
+          <option value="CTRL,SHIFT">⌃ + ⇧ (Ctrl + Shift)</option>
+        </optgroup>
+        <optgroup label="Function Keys (Safe Single Keys)">
+          <option value="F13">F13 ★ (Recommended)</option>
+          <option value="F14">F14 ★ (Recommended)</option>
+          <option value="F15">F15 ★ (Recommended)</option>
+          <option value="F16">F16</option>
+          <option value="F17">F17</option>
+          <option value="F18">F18</option>
+          <option value="F19">F19</option>
+          <option value="F20">F20</option>
+          <option value="F1">F1 ⚠️ (May conflict)</option>
+          <option value="F2">F2 ⚠️ (May conflict)</option>
+          <option value="F3">F3 ⚠️ (May conflict)</option>
+          <option value="F4">F4 ⚠️ (May conflict)</option>
+          <option value="F5">F5 ⚠️ (May conflict)</option>
+          <option value="F6">F6 ⚠️ (May conflict)</option>
+          <option value="F7">F7 ⚠️ (May conflict)</option>
+          <option value="F8">F8 ⚠️ (May conflict)</option>
+          <option value="F9">F9 ⚠️ (May conflict)</option>
+          <option value="F10">F10 ⚠️ (May conflict)</option>
+          <option value="F11">F11 ⚠️ (May conflict)</option>
+          <option value="F12">F12 ⚠️ (May conflict)</option>
+        </optgroup>
+        <optgroup label="Special Keys">
+          <option value="CAPS">⇪ (Caps Lock)</option>
+          <option value="TAB">⇥ (Tab)</option>
+          <option value="ESC">⎋ (Escape)</option>
+          <option value="SPACE">⎵ (Space)</option>
+          <option value="ENTER">↵ (Enter)</option>
+          <option value="BACKSPACE">⌫ (Backspace)</option>
+          <option value="DELETE">⌦ (Delete)</option>
+        </optgroup>
+        <optgroup label="Arrow Keys">
+          <option value="UP">↑ (Up Arrow)</option>
+          <option value="DOWN">↓ (Down Arrow)</option>
+          <option value="LEFT">← (Left Arrow)</option>
+          <option value="RIGHT">→ (Right Arrow)</option>
+        </optgroup>
+        <optgroup label="Navigation Keys">
+          <option value="HOME">⇱ (Home)</option>
+          <option value="END">⇲ (End)</option>
+          <option value="PAGEUP">⇞ (Page Up)</option>
+          <option value="PAGEDOWN">⇟ (Page Down)</option>
+        </optgroup>
+        <optgroup label="Symbol Keys">
+          <option value="GRAVE">` (Backtick)</option>
+          <option value="MINUS">- (Minus)</option>
+          <option value="EQUALS">= (Equals)</option>
+          <option value="SEMICOLON">; (Semicolon)</option>
+          <option value="QUOTE">' (Quote)</option>
+          <option value="COMMA">, (Comma)</option>
+          <option value="PERIOD">. (Period)</option>
+          <option value="SLASH">/ (Slash)</option>
+          <option value="BACKSLASH">\ (Backslash)</option>
+        </optgroup>
       </select>
-      <div class="help-text">Hold this key combination to record</div>
+      <div class="help-text">Hold this key to record. Single keys are more convenient but may conflict with normal typing.</div>
     </div>
     
     <div class="divider"></div>

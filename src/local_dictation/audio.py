@@ -111,7 +111,7 @@ class VoiceRecorder:
         if self.use_vad:
             try:
                 from .vad import SileroVAD
-                self.vad = SileroVAD(threshold=0.5, min_speech_duration_ms=250, min_silence_duration_ms=100)
+                self.vad = SileroVAD(threshold=0.5, min_speech_duration_ms=1000, min_silence_duration_ms=100)
                 print("✅ VAD enabled for silence filtering", file=sys.stderr)
             except Exception as e:
                 print(f"⚠️ VAD initialization failed, continuing without: {e}", file=sys.stderr)

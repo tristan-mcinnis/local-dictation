@@ -108,6 +108,15 @@ def main():
         assistant = Assistant(model_name=args.assistant_model)
         assistant.enable()
 
+        # Report assistant status
+        if assistant.enabled:
+            send_message("ASSISTANT_MODE", "ready")
+            print(f"✅ Assistant model loaded: {args.assistant_model}", file=sys.stderr)
+        else:
+            send_message("ASSISTANT_MODE", "failed")
+            print(f"❌ Assistant model failed to load: {args.assistant_model}", file=sys.stderr)
+            print("   Commands will fall back to regular dictation", file=sys.stderr)
+
     # Send ready signal with actual VAD status
     send_message("READY", json.dumps({
         "model": args.model,
@@ -116,6 +125,7 @@ def main():
         "needs_resample": rec.needs_resample,
         "assistant_mode": args.assistant_mode,
         "assistant_model": args.assistant_model if args.assistant_mode else None,
+        "assistant_ready": assistant.enabled if assistant else False,
         "vad_enabled": vad_actually_enabled,
         "idle_timeout": args.idle_timeout,
         "custom_words_loaded": len(custom_words) if custom_words else 0
@@ -123,7 +133,10 @@ def main():
 
     # Create a keyboard controller for typing
     kbd = keyboard.Controller()
-    
+
+    # Track processing state to prevent duplicates
+    processing_state = {"active": False, "last_text": "", "last_time": 0}
+
     def on_chord(active: bool):
         try:
             if active:
@@ -131,28 +144,55 @@ def main():
                 rec.start()
             else:
                 send_message("RECORDING_STOP")
-                
+
                 audio = rec.stop()
-                
+
                 if audio is not None and audio.size > 0:
-                    text = tx.transcribe(audio, output="text")
-                    
+                    try:
+                        text = tx.transcribe(audio, output="text")
+                    except Exception as e:
+                        # Handle GPU/Metal resource conflicts gracefully
+                        error_msg = str(e)
+                        if "metal" in error_msg.lower() or "gpu" in error_msg.lower() or "ggml" in error_msg.lower():
+                            send_message("ERROR", "GPU resources busy (Ollama running?). Please restart app.")
+                            print(f"GPU resource conflict detected: {error_msg}", file=sys.stderr)
+                        else:
+                            send_message("ERROR", f"Transcription failed: {error_msg}")
+                            print(f"Transcription error: {error_msg}", file=sys.stderr)
+                        return
+
                     if text:
+                        # Prevent duplicate processing of the same text within a short time window
+                        current_time = time.time()
+                        if (processing_state["last_text"] == text and
+                            current_time - processing_state["last_time"] < 2.0):
+                            print(f"Skipping duplicate text: {text[:50]}...", file=sys.stderr)
+                            return
+
+                        processing_state["last_text"] = text
+                        processing_state["last_time"] = current_time
+
                         # Send transcript to Electron for saving
                         send_message("TRANSCRIPT", text)
-                        
+
                         # In assistant mode, try to process as command first
                         if assistant and assistant.process_transcription(text):
                             send_message("COMMAND_PROCESSED", text)
                         else:
+                            # Check if it looked like a command but failed
+                            if assistant and assistant.enabled:
+                                command_type, _ = assistant.parse_command(text)
+                                if command_type:
+                                    send_message("COMMAND_FAILED", f"Command detected but failed: {command_type}")
+                                    print(f"⚠️ Command '{command_type}' detected but failed to execute", file=sys.stderr)
                             # Apply app-aware formatting if assistant is enabled and email formatting is on
                             if assistant and assistant.enabled and email_formatting:
                                 text = assistant.format_for_app_context(text, sign_off=email_sign_off)
-                            
+
                             # Regular dictation - type the text
                             # Minimal delay to ensure window focus is back
                             time.sleep(0.05)
-                            
+
                             # Type the text at cursor position
                             if type_text(text, kbd):
                                 send_message("TYPED", "success")

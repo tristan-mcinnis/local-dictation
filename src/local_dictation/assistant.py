@@ -5,6 +5,7 @@ Processes spoken commands to perform actions on text.
 
 import re
 import time
+import threading
 import logging
 from typing import Optional, Tuple
 from pynput import keyboard
@@ -45,9 +46,16 @@ class Assistant:
                 self.enabled = False
                 return False
             except Exception as e:
+                error_msg = str(e)
                 logger.error(f"Failed to load model: {e}")
-                logger.error("Try running again - the model may still be downloading.")
-                logger.error("Or check your internet connection and try a different model.")
+
+                if "metal" in error_msg.lower() or "gpu" in error_msg.lower() or "memory" in error_msg.lower():
+                    logger.error("GPU/Metal resources may be busy. If Ollama is running, consider stopping it.")
+                    logger.error("Run 'ollama stop' or restart this app after stopping other GPU-intensive apps.")
+                else:
+                    logger.error("Try running again - the model may still be downloading.")
+                    logger.error("Or check your internet connection and try a different model.")
+
                 self.enabled = False
                 return False
         return True
@@ -115,19 +123,32 @@ class Assistant:
     def get_selected_text(self) -> Optional[str]:
         """Get currently selected text via clipboard."""
         try:
+            # Save current clipboard first to restore later
+            old_clipboard = ""
+            try:
+                old_clipboard = pyperclip.paste()
+            except:
+                pass
+
             # Copy selection to clipboard (just like the reference code)
             with controller.pressed(Key.cmd):
                 controller.tap("c")
-            
-            # Get the clipboard string
-            time.sleep(0.1)
+
+            # Get the clipboard string with a longer delay to ensure it's updated
+            time.sleep(0.15)
             text = pyperclip.paste()
-            
-            if text:
+
+            # Restore original clipboard content if we got text
+            if text and text != old_clipboard:
                 logger.debug(f"Text copied from selection: {text[:50]}...")
+                # Defer restoring clipboard to prevent interference
+                threading.Timer(0.5, lambda: pyperclip.copy(old_clipboard)).start()
                 return text
             else:
                 logger.warning("No text in clipboard after copy")
+                # Restore original clipboard immediately if no new text
+                if old_clipboard:
+                    pyperclip.copy(old_clipboard)
                 return None
         except Exception as e:
             logger.error(f"Failed to get selected text: {e}")
@@ -139,11 +160,14 @@ class Assistant:
             # Paste the fixed string to clipboard (just like reference code)
             pyperclip.copy(new_text)
             time.sleep(0.1)
-            
+
             # Paste the clipboard and replace the selected text
             with controller.pressed(Key.cmd):
                 controller.tap("v")
-            
+
+            # Add a small delay to ensure the paste completes
+            time.sleep(0.05)
+
             logger.debug("Replaced text with corrected version")
         except Exception as e:
             logger.error(f"Failed to replace text: {e}")
@@ -166,11 +190,11 @@ class Assistant:
             
             logger.debug(f"Generating response for prompt: {prompt[:100]}...")
             response = generate(
-                self.model, 
-                self.tokenizer, 
-                prompt=prompt, 
+                self.model,
+                self.tokenizer,
+                prompt=prompt,
                 verbose=False,
-                max_tokens=500
+                max_tokens=1000  # Increased from 500 to allow longer responses
             )
             
             # Clean up the response - remove XML tags and thinking sections
@@ -200,8 +224,16 @@ class Assistant:
         
         prompts = {
             'rewrite': f"Rewrite this text {args}:\n\n{selected_text}\n\nReturn only the rewritten text:",
-            'explain': f"Explain this:\n\n{selected_text}\n\nReturn only the explanation:",
-            'summarize': f"Summarize this:\n\n{selected_text}\n\nReturn only the summary:",
+            'explain': f"""Provide a detailed explanation of this text. Break down the concepts, explain any technical terms, and provide context where helpful:
+
+{selected_text}
+
+Return only the explanation:""",
+            'summarize': f"""Provide a comprehensive summary of this text. Include the main points, key details, and important conclusions. Make it thorough but concise:
+
+{selected_text}
+
+Return only the summary:""",
             'translate': f"Translate to {args}:\n\n{selected_text}\n\nReturn only the translation:",
             'fix': f"""Fix all typos and casing and punctuation and grammar in this text:
 

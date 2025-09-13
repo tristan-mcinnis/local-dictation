@@ -15,7 +15,7 @@ const store = new Store({
     emailSignOff: 'Best regards,\n[Your Name]',
     showVisualizer: true,
     playSounds: true,
-    useVad: false,
+    useVad: true,
     idleTimeout: 60,
     engine: 'whisper'  // Default to Whisper since Parakeet is not ready
   }
@@ -93,17 +93,65 @@ function playSound(soundPath) {
   
   // Use afplay on macOS for simple sound playback
   const { exec } = require('child_process');
-  exec(`afplay "${soundPath}" -v 0.3`, (error) => {
+  exec(`afplay "${soundPath}" -v 0.15`, (error) => {
     if (error) {
       console.error('Error playing sound:', error);
     }
   });
 }
 
+function formatHotkeyForMenu(hotkey) {
+  // Convert internal hotkey format to Electron menu accelerator format
+  if (!hotkey) return 'Cmd+Alt';
+
+  // Handle single keys
+  if (!hotkey.includes(',')) {
+    const key = hotkey.toUpperCase();
+
+    // Function keys
+    if (key.startsWith('F') && /^F\d+$/.test(key)) {
+      return key; // F1, F2, ..., F20
+    }
+
+    // Special key mappings for Electron menu
+    const keyMap = {
+      'CAPS': 'CapsLock',
+      'TAB': 'Tab',
+      'ESC': 'Escape',
+      'SPACE': 'Space',
+      'ENTER': 'Enter',
+      'BACKSPACE': 'Backspace',
+      'DELETE': 'Delete',
+      'UP': 'Up',
+      'DOWN': 'Down',
+      'LEFT': 'Left',
+      'RIGHT': 'Right',
+      'HOME': 'Home',
+      'END': 'End',
+      'PAGEUP': 'PageUp',
+      'PAGEDOWN': 'PageDown',
+      'GRAVE': '`',
+      'MINUS': '-',
+      'EQUALS': '=',
+      'SEMICOLON': ';',
+      'QUOTE': "'",
+      'COMMA': ',',
+      'PERIOD': '.',
+      'SLASH': '/',
+      'BACKSLASH': '\\'
+    };
+
+    return keyMap[key] || key;
+  }
+
+  // Handle key combinations
+  return hotkey.replace(/,/g, '+').replace(/CMD/g, 'Cmd').replace(/ALT/g, 'Alt').replace(/CTRL/g, 'Ctrl').replace(/SHIFT/g, 'Shift');
+}
+
 function createTray() {
   const iconPath = path.join(__dirname, 'assets', 'trayTemplate.png');
   tray = new Tray(iconPath);
-  
+
   const contextMenu = Menu.buildFromTemplate([
     {
       label: 'Settings',
@@ -120,7 +168,7 @@ function createTray() {
     { type: 'separator' },
     {
       label: 'Start Recording',
-      accelerator: store.get('hotkey', 'Cmd+Alt'),
+      accelerator: formatHotkeyForMenu(store.get('hotkey', 'CMD,ALT')),
       click: () => startRecording()
     },
     { type: 'separator' },
@@ -132,7 +180,7 @@ function createTray() {
       }
     }
   ]);
-  
+
   tray.setToolTip('Local Dictation');
   tray.setContextMenu(contextMenu);
 }
@@ -412,7 +460,16 @@ async function startPythonBackend() {
         addLog(`Assistant command processed: ${command}`, 'success', fullCycleTime);
       } else if (message.startsWith('ASSISTANT_MODE:')) {
         const status = message.substring(15);
-        addLog(`Assistant mode ${status}`, 'info');
+        if (status === 'ready') {
+          addLog(`Assistant model loaded successfully`, 'success');
+        } else if (status === 'failed') {
+          addLog(`Assistant model failed to load - commands will fall back to dictation`, 'warning');
+        } else {
+          addLog(`Assistant mode ${status}`, 'info');
+        }
+      } else if (message.startsWith('COMMAND_FAILED:')) {
+        const details = message.substring(15);
+        addLog(`Command failed: ${details}`, 'warning');
       }
     }
   });
@@ -472,15 +529,20 @@ ipcMain.handle('get-settings', () => {
   // If using an English-only model, ensure language is set to 'en'
   const language = store.get('language');
   const adjustedLanguage = model.endsWith('.en') && language === 'auto' ? 'en' : language;
-  
+
   return {
+    engine: store.get('engine'),
     model: model,
     language: adjustedLanguage,
     hotkey: store.get('hotkey'),
     assistantMode: store.get('assistantMode'),
     assistantModel: store.get('assistantModel'),
     emailFormatting: store.get('emailFormatting'),
-    emailSignOff: store.get('emailSignOff')
+    emailSignOff: store.get('emailSignOff'),
+    useVad: store.get('useVad'),
+    idleTimeout: store.get('idleTimeout'),
+    showVisualizer: store.get('showVisualizer'),
+    playSounds: store.get('playSounds')
   };
 });
 
@@ -506,6 +568,9 @@ ipcMain.handle('save-settings', async (event, settings) => {
     visualizerWindow = null;
   }
   
+  // Recreate tray menu to update hotkey display
+  createTray();
+
   await startPythonBackend();
   return true;
 });
