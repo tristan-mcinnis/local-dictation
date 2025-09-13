@@ -1,0 +1,6 @@
+{
+  "mode": "ptt",
+  "vad": { "threshold": 0.6, "hangover_ms": 150, "debounce_ms": 200 },
+  "decode_profile": "burst",
+  "hardware": { "metal": true, "coreml_encode": true }
+}
