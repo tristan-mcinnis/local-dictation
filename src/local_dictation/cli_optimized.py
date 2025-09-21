@@ -23,9 +23,36 @@ from .metrics import PerformanceTracker
 from .assistant import Assistant
 from .config import get_config_path, load_config
 
-def env_or(name: str, default: str):
+def env_or(name: str, default: str | None):
     """Get environment variable or default"""
     return os.getenv(name, default)
+
+
+def env_flag(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def env_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 def build_argparser() -> argparse.ArgumentParser:
     """Build argument parser with all options"""
@@ -85,9 +112,40 @@ def build_argparser() -> argparse.ArgumentParser:
     # Assistant mode
     p.add_argument("--assistant-mode", action="store_true",
                    help="Enable assistant mode for text processing")
-    p.add_argument("--assistant-model", 
-                   default=env_or("ASSISTANT_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit"),
-                   help="MLX model for assistant mode")
+    p.add_argument("--assistant-provider", choices=["mlx", "openai"],
+                   default=env_or("ASSISTANT_PROVIDER", None),
+                   help="Assistant backend: 'mlx' for local models or 'openai' for GPT-5")
+    p.add_argument("--assistant-model",
+                   default=env_or("ASSISTANT_MODEL", None),
+                   help="MLX model for assistant mode (when provider=mlx)")
+    p.add_argument("--assistant-openai-model",
+                   default=env_or("ASSISTANT_OPENAI_MODEL", None),
+                   help="OpenAI model to use when provider=openai (gpt-5, gpt-5-mini, gpt-5-nano)")
+    p.add_argument("--assistant-openai-key",
+                   default=env_or("ASSISTANT_OPENAI_KEY", None),
+                   help="OpenAI API key (optional if set in environment)")
+    p.add_argument("--assistant-openai-key-env",
+                   default=env_or("ASSISTANT_OPENAI_KEY_ENV", None),
+                   help="Environment variable name containing the OpenAI API key")
+    p.add_argument("--assistant-openai-organization",
+                   default=env_or("ASSISTANT_OPENAI_ORG", None),
+                   help="OpenAI organization ID (optional)")
+    p.add_argument("--assistant-openai-base-url",
+                   default=env_or("ASSISTANT_OPENAI_BASE_URL", None),
+                   help="Custom OpenAI-compatible base URL (optional)")
+    p.add_argument("--assistant-result-action",
+                   choices=["auto", "replace_selection", "copy_to_clipboard", "show_textedit"],
+                   default=env_or("ASSISTANT_RESULT_ACTION", None),
+                   help="How assistant results are delivered (default: auto)")
+    p.add_argument("--assistant-temperature", type=float, default=None,
+                   help="Sampling temperature for assistant responses")
+    p.add_argument("--assistant-max-output-tokens", type=int, default=None,
+                   help="Maximum tokens for assistant responses")
+    p.add_argument("--assistant-copy-result", dest="assistant_copy_result", action="store_true",
+                   help="Always copy assistant output to the clipboard")
+    p.add_argument("--assistant-no-copy-result", dest="assistant_copy_result", action="store_false",
+                   help="Do not leave assistant output on the clipboard after replacing text")
+    p.set_defaults(assistant_copy_result=None)
     
     # Performance options
     p.add_argument("--warmup", action="store_true", default=True,
@@ -186,16 +244,88 @@ def main():
         paste_delay_ms=args.paste_delay_ms
     )
     
+    assistant_config = config.get('assistant', {})
+
     # Initialize assistant if enabled
     assistant = None
     if args.assistant_mode:
         print(f"🤖 Initializing Assistant Mode...", file=sys.stderr)
-        assistant = Assistant(model_name=args.assistant_model)
+
+        assistant_provider = (args.assistant_provider or assistant_config.get('provider') or 'mlx').lower()
+        openai_model = (
+            args.assistant_openai_model
+            or assistant_config.get('openai_model')
+            or ('gpt-5-mini' if assistant_provider == 'openai' else None)
+        )
+
+        if assistant_provider == 'openai':
+            model_name = openai_model or 'gpt-5-mini'
+        else:
+            model_name = (
+                args.assistant_model
+                or assistant_config.get('model')
+                or 'mlx-community/Llama-3.2-3B-Instruct-4bit'
+            )
+
+        result_action = args.assistant_result_action or assistant_config.get('result_action', 'auto')
+
+        copy_result = assistant_config.get('copy_result_to_clipboard', True)
+        copy_env = env_flag('ASSISTANT_COPY_RESULT')
+        if copy_env is not None:
+            copy_result = copy_env
+        if args.assistant_copy_result is not None:
+            copy_result = args.assistant_copy_result
+
+        temperature = assistant_config.get('temperature', 0.2)
+        temp_env = env_float('ASSISTANT_TEMPERATURE')
+        if temp_env is not None:
+            temperature = temp_env
+        if args.assistant_temperature is not None:
+            temperature = args.assistant_temperature
+
+        max_tokens = assistant_config.get('max_output_tokens', 900)
+        max_env = env_int('ASSISTANT_MAX_OUTPUT_TOKENS')
+        if max_env is not None:
+            max_tokens = max_env
+        if args.assistant_max_output_tokens is not None:
+            max_tokens = args.assistant_max_output_tokens
+
+        openai_api_key = args.assistant_openai_key or assistant_config.get('openai_api_key')
+        openai_key_env = args.assistant_openai_key_env or assistant_config.get('openai_api_key_env', 'OPENAI_API_KEY')
+        openai_org = args.assistant_openai_organization or assistant_config.get('openai_organization')
+        openai_base_url = args.assistant_openai_base_url or assistant_config.get('openai_base_url')
+
+        assistant_kwargs = {
+            'model_name': model_name,
+            'provider': assistant_provider,
+            'openai_model': openai_model,
+            'openai_api_key': openai_api_key,
+            'openai_api_key_env': openai_key_env,
+            'openai_organization': openai_org,
+            'openai_base_url': openai_base_url,
+            'result_action': result_action,
+            'copy_result_to_clipboard': copy_result,
+            'temperature': temperature,
+            'max_output_tokens': max_tokens,
+            'system_prompt': assistant_config.get('system_prompt'),
+            'more_info_prompt': assistant_config.get('more_info_prompt'),
+        }
+
+        assistant = Assistant(**assistant_kwargs)
         assistant.enable()
         if assistant.enabled:
-            print(f"✅ Assistant Mode enabled", file=sys.stderr)
+            provider_label = "OpenAI" if assistant.provider == "openai" else "MLX"
+            print(f"✅ Assistant Mode enabled ({provider_label}: {assistant.model_name})", file=sys.stderr)
+            print(f"   Result delivery: {assistant.result_action}", file=sys.stderr)
+            if assistant.provider == "openai":
+                print("   Using OpenAI Responses API (gpt-5 / gpt-5-mini / gpt-5-nano)", file=sys.stderr)
         else:
             print(f"⚠️  Assistant Mode failed to initialize", file=sys.stderr)
+            if assistant_provider == 'openai':
+                print(
+                    f"   Verify that the OpenAI API key is available via {openai_key_env}.",
+                    file=sys.stderr,
+                )
             assistant = None
     
     # Print configuration summary

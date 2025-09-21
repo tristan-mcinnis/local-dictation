@@ -15,10 +15,38 @@ from .audio import VoiceRecorder, list_input_devices
 from .transcribe_unified import UnifiedTranscriber
 from .type_text import type_text
 from .assistant import Assistant
+from .config import load_config
 from .app_context import get_formatting_prompt
 
-def env_or(name: str, default: str):
+def env_or(name: str, default: str | None):
     return os.getenv(name, default)
+
+
+def env_flag(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def env_float(name: str) -> float | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def env_int(name: str) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("local-dictation-electron", 
@@ -35,8 +63,34 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--device", default=env_or("AUDIO_DEVICE", None))
     p.add_argument("--assistant-mode", action="store_true",
                    help="Enable assistant mode")
-    p.add_argument("--assistant-model", default=env_or("ASSISTANT_MODEL", "mlx-community/Llama-3.2-3B-Instruct-4bit"),
-                   help="MLX model for assistant mode")
+    p.add_argument("--assistant-provider", choices=["mlx", "openai"],
+                   default=env_or("ASSISTANT_PROVIDER", None),
+                   help="Assistant backend to use: local MLX or OpenAI GPT-5")
+    p.add_argument("--assistant-model", default=env_or("ASSISTANT_MODEL", None),
+                   help="MLX model for assistant mode (provider=mlx)")
+    p.add_argument("--assistant-openai-model", default=env_or("ASSISTANT_OPENAI_MODEL", None),
+                   help="OpenAI model when provider=openai (gpt-5, gpt-5-mini, gpt-5-nano)")
+    p.add_argument("--assistant-openai-key", default=env_or("ASSISTANT_OPENAI_KEY", None),
+                   help="OpenAI API key (optional if set in environment)")
+    p.add_argument("--assistant-openai-key-env", default=env_or("ASSISTANT_OPENAI_KEY_ENV", None),
+                   help="Environment variable name for the OpenAI API key")
+    p.add_argument("--assistant-openai-organization", default=env_or("ASSISTANT_OPENAI_ORG", None),
+                   help="OpenAI organization ID (optional)")
+    p.add_argument("--assistant-openai-base-url", default=env_or("ASSISTANT_OPENAI_BASE_URL", None),
+                   help="Custom OpenAI-compatible base URL")
+    p.add_argument("--assistant-result-action",
+                   choices=["auto", "replace_selection", "copy_to_clipboard", "show_textedit"],
+                   default=env_or("ASSISTANT_RESULT_ACTION", None),
+                   help="How to deliver assistant results (default: auto)")
+    p.add_argument("--assistant-temperature", type=float, default=None,
+                   help="Sampling temperature for assistant responses")
+    p.add_argument("--assistant-max-output-tokens", type=int, default=None,
+                   help="Maximum token count for assistant responses")
+    p.add_argument("--assistant-copy-result", dest="assistant_copy_result", action="store_true",
+                   help="Always copy assistant output to the clipboard")
+    p.add_argument("--assistant-no-copy-result", dest="assistant_copy_result", action="store_false",
+                   help="Do not leave assistant output on the clipboard after replacing text")
+    p.set_defaults(assistant_copy_result=None)
     p.add_argument("--use-vad", action="store_true",
                    help="Enable VAD (Voice Activity Detection) to filter silence")
     p.add_argument("--idle-timeout", type=int, default=int(env_or("IDLE_TIMEOUT", "60")),
@@ -59,6 +113,8 @@ def main():
     sys.stderr = open(os.devnull, 'w')
     
     args = build_argparser().parse_args()
+
+    config = load_config()
 
     chord = parse_chord(args.chord)
     if not chord:
@@ -99,33 +155,112 @@ def main():
         idle_timeout_seconds=args.idle_timeout,
         custom_words=custom_words)
     
+    assistant_config = config.get('assistant', {})
+
     # Initialize assistant if enabled
     assistant = None
+    assistant_provider_ready = None
+    assistant_model_requested = None
     email_formatting = os.getenv('EMAIL_FORMATTING', 'true').lower() == 'true'
     email_sign_off = os.getenv('EMAIL_SIGN_OFF', 'Best regards,\n[Your Name]')
-    
+
     if args.assistant_mode:
-        assistant = Assistant(model_name=args.assistant_model)
+        assistant_provider = (args.assistant_provider or assistant_config.get('provider') or 'mlx').lower()
+        openai_model = (
+            args.assistant_openai_model
+            or assistant_config.get('openai_model')
+            or ('gpt-5-mini' if assistant_provider == 'openai' else None)
+        )
+
+        if assistant_provider == 'openai':
+            model_name = openai_model or 'gpt-5-mini'
+        else:
+            model_name = (
+                args.assistant_model
+                or assistant_config.get('model')
+                or 'mlx-community/Llama-3.2-3B-Instruct-4bit'
+            )
+
+        result_action = args.assistant_result_action or assistant_config.get('result_action', 'auto')
+
+        copy_result = assistant_config.get('copy_result_to_clipboard', True)
+        copy_env = env_flag('ASSISTANT_COPY_RESULT')
+        if copy_env is not None:
+            copy_result = copy_env
+        if args.assistant_copy_result is not None:
+            copy_result = args.assistant_copy_result
+
+        temperature = assistant_config.get('temperature', 0.2)
+        temp_env = env_float('ASSISTANT_TEMPERATURE')
+        if temp_env is not None:
+            temperature = temp_env
+        if args.assistant_temperature is not None:
+            temperature = args.assistant_temperature
+
+        max_tokens = assistant_config.get('max_output_tokens', 900)
+        max_env = env_int('ASSISTANT_MAX_OUTPUT_TOKENS')
+        if max_env is not None:
+            max_tokens = max_env
+        if args.assistant_max_output_tokens is not None:
+            max_tokens = args.assistant_max_output_tokens
+
+        openai_api_key = args.assistant_openai_key or assistant_config.get('openai_api_key')
+        openai_key_env = args.assistant_openai_key_env or assistant_config.get('openai_api_key_env', 'OPENAI_API_KEY')
+        openai_org = args.assistant_openai_organization or assistant_config.get('openai_organization')
+        openai_base_url = args.assistant_openai_base_url or assistant_config.get('openai_base_url')
+
+        assistant_kwargs = {
+            'model_name': model_name,
+            'provider': assistant_provider,
+            'openai_model': openai_model,
+            'openai_api_key': openai_api_key,
+            'openai_api_key_env': openai_key_env,
+            'openai_organization': openai_org,
+            'openai_base_url': openai_base_url,
+            'result_action': result_action,
+            'copy_result_to_clipboard': copy_result,
+            'temperature': temperature,
+            'max_output_tokens': max_tokens,
+            'system_prompt': assistant_config.get('system_prompt'),
+            'more_info_prompt': assistant_config.get('more_info_prompt'),
+        }
+
+        assistant_provider_ready = assistant_provider
+        assistant_model_requested = model_name
+
+        assistant = Assistant(**assistant_kwargs)
         assistant.enable()
 
         # Report assistant status
         if assistant.enabled:
             send_message("ASSISTANT_MODE", "ready")
-            print(f"✅ Assistant model loaded: {args.assistant_model}", file=sys.stderr)
+            print(f"✅ Assistant model loaded: {assistant.model_name}", file=sys.stderr)
+            if assistant.provider == "openai":
+                print("   Using OpenAI Responses API (gpt-5 / gpt-5-mini / gpt-5-nano)", file=sys.stderr)
         else:
             send_message("ASSISTANT_MODE", "failed")
-            print(f"❌ Assistant model failed to load: {args.assistant_model}", file=sys.stderr)
+            print(f"❌ Assistant model failed to load: {model_name}", file=sys.stderr)
+            if assistant_provider == 'openai':
+                print(f"   Verify that the OpenAI API key is available via {openai_key_env}.", file=sys.stderr)
             print("   Commands will fall back to regular dictation", file=sys.stderr)
 
     # Send ready signal with actual VAD status
+    assistant_ready = assistant.enabled if assistant else False
+    assistant_model_info = None
+    assistant_provider_info = None
+    if args.assistant_mode:
+        assistant_provider_info = assistant_provider_ready
+        assistant_model_info = assistant.model_name if assistant_ready else assistant_model_requested
+
     send_message("READY", json.dumps({
         "model": args.model,
         "chord": args.chord,
         "device_rate": rec.samplerate,
         "needs_resample": rec.needs_resample,
         "assistant_mode": args.assistant_mode,
-        "assistant_model": args.assistant_model if args.assistant_mode else None,
-        "assistant_ready": assistant.enabled if assistant else False,
+        "assistant_provider": assistant_provider_info,
+        "assistant_model": assistant_model_info,
+        "assistant_ready": assistant_ready,
         "vad_enabled": vad_actually_enabled,
         "idle_timeout": args.idle_timeout,
         "custom_words_loaded": len(custom_words) if custom_words else 0

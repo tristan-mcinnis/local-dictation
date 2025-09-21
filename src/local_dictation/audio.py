@@ -68,13 +68,14 @@ class VoiceRecorder:
     """
     def __init__(self, device_name: str | None, max_sec: float, highpass_hz: float = 0.0, channels: int = 1,
                  use_vad: bool = False,
+                 vad_instance: Optional[object] = None,
                  endpoint_manager: Optional[EndpointManager] = None,
                  on_auto_stop: Optional[Callable[[], None]] = None):
         self.max_sec = max_sec
         self.highpass_hz = highpass_hz
         self.channels = channels
         self.use_vad = use_vad
-        self.vad = None
+        self.vad = vad_instance
         self.endpoint_manager = endpoint_manager
         self.on_auto_stop = on_auto_stop
 
@@ -108,7 +109,7 @@ class VoiceRecorder:
             self.hp_b = self.hp_a = None
         
         # Initialize VAD if requested
-        if self.use_vad:
+        if self.use_vad and self.vad is None:
             try:
                 from .vad import SileroVAD
                 self.vad = SileroVAD(threshold=0.5, min_speech_duration_ms=1000, min_silence_duration_ms=100)
