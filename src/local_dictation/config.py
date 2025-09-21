@@ -33,8 +33,23 @@ def get_default_config() -> Dict[str, Any]:
             'format_enabled': True
         },
         'assistant': {
+            'enabled': False,
+            'provider': 'mlx',
             'model': 'mlx-community/Llama-3.2-3B-Instruct-4bit',
-            'enabled': False
+            'openai_model': 'gpt-5-mini',
+            'openai_api_key': None,
+            'openai_api_key_env': 'OPENAI_API_KEY',
+            'openai_base_url': None,
+            'openai_organization': None,
+            'result_action': 'auto',
+            'copy_result_to_clipboard': True,
+            'temperature': 0.2,
+            'max_output_tokens': 900,
+            'system_prompt': None,
+            'more_info_prompt': None,
+            'use_mcp': False,
+            'mcp_servers': [],
+            'mcp_startup_timeout': 15.0
         },
         'hotkey': {
             'chord': 'CMD,ALT',
@@ -43,7 +58,8 @@ def get_default_config() -> Dict[str, Any]:
         'audio': {
             'model': 'medium.en',
             'language': 'en',
-            'max_seconds': 90
+            'max_seconds': 90,
+            'wake_words': []
         }
     }
 
@@ -139,9 +155,15 @@ def get_email_sign_off() -> str:
 def is_email_formatting_enabled() -> bool:
     """
     Check if email formatting is enabled.
-    
+
     Returns:
         True if email formatting is enabled
     """
     config = load_config()
     return config.get('email', {}).get('format_enabled', True)
+
+def get_assistant_settings() -> Dict[str, Any]:
+    """Return assistant configuration block with defaults applied."""
+
+    config = load_config()
+    return config.get('assistant', {})
