@@ -1,0 +1,46 @@
+[package]
+name = "fast-dictate-backend"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Low-latency local dictation pipeline for Apple Silicon: Parakeet TDT v3 + Gemma 3 4B + macOS AX inject."
+repository = "https://github.com/tristan-mcinnis/fast-dictate-backend"
+readme = "README.md"
+keywords = ["dictation", "speech-to-text", "parakeet", "gemma", "macos"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[lib]
+name = "fast_dictate_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fast-dictate-backend"
+path = "src/main.rs"
+
+[features]
+default = []
+# Pulls parakeet-rs + ort (downloads onnxruntime binary at build time) + CoreML EP.
+parakeet = ["dep:parakeet-rs", "dep:hound"]
+# Adds llama.cpp (via llama-cpp-2) with Metal for the cleanup engine.
+# llama-cpp-2 (despite its 0.1.x version) is the actively-maintained binding;
+# `llama_cpp` 0.3.x vendors a llama.cpp from April 2024 and cannot load Gemma 3.
+cleaner = ["dep:llama-cpp-2", "dep:encoding_rs"]
+# Real macOS Accessibility-based text injection + clipboard fallback.
+ax-inject = ["dep:accessibility-sys", "dep:core-foundation", "dep:core-graphics", "dep:arboard"]
+# Convenience: everything on.
+full = ["parakeet", "cleaner", "ax-inject"]
+
+[dependencies]
+ringbuf = "0.4"
+cpal = "0.15"
+eyre = "0.6"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+parakeet-rs = { version = "0.3", optional = true, features = ["coreml"] }
+hound = { version = "3.5", optional = true }
+llama-cpp-2 = { version = "0.1", optional = true, default-features = false, features = ["metal"] }
+encoding_rs = { version = "0.8", optional = true }
+accessibility-sys = { version = "0.2", optional = true }
+core-foundation = { version = "0.10", optional = true }
+core-graphics = { version = "0.25", optional = true }
+arboard = { version = "3", optional = true, default-features = false }
+libc = "0.2"

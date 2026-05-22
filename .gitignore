@@ -1,0 +1,19 @@
+# Rust build artefacts
+/target/
+
+# Downloaded models (multi-GB binaries — fetched via scripts/download-models.sh)
+/models/*/
+!/models/.gitkeep
+
+# macOS
+.DS_Store
+._*
+
+# Editor / tooling
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+*.log
