@@ -177,10 +177,14 @@ fn worker_loop(
 
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
-        eprintln!("[daemon] loading Gemma 3 4B from {}", config.gemma_path);
+        let pretty = std::path::Path::new(&config.gemma_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&config.gemma_path);
+        eprintln!("[daemon] loading cleanup model: {pretty}");
         let t = Instant::now();
         let c = TextCleanupEngine::initialize(&config.gemma_path)?;
-        eprintln!("[daemon] gemma loaded in {:?}", t.elapsed());
+        eprintln!("[daemon] cleanup model loaded in {:?}", t.elapsed());
         Some(c)
     } else {
         None

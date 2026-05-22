@@ -9,7 +9,7 @@ use llama_cpp_2::{
     context::params::LlamaContextParams,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel},
     sampling::LlamaSampler,
 };
 use std::{
@@ -17,6 +17,13 @@ use std::{
     path::Path,
     sync::{Arc, OnceLock},
 };
+
+const SYSTEM_INSTRUCTION: &str =
+    "You are a real-time dictation cleaner. Remove verbal fillers \
+     (uh, um, like, you know), fix punctuation and capitalization, \
+     and preserve domain-specific casing such as Rust, macOS, ONNX, \
+     Parakeet. Output ONLY the cleaned text — no preamble, no \
+     commentary, no quotes.";
 
 // LlamaBackend can be initialised only once per process. Hold it in a OnceLock
 // so multiple TextCleanupEngine instances share the same backend handle.
@@ -34,6 +41,7 @@ fn backend() -> eyre::Result<Arc<LlamaBackend>> {
 pub struct TextCleanupEngine {
     backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
+    chat_template: Arc<LlamaChatTemplate>,
     max_tokens: i32,
 }
 
@@ -45,9 +53,16 @@ impl TextCleanupEngine {
         let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
         let model = LlamaModel::load_from_file(&backend, model_path.as_ref(), &model_params)
             .map_err(|e| eyre::eyre!("LlamaModel::load_from_file failed: {e:?}"))?;
+        // Use the model's bundled chat template (Gemma / ChatML / Llama 3 /
+        // whatever the GGUF declares). Falls back to a no-op format if the
+        // model has no template — in practice all instruct GGUFs do.
+        let chat_template = model
+            .chat_template(None)
+            .map_err(|e| eyre::eyre!("chat_template lookup failed: {e:?}"))?;
         Ok(Self {
             backend,
             model: Arc::new(model),
+            chat_template: Arc::new(chat_template),
             max_tokens: 256,
         })
     }
@@ -60,16 +75,15 @@ impl TextCleanupEngine {
             return Ok(String::new());
         }
 
-        // Gemma 3 chat template.
-        let prompt = format!(
-            "<start_of_turn>user\n\
-             You are a real-time dictation cleaner. Remove verbal fillers \
-             (uh, um, like, you know), fix punctuation and capitalization, \
-             and preserve domain-specific casing such as Rust, macOS, ONNX, \
-             Parakeet. Output ONLY the cleaned text — no preamble, no \
-             commentary, no quotes.\n\n\
-             Raw transcript:\n{raw}<end_of_turn>\n<start_of_turn>model\n"
-        );
+        // Build the chat using the model's own bundled template. Works for
+        // Gemma / Llama 3 / Qwen-ChatML / SmolLM without per-family hardcoding.
+        let user_msg = format!("{SYSTEM_INSTRUCTION}\n\nRaw transcript:\n{raw}");
+        let messages = vec![LlamaChatMessage::new("user".into(), user_msg)
+            .map_err(|e| eyre::eyre!("invalid chat message: {e:?}"))?];
+        let prompt = self
+            .model
+            .apply_chat_template(&self.chat_template, &messages, true)
+            .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))?;
 
         let backend = self.backend.clone();
         let model = self.model.clone();
