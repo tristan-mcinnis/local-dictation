@@ -41,8 +41,12 @@ async fn main() -> eyre::Result<()> {
         }
         "ax-check" => run_ax_check(),
         "inject-test" => run_inject_test(args.get(2).cloned()),
+        "daemon" => run_daemon(args.iter().any(|a| a == "--no-cleanup")).await,
+        "synth-press" => run_synth_press(
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
+        ),
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: mock-loop, bench [wav], dictate [ms], ax-check"
+            "unknown subcommand `{other}` — use one of: mock-loop, bench [wav], dictate [ms], daemon [--no-cleanup], inject-test [text], ax-check"
         )),
     }
 }
@@ -293,4 +297,59 @@ fn parakeet_dir() -> String {
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
 fn gemma_path() -> String {
     std::env::var("GEMMA_MODEL_PATH").unwrap_or_else(|_| GEMMA_DEFAULT_REL.to_string())
+}
+
+#[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
+async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
+    use fast_dictate_backend::daemon::{run, DaemonConfig};
+    // Spawn the daemon on a blocking thread because it calls CFRunLoop::run_current()
+    // which blocks indefinitely — we don't want to occupy the tokio runtime.
+    let config = DaemonConfig::from_env(
+        parakeet_dir(),
+        #[cfg(feature = "cleaner")]
+        gemma_path(),
+        no_cleanup,
+    );
+    tokio::task::spawn_blocking(move || run(config))
+        .await
+        .map_err(|e| eyre::eyre!("daemon task join failed: {e}"))?
+}
+
+#[cfg(not(all(target_os = "macos", feature = "parakeet", feature = "ax-inject")))]
+async fn run_daemon(_no_cleanup: bool) -> eyre::Result<()> {
+    Err(eyre::eyre!(
+        "`daemon` requires --features full (parakeet + cleaner + ax-inject) on macOS"
+    ))
+}
+
+/// Hidden helper: synthesize Right-Option hold for `hold_ms` ms via CGEvent.
+/// Lets the running daemon be tested from a second process.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+fn run_synth_press(hold_ms: u64) -> eyre::Result<()> {
+    use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    const RIGHT_OPTION_KEYCODE: u16 = 0x3D;
+
+    let src = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| eyre::eyre!("CGEventSource::new failed"))?;
+
+    let down = CGEvent::new_keyboard_event(src.clone(), RIGHT_OPTION_KEYCODE, true)
+        .map_err(|_| eyre::eyre!("down event create failed"))?;
+    down.set_flags(CGEventFlags::CGEventFlagAlternate);
+    down.post(CGEventTapLocation::HID);
+    println!("[synth] Right Option DOWN");
+
+    std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+
+    let up = CGEvent::new_keyboard_event(src, RIGHT_OPTION_KEYCODE, false)
+        .map_err(|_| eyre::eyre!("up event create failed"))?;
+    up.set_flags(CGEventFlags::CGEventFlagNull);
+    up.post(CGEventTapLocation::HID);
+    println!("[synth] Right Option UP");
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+fn run_synth_press(_hold_ms: u64) -> eyre::Result<()> {
+    Err(eyre::eyre!("synth-press requires --features ax-inject on macOS"))
 }

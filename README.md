@@ -93,11 +93,13 @@ cargo build --features full --release
 
 | Command | What it does |
 | --- | --- |
+| **`daemon [--no-cleanup]`** | **Push-to-talk daemon. Loads + pre-warms both models, then listens for Right Option held → records → releases → transcribes → cleans → injects. This is the way to actually use the tool.** |
 | `mock-loop` | No models needed. Drives the ring buffer with a synthetic sine; useful for buffer-plumbing sanity. |
 | `bench [path/to/wav]` | Loads Parakeet + Gemma, transcribes the WAV, cleans it, reports timings, then injects the cleaned text into the focused field (or `FOCUS_APP`). |
-| `dictate <ms>` | Opens the default input device, records for `ms` ms, transcribes, cleans, injects. Plays `Tink` on start / `Pop` on stop. Ctrl+C cancels without injecting. |
+| `dictate <ms>` | Fixed-duration capture (no hotkey). Records for `ms` ms, transcribes, cleans, injects. Plays `Tink` on start / `Pop` on stop. |
 | `inject-test [text]` | Smoke-test the AX injector with a fixed string (default: `"hello from fast-dictate-backend!"`). |
 | `ax-check` | Probes Accessibility permission; surfaces the system prompt on first call. |
+| `synth-press [ms]` | Synthesize a Right Option press-and-hold for `ms` ms via `CGEventPost`. Used to test the running daemon from a second process. |
 
 ## Environment knobs
 
@@ -107,6 +109,52 @@ cargo build --features full --release
 | `GEMMA_MODEL_PATH` | Overrides the Gemma GGUF path. Default: `models/gemma-3-4b-it/gemma-3-4b-it-Q4_K_M.gguf`. |
 | `FOCUS_APP` | If set (e.g. `FOCUS_APP=TextEdit`), activates the named app and injects into it by PID. Useful for scripted tests against a specific target. |
 | `DICTATE_QUIET` | Mutes audio cues. |
+| `DICTATE_HOTKEY_KEYCODE` | Override the daemon's hotkey (default `0x3D` = Right Option). Examples: `0x3E` Right Control, `0x36` Right Command, `0x3C` Right Shift. |
+
+## Push-to-talk daemon (the way to use this for real)
+
+```bash
+./target/release/fast-dictate-backend daemon
+```
+
+What it does:
+1. Loads Parakeet + Gemma 3 4B once at startup (~1.5 s total).
+2. **Pre-warms** both with a dummy inference (~400 ms) so the first real utterance pays no jitter cost.
+3. Installs a `CGEventTap` on the main `CFRunLoop` watching modifier-flag changes for Right Option.
+4. **Hold Right Option** → `Tink` plays, cpal opens the mic. Speak.
+5. **Release Right Option** → `Pop` plays, mic closes, Parakeet transcribes, Gemma cleans, AX injects at the cursor.
+6. Repeat. Ctrl+C to quit.
+
+### Verified daemon-mode latency (M-series Mac, hot path after warm-up)
+
+Measured via `synth-press` from a second process — single round-trip after a 2-second key hold:
+
+| Stage | Wall time |
+| --- | --- |
+| Daemon boot: Parakeet load | ~800 ms one-time |
+| Daemon boot: Gemma load | ~700 ms one-time |
+| Daemon boot: warm-up (both) | ~400 ms one-time |
+| Drain ring buffer + transcribe | **~133 ms** |
+| Gemma cleanup (4B Q4_K_M, Metal) | ~700 ms |
+| AX inject (incl. smart-pad context read) | ~200 ms |
+| **Per-utterance: release → injected** | **~1.04 s** |
+
+With `--no-cleanup` (skip Gemma):
+
+| Stage | Wall time |
+| --- | --- |
+| Daemon boot: Parakeet load only | ~800 ms one-time |
+| Warm-up (Parakeet only) | ~45 ms one-time |
+| **Per-utterance: release → injected** | **~330 ms** (transcribe + inject) |
+
+So the trade-off is **~330 ms raw vs ~1040 ms polished** per utterance. Use `--no-cleanup` when you want instant low-latency dictation and don't mind filler words / casing slips.
+
+### Daemon caveats
+
+- Right Option is the default because it's rarely typed alone. Override with `DICTATE_HOTKEY_KEYCODE=0x3E` etc.
+- The tap requires **Accessibility permission**. First daemon boot will prompt; toggle the binary on in System Settings → Privacy & Security → Accessibility and re-run.
+- `cpal::Stream` is `!Send`, so the daemon owns it on a single worker thread. The mic is opened/closed per utterance — cheap, but adds ~10 ms each side.
+- No menu-bar UI yet (see "What's not built (yet)" below). Cues + stderr are the indicator.
 
 ## Cargo features
 
@@ -181,11 +229,13 @@ models/                 # downloaded models live here (gitignored)
 
 Honest list of things a shipping dictation app would have but this backend doesn't:
 
-- **Global hotkey daemon.** No `CGEventTap` push-to-talk listener. You drive the binary from the CLI today; a real product would run as a background `LaunchAgent` with a menu-bar status item and a hold-to-talk hotkey.
-- **Voice activity detection.** Capture duration is hotkey-controlled (ms argument); no silence-based auto-stop.
+- ~~**Global hotkey daemon.** No `CGEventTap` push-to-talk listener.~~ **Shipped** — see [Push-to-talk daemon](#push-to-talk-daemon-the-way-to-use-this-for-real) above.
+- **Menu-bar status indicator.** Daemon prints state to stderr and plays audio cues; a real `NSStatusItem` icon (red dot while recording, mic icon idle) is the obvious next add. Skipped because it requires refactoring the run loop from `CFRunLoop::run_current()` to `NSApplication.run()` without breaking the event tap — non-trivial.
+- **`LaunchAgent` auto-start.** Today you start the daemon manually from a terminal; a `~/Library/LaunchAgents/*.plist` would make it boot at login.
+- **Voice activity detection.** Capture is hotkey-controlled (press / release); no silence-based auto-stop within a hold.
 - **Rich-clipboard round-trip.** The clipboard fallback restores plain text only; images/RTF/file URLs on the clipboard at fallback time are lost.
-- **Code signing / notarization.** Not signed; AX prompts will identify the binary by path rather than developer name.
-- **Streaming partials.** `dictate` is bounded-window, not streaming; partial transcripts aren't surfaced mid-utterance.
+- **Code signing / notarization.** Not signed; AX prompts identify the binary by path rather than developer name.
+- **Streaming partials.** Parakeet TDT is offline-batch; no mid-utterance partial transcripts. NVIDIA does ship streaming variants — would require a separate Rust binding.
 
 ## Why these choices
 

@@ -10,3 +10,8 @@ pub mod cleaner;
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub mod clipboard_paste;
+
+// Push-to-talk daemon. Needs the full feature stack — Parakeet for ASR and
+// AX for the event tap + injection.
+#[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
+pub mod daemon;
