@@ -14,8 +14,53 @@
 //!      save-clipboard → set-clipboard → synthesize Cmd+V → restore.
 
 use crate::smart_pad::{last_non_ws_before, smart_pad};
+use std::sync::Mutex;
 
 pub struct AccessibilityInjector;
+
+/// Process-wide memory of the last character we successfully injected.
+/// When the focused app doesn't expose `kAXValue` (Electron apps,
+/// sandboxed web views, some Java apps), we fall back to using this as
+/// the implicit `char_before` so consecutive utterances still get the
+/// right spacing + capitalization.
+///
+/// Reset on first call (None) → first utterance behaves like "start of
+/// field." Updated to the last char of every successful inject.
+static LAST_TAIL: Mutex<Option<char>> = Mutex::new(None);
+
+/// PID of the focused app that's known to not expose AXValue. Skip the
+/// context read for it on subsequent injects (saves ~100 ms per utterance
+/// in Electron / web-view targets).
+static AX_BLIND_PID: Mutex<Option<i32>> = Mutex::new(None);
+
+fn mark_ax_blind(pid: i32) {
+    if let Ok(mut g) = AX_BLIND_PID.lock() {
+        *g = Some(pid);
+    }
+}
+
+fn is_ax_blind(pid: i32) -> bool {
+    matches!(AX_BLIND_PID.lock().ok().and_then(|g| *g), Some(p) if p == pid)
+}
+
+fn remember_tail(text: &str) {
+    let tail = text.chars().rev().find(|c| !c.is_whitespace());
+    if let Ok(mut g) = LAST_TAIL.lock() {
+        *g = tail;
+    }
+}
+
+fn recall_tail() -> Option<char> {
+    LAST_TAIL.lock().ok().and_then(|g| *g)
+}
+
+/// Public: clear the cross-utterance state. Useful when the user
+/// switches target apps and the previous tail no longer applies.
+pub fn reset_inject_state() {
+    if let Ok(mut g) = LAST_TAIL.lock() {
+        *g = None;
+    }
+}
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 mod imp {
@@ -24,8 +69,8 @@ mod imp {
         kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXSelectedTextAttribute,
         kAXSelectedTextRangeAttribute, kAXTrustedCheckOptionPrompt, kAXValueAttribute,
         kAXValueTypeCFRange, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
-        AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementRef,
-        AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
+        AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
+        AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
     use core_foundation::base::{CFRange, CFTypeRef, TCFType};
     use core_foundation::boolean::CFBoolean;
@@ -88,17 +133,52 @@ mod imp {
             &mut focused_ref,
         );
         if err != kAXErrorSuccess || focused_ref.is_null() {
-            // No focused field — try clipboard paste against whatever is
-            // frontmost (the user clearly wanted *something* to receive it).
+            // No focused field exposed — try clipboard paste against whatever
+            // is frontmost. Still apply smart-pad using the remembered tail
+            // so consecutive utterances don't mash together.
             eprintln!("[inject] no focused AX element (AXError {err}); using clipboard paste");
-            return crate::clipboard_paste::paste_via_clipboard(&smart_pad(text, None, None, None));
+            let tail = super::recall_tail();
+            let padded = smart_pad(text, tail, tail, None);
+            let r = crate::clipboard_paste::paste_via_clipboard(&padded);
+            if r.is_ok() {
+                super::remember_tail(&padded);
+            }
+            return r;
         }
         let focused = focused_ref as AXUIElementRef;
 
         // 2. Context: read current value + caret position. Both may be
-        //    absent (some fields don't expose AXValue) — that's fine, we
-        //    just inject without smart spacing in that case.
-        let (immediate_before, last_nws_before, char_after) = read_caret_context(focused);
+        //    absent (Electron apps, sandboxed web views, some Java apps
+        //    don't expose AXValue) — in that case fall back to our
+        //    remembered last-injected-tail character so consecutive
+        //    utterances still get the right spacing + capitalization.
+        //
+        // Optimization: if the focused app's PID has previously refused
+        // AXValue reads, skip the (~100 ms) round-trip entirely and go
+        // straight to the LAST_TAIL fallback.
+        let focused_pid = focused_pid_of(focused);
+        let (mut immediate_before, mut last_nws_before, char_after) =
+            if let Some(pid) = focused_pid {
+                if super::is_ax_blind(pid) {
+                    (None, None, None)
+                } else {
+                    let ctx = read_caret_context(focused);
+                    if ctx.0.is_none() && ctx.1.is_none() {
+                        // Remember this app is AX-blind so we don't pay the
+                        // round-trip again next time.
+                        super::mark_ax_blind(pid);
+                    }
+                    ctx
+                }
+            } else {
+                read_caret_context(focused)
+            };
+        if immediate_before.is_none() && last_nws_before.is_none() {
+            if let Some(tail) = super::recall_tail() {
+                immediate_before = Some(tail);
+                last_nws_before = Some(tail);
+            }
+        }
 
         // 3. Smart-pad.
         let padded = smart_pad(text, immediate_before, last_nws_before, char_after);
@@ -118,6 +198,7 @@ mod imp {
 
         if sel_err == kAXErrorSuccess {
             cf_release(focused as CFTypeRef);
+            super::remember_tail(&padded);
             return Ok(());
         }
 
@@ -130,6 +211,7 @@ mod imp {
         cf_release(focused as CFTypeRef);
 
         if val_err == kAXErrorSuccess {
+            super::remember_tail(&padded);
             return Ok(());
         }
 
@@ -137,7 +219,23 @@ mod imp {
         eprintln!(
             "[inject] AX writes refused (selected={sel_err}, value={val_err}); using clipboard paste"
         );
-        crate::clipboard_paste::paste_via_clipboard(&padded)
+        let r = crate::clipboard_paste::paste_via_clipboard(&padded);
+        if r.is_ok() {
+            super::remember_tail(&padded);
+        }
+        r
+    }
+
+    /// Get the PID of the process that owns the focused AXUIElement, or None
+    /// if AX refuses to tell us.
+    unsafe fn focused_pid_of(focused: AXUIElementRef) -> Option<i32> {
+        let mut pid: libc::pid_t = 0;
+        let err = AXUIElementGetPid(focused, &mut pid);
+        if err == kAXErrorSuccess && pid > 0 {
+            Some(pid)
+        } else {
+            None
+        }
     }
 
     /// Read kAXValue + kAXSelectedTextRange, return (immediate_before,

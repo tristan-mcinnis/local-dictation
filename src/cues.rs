@@ -13,7 +13,8 @@ pub fn play_start() {
 }
 
 pub fn play_stop() {
-    play("Pop");
+    // Glass is crisper than Pop — no reverb tail / "double-click" quality.
+    play("Glass");
 }
 
 pub fn play_cancel() {

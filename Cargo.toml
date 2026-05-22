@@ -44,3 +44,20 @@ core-foundation = { version = "0.10", optional = true }
 core-graphics = { version = "0.25", optional = true }
 arboard = { version = "3", optional = true, default-features = false }
 libc = "0.2"
+# Menu-bar status item. Pulled in only with the ax-inject + parakeet stack
+# (i.e. the daemon path) — the lib build doesn't need it.
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSRunLoop", "NSThread"] }
+objc2-app-kit = { version = "0.3", optional = true, features = [
+    "NSApplication",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSButton",
+    "NSResponder",
+    "NSControl",
+    "NSView",
+    "NSCell",
+] }
