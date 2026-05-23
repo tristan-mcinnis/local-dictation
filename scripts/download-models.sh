@@ -5,8 +5,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PARAKEET_DIR="models/parakeet-tdt-v3-int8"
-GEMMA_DIR="models/gemma-3-1b-it"
+PARAKEET_DIR="models/dictation/parakeet-tdt-v3-int8"
+GEMMA_DIR="models/llm/gemma-3-1b-it"
 mkdir -p "$PARAKEET_DIR" "$GEMMA_DIR"
 
 PARAKEET_BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
@@ -35,8 +35,8 @@ echo "      - Reliably follows the system instruction (filler removal,"
 echo "        colloquial expansion, casing preservation)."
 echo "      - ~310 ms hot cleanup latency on M-series."
 echo "      - Same cleanup output as the 4B model on conversational English."
-echo "    Alternatives: GEMMA_MODEL_PATH=models/gemma-3-4b-it/... for max"
-echo "    polish; models/qwen-2.5-0.5b-it/... for raw speed (drops some"
+echo "    Alternatives: GEMMA_MODEL_PATH=models/llm/gemma-3-4b-it/... for max"
+echo "    polish; models/llm/qwen-2.5-0.5b-it/... for raw speed (drops some"
 echo "    quality, struggles with formal-spelling rules)."
 fetch "$GEMMA_BASE/gemma-3-1b-it-Q4_K_M.gguf" "$GEMMA_DIR/gemma-3-1b-it-Q4_K_M.gguf"
 

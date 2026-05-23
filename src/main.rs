@@ -12,9 +12,9 @@ use std::time::Instant;
 // Default model locations — kept inside the project tree so they're
 // discoverable + cached alongside the code.
 #[cfg(feature = "parakeet")]
-const PARAKEET_DEFAULT_REL: &str = "models/parakeet-tdt-v3-int8";
+const PARAKEET_DEFAULT_REL: &str = "models/dictation/parakeet-tdt-v3-int8";
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
-const GEMMA_DEFAULT_REL: &str = "models/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf";
+const GEMMA_DEFAULT_REL: &str = "models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf";
 
 // cpal::Stream is !Send on macOS — pin the runtime to one thread so the
 // engine can stay put.
