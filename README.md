@@ -10,7 +10,17 @@ A local dictation app for Apple Silicon. Hold a hotkey, speak, release — clean
 ./target/release/fast-dictate-backend daemon
 ```
 
-Then **hold Right Option**, speak, release. The cleaned text gets injected wherever your cursor is. A small floating pill shows live mic levels while you talk.
+Then **hold Right Option**, speak, release. The cleaned text gets injected wherever your cursor is.
+
+While you talk, a small dark pill floats at the bottom of your cursor's screen with a **live waveform** driven by your mic — bars rise instantly on each syllable and decay slowly so peaks are visible:
+
+```
+        ╭─────────────────────────╮
+        │   ▎▍▆█▇▅▎▏ ▍▆▇▄▎       │   ← live mic, ~30 FPS
+        ╰─────────────────────────╯
+```
+
+A small **menu-bar icon** mirrors the state: 🎤 idle · 🔴 recording · ⏳ processing. Subtle audio cues (Tink on start, Bottle on stop) confirm key transitions without being noisy.
 
 ## Verified performance
 
@@ -74,13 +84,37 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 ## Features
 
 - **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`).
+- **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
+- **Menu-bar icon + Quit.** 🎤 idle / 🔴 recording / ⏳ processing. Click to access ⌘Q.
+- **Audio cues.** Tink on start, Bottle on stop, Basso on error. Mute with `DICTATE_QUIET=1`.
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
 - **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
-- **Live waveform pill.** Small dark rounded pill at the bottom of your cursor's screen, 14 vertical bars driven by real RMS, peak-hold + decay so it feels alive.
-- **Menu-bar icon.** 🎤 idle / 🔴 recording / ⏳ processing, with a Quit item (⌘Q).
 - **Voice command: "press enter".** End a dictation with `press enter` / `press return` / `hit enter` / `hit return` and it injects the body then synthesizes a Return keystroke. Doesn't fire mid-sentence.
-- **Audio cues.** Tink on start, Bottle on stop, Basso on error. Mute with `DICTATE_QUIET=1`.
+- **Structured logs.** Aligned per-utterance blocks at `/tmp/dictate-daemon.log` showing transcribe / cleanup / inject timings, the target app name, and the final injected text.
+
+## What the log looks like
+
+`/tmp/dictate-daemon.log` after a couple of utterances:
+
+```
+[boot] parakeet    loaded in  757 ms
+[boot] cleaner     loaded in  360 ms · gemma-3-1b-it-Q4_K_M.gguf
+[boot] warm-up     done   in  374 ms
+[boot] ready · hold Right Option (0x3d) to dictate · ⌘Q quits
+
+▶ recording
+⏹ stopped · held 2.16s
+  xcr   142 ms · cln  305 ms · inj  183 ms
+  app  Visual Studio Code (pid 82458)
+  ✓    "How do these things are they showing up better?"
+
+▶ recording
+⏹ stopped · held 0.89s
+  skip · empty transcript
+```
+
+`xcr` = transcribe (Parakeet), `cln` = cleanup (Gemma), `inj` = inject (AX or clipboard). `app` is the resolved name of whatever process owned the focused UI element. Tail it live with `tail -f /tmp/dictate-daemon.log`.
 
 ## Subcommands
 
