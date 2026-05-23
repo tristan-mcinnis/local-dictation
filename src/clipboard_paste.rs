@@ -12,8 +12,9 @@ use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode}
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::time::Duration;
 
-// US ANSI virtual key code for "V".
+// US ANSI virtual key codes.
 const KEY_V: CGKeyCode = 9;
+const KEY_RETURN: CGKeyCode = 36;
 // Time the OS needs to actually consume the synthesized Cmd+V and let the
 // receiving app pull from the pasteboard before we restore.
 const PASTE_SETTLE_MS: u64 = 180;
@@ -55,6 +56,24 @@ fn synthesize_cmd_v() -> eyre::Result<()> {
         .map_err(|_| eyre::eyre!("CGEvent keyup create failed"))?;
     key_up.set_flags(CGEventFlags::CGEventFlagCommand);
     key_up.post(CGEventTapLocation::HID);
+
+    Ok(())
+}
+
+/// Synthesize a Return key press + release. Used when the dictated text
+/// ends with "press enter" — the daemon strips the trigger phrase and
+/// calls this after the cleaned text is in the field.
+pub fn synthesize_return() -> eyre::Result<()> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| eyre::eyre!("CGEventSource::new failed"))?;
+
+    let down = CGEvent::new_keyboard_event(source.clone(), KEY_RETURN, true)
+        .map_err(|_| eyre::eyre!("Return keydown create failed"))?;
+    down.post(CGEventTapLocation::HID);
+
+    let up = CGEvent::new_keyboard_event(source, KEY_RETURN, false)
+        .map_err(|_| eyre::eyre!("Return keyup create failed"))?;
+    up.post(CGEventTapLocation::HID);
 
     Ok(())
 }

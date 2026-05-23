@@ -4,10 +4,41 @@ use ringbuf::{
     traits::{Producer, Split},
     HeapCons, HeapProd, HeapRb,
 };
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+
+/// How many recent RMS samples we keep for the waveform display.
+/// Matches the number of bars in the floating pill.
+pub const WAVEFORM_BARS: usize = 14;
+
+/// Process-wide ring of recent RMS levels (one per cpal callback chunk).
+/// Written from the cpal audio thread, read from the menu-bar UI timer.
+static AUDIO_LEVELS: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::new());
+
+pub fn push_audio_level(rms: f32) {
+    if let Ok(mut q) = AUDIO_LEVELS.lock() {
+        if q.len() >= WAVEFORM_BARS {
+            q.pop_front();
+        }
+        q.push_back(rms);
+    }
+}
+
+pub fn recent_levels() -> Vec<f32> {
+    AUDIO_LEVELS
+        .lock()
+        .map(|q| q.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+pub fn reset_levels() {
+    if let Ok(mut q) = AUDIO_LEVELS.lock() {
+        q.clear();
+    }
+}
 
 pub const SAMPLE_RATE: u32 = 16_000;
 /// 30 s of headroom (16 000 samples/s · 30) — comfortably bigger than the
@@ -193,6 +224,12 @@ fn push_resampled(
             mono.push(sum / channels as f32);
         }
     }
+
+    // Push RMS of this chunk to the waveform ring for the UI pill. Computed
+    // pre-resample on native mono so it reflects real microphone activity.
+    let sum_sq: f32 = mono.iter().map(|x| x * x).sum();
+    let rms = (sum_sq / mono.len() as f32).sqrt();
+    push_audio_level(rms);
 
     // Linear-interpolate at `stride`. `pos` indexes into the mono buffer.
     // When pos crosses a frame boundary the carry advances by `stride` again.

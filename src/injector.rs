@@ -43,6 +43,48 @@ fn is_ax_blind(pid: i32) -> bool {
     matches!(AX_BLIND_PID.lock().ok().and_then(|g| *g), Some(p) if p == pid)
 }
 
+/// Cache of `pid → uses_electron_ax_quirks`. Looked up via `ps` once per
+/// PID. Electron apps (VS Code, Cursor, Slack, Discord, Claude Code,
+/// browsers etc.) report AX TextField role and accept kAXSelectedText
+/// writes with kAXErrorSuccess, but their renderer never receives the
+/// text — so we always route them through clipboard paste.
+static ELECTRON_CACHE: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+
+pub fn is_clipboard_only_pid(pid: i32) -> bool {
+    if let Ok(cache) = ELECTRON_CACHE.lock() {
+        for &(p, v) in cache.iter() {
+            if p == pid {
+                return v;
+            }
+        }
+    }
+    let comm = std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+        .unwrap_or_default();
+    let is_electron = comm.contains("/electron")
+        || comm.contains("visual studio code")
+        || comm.contains("/code helper")
+        || comm.contains("/code.app")
+        || comm.contains("/cursor")
+        || comm.contains("/slack")
+        || comm.contains("/discord")
+        || comm.contains("/claude")
+        || comm.contains("/notion")
+        || comm.contains("/chrome")
+        || comm.contains("/brave")
+        || comm.contains("/arc")
+        || comm.contains("/obsidian")
+        || comm.contains("/zed")
+        || comm.contains("/figma");
+    if let Ok(mut cache) = ELECTRON_CACHE.lock() {
+        cache.push((pid, is_electron));
+    }
+    is_electron
+}
+
 fn remember_tail(text: &str) {
     let tail = text.chars().rev().find(|c| !c.is_whitespace());
     if let Ok(mut g) = LAST_TAIL.lock() {
@@ -66,9 +108,10 @@ pub fn reset_inject_state() {
 mod imp {
     use super::*;
     use accessibility_sys::{
-        kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXSelectedTextAttribute,
-        kAXSelectedTextRangeAttribute, kAXTrustedCheckOptionPrompt, kAXValueAttribute,
-        kAXValueTypeCFRange, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
+        kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute,
+        kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute,
+        kAXTrustedCheckOptionPrompt, kAXValueAttribute, kAXValueTypeCFRange,
+        AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
         AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
         AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
@@ -331,6 +374,7 @@ mod imp {
     /// AXUIElement is a CFType, thread-safe to use after CFRetain.
     pub struct FocusTargetInner {
         focused: AXUIElementRef,
+        pub pid: Option<i32>,
         pub immediate_before: Option<char>,
         pub last_nws_before: Option<char>,
         pub char_after: Option<char>,
@@ -388,12 +432,34 @@ mod imp {
                     read_caret_context(focused)
                 };
 
+            // Diagnostic: log what we're about to write into. Enable with
+            // INJECT_DIAG=1. Helps explain "no text appears" when an
+            // element accepts the AX call but doesn't actually render.
+            if std::env::var("INJECT_DIAG").is_ok() {
+                let mut role_ref: CFTypeRef = ptr::null();
+                let role_attr = CFString::new(kAXRoleAttribute);
+                let r_err = AXUIElementCopyAttributeValue(
+                    focused,
+                    role_attr.as_concrete_TypeRef(),
+                    &mut role_ref,
+                );
+                let role = if r_err == kAXErrorSuccess && !role_ref.is_null() {
+                    let s = CFString::wrap_under_create_rule(role_ref as CFStringRef)
+                        .to_string();
+                    s
+                } else {
+                    format!("<unknown AXError {r_err}>")
+                };
+                eprintln!(
+                    "[inject-diag] focus capture: pid={focused_pid:?} role={role}"
+                );
+            }
+
             // Retain — focused_ref was returned by AXUIElementCopyAttributeValue
             // under the Create rule, so it's already +1. We just hold it.
-            // (cf_release(focused_ref) above released the system-wide root,
-            // not the focused element.)
             Ok(FocusTargetInner {
                 focused,
+                pid: focused_pid,
                 immediate_before,
                 last_nws_before,
                 char_after,
@@ -420,6 +486,23 @@ mod imp {
         let padded = smart_pad(text, immediate_before, last_nws_before, target.char_after);
         if padded.is_empty() {
             return Ok(());
+        }
+
+        // Short-circuit: Electron / browser targets accept AX writes with
+        // kAXErrorSuccess but never render the text. Route them straight
+        // to clipboard paste, which always works because it uses the
+        // system-level Cmd+V handler.
+        if let Some(pid) = target.pid {
+            if super::is_clipboard_only_pid(pid) {
+                if prof {
+                    eprintln!("[inject-prof] (via target) Electron pid {pid} — clipboard paste");
+                }
+                let r = crate::clipboard_paste::paste_via_clipboard(&padded);
+                if r.is_ok() {
+                    super::remember_tail(&padded);
+                }
+                return r;
+            }
         }
 
         unsafe {

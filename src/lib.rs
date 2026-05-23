@@ -4,6 +4,7 @@ pub mod injector;
 pub mod smart_pad;
 pub mod text_polish;
 pub mod transcriber;
+pub mod voice_commands;
 
 #[cfg(feature = "cleaner")]
 pub mod cleaner;

@@ -18,6 +18,7 @@ use crate::cues;
 use crate::injector::{AccessibilityInjector, FocusTarget};
 use crate::menubar::{self, UiState};
 use crate::transcriber::LocalInferenceWorker;
+use crate::voice_commands::{parse_trailing_command, TrailingAction};
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -326,6 +327,21 @@ fn worker_loop(
                 };
 
                 if final_text.trim().is_empty() {
+                    menubar::set_state(UiState::Idle);
+                    continue;
+                }
+
+                // Voice command detection: trailing "press enter" is
+                // stripped and turned into a Return keystroke after inject.
+                let (final_text, action) = parse_trailing_command(&final_text);
+                if matches!(action, TrailingAction::PressEnter) {
+                    eprintln!("[daemon] trailing voice command: press enter");
+                }
+
+                if final_text.trim().is_empty() && !matches!(action, TrailingAction::None) {
+                    // Pure "press enter" with no body: just fire Return.
+                    let _ = crate::clipboard_paste::synthesize_return();
+                    menubar::set_state(UiState::Idle);
                     continue;
                 }
 
@@ -365,6 +381,16 @@ fn worker_loop(
                         final_text.len(),
                         t_inject.elapsed()
                     );
+                    if matches!(action, TrailingAction::PressEnter) {
+                        // Small settle delay so the text is actually in
+                        // the field before Return fires.
+                        std::thread::sleep(Duration::from_millis(40));
+                        if let Err(e) = crate::clipboard_paste::synthesize_return() {
+                            eprintln!("[daemon] synth return failed: {e:?}");
+                        } else {
+                            eprintln!("[daemon] ↵ Return key sent");
+                        }
+                    }
                 }
                 menubar::set_state(UiState::Idle);
             }
