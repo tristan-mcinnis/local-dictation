@@ -78,5 +78,6 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSTextField",
     "NSGraphics",
     "NSGraphicsContext",
+    "NSImage",
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }

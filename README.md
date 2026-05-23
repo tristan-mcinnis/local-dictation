@@ -85,7 +85,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 
 - **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`).
 - **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
-- **Menu-bar icon + Quit.** 🎤 idle / 🔴 recording / ⏳ processing. Click to access ⌘Q.
+- **Menu-bar icon (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click for an **Open Log** item (⌘L — opens `/tmp/dictate-daemon.log` in your default editor) and **Quit** (⌘Q).
 - **Audio cues.** Tink on start, Bottle on stop, Basso on error. Mute with `DICTATE_QUIET=1`.
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
@@ -122,6 +122,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 | Command | What it does |
 | --- | --- |
 | `daemon` | Push-to-talk daemon — the way to use this for real |
+| `logs` | Open `/tmp/dictate-daemon.log` in your default editor |
 | `bench [wav]` | Transcribe + clean a WAV, report timings |
 | `dictate <ms>` | Fixed-duration capture (no hotkey) |
 | `inject-test [text]` | AX-only smoke test |

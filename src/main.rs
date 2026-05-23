@@ -45,8 +45,9 @@ async fn main() -> eyre::Result<()> {
         "synth-press" => run_synth_press(
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
+        "logs" => run_logs(),
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: mock-loop, bench [wav], dictate [ms], daemon [--no-cleanup], inject-test [text], ax-check"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], ax-check, mock-loop"
         )),
     }
 }
@@ -106,6 +107,27 @@ fn inject_with_optional_focus(text: &str) -> eyre::Result<()> {
         .map_err(|_| eyre::eyre!("could not resolve PID for {app}: {:?}", out))?;
     println!("[inject] targeting {app} (pid {pid})");
     AccessibilityInjector::inject_into_pid(pid, text)
+}
+
+/// Open the daemon log in the user's default text editor / Console.app.
+/// Same path the menu-bar "Open Log" item uses.
+fn run_logs() -> eyre::Result<()> {
+    let log_path = "/tmp/dictate-daemon.log";
+    if !std::path::Path::new(log_path).exists() {
+        eprintln!(
+            "[logs] {log_path} doesn't exist yet — start the daemon first with `daemon`."
+        );
+        return Ok(());
+    }
+    // `open -t` uses the default .txt editor (Console.app on most setups).
+    let status = std::process::Command::new("open")
+        .args(["-t", log_path])
+        .status()?;
+    if !status.success() {
+        return Err(eyre::eyre!("`open` exited with {status}"));
+    }
+    println!("[logs] opened {log_path}");
+    Ok(())
 }
 
 fn run_ax_check() -> eyre::Result<()> {

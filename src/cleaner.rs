@@ -30,9 +30,15 @@ const SYSTEM_INSTRUCTION: &str =
        woulda → would have, y'all → you all.\n\
      - KEEP standard contractions as-is: don't, it's, won't, can't, I'm, \
        I'll, we're, etc. — do not over-formalize.\n\
-     - Fix punctuation and capitalization.\n\
-     - Preserve domain-specific casing: Rust, macOS, ONNX, GitHub, Parakeet, \
-       iOS, Apple Silicon, etc.\n\
+     - Fix punctuation and capitalization of sentence boundaries.\n\
+     - Preserve domain-specific casing when it appears: Rust, macOS, ONNX, \
+       GitHub, Parakeet, iOS, Apple Silicon, etc.\n\
+     - CRITICAL: Do NOT substitute common words for proper nouns based on \
+       guessed context. If the speaker says 'main', keep 'main' — do not \
+       change to 'Maine'. If they say 'mark', keep 'mark' — do not change \
+       to 'Mark'. Tech terms like 'git', 'npm', 'cd', 'ls', 'main', \
+       'master', 'dev', 'prod', 'api' stay lowercase as written. Only \
+       capitalize when the word is unambiguously a proper noun in context.\n\
      - Do NOT rephrase, paraphrase, summarize, or add words the speaker \
        didn't say. Preserve the speaker's voice and word choice.\n\
      Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
