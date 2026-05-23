@@ -4,21 +4,30 @@
 //! at the bottom-center of the cursor's screen, containing a live
 //! waveform driven by mic RMS. Hidden when idle.
 //!
+//! The status-item menu exposes the settings a GUI user would expect —
+//! cleanup model, push-to-talk key, cleanup on/off — plus quality-of-life
+//! items (copy last dictation, open/export log, corrections folder).
+//! Settings-changing items write `settings.json` and relaunch the daemon
+//! so the change takes effect; the model load makes in-process swapping not
+//! worth the complexity.
+//!
 //! Architecture:
-//!   * Worker thread broadcasts state changes via SHARED_STATE (atomic).
+//!   * Worker thread broadcasts state changes via SHARED_STATE (atomic) and
+//!     the last injected text via LAST_DICTATION (mutex).
 //!   * cpal audio thread writes RMS samples to `audio::AUDIO_LEVELS`.
 //!   * Main thread runs NSApplication.run(); a CFRunLoopTimer fires every
 //!     33 ms (~30 FPS) to update bar heights + show/hide the pill on
 //!     state transitions.
-//!   * Status item icon swaps emoji per state.
+//!   * Status item icon swaps SF Symbols per state.
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent,
-    NSImage, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSImage, NSMenu, NSMenuItem,
+    NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowLevel, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
@@ -26,8 +35,13 @@ use objc2_core_foundation::{
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use crate::settings::{self, Settings};
+
+const LOG_PATH: &str = "/tmp/dictate-daemon.log";
 
 // Pill geometry — tuned to match Wispr Flow's compact pill.
 const PILL_W: f64 = 120.0;
@@ -48,8 +62,22 @@ pub enum UiState {
 
 static SHARED_STATE: AtomicU8 = AtomicU8::new(0);
 
+/// The last successfully-injected text, for the "Copy last dictation" item.
+static LAST_DICTATION: Mutex<String> = Mutex::new(String::new());
+
 pub fn set_state(state: UiState) {
     SHARED_STATE.store(state as u8, Ordering::SeqCst);
+}
+
+/// Record the most recent injected text (called by the worker thread).
+pub fn set_last_dictation(text: &str) {
+    if let Ok(mut g) = LAST_DICTATION.lock() {
+        *g = text.to_string();
+    }
+}
+
+fn last_dictation() -> String {
+    LAST_DICTATION.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 struct UiGlobals {
@@ -66,33 +94,77 @@ struct UiGlobals {
     icon_idle: Option<Retained<NSImage>>,
     icon_recording: Option<Retained<NSImage>>,
     icon_processing: Option<Retained<NSImage>>,
-    /// Held alive so the Open-Log menu item's target stays valid.
-    _log_opener: Retained<LogOpener>,
+    /// The disabled "Last: …" preview item, refreshed when we return to Idle.
+    last_item: Retained<NSMenuItem>,
+    /// Held alive so the menu items' action target stays valid.
+    _actions: Retained<MenuActions>,
 }
 unsafe impl Sync for UiGlobals {}
 unsafe impl Send for UiGlobals {}
 
-// ─── Custom NSObject subclass that opens the daemon log on menu click ───
+// ─── Custom NSObject subclass holding all menu actions ──────────────────
 //
-// NSMenuItem dispatches its action via objc selector — we need a target
-// that responds to the selector. The simplest path is a tiny custom
-// class with one method.
+// NSMenuItem dispatches its action via an objc selector to its target. We
+// route every dynamic menu item to one instance of this class.
 define_class!(
     #[unsafe(super(NSObject))]
-    #[name = "FDLogOpener"]
-    pub struct LogOpener;
+    #[name = "FDMenuActions"]
+    pub struct MenuActions;
 
-    impl LogOpener {
+    impl MenuActions {
         #[unsafe(method(openLog:))]
         fn open_log(&self, _sender: *mut AnyObject) {
             let _ = std::process::Command::new("open")
-                .args(["-t", "/tmp/dictate-daemon.log"])
+                .args(["-t", LOG_PATH])
                 .status();
+        }
+
+        #[unsafe(method(exportLog:))]
+        fn export_log(&self, _sender: *mut AnyObject) {
+            export_log_to_downloads();
+        }
+
+        #[unsafe(method(copyLast:))]
+        fn copy_last(&self, _sender: *mut AnyObject) {
+            let text = last_dictation();
+            if !text.is_empty() {
+                copy_to_clipboard(&text);
+            }
+        }
+
+        #[unsafe(method(openCorrections:))]
+        fn open_corrections(&self, _sender: *mut AnyObject) {
+            open_corrections_folder();
+        }
+
+        #[unsafe(method(selectModel:))]
+        fn select_model(&self, sender: *mut AnyObject) {
+            let path = unsafe {
+                let obj: *mut AnyObject = msg_send![sender, representedObject];
+                if obj.is_null() {
+                    return;
+                }
+                let s: &NSString = &*(obj as *const NSString);
+                s.to_string()
+            };
+            write_settings_and_relaunch(move |set| set.gemma_model = Some(path));
+        }
+
+        #[unsafe(method(selectHotkey:))]
+        fn select_hotkey(&self, sender: *mut AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            write_settings_and_relaunch(move |set| set.hotkey_keycode = Some(tag as i64));
+        }
+
+        #[unsafe(method(toggleCleanup:))]
+        fn toggle_cleanup(&self, _sender: *mut AnyObject) {
+            let current = Settings::load().cleanup_enabled.unwrap_or(true);
+            write_settings_and_relaunch(move |set| set.cleanup_enabled = Some(!current));
         }
     }
 );
 
-impl LogOpener {
+impl MenuActions {
     fn new() -> Retained<Self> {
         let alloc = Self::alloc();
         unsafe { msg_send![alloc, init] }
@@ -108,21 +180,21 @@ pub fn init_and_run() -> eyre::Result<()> {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let log_opener = LogOpener::new();
-    let (status_item, icon_idle, icon_recording, icon_processing) =
-        build_status_item(mtm, &log_opener)?;
+    let actions = MenuActions::new();
+    let built = build_status_item(mtm, &actions)?;
     let (pill_window, bars) = build_pill_window(mtm)?;
 
     let globals = UiGlobals {
-        status_item,
+        status_item: built.status_item,
         pill_window,
         bars,
         last_state: AtomicU8::new(255),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
-        icon_idle,
-        icon_recording,
-        icon_processing,
-        _log_opener: log_opener,
+        icon_idle: built.icon_idle,
+        icon_recording: built.icon_recording,
+        icon_processing: built.icon_processing,
+        last_item: built.last_item,
+        _actions: actions,
     };
     let _ = GLOBALS.set(globals);
 
@@ -131,15 +203,43 @@ pub fn init_and_run() -> eyre::Result<()> {
     Ok(())
 }
 
+struct StatusItemBuild {
+    status_item: Retained<NSStatusItem>,
+    icon_idle: Option<Retained<NSImage>>,
+    icon_recording: Option<Retained<NSImage>>,
+    icon_processing: Option<Retained<NSImage>>,
+    last_item: Retained<NSMenuItem>,
+}
+
+/// Build a plain menu item with a title, selector, and key-equivalent,
+/// targeting `actions`. Always enabled (we disable auto-enabling on the
+/// menu so we control state explicitly).
+fn action_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    selector: objc2::runtime::Sel,
+    key: &str,
+    actions: &Retained<MenuActions>,
+) -> Retained<NSMenuItem> {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            Some(selector),
+            &NSString::from_str(key),
+        )
+    };
+    unsafe {
+        item.setTarget(Some(actions));
+        item.setEnabled(true);
+    }
+    item
+}
+
 fn build_status_item(
     mtm: MainThreadMarker,
-    log_opener: &Retained<LogOpener>,
-) -> eyre::Result<(
-    Retained<NSStatusItem>,
-    Option<Retained<NSImage>>,
-    Option<Retained<NSImage>>,
-    Option<Retained<NSImage>>,
-)> {
+    actions: &Retained<MenuActions>,
+) -> eyre::Result<StatusItemBuild> {
     let bar = unsafe { NSStatusBar::systemStatusBar() };
     let item = unsafe { bar.statusItemWithLength(-1.0) };
     let button = item
@@ -156,29 +256,95 @@ fn build_status_item(
         unsafe { button.setImage(Some(img)) };
         unsafe { button.setTitle(&NSString::from_str("")) };
     } else {
-        // Fall back to text if SF Symbols somehow fail.
         unsafe { button.setTitle(&NSString::from_str("◯")) };
     }
 
     let menu = NSMenu::new(mtm);
+    // We manage enabled-state ourselves (lets us grey the preview label and
+    // any env-locked items).
+    unsafe { menu.setAutoenablesItems(false) };
 
-    // Open Log → opens /tmp/dictate-daemon.log in the default text editor.
-    let open_log = unsafe {
+    let settings = Settings::load();
+
+    // ── Last dictation preview (disabled label) + Copy ──────────────────
+    let last_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str("Open Log"),
-            Some(sel!(openLog:)),
-            &NSString::from_str("l"),
+            &NSString::from_str(&last_dictation_label()),
+            None,
+            &NSString::from_str(""),
         )
     };
-    unsafe { open_log.setTarget(Some(log_opener)) };
-    menu.addItem(&open_log);
+    unsafe { last_item.setEnabled(false) };
+    menu.addItem(&last_item);
 
-    // Separator.
-    let sep = unsafe { NSMenuItem::separatorItem(mtm) };
-    menu.addItem(&sep);
+    let copy_last = action_item(mtm, "Copy last dictation", sel!(copyLast:), "c", actions);
+    menu.addItem(&copy_last);
 
-    // Quit → standard NSApp terminate: selector (works with nil target).
+    menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+
+    // ── Cleanup model submenu ───────────────────────────────────────────
+    let model_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Cleanup model"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    unsafe { model_parent.setEnabled(true) };
+    let model_submenu = build_model_submenu(mtm, actions, &settings);
+    unsafe { model_parent.setSubmenu(Some(&model_submenu)) };
+    menu.addItem(&model_parent);
+
+    // ── Hotkey submenu ──────────────────────────────────────────────────
+    let hotkey_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Push-to-talk key"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    unsafe { hotkey_parent.setEnabled(true) };
+    let hotkey_submenu = build_hotkey_submenu(mtm, actions, &settings);
+    unsafe { hotkey_parent.setSubmenu(Some(&hotkey_submenu)) };
+    menu.addItem(&hotkey_parent);
+
+    // ── Cleanup on/off toggle ───────────────────────────────────────────
+    let cleanup_item = action_item(
+        mtm,
+        "Cleanup enabled",
+        sel!(toggleCleanup:),
+        "",
+        actions,
+    );
+    let cleanup_on = settings.cleanup_enabled.unwrap_or(true);
+    unsafe {
+        cleanup_item.setState(if cleanup_on {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    }
+    menu.addItem(&cleanup_item);
+
+    menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+
+    // ── Logs + corrections ──────────────────────────────────────────────
+    menu.addItem(&action_item(mtm, "Open Log", sel!(openLog:), "l", actions));
+    menu.addItem(&action_item(mtm, "Export Log to Downloads…", sel!(exportLog:), "", actions));
+    menu.addItem(&action_item(
+        mtm,
+        "Open corrections folder",
+        sel!(openCorrections:),
+        "",
+        actions,
+    ));
+
+    menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+
+    // ── Quit (standard NSApp terminate: — works with nil target) ─────────
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -187,10 +353,273 @@ fn build_status_item(
             &NSString::from_str("q"),
         )
     };
+    unsafe { quit_item.setEnabled(true) };
     menu.addItem(&quit_item);
 
     item.setMenu(Some(&menu));
-    Ok((item, icon_idle, icon_recording, icon_processing))
+    Ok(StatusItemBuild {
+        status_item: item,
+        icon_idle,
+        icon_recording,
+        icon_processing,
+        last_item,
+    })
+}
+
+/// Build the model-picker submenu. Each discovered model gets a checkable
+/// item; the active one is checked. If `GEMMA_MODEL_PATH` is set in the
+/// environment it overrides everything, so we surface a disabled note and
+/// leave the items unchecked.
+fn build_model_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+) -> Retained<NSMenu> {
+    let submenu = NSMenu::new(mtm);
+    unsafe { submenu.setAutoenablesItems(false) };
+
+    let env_locked = std::env::var_os("GEMMA_MODEL_PATH").is_some();
+    let models = settings::discover_llm_models();
+
+    if models.is_empty() {
+        let none = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("(no models found under models/llm/)"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { none.setEnabled(false) };
+        submenu.addItem(&none);
+        return submenu;
+    }
+
+    // Effective active path: settings choice, or the canonicalized default.
+    let effective = settings.gemma_model.clone().unwrap_or_else(|| {
+        std::fs::canonicalize(settings::DEFAULT_GEMMA_REL)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| settings::DEFAULT_GEMMA_REL.to_string())
+    });
+
+    for choice in &models {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(&choice.label),
+                Some(sel!(selectModel:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(actions));
+            item.setEnabled(!env_locked);
+            // Stash the absolute path so the action knows what was picked.
+            let path_ns = NSString::from_str(&choice.path);
+            let rep: &AnyObject = &path_ns;
+            item.setRepresentedObject(Some(rep));
+            if !env_locked && choice.path == effective {
+                item.setState(NSControlStateValueOn);
+            } else {
+                item.setState(NSControlStateValueOff);
+            }
+        }
+        submenu.addItem(&item);
+    }
+
+    if env_locked {
+        submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+        let note = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("(locked by GEMMA_MODEL_PATH env var)"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { note.setEnabled(false) };
+        submenu.addItem(&note);
+    }
+
+    submenu
+}
+
+/// Build the push-to-talk key submenu from `settings::HOTKEY_CHOICES`.
+fn build_hotkey_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+) -> Retained<NSMenu> {
+    let submenu = NSMenu::new(mtm);
+    unsafe { submenu.setAutoenablesItems(false) };
+
+    let env_locked = std::env::var_os("DICTATE_HOTKEY_KEYCODE").is_some();
+    let active = settings.hotkey_keycode.unwrap_or(0x3D); // default Right Option
+
+    for (label, code) in settings::HOTKEY_CHOICES {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(label),
+                Some(sel!(selectHotkey:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(actions));
+            item.setEnabled(!env_locked);
+            item.setTag(*code as isize);
+            if !env_locked && *code == active {
+                item.setState(NSControlStateValueOn);
+            } else {
+                item.setState(NSControlStateValueOff);
+            }
+        }
+        submenu.addItem(&item);
+    }
+
+    if env_locked {
+        submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+        let note = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("(locked by DICTATE_HOTKEY_KEYCODE env var)"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { note.setEnabled(false) };
+        submenu.addItem(&note);
+    }
+
+    submenu
+}
+
+/// Title for the disabled preview item, truncated for the menu.
+fn last_dictation_label() -> String {
+    let text = last_dictation();
+    if text.is_empty() {
+        return "No dictation yet".to_string();
+    }
+    let one_line = text.replace('\n', " ");
+    let truncated: String = one_line.chars().take(48).collect();
+    if one_line.chars().count() > 48 {
+        format!("Last: \"{truncated}…\"")
+    } else {
+        format!("Last: \"{truncated}\"")
+    }
+}
+
+// ─── Settings mutation + daemon relaunch ────────────────────────────────
+
+/// Load settings, apply `mutate`, save, then relaunch the daemon so the
+/// change takes effect. Runs on the main thread (inside a menu action).
+fn write_settings_and_relaunch(mutate: impl FnOnce(&mut Settings)) {
+    let mut s = Settings::load();
+    mutate(&mut s);
+    if let Err(e) = s.save() {
+        eprintln!("[menu] failed to save settings: {e}");
+        return;
+    }
+    relaunch_daemon();
+}
+
+/// Spawn a fresh daemon (same binary, `daemon` subcommand) with stdout+stderr
+/// pointed at the log file — matching how the daemon is normally launched so
+/// Open/Export Log keep working — then terminate ourselves.
+fn relaunch_daemon() {
+    use std::process::{Command, Stdio};
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[menu] current_exe failed, not relaunching: {e}");
+            return;
+        }
+    };
+
+    let open_log = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(LOG_PATH)
+    };
+    let (stdout, stderr) = match (open_log(), open_log()) {
+        (Ok(a), Ok(b)) => (Stdio::from(a), Stdio::from(b)),
+        _ => (Stdio::inherit(), Stdio::inherit()),
+    };
+
+    eprintln!("[menu] settings changed — relaunching daemon…");
+    match Command::new(&exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+    {
+        Ok(_) => terminate_app(),
+        Err(e) => eprintln!("[menu] relaunch spawn failed: {e}"),
+    }
+}
+
+fn terminate_app() {
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        app.terminate(None);
+    }
+}
+
+// ─── Menu action helpers (plain Rust, no AppKit) ────────────────────────
+
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
+fn export_log_to_downloads() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    if !std::path::Path::new(LOG_PATH).exists() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let dest = PathBuf::from(home)
+        .join("Downloads")
+        .join(format!("dictate-log-{ts}.txt"));
+    if std::fs::copy(LOG_PATH, &dest).is_ok() {
+        // Reveal it in Finder so the user sees where it landed.
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(&dest)
+            .status();
+    }
+}
+
+fn open_corrections_folder() {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = PathBuf::from(home).join(".config").join("local-dictation");
+    let _ = std::fs::create_dir_all(&dir);
+    let corrections = dir.join("corrections.json");
+    if corrections.exists() {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(&corrections)
+            .status();
+    } else {
+        let _ = std::process::Command::new("open").arg(&dir).status();
+    }
 }
 
 /// Build an NSImage from an SF Symbol name. Returns None if the symbol
@@ -360,6 +789,13 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
 
     match state {
         UiState::Idle => {
+            // A dictation just completed (or we were cancelled) — refresh the
+            // "Last: …" preview so the menu shows the newest text.
+            unsafe {
+                globals
+                    .last_item
+                    .setTitle(&NSString::from_str(&last_dictation_label()));
+            }
             crate::audio::reset_levels();
             collapse_bars(globals);
             unsafe { globals.pill_window.orderOut(None) };

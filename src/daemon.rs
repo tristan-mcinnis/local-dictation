@@ -94,16 +94,8 @@ impl DaemonConfig {
         #[cfg(feature = "cleaner")] gemma_path: String,
         no_cleanup: bool,
     ) -> Self {
-        let hotkey_keycode = std::env::var("DICTATE_HOTKEY_KEYCODE")
-            .ok()
-            .and_then(|s| {
-                if let Some(rest) = s.strip_prefix("0x") {
-                    i64::from_str_radix(rest, 16).ok()
-                } else {
-                    s.parse().ok()
-                }
-            })
-            .unwrap_or(DEFAULT_HOTKEY_KEYCODE);
+        let hotkey_keycode =
+            crate::settings::Settings::load().resolve_hotkey(DEFAULT_HOTKEY_KEYCODE);
         Self {
             parakeet_dir,
             #[cfg(feature = "cleaner")]
@@ -147,6 +139,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // FAST — just send to the worker.
     let tx_for_callback = tx.clone();
     let hotkey_keycode = read_hotkey_keycode();
+    // The hold is detected by watching the modifier-flag bit that THIS key
+    // toggles — Option vs Command vs Control vs Shift. Without this, any
+    // non-Option hotkey would never register a press (the old code checked
+    // the Alternate bit unconditionally).
+    let hotkey_flag = keycode_to_modifier_flag(hotkey_keycode);
     let currently_pressed = Arc::new(AtomicBool::new(false));
     let pressed_for_callback = currently_pressed.clone();
 
@@ -161,7 +158,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
             if keycode == hotkey_keycode {
                 let flags = event.get_flags();
-                let is_set_now = flags.contains(CGEventFlags::CGEventFlagAlternate);
+                let is_set_now = flags.contains(hotkey_flag);
                 let was_pressed = pressed_for_callback.load(Ordering::SeqCst);
                 if is_set_now && !was_pressed {
                     pressed_for_callback.store(true, Ordering::SeqCst);
@@ -192,7 +189,8 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     std::mem::forget(loop_source);
 
     eprintln!(
-        "[boot] ready · hold Right Option (0x{:x}) to dictate · ⌘Q quits",
+        "[boot] ready · hold {} (0x{:x}) to dictate · ⌘Q quits",
+        crate::settings::hotkey_name(hotkey_keycode),
         hotkey_keycode
     );
     eprintln!();
@@ -210,16 +208,22 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
 }
 
 fn read_hotkey_keycode() -> i64 {
-    std::env::var("DICTATE_HOTKEY_KEYCODE")
-        .ok()
-        .and_then(|s| {
-            if let Some(rest) = s.strip_prefix("0x") {
-                i64::from_str_radix(rest, 16).ok()
-            } else {
-                s.parse().ok()
-            }
-        })
-        .unwrap_or(DEFAULT_HOTKEY_KEYCODE)
+    // Precedence: DICTATE_HOTKEY_KEYCODE env > settings.json > default.
+    crate::settings::Settings::load().resolve_hotkey(DEFAULT_HOTKEY_KEYCODE)
+}
+
+/// Map a modifier-key keycode to the CGEvent flag bit it toggles. On a
+/// FlagsChanged event the keycode tells us which physical key moved; this
+/// tells us which flag bit to read to know if it's now held or released.
+/// Unknown keycodes fall back to Option (the historical default).
+fn keycode_to_modifier_flag(keycode: i64) -> CGEventFlags {
+    match keycode {
+        0x3A | 0x3D => CGEventFlags::CGEventFlagAlternate, // Left / Right Option
+        0x37 | 0x36 => CGEventFlags::CGEventFlagCommand,   // Left / Right Command
+        0x3B | 0x3E => CGEventFlags::CGEventFlagControl,   // Left / Right Control
+        0x38 | 0x3C => CGEventFlags::CGEventFlagShift,     // Left / Right Shift
+        _ => CGEventFlags::CGEventFlagAlternate,
+    }
 }
 
 fn worker_loop(
@@ -448,6 +452,8 @@ fn worker_loop(
                     cues::play_error();
                 } else {
                     eprintln!("  ✓    \"{final_text}\"");
+                    // Remember it for the menu-bar "Copy last dictation" item.
+                    menubar::set_last_dictation(&final_text);
                     if press_enter {
                         std::thread::sleep(Duration::from_millis(40));
                         match crate::clipboard_paste::synthesize_return() {

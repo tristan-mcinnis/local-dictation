@@ -13,8 +13,6 @@ use std::time::Instant;
 // discoverable + cached alongside the code.
 #[cfg(feature = "parakeet")]
 const PARAKEET_DEFAULT_REL: &str = "models/dictation/parakeet-tdt-v3-int8";
-#[cfg(all(feature = "parakeet", feature = "cleaner"))]
-const GEMMA_DEFAULT_REL: &str = "models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf";
 
 // cpal::Stream is !Send on macOS — pin the runtime to one thread so the
 // engine can stay put.
@@ -318,7 +316,9 @@ fn parakeet_dir() -> String {
 
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
 fn gemma_path() -> String {
-    std::env::var("GEMMA_MODEL_PATH").unwrap_or_else(|_| GEMMA_DEFAULT_REL.to_string())
+    // Precedence: GEMMA_MODEL_PATH env > settings.json > built-in default.
+    use fast_dictate_backend::settings::{Settings, DEFAULT_GEMMA_REL};
+    Settings::load().resolve_gemma(DEFAULT_GEMMA_REL)
 }
 
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
@@ -329,6 +329,11 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     // to #[tokio::main(flavor = "current_thread")] — DO NOT wrap in
     // spawn_blocking, that moves the call to a worker thread and
     // MainThreadMarker::new() will return None.
+    // The menu-bar cleanup toggle lives in settings.json; a CLI --no-cleanup
+    // is a hard override that always wins.
+    #[cfg(feature = "cleaner")]
+    let no_cleanup = !fast_dictate_backend::settings::Settings::load()
+        .resolve_cleanup_enabled(no_cleanup);
     let config = DaemonConfig::from_env(
         parakeet_dir(),
         #[cfg(feature = "cleaner")]
