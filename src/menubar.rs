@@ -286,16 +286,15 @@ fn update_bars(globals: &UiGlobals) {
             }
         };
 
-        // Aggressive gain so normal speech (RMS ~0.01-0.05) actually
-        // saturates the bar. powf(0.4) is roughly between sqrt and
-        // identity — gives quiet sound visible presence without making
-        // loud sound look identical to medium.
-        let target = if level < 0.0008 {
-            // Floor for ambient mic noise — keeps the pill visibly idle
-            // when the user isn't speaking.
+        // Noise gate + moderate gain. Floor at RMS 0.003 silences the
+        // "hum animation" the user noticed — ambient mic noise sits
+        // around 0.001-0.0025, real speech starts around 0.005+. powf
+        // shape (0.45) gives quiet speech visible presence without
+        // making the bars constantly max out on loud syllables.
+        let target = if level < 0.003 {
             BAR_MIN_H
         } else {
-            let normalized = ((level * 40.0) as f64).powf(0.4).min(1.0);
+            let normalized = (((level - 0.003) * 25.0) as f64).powf(0.45).min(1.0);
             BAR_MIN_H + normalized * (BAR_MAX_H - BAR_MIN_H)
         };
 
