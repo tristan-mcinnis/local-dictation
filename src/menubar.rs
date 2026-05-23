@@ -12,19 +12,19 @@
 //!     state transitions.
 //!   * Status item icon swaps emoji per state.
 
-use objc2::msg_send;
 use objc2::rc::Retained;
-use objc2::{sel, AllocAnyThread, MainThreadOnly};
+use objc2::runtime::AnyObject;
+use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent,
-    NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow,
+    NSImage, NSMenu, NSMenuItem, NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow,
     NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
     CFRunLoopTimerContext,
 };
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -61,9 +61,43 @@ struct UiGlobals {
     /// slowly toward the new RMS sample — gives the snappy bouncing
     /// feel of real audio meters.
     displayed_heights: Mutex<Vec<f64>>,
+    /// Pre-built SF Symbol images for the three states. Swapped onto the
+    /// status item's button when the state changes.
+    icon_idle: Option<Retained<NSImage>>,
+    icon_recording: Option<Retained<NSImage>>,
+    icon_processing: Option<Retained<NSImage>>,
+    /// Held alive so the Open-Log menu item's target stays valid.
+    _log_opener: Retained<LogOpener>,
 }
 unsafe impl Sync for UiGlobals {}
 unsafe impl Send for UiGlobals {}
+
+// ─── Custom NSObject subclass that opens the daemon log on menu click ───
+//
+// NSMenuItem dispatches its action via objc selector — we need a target
+// that responds to the selector. The simplest path is a tiny custom
+// class with one method.
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[name = "FDLogOpener"]
+    pub struct LogOpener;
+
+    impl LogOpener {
+        #[unsafe(method(openLog:))]
+        fn open_log(&self, _sender: *mut AnyObject) {
+            let _ = std::process::Command::new("open")
+                .args(["-t", "/tmp/dictate-daemon.log"])
+                .status();
+        }
+    }
+);
+
+impl LogOpener {
+    fn new() -> Retained<Self> {
+        let alloc = Self::alloc();
+        unsafe { msg_send![alloc, init] }
+    }
+}
 
 static GLOBALS: OnceLock<UiGlobals> = OnceLock::new();
 
@@ -74,7 +108,9 @@ pub fn init_and_run() -> eyre::Result<()> {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let status_item = build_status_item(mtm)?;
+    let log_opener = LogOpener::new();
+    let (status_item, icon_idle, icon_recording, icon_processing) =
+        build_status_item(mtm, &log_opener)?;
     let (pill_window, bars) = build_pill_window(mtm)?;
 
     let globals = UiGlobals {
@@ -83,6 +119,10 @@ pub fn init_and_run() -> eyre::Result<()> {
         bars,
         last_state: AtomicU8::new(255),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
+        icon_idle,
+        icon_recording,
+        icon_processing,
+        _log_opener: log_opener,
     };
     let _ = GLOBALS.set(globals);
 
@@ -91,28 +131,81 @@ pub fn init_and_run() -> eyre::Result<()> {
     Ok(())
 }
 
-fn build_status_item(mtm: MainThreadMarker) -> eyre::Result<Retained<NSStatusItem>> {
+fn build_status_item(
+    mtm: MainThreadMarker,
+    log_opener: &Retained<LogOpener>,
+) -> eyre::Result<(
+    Retained<NSStatusItem>,
+    Option<Retained<NSImage>>,
+    Option<Retained<NSImage>>,
+    Option<Retained<NSImage>>,
+)> {
     let bar = unsafe { NSStatusBar::systemStatusBar() };
     let item = unsafe { bar.statusItemWithLength(-1.0) };
     let button = item
         .button(mtm)
         .ok_or_else(|| eyre::eyre!("status item has no button"))?;
-    unsafe { button.setTitle(&NSString::from_str("🎤")) };
+
+    // Pre-build three SF Symbol images. setTemplate(true) makes them
+    // monochrome and follow the menu-bar tint (white on dark, black on
+    // light), matching every native macOS app.
+    let icon_idle = sf_symbol("mic");
+    let icon_recording = sf_symbol("mic.fill");
+    let icon_processing = sf_symbol("waveform");
+    if let Some(img) = &icon_idle {
+        unsafe { button.setImage(Some(img)) };
+        unsafe { button.setTitle(&NSString::from_str("")) };
+    } else {
+        // Fall back to text if SF Symbols somehow fail.
+        unsafe { button.setTitle(&NSString::from_str("◯")) };
+    }
 
     let menu = NSMenu::new(mtm);
-    let quit_title = NSString::from_str("Quit local-dictation");
-    let quit_key = NSString::from_str("q");
+
+    // Open Log → opens /tmp/dictate-daemon.log in the default text editor.
+    let open_log = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Open Log"),
+            Some(sel!(openLog:)),
+            &NSString::from_str("l"),
+        )
+    };
+    unsafe { open_log.setTarget(Some(log_opener)) };
+    menu.addItem(&open_log);
+
+    // Separator.
+    let sep = unsafe { NSMenuItem::separatorItem(mtm) };
+    menu.addItem(&sep);
+
+    // Quit → standard NSApp terminate: selector (works with nil target).
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &quit_title,
+            &NSString::from_str("Quit local-dictation"),
             Some(sel!(terminate:)),
-            &quit_key,
+            &NSString::from_str("q"),
         )
     };
     menu.addItem(&quit_item);
+
     item.setMenu(Some(&menu));
-    Ok(item)
+    Ok((item, icon_idle, icon_recording, icon_processing))
+}
+
+/// Build an NSImage from an SF Symbol name. Returns None if the symbol
+/// doesn't exist or we're on an older macOS without SF Symbols.
+fn sf_symbol(name: &str) -> Option<Retained<NSImage>> {
+    let ns_name = NSString::from_str(name);
+    let img = unsafe {
+        NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None)
+    };
+    if let Some(ref img) = img {
+        // Template mode: the image adopts the menu-bar tint color
+        // (dark or light depending on the user's theme).
+        unsafe { img.setTemplate(true) };
+    }
+    img
 }
 
 /// Build the floating pill window and return (window, bar_views).
@@ -243,13 +336,26 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         Some(m) => m,
         None => return,
     };
+
+    // Pick the SF Symbol for this state. mic / mic.fill / waveform make
+    // a clean visual progression: outline → filled → animated wave.
     let icon = match state {
-        UiState::Idle => "🎤",
-        UiState::Recording => "🔴",
-        UiState::Processing => "⏳",
+        UiState::Idle => &globals.icon_idle,
+        UiState::Recording => &globals.icon_recording,
+        UiState::Processing => &globals.icon_processing,
     };
     if let Some(button) = globals.status_item.button(mtm) {
-        unsafe { button.setTitle(&NSString::from_str(icon)) };
+        if let Some(img) = icon {
+            unsafe { button.setImage(Some(img)) };
+        } else {
+            // Fallback if SF Symbols weren't available.
+            let fallback = match state {
+                UiState::Idle => "◯",
+                UiState::Recording => "●",
+                UiState::Processing => "◌",
+            };
+            unsafe { button.setTitle(&NSString::from_str(fallback)) };
+        }
     }
 
     match state {
