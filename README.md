@@ -90,6 +90,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
 - **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
+- **Personal corrections dictionary.** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Applied after cleanup, before injection. Case-insensitive match at word boundaries; replacement is verbatim. See `corrections.example.json`.
 - **Voice command: "press enter".** End a dictation with `press enter` / `press return` / `hit enter` / `hit return` and it injects the body then synthesizes a Return keystroke. Doesn't fire mid-sentence.
 - **Structured logs.** Aligned per-utterance blocks at `/tmp/dictate-daemon.log` showing transcribe / cleanup / inject timings, the target app name, and the final injected text.
 
@@ -136,6 +137,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 | `DICTATE_QUIET` | Set to anything to mute audio cues |
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
+| `DICTATE_CORRECTIONS_PATH` | Override the corrections JSON path (default: `~/.config/local-dictation/corrections.json`) |
 
 ## Trade-offs (the honest list)
 

@@ -1,0 +1,15 @@
+{
+    "_comment": "Copy this file to ~/.config/local-dictation/corrections.json and edit. Keys are matched case-insensitively at word boundaries; values are written verbatim. Remove the _comment line — it's only here for documentation.",
+
+    "lings": "Lingzi",
+    "tristan": "Tristan",
+    "github": "GitHub",
+    "macos": "macOS",
+    "ios": "iOS",
+    "onnx": "ONNX",
+    "postgres": "Postgres",
+    "javascript": "JavaScript",
+    "typescript": "TypeScript",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic"
+}
