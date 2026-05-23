@@ -124,7 +124,11 @@ mod imp {
     /// Full path: resolve focused element → read context → smart-pad →
     /// attempt AX inject → fall back to clipboard paste.
     unsafe fn inject_through(root: AXUIElementRef, text: &str) -> eyre::Result<()> {
+        let prof = std::env::var("INJECT_PROFILE").is_ok();
+        let t_total = std::time::Instant::now();
+
         // 1. Focused element.
+        let t = std::time::Instant::now();
         let mut focused_ref: CFTypeRef = ptr::null();
         let focused_attr = CFString::new(kAXFocusedUIElementAttribute);
         let err = AXUIElementCopyAttributeValue(
@@ -132,6 +136,7 @@ mod imp {
             focused_attr.as_concrete_TypeRef(),
             &mut focused_ref,
         );
+        if prof { eprintln!("[inject-prof] get_focused_element: {:?}", t.elapsed()); }
         if err != kAXErrorSuccess || focused_ref.is_null() {
             // No focused field exposed — try clipboard paste against whatever
             // is frontmost. Still apply smart-pad using the remembered tail
@@ -156,7 +161,12 @@ mod imp {
         // Optimization: if the focused app's PID has previously refused
         // AXValue reads, skip the (~100 ms) round-trip entirely and go
         // straight to the LAST_TAIL fallback.
+        let t = std::time::Instant::now();
         let focused_pid = focused_pid_of(focused);
+        if prof { eprintln!("[inject-prof] get_pid:               {:?}  (pid={:?}, blind={:?})",
+            t.elapsed(), focused_pid, focused_pid.map(super::is_ax_blind)); }
+
+        let t = std::time::Instant::now();
         let (mut immediate_before, mut last_nws_before, char_after) =
             if let Some(pid) = focused_pid {
                 if super::is_ax_blind(pid) {
@@ -164,8 +174,6 @@ mod imp {
                 } else {
                     let ctx = read_caret_context(focused);
                     if ctx.0.is_none() && ctx.1.is_none() {
-                        // Remember this app is AX-blind so we don't pay the
-                        // round-trip again next time.
                         super::mark_ax_blind(pid);
                     }
                     ctx
@@ -173,6 +181,8 @@ mod imp {
             } else {
                 read_caret_context(focused)
             };
+        if prof { eprintln!("[inject-prof] read_caret_context:    {:?}  (immediate={:?}, after={:?})",
+            t.elapsed(), immediate_before, char_after); }
         if immediate_before.is_none() && last_nws_before.is_none() {
             if let Some(tail) = super::recall_tail() {
                 immediate_before = Some(tail);
@@ -188,6 +198,7 @@ mod imp {
         }
 
         // 4. AX write — try SelectedText, then Value.
+        let t = std::time::Instant::now();
         let payload = CFString::new(&padded);
         let sel_attr = CFString::new(kAXSelectedTextAttribute);
         let sel_err = AXUIElementSetAttributeValue(
@@ -195,19 +206,23 @@ mod imp {
             sel_attr.as_concrete_TypeRef(),
             payload.as_concrete_TypeRef() as CFTypeRef,
         );
+        if prof { eprintln!("[inject-prof] set_selected_text:     {:?}  (err={sel_err})", t.elapsed()); }
 
         if sel_err == kAXErrorSuccess {
             cf_release(focused as CFTypeRef);
             super::remember_tail(&padded);
+            if prof { eprintln!("[inject-prof] TOTAL:                {:?}", t_total.elapsed()); }
             return Ok(());
         }
 
+        let t = std::time::Instant::now();
         let val_attr = CFString::new(kAXValueAttribute);
         let val_err = AXUIElementSetAttributeValue(
             focused,
             val_attr.as_concrete_TypeRef(),
             payload.as_concrete_TypeRef() as CFTypeRef,
         );
+        if prof { eprintln!("[inject-prof] set_value:             {:?}  (err={val_err})", t.elapsed()); }
         cf_release(focused as CFTypeRef);
 
         if val_err == kAXErrorSuccess {
@@ -311,6 +326,186 @@ mod imp {
             unsafe { CFRelease(ptr) }
         }
     }
+
+    /// Owned focus target — releases the retained AXUIElement on drop.
+    /// AXUIElement is a CFType, thread-safe to use after CFRetain.
+    pub struct FocusTargetInner {
+        focused: AXUIElementRef,
+        pub immediate_before: Option<char>,
+        pub last_nws_before: Option<char>,
+        pub char_after: Option<char>,
+    }
+
+    impl Drop for FocusTargetInner {
+        fn drop(&mut self) {
+            cf_release(self.focused as CFTypeRef);
+        }
+    }
+
+    /// Resolve the currently-focused UI element from the system-wide AX
+    /// proxy + read its caret context. Suitable to call on a background
+    /// thread in parallel with inference. Retains the focused element so
+    /// the caller can use it later from any thread.
+    pub fn capture_focus_target() -> eyre::Result<FocusTargetInner> {
+        if !ensure_trusted_or_prompt() {
+            return Err(eyre::eyre!("Accessibility permission not granted"));
+        }
+        unsafe {
+            let root = AXUIElementCreateSystemWide();
+            if root.is_null() {
+                return Err(eyre::eyre!("AXUIElementCreateSystemWide returned null"));
+            }
+            let mut focused_ref: CFTypeRef = ptr::null();
+            let focused_attr = CFString::new(kAXFocusedUIElementAttribute);
+            let err = AXUIElementCopyAttributeValue(
+                root,
+                focused_attr.as_concrete_TypeRef(),
+                &mut focused_ref,
+            );
+            cf_release(root as CFTypeRef);
+            if err != kAXErrorSuccess || focused_ref.is_null() {
+                return Err(eyre::eyre!(
+                    "no focused UI element (AXError {err}); click into a text field first"
+                ));
+            }
+            let focused = focused_ref as AXUIElementRef;
+
+            // Read context immediately while we have the element handy. In
+            // AX-blind apps this returns (None, None, None) quickly.
+            let focused_pid = focused_pid_of(focused);
+            let (immediate_before, last_nws_before, char_after) =
+                if let Some(pid) = focused_pid {
+                    if super::is_ax_blind(pid) {
+                        (None, None, None)
+                    } else {
+                        let ctx = read_caret_context(focused);
+                        if ctx.0.is_none() && ctx.1.is_none() {
+                            super::mark_ax_blind(pid);
+                        }
+                        ctx
+                    }
+                } else {
+                    read_caret_context(focused)
+                };
+
+            // Retain — focused_ref was returned by AXUIElementCopyAttributeValue
+            // under the Create rule, so it's already +1. We just hold it.
+            // (cf_release(focused_ref) above released the system-wide root,
+            // not the focused element.)
+            Ok(FocusTargetInner {
+                focused,
+                immediate_before,
+                last_nws_before,
+                char_after,
+            })
+        }
+    }
+
+    /// Write `text` into a pre-captured focus target. Skips the
+    /// get_focused_element + context read costs entirely.
+    pub fn inject_via_target(target: FocusTargetInner, text: &str) -> eyre::Result<()> {
+        let prof = std::env::var("INJECT_PROFILE").is_ok();
+        let t_total = std::time::Instant::now();
+
+        // Apply remembered tail fallback if context was empty.
+        let (immediate_before, last_nws_before) = if target.immediate_before.is_none()
+            && target.last_nws_before.is_none()
+        {
+            let tail = super::recall_tail();
+            (tail, tail)
+        } else {
+            (target.immediate_before, target.last_nws_before)
+        };
+
+        let padded = smart_pad(text, immediate_before, last_nws_before, target.char_after);
+        if padded.is_empty() {
+            return Ok(());
+        }
+
+        unsafe {
+            let t = std::time::Instant::now();
+            let payload = CFString::new(&padded);
+            let sel_attr = CFString::new(kAXSelectedTextAttribute);
+            let sel_err = AXUIElementSetAttributeValue(
+                target.focused,
+                sel_attr.as_concrete_TypeRef(),
+                payload.as_concrete_TypeRef() as CFTypeRef,
+            );
+            if prof {
+                eprintln!("[inject-prof] (via target) set_selected_text: {:?} err={sel_err}", t.elapsed());
+            }
+
+            if sel_err == kAXErrorSuccess {
+                super::remember_tail(&padded);
+                if prof { eprintln!("[inject-prof] (via target) TOTAL: {:?}", t_total.elapsed()); }
+                return Ok(());
+            }
+
+            let t = std::time::Instant::now();
+            let val_attr = CFString::new(kAXValueAttribute);
+            let val_err = AXUIElementSetAttributeValue(
+                target.focused,
+                val_attr.as_concrete_TypeRef(),
+                payload.as_concrete_TypeRef() as CFTypeRef,
+            );
+            if prof {
+                eprintln!("[inject-prof] (via target) set_value: {:?} err={val_err}", t.elapsed());
+            }
+
+            if val_err == kAXErrorSuccess {
+                super::remember_tail(&padded);
+                if prof { eprintln!("[inject-prof] (via target) TOTAL: {:?}", t_total.elapsed()); }
+                return Ok(());
+            }
+
+            // Both AX writes failed — fall back to clipboard paste.
+            eprintln!(
+                "[inject] AX writes refused (sel={sel_err}, val={val_err}); using clipboard paste"
+            );
+            let r = crate::clipboard_paste::paste_via_clipboard(&padded);
+            if r.is_ok() {
+                super::remember_tail(&padded);
+            }
+            r
+        }
+    }
+}
+
+/// Pre-captured focus target — owned, Send across threads. Created at
+/// key-release time and used at inject time after Parakeet+Gemma finish.
+/// Holds a retained AXUIElement and the surrounding caret context.
+///
+/// Why this exists: `get_focused_element` is the dominant cost in the
+/// inject path (89% in TextEdit, even more in Electron where AX hops
+/// through multiple processes). Capturing it in parallel with the
+/// inference pipeline removes it from the critical path.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub struct FocusTarget {
+    inner: imp::FocusTargetInner,
+}
+
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+unsafe impl Send for FocusTarget {}
+
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+impl FocusTarget {
+    /// Capture the currently-focused UI element + its caret context.
+    /// Safe to call from any thread.
+    pub fn capture() -> eyre::Result<Self> {
+        Ok(Self {
+            inner: imp::capture_focus_target()?,
+        })
+    }
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+pub struct FocusTarget;
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+impl FocusTarget {
+    pub fn capture() -> eyre::Result<Self> {
+        Ok(Self)
+    }
 }
 
 impl AccessibilityInjector {
@@ -320,6 +515,22 @@ impl AccessibilityInjector {
             return Ok(());
         }
         imp::inject_systemwide(text)
+    }
+
+    /// Inject using a target captured earlier (parallel-with-inference path).
+    /// Skips `get_focused_element` and `read_caret_context` — saves the
+    /// ~80–150 ms those cost in Electron apps.
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    pub fn inject_with_target(target: FocusTarget, text: &str) -> eyre::Result<()> {
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        imp::inject_via_target(target.inner, text)
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+    pub fn inject_with_target(_target: FocusTarget, text: &str) -> eyre::Result<()> {
+        Self::inject_text(text)
     }
 
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]

@@ -15,7 +15,7 @@
 
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
 use crate::cues;
-use crate::injector::AccessibilityInjector;
+use crate::injector::{AccessibilityInjector, FocusTarget};
 use crate::transcriber::LocalInferenceWorker;
 use core_foundation::runloop::CFRunLoop;
 use core_graphics::event::{
@@ -245,6 +245,17 @@ fn worker_loop(
                     press_to_release.unwrap_or_default()
                 );
 
+                // Spawn AX focus capture in parallel with the inference
+                // pipeline. By the time Parakeet+Gemma finish, the focused
+                // element is already known — get_focused_element drops off
+                // the critical path.
+                let t_ax_start = Instant::now();
+                let (target_tx, target_rx) =
+                    std::sync::mpsc::channel::<eyre::Result<FocusTarget>>();
+                std::thread::spawn(move || {
+                    let _ = target_tx.send(FocusTarget::capture());
+                });
+
                 let c = consumer.take().unwrap();
                 let r = is_recording.take().unwrap();
 
@@ -300,8 +311,34 @@ fn worker_loop(
                     continue;
                 }
 
+                // Inject using the pre-captured focus target if it's ready
+                // (it almost always is — capture takes 30-150 ms; inference
+                // takes 200-500 ms). Falls back to fresh inject path on
+                // capture failure (e.g. nothing was focused at key release).
                 let t_inject = Instant::now();
-                if let Err(err) = AccessibilityInjector::inject_text(&final_text) {
+                let inject_result = match target_rx.try_recv() {
+                    Ok(Ok(target)) => {
+                        let ax_wait = t_ax_start.elapsed();
+                        eprintln!(
+                            "[daemon] focus captured in {ax_wait:?} (parallel with inference)"
+                        );
+                        AccessibilityInjector::inject_with_target(target, &final_text)
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "[daemon] focus capture failed ({e:?}); using fresh inject"
+                        );
+                        AccessibilityInjector::inject_text(&final_text)
+                    }
+                    Err(_) => {
+                        // Capture not done yet — block briefly for it.
+                        match target_rx.recv() {
+                            Ok(Ok(t)) => AccessibilityInjector::inject_with_target(t, &final_text),
+                            _ => AccessibilityInjector::inject_text(&final_text),
+                        }
+                    }
+                };
+                if let Err(err) = inject_result {
                     eprintln!("[daemon] inject failed: {err:?}");
                     cues::play_error();
                 } else {

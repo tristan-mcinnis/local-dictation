@@ -14,7 +14,7 @@ use std::time::Instant;
 #[cfg(feature = "parakeet")]
 const PARAKEET_DEFAULT_REL: &str = "models/parakeet-tdt-v3-int8";
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
-const GEMMA_DEFAULT_REL: &str = "models/qwen-2.5-0.5b-it/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf";
+const GEMMA_DEFAULT_REL: &str = "models/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf";
 
 // cpal::Stream is !Send on macOS — pin the runtime to one thread so the
 // engine can stay put.

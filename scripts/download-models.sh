@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Download the ONNX (Parakeet) and GGUF (Qwen 2.5 0.5B) models into ./models/.
+# Download the ONNX (Parakeet) and GGUF (Gemma 3 1B) models into ./models/.
 # Idempotent: skips files that already exist with non-zero size.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PARAKEET_DIR="models/parakeet-tdt-v3-int8"
-QWEN_DIR="models/qwen-2.5-0.5b-it"
-mkdir -p "$PARAKEET_DIR" "$QWEN_DIR"
+GEMMA_DIR="models/gemma-3-1b-it"
+mkdir -p "$PARAKEET_DIR" "$GEMMA_DIR"
 
 PARAKEET_BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
-QWEN_BASE="https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main"
+GEMMA_BASE="https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main"
 
 fetch() {
   local url="$1" out="$2"
@@ -29,12 +29,16 @@ fetch "$PARAKEET_BASE/decoder_joint-model.int8.onnx" "$PARAKEET_DIR/decoder_join
 fetch "$PARAKEET_BASE/vocab.txt"                     "$PARAKEET_DIR/vocab.txt"
 
 echo
-echo "==> Qwen 2.5 0.5B-Instruct Q4_K_M GGUF (~380 MB)"
-echo "    (Qwen 0.5B is the snappy default — ~150 ms hot cleanup on M-series."
-echo "     If you want stronger domain-casing fidelity (macOS, ONNX, etc.) at"
-echo "     the cost of ~150 ms more per utterance, point GEMMA_MODEL_PATH at"
-echo "     models/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf or the 4B variant.)"
-fetch "$QWEN_BASE/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf" "$QWEN_DIR/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+echo "==> Gemma 3 1B-IT Q4_K_M GGUF (~770 MB)"
+echo "    Sweet spot for the dictation cleanup task:"
+echo "      - Reliably follows the system instruction (filler removal,"
+echo "        colloquial expansion, casing preservation)."
+echo "      - ~310 ms hot cleanup latency on M-series."
+echo "      - Same cleanup output as the 4B model on conversational English."
+echo "    Alternatives: GEMMA_MODEL_PATH=models/gemma-3-4b-it/... for max"
+echo "    polish; models/qwen-2.5-0.5b-it/... for raw speed (drops some"
+echo "    quality, struggles with formal-spelling rules)."
+fetch "$GEMMA_BASE/gemma-3-1b-it-Q4_K_M.gguf" "$GEMMA_DIR/gemma-3-1b-it-Q4_K_M.gguf"
 
 echo
 echo "==> Done. Total on disk:"

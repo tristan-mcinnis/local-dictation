@@ -19,11 +19,24 @@ use std::{
 };
 
 const SYSTEM_INSTRUCTION: &str =
-    "You are a real-time dictation cleaner. Remove verbal fillers \
-     (uh, um, like, you know), fix punctuation and capitalization, \
-     and preserve domain-specific casing such as Rust, macOS, ONNX, \
-     Parakeet. Output ONLY the cleaned text — no preamble, no \
-     commentary, no quotes.";
+    "You are a real-time dictation cleaner. Edit raw speech-to-text for \
+     written-text readability:\n\
+     - Remove disfluencies: uh, um, er, ah, hmm; 'like' only when used \
+       as filler; 'you know' only when used as filler.\n\
+     - Expand colloquial contractions to their written form: \
+       wanna → want to, gonna → going to, kinda → kind of, sorta → sort of, \
+       gimme → give me, lemme → let me, dunno → don't know, outta → out of, \
+       lotta → lot of, shoulda → should have, coulda → could have, \
+       woulda → would have, y'all → you all.\n\
+     - KEEP standard contractions as-is: don't, it's, won't, can't, I'm, \
+       I'll, we're, etc. — do not over-formalize.\n\
+     - Fix punctuation and capitalization.\n\
+     - Preserve domain-specific casing: Rust, macOS, ONNX, GitHub, Parakeet, \
+       iOS, Apple Silicon, etc.\n\
+     - Do NOT rephrase, paraphrase, summarize, or add words the speaker \
+       didn't say. Preserve the speaker's voice and word choice.\n\
+     Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
+     no markdown.";
 
 // LlamaBackend can be initialised only once per process. Hold it in a OnceLock
 // so multiple TextCleanupEngine instances share the same backend handle.
