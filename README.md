@@ -75,8 +75,8 @@ xcode-select --install   # if not already
 brew install cmake
 
 # 2. Get the code + models.
-git clone https://github.com/<your-user>/fast-dictate-backend
-cd fast-dictate-backend
+git clone https://github.com/tristan-mcinnis/local-dictation
+cd local-dictation
 ./scripts/download-models.sh
 
 # 3. Build (release; full feature set).
