@@ -27,7 +27,7 @@ use objc2_core_foundation::{
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 // Pill geometry — tuned to match Wispr Flow's compact pill.
 const PILL_W: f64 = 120.0;
@@ -57,6 +57,10 @@ struct UiGlobals {
     pill_window: Retained<NSWindow>,
     bars: Vec<Retained<NSView>>,
     last_state: AtomicU8,
+    /// Per-bar smoothed height. Rises instantly to a new peak, decays
+    /// slowly toward the new RMS sample — gives the snappy bouncing
+    /// feel of real audio meters.
+    displayed_heights: Mutex<Vec<f64>>,
 }
 unsafe impl Sync for UiGlobals {}
 unsafe impl Send for UiGlobals {}
@@ -78,6 +82,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         pill_window,
         bars,
         last_state: AtomicU8::new(255),
+        displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
     };
     let _ = GLOBALS.set(globals);
 
@@ -262,35 +267,62 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
 
 fn update_bars(globals: &UiGlobals) {
     let levels = crate::audio::recent_levels();
+    let mut displayed = match globals.displayed_heights.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
     for (i, bar) in globals.bars.iter().enumerate() {
-        // Pad missing levels with 0. Latest levels are at the end of the
-        // VecDeque, so the rightmost bar is the most recent sample —
-        // gives the audio-scroll effect you see in Wispr/Superwhisper.
-        let level = if i < levels.len() {
-            // Right-align: bar[BAR_COUNT-1] = levels[len-1] (newest).
-            let offset = BAR_COUNT - levels.len();
+        // Right-align: bar[BAR_COUNT-1] = newest level. As new samples
+        // arrive the entire history scrolls left by one bar.
+        let level = if levels.is_empty() {
+            0.0
+        } else {
+            let offset = BAR_COUNT.saturating_sub(levels.len());
             if i < offset {
                 0.0
             } else {
                 levels[i - offset]
             }
-        } else {
-            0.0
         };
-        // RMS for speech typically sits in [0.005, 0.25]. Use sqrt to give
-        // quiet input more visual presence, then map to bar height.
-        let normalized = (level * 6.0).sqrt().min(1.0);
-        let h = (BAR_MIN_H + normalized as f64 * (BAR_MAX_H - BAR_MIN_H))
-            .clamp(BAR_MIN_H, BAR_MAX_H);
+
+        // Aggressive gain so normal speech (RMS ~0.01-0.05) actually
+        // saturates the bar. powf(0.4) is roughly between sqrt and
+        // identity — gives quiet sound visible presence without making
+        // loud sound look identical to medium.
+        let target = if level < 0.0008 {
+            // Floor for ambient mic noise — keeps the pill visibly idle
+            // when the user isn't speaking.
+            BAR_MIN_H
+        } else {
+            let normalized = ((level * 40.0) as f64).powf(0.4).min(1.0);
+            BAR_MIN_H + normalized * (BAR_MAX_H - BAR_MIN_H)
+        };
+
+        // Peak-hold with slow decay: rise instantly to new highs, drop
+        // gently toward target so the eye can catch the peak.
+        let current = displayed[i];
+        let new_h = if target >= current {
+            target
+        } else {
+            current * 0.78 + target * 0.22
+        };
+        displayed[i] = new_h;
+
         let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
         let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
-        let y = (PILL_H - h) / 2.0;
-        let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, h));
+        let y = (PILL_H - new_h) / 2.0;
+        let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, new_h));
         unsafe { bar.setFrame(new_frame) };
     }
 }
 
 fn collapse_bars(globals: &UiGlobals) {
+    if let Ok(mut g) = globals.displayed_heights.lock() {
+        for v in g.iter_mut() {
+            *v = BAR_MIN_H;
+        }
+    }
     for (i, bar) in globals.bars.iter().enumerate() {
         let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
         let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
