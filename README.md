@@ -46,7 +46,7 @@ Inject is ~185 ms for Electron-class apps (VS Code, Slack, Discord, browsers, No
 
 ## Models
 
-Both fully local. A helper script downloads them:
+Both fully local. A helper script downloads the two defaults:
 
 ```bash
 ./scripts/download-models.sh
@@ -57,7 +57,30 @@ Both fully local. A helper script downloads them:
 | Parakeet TDT v3 INT8 (ONNX) | 640 MB | ASR — speech → text |
 | Gemma 3 1B-IT Q4_K_M (GGUF) | 770 MB | Cleanup — strip fillers, fix punctuation, preserve domain casing |
 
-Override either via `PARAKEET_MODEL_DIR` / `GEMMA_MODEL_PATH`. Larger cleanup models like Gemma 3 4B give marginally better output but ~3× the latency.
+### Why Gemma 3 1B is the default cleanup model
+
+Five GGUF cleanup models were tried on conversational English dictation. The
+job is small — drop fillers, fix punctuation/casing, expand `gonna → going to`
+— so the question was the smallest model that does it *without* mangling
+meaning or domain casing. Sizes are Q4_K_M on disk; latency is hot-path
+cleanup of a ~2 s utterance on Apple Silicon (Metal).
+
+| Model | Size | Cleanup latency | Quality on dictation | Verdict |
+| --- | --- | --- | --- | --- |
+| **Gemma 3 1B-IT** | 770 MB | **~150 ms** | Matches 4B on everyday speech; keeps `macOS`/`Rust`/`GitHub` casing | **Default** — best quality-per-ms |
+| Gemma 3 4B-IT | 2.5 GB | ~3× slower (~450 ms) | Marginally better on long/complex sentences | Use for max polish if you don't mind the latency |
+| Llama 3.2 1B-IT | 808 MB | ~1B-class | Solid, but slightly looser on punctuation than Gemma 1B | Fine alternative; no clear win over the default |
+| Qwen 2.5 0.5B-IT | 398 MB | Fastest of the usable set | Quicker, but drops the occasional word and over-trims | Pick for raw speed on a slow machine |
+| SmolLM2 360M-IT | 271 MB | Fastest overall | Too aggressive — rewrites/omits content | Not recommended for cleanup |
+
+The takeaway: **4B isn't worth ~3× the latency for everyday dictation, and the
+sub-1B models start trading away accuracy.** Gemma 3 1B sits at the knee of the
+curve, so it ships as the default.
+
+You don't have to edit anything to switch — pick a different model from the
+**menu bar** (see below), or set `GEMMA_MODEL_PATH` for a scripted launch. The
+download script fetches only Parakeet + Gemma 3 1B; the other four are optional
+and can be downloaded into `models/llm/<name>/` to appear in the picker.
 
 ## Quick start
 
@@ -85,7 +108,14 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 
 - **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`).
 - **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
-- **Menu-bar icon (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click for an **Open Log** item (⌘L — opens `/tmp/dictate-daemon.log` in your default editor) and **Quit** (⌘Q).
+- **Menu-bar icon + settings (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click it for a full menu — no env vars or relaunch scripts needed:
+  - **Last dictation preview** + **Copy last dictation** (⌘C) — grab what you just dictated.
+  - **Cleanup model ▸** — checkable submenu of every model under `models/llm/`; pick one and the daemon relaunches on it.
+  - **Push-to-talk key ▸** — Right Option / Command / Control / Shift.
+  - **Cleanup enabled** — toggle LLM cleanup on/off (raw transcript when off).
+  - **Open Log** (⌘L), **Export Log to Downloads…**, **Open corrections folder**.
+  - **Quit** (⌘Q).
+  Settings persist to `~/.config/local-dictation/settings.json`. Changing the model, hotkey, or cleanup toggle relaunches the daemon to apply (the model is loaded once at boot, so a relaunch is cleaner than a live swap). Any env var override (`GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE`) wins over the menu and greys out the matching items.
 - **Audio cues.** Tink on start, Bottle on stop, Basso on error. Mute with `DICTATE_QUIET=1`.
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
@@ -128,13 +158,19 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 | `inject-test [text]` | AX-only smoke test |
 | `ax-check` | Surface the Accessibility permission prompt |
 
-## Environment knobs
+## Settings & environment knobs
+
+Two ways to configure the daemon, in order of precedence:
+
+1. **Env vars** (below) — win over everything; best for scripted launches.
+2. **`~/.config/local-dictation/settings.json`** — written by the menu bar; holds `gemma_model`, `hotkey_keycode`, `cleanup_enabled`. You rarely edit it by hand.
+3. **Built-in defaults.**
 
 | Var | Effect |
 | --- | --- |
 | `PARAKEET_MODEL_DIR` | Default: `models/dictation/parakeet-tdt-v3-int8` |
-| `GEMMA_MODEL_PATH` | Default: `models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf` |
-| `DICTATE_HOTKEY_KEYCODE` | Default: `0x3D` (Right Option). Other useful values: `0x36` Right ⌘, `0x3E` Right Control |
+| `GEMMA_MODEL_PATH` | Cleanup model. Default: `models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf`. Overrides the menu's model picker. |
+| `DICTATE_HOTKEY_KEYCODE` | Default: `0x3D` (Right Option). Also handled: `0x36` Right ⌘, `0x3E` Right Control, `0x3C` Right Shift. The daemon watches the matching modifier flag, so any of these register a hold correctly. Overrides the menu's key picker. |
 | `DICTATE_QUIET` | Set to anything to mute audio cues |
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
@@ -159,7 +195,8 @@ src/
 ├── cues.rs             afplay system sounds
 ├── daemon.rs           push-to-talk loop, CGEventTap, worker thread
 ├── injector.rs         AX direct + smart-spacing + Electron clipboard route
-├── menubar.rs          NSStatusItem + floating waveform pill
+├── menubar.rs          NSStatusItem menu (model/hotkey/cleanup picker) + pill
+├── settings.rs         ~/.config/local-dictation/settings.json load/save
 ├── smart_pad.rs        spacing & capitalization rules
 ├── text_polish.rs      strip LLM preamble / quotes / artefacts
 ├── transcriber.rs      Parakeet wrapper + WAV loader

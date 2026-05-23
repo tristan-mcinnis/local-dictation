@@ -2,6 +2,7 @@ pub mod audio;
 pub mod corrections;
 pub mod cues;
 pub mod injector;
+pub mod settings;
 pub mod smart_pad;
 pub mod text_polish;
 pub mod transcriber;
