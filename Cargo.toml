@@ -25,8 +25,18 @@ parakeet = ["dep:parakeet-rs", "dep:hound"]
 # llama-cpp-2 (despite its 0.1.x version) is the actively-maintained binding;
 # `llama_cpp` 0.3.x vendors a llama.cpp from April 2024 and cannot load Gemma 3.
 cleaner = ["dep:llama-cpp-2", "dep:encoding_rs"]
-# Real macOS Accessibility-based text injection + clipboard fallback.
-ax-inject = ["dep:accessibility-sys", "dep:core-foundation", "dep:core-graphics", "dep:arboard"]
+# Real macOS Accessibility-based text injection + clipboard fallback +
+# menu-bar status item + floating cursor pill.
+ax-inject = [
+    "dep:accessibility-sys",
+    "dep:core-foundation",
+    "dep:core-graphics",
+    "dep:arboard",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-app-kit",
+    "dep:objc2-core-foundation",
+]
 # Convenience: everything on.
 full = ["parakeet", "cleaner", "ax-inject"]
 
@@ -60,4 +70,11 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSControl",
     "NSView",
     "NSCell",
+    "NSWindow",
+    "NSColor",
+    "NSScreen",
+    "NSTextField",
+    "NSGraphics",
+    "NSGraphicsContext",
 ] }
+objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }

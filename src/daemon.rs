@@ -16,8 +16,9 @@
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
 use crate::cues;
 use crate::injector::{AccessibilityInjector, FocusTarget};
+use crate::menubar::{self, UiState};
 use crate::transcriber::LocalInferenceWorker;
-use core_foundation::runloop::CFRunLoop;
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CallbackResult, EventField,
@@ -108,7 +109,9 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let currently_pressed = Arc::new(AtomicBool::new(false));
     let pressed_for_callback = currently_pressed.clone();
 
-    let tap_result = CGEventTap::with_enabled(
+    // Install CGEventTap manually so we can hand the main thread over to
+    // NSApplication.run() (needed for the menu-bar item + floating pill).
+    let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::ListenOnly,
@@ -117,9 +120,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
             if keycode == hotkey_keycode {
                 let flags = event.get_flags();
-                // For Right Option, the relevant flag bit is
-                // CGEventFlagAlternate. Detect press vs release via the
-                // transition: set + not-pressed = down; clear + pressed = up.
                 let is_set_now = flags.contains(CGEventFlags::CGEventFlagAlternate);
                 let was_pressed = pressed_for_callback.load(Ordering::SeqCst);
                 if is_set_now && !was_pressed {
@@ -132,22 +132,36 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             }
             CallbackResult::Keep
         },
-        || {
-            eprintln!(
-                "[daemon] ready. Hold Right Option (keycode 0x{:x}) to dictate. Ctrl+C to quit.",
-                hotkey_keycode
-            );
-            CFRunLoop::run_current();
-        },
-    );
-
-    if tap_result.is_err() {
-        return Err(eyre::eyre!(
+    )
+    .map_err(|_| {
+        eyre::eyre!(
             "failed to install CGEventTap — Accessibility permission missing or revoked"
-        ));
-    }
+        )
+    })?;
 
-    // Reachable only if CFRunLoop returns (it normally won't until SIGINT).
+    let loop_source = tap
+        .mach_port()
+        .create_runloop_source(0)
+        .map_err(|_| eyre::eyre!("create_runloop_source failed"))?;
+    CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
+    tap.enable();
+    // Leak the tap — it must outlive the run loop. Safe to drop only on
+    // process exit (which NSApp.terminate handles).
+    std::mem::forget(tap);
+    std::mem::forget(loop_source);
+
+    eprintln!(
+        "[daemon] ready. Hold Right Option (keycode 0x{:x}) to dictate. ⌘Q in the menu-bar item quits.",
+        hotkey_keycode
+    );
+    menubar::set_state(UiState::Idle);
+
+    // Hand the main thread to NSApplication. AppKit pumps the same
+    // CFRunLoop that our event tap is attached to, so the tap + menu bar +
+    // pill all coexist on the same loop.
+    menubar::init_and_run()?;
+
+    // Reachable only after NSApp.terminate.
     drop(tx);
     let _ = worker_handle.join();
     Ok(())
@@ -230,6 +244,7 @@ fn worker_loop(
                     }
                 };
                 cues::play_start();
+                menubar::set_state(UiState::Recording);
                 eprintln!("[daemon] ● recording");
                 engine = Some(e);
                 consumer = Some(c);
@@ -239,6 +254,7 @@ fn worker_loop(
                 let Some(mut e) = engine.take() else { continue };
                 e.stop_capture();
                 cues::play_stop();
+                menubar::set_state(UiState::Processing);
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 eprintln!(
                     "[daemon] ○ stopped after {:?}",
@@ -265,6 +281,7 @@ fn worker_loop(
                     Err(err) => {
                         eprintln!("[daemon] transcribe failed: {err:?}");
                         cues::play_error();
+                        menubar::set_state(UiState::Idle);
                         continue;
                     }
                 };
@@ -272,6 +289,7 @@ fn worker_loop(
 
                 let final_text = if transcript.trim().is_empty() {
                     eprintln!("[daemon] empty transcript — skipping");
+                    menubar::set_state(UiState::Idle);
                     continue;
                 } else {
                     #[cfg(feature = "cleaner")]
@@ -348,6 +366,7 @@ fn worker_loop(
                         t_inject.elapsed()
                     );
                 }
+                menubar::set_state(UiState::Idle);
             }
         }
 

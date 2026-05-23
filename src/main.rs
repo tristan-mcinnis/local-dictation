@@ -302,17 +302,18 @@ fn gemma_path() -> String {
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
 async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run, DaemonConfig};
-    // Spawn the daemon on a blocking thread because it calls CFRunLoop::run_current()
-    // which blocks indefinitely — we don't want to occupy the tokio runtime.
+    // IMPORTANT: must call daemon::run on the OS main thread (NSApp.run()
+    // refuses to start otherwise). We're already on the main thread thanks
+    // to #[tokio::main(flavor = "current_thread")] — DO NOT wrap in
+    // spawn_blocking, that moves the call to a worker thread and
+    // MainThreadMarker::new() will return None.
     let config = DaemonConfig::from_env(
         parakeet_dir(),
         #[cfg(feature = "cleaner")]
         gemma_path(),
         no_cleanup,
     );
-    tokio::task::spawn_blocking(move || run(config))
-        .await
-        .map_err(|e| eyre::eyre!("daemon task join failed: {e}"))?
+    run(config)
 }
 
 #[cfg(not(all(target_os = "macos", feature = "parakeet", feature = "ax-inject")))]
