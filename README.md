@@ -132,8 +132,8 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 
 | Var | Effect |
 | --- | --- |
-| `PARAKEET_MODEL_DIR` | Default: `models/parakeet-tdt-v3-int8` |
-| `GEMMA_MODEL_PATH` | Default: `models/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf` |
+| `PARAKEET_MODEL_DIR` | Default: `models/dictation/parakeet-tdt-v3-int8` |
+| `GEMMA_MODEL_PATH` | Default: `models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf` |
 | `DICTATE_HOTKEY_KEYCODE` | Default: `0x3D` (Right Option). Other useful values: `0x36` Right ⌘, `0x3E` Right Control |
 | `DICTATE_QUIET` | Set to anything to mute audio cues |
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
