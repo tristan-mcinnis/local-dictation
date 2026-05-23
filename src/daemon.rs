@@ -14,6 +14,7 @@
 //! injector's `ensure_trusted_or_prompt`.
 
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
+use crate::corrections::Corrections;
 use crate::cues;
 use crate::injector::{AccessibilityInjector, FocusTarget};
 use crate::menubar::{self, UiState};
@@ -263,6 +264,22 @@ fn worker_loop(
     }
     eprintln!("[boot] warm-up     done   in {:>4} ms", ms(t_warm.elapsed()));
 
+    // Load personal corrections dictionary (no-op if no file).
+    let corrections = match Corrections::load_default() {
+        Ok(c) => {
+            if c.is_empty() {
+                eprintln!("[boot] corrections none loaded (no dictionary file)");
+            } else {
+                eprintln!("[boot] corrections {:>4} entries loaded", c.len());
+            }
+            c
+        }
+        Err(e) => {
+            eprintln!("[warn] corrections failed to load: {e}");
+            Corrections::empty()
+        }
+    };
+
     // Per-utterance state.
     let mut engine: Option<AudioCaptureEngine> = None;
     let mut consumer: Option<crate::audio::HeapAudioConsumer> = None;
@@ -365,6 +382,11 @@ fn worker_loop(
                     menubar::set_state(UiState::Idle);
                     continue;
                 }
+
+                // Apply user corrections dictionary (proper nouns, common
+                // misspellings, domain casing) BEFORE the voice-command
+                // parse so corrections to the trigger phrase don't fire.
+                let final_text = corrections.apply(&final_text);
 
                 // Voice command detection: trailing "press enter" is
                 // stripped and turned into a Return keystroke after inject.

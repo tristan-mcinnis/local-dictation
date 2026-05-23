@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod corrections;
 pub mod cues;
 pub mod injector;
 pub mod smart_pad;
