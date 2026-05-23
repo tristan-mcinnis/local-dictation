@@ -13,8 +13,9 @@ pub fn play_start() {
 }
 
 pub fn play_stop() {
-    // Glass is crisper than Pop — no reverb tail / "double-click" quality.
-    play("Glass");
+    // Bottle is a soft completion "bloop" — distinct from the Tink start
+    // cue, no bell tail (which Glass had).
+    play("Bottle");
 }
 
 pub fn play_cancel() {

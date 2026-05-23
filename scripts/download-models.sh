@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
-# Download the ONNX (Parakeet) and GGUF (Gemma 3) models into ./models/.
+# Download the ONNX (Parakeet) and GGUF (Qwen 2.5 0.5B) models into ./models/.
 # Idempotent: skips files that already exist with non-zero size.
 
 set -euo pipefail
-
 cd "$(dirname "$0")/.."
 
 PARAKEET_DIR="models/parakeet-tdt-v3-int8"
-GEMMA_DIR="models/gemma-3-1b-it"
-mkdir -p "$PARAKEET_DIR" "$GEMMA_DIR"
+QWEN_DIR="models/qwen-2.5-0.5b-it"
+mkdir -p "$PARAKEET_DIR" "$QWEN_DIR"
 
 PARAKEET_BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
-GEMMA_BASE="https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main"
+QWEN_BASE="https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main"
 
 fetch() {
-  local url="$1"
-  local out="$2"
+  local url="$1" out="$2"
   if [ -s "$out" ]; then
     echo "  ✓ $out already present ($(du -h "$out" | cut -f1)), skipping"
     return
@@ -31,12 +29,12 @@ fetch "$PARAKEET_BASE/decoder_joint-model.int8.onnx" "$PARAKEET_DIR/decoder_join
 fetch "$PARAKEET_BASE/vocab.txt"                     "$PARAKEET_DIR/vocab.txt"
 
 echo
-echo "==> Gemma 3 1B-IT Q4_K_M GGUF (~770 MB)"
-echo "    (1B is the recommended default — matches 4B's cleanup quality"
-echo "     at ~38% of the latency on dictation-style text. Set"
-echo "     GEMMA_MODEL_PATH to point at the 4B GGUF if you want maximum"
-echo "     polish at the cost of ~500 ms more per utterance.)"
-fetch "$GEMMA_BASE/gemma-3-1b-it-Q4_K_M.gguf" "$GEMMA_DIR/gemma-3-1b-it-Q4_K_M.gguf"
+echo "==> Qwen 2.5 0.5B-Instruct Q4_K_M GGUF (~380 MB)"
+echo "    (Qwen 0.5B is the snappy default — ~150 ms hot cleanup on M-series."
+echo "     If you want stronger domain-casing fidelity (macOS, ONNX, etc.) at"
+echo "     the cost of ~150 ms more per utterance, point GEMMA_MODEL_PATH at"
+echo "     models/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf or the 4B variant.)"
+fetch "$QWEN_BASE/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf" "$QWEN_DIR/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
 
 echo
 echo "==> Done. Total on disk:"
