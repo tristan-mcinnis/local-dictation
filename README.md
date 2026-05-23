@@ -1,251 +1,144 @@
-# fast-dictate-backend
+# local-dictation
 
-Low-latency local dictation pipeline for Apple Silicon, written in Rust.
+A local dictation app for Apple Silicon. Hold a hotkey, speak, release — cleaned text appears at your cursor.
 
-**Stack:** [Parakeet TDT v3 INT8](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx) for ASR (via [`parakeet-rs`](https://crates.io/crates/parakeet-rs) on ONNX Runtime with the CoreML execution provider) → [Gemma 3 4B Q4_K_M](https://huggingface.co/ggml-org/gemma-3-4b-it-GGUF) for cleanup (via [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) with the Metal backend) → macOS Accessibility API for cursor-position text injection (with clipboard paste fallback).
+**Optimized for lowest latency and highest accuracy**, with the obvious trade-offs: it's English-first, macOS-only, and the cleanup model spends ~300 ms thinking about your text. Everything runs on-device. No network at runtime.
 
-Everything runs **on-device**. No network calls at runtime.
-
-## Verified performance
-
-Measured on an Apple Silicon Mac against an 8.35-second `say`-generated WAV. `release` build, models loaded once and timed both warm-up and hot calls:
-
-| Stage | Wall time | Notes |
-| --- | --- | --- |
-| Load 8.35 s WAV (`hound`) | 0.9 ms | — |
-| Parakeet TDT v3 INT8 model load | ~700 ms | One-time, CoreML EP |
-| Gemma 3 4B Q4_K_M model load | ~850 ms | One-time, Metal |
-| Transcribe (hot) | **~190 ms** | **~45× realtime** |
-| Cleanup (hot) | ~860 ms | Gemma 3 4B Q4_K_M, Metal |
-| **End-to-end hot (transcribe + cleanup)** | **~1.05 s** | for 8.35 s of speech |
-
-Sample quality:
-
-```
-Raw  : "So uh yeah we should build the Rust loop and then like compile it on Mac OS,
-        right? Um, the Parakeet ONNX runtime is the core dependency."
-Clean: "We should build the Rust loop and then compile it on macOS, right?
-        The Parakeet ONNX runtime is the core dependency."
-```
-
-Filler words stripped (`uh`, `like`, `Um`), domain casing preserved (`Mac OS → macOS`), punctuation tightened.
-
-## Architecture
-
-```
-┌───────────────┐    cpal callback     ┌────────────────────┐   tokio drain    ┌────────────────────┐
-│ MacBook mic   │ ───── 48 kHz f32 ──▶ │ resample → 16 kHz  │ ─── pop_slice ─▶ │ Parakeet TDT INT8  │
-│ (CoreAudio)   │                      │ SPSC ring buffer   │                  │  CoreML execution  │
-└───────────────┘                      │  (ringbuf 0.4)     │                  └─────────┬──────────┘
-                                       └────────────────────┘                            │ raw transcript
-                                                                                         ▼
-┌───────────────┐   AX kAXSelectedText   ┌─────────────┐    text_polish    ┌────────────────────────┐
-│ focused field │ ◀──── + smart_pad ──── │  smart_pad  │ ◀──── + cleanup ──│ Gemma 3 4B Q4_K_M GGUF │
-│ in any app    │   (clipboard if AX     │  context    │   strip preamble  │  llama.cpp + Metal     │
-└───────────────┘    refuses)            └─────────────┘                    └────────────────────────┘
-```
-
-## Models
-
-Both fully local; place under `./models/`. A helper script downloads them into the right structure:
-
-```bash
-./scripts/download-models.sh
-```
-
-Layout after download:
-```
-models/
-├── parakeet-tdt-v3-int8/
-│   ├── encoder-model.int8.onnx       (~622 MB)
-│   ├── decoder_joint-model.int8.onnx (~17 MB)
-│   └── vocab.txt                      (~92 KB)
-└── gemma-3-4b-it/
-    └── gemma-3-4b-it-Q4_K_M.gguf      (~2.3 GB)
-```
-
-Total disk: ~3 GB. Override locations with `PARAKEET_MODEL_DIR` and `GEMMA_MODEL_PATH` env vars.
-
-## Quick start
-
-```bash
-# 1. Toolchain: stable Rust + Xcode CLT + cmake.
-rustup update stable
-xcode-select --install   # if not already
-brew install cmake
-
-# 2. Get the code + models.
-git clone https://github.com/tristan-mcinnis/local-dictation
-cd local-dictation
-./scripts/download-models.sh
-
-# 3. Build (release; full feature set).
-cargo build --features full --release
-
-# 4. Run the offline bench against the bundled test WAV.
-./target/release/fast-dictate-backend bench
-
-# 5. Live mic capture (5-second window).
-./target/release/fast-dictate-backend dictate 5000
-```
-
-## Subcommands
-
-| Command | What it does |
-| --- | --- |
-| **`daemon [--no-cleanup]`** | **Push-to-talk daemon. Loads + pre-warms both models, then listens for Right Option held → records → releases → transcribes → cleans → injects. This is the way to actually use the tool.** |
-| `mock-loop` | No models needed. Drives the ring buffer with a synthetic sine; useful for buffer-plumbing sanity. |
-| `bench [path/to/wav]` | Loads Parakeet + Gemma, transcribes the WAV, cleans it, reports timings, then injects the cleaned text into the focused field (or `FOCUS_APP`). |
-| `dictate <ms>` | Fixed-duration capture (no hotkey). Records for `ms` ms, transcribes, cleans, injects. Plays `Tink` on start / `Pop` on stop. |
-| `inject-test [text]` | Smoke-test the AX injector with a fixed string (default: `"hello from fast-dictate-backend!"`). |
-| `ax-check` | Probes Accessibility permission; surfaces the system prompt on first call. |
-| `synth-press [ms]` | Synthesize a Right Option press-and-hold for `ms` ms via `CGEventPost`. Used to test the running daemon from a second process. |
-
-## Environment knobs
-
-| Var | Effect |
-| --- | --- |
-| `PARAKEET_MODEL_DIR` | Overrides the parakeet model directory. Default: `models/parakeet-tdt-v3-int8`. |
-| `GEMMA_MODEL_PATH` | Overrides the Gemma GGUF path. Default: `models/gemma-3-4b-it/gemma-3-4b-it-Q4_K_M.gguf`. |
-| `FOCUS_APP` | If set (e.g. `FOCUS_APP=TextEdit`), activates the named app and injects into it by PID. Useful for scripted tests against a specific target. |
-| `DICTATE_QUIET` | Mutes audio cues. |
-| `DICTATE_HOTKEY_KEYCODE` | Override the daemon's hotkey (default `0x3D` = Right Option). Examples: `0x3E` Right Control, `0x36` Right Command, `0x3C` Right Shift. |
-
-## Push-to-talk daemon (the way to use this for real)
+## What you actually do
 
 ```bash
 ./target/release/fast-dictate-backend daemon
 ```
 
-What it does:
-1. Loads Parakeet + Gemma 3 4B once at startup (~1.5 s total).
-2. **Pre-warms** both with a dummy inference (~400 ms) so the first real utterance pays no jitter cost.
-3. Installs a `CGEventTap` on the main `CFRunLoop` watching modifier-flag changes for Right Option.
-4. **Hold Right Option** → `Tink` plays, cpal opens the mic. Speak.
-5. **Release Right Option** → `Pop` plays, mic closes, Parakeet transcribes, Gemma cleans, AX injects at the cursor.
-6. Repeat. Ctrl+C to quit.
+Then **hold Right Option**, speak, release. The cleaned text gets injected wherever your cursor is. A small floating pill shows live mic levels while you talk.
 
-### Verified daemon-mode latency (M-series Mac, hot path after warm-up)
+## Verified performance
 
-Measured via `synth-press` from a second process — single round-trip after a 2-second key hold:
+Measured on Apple Silicon, hot path after warm-up, end-to-end from key release to text injected:
 
-| Stage | Wall time |
+| Speech length | Total latency |
 | --- | --- |
-| Daemon boot: Parakeet load | ~800 ms one-time |
-| Daemon boot: Gemma load | ~700 ms one-time |
-| Daemon boot: warm-up (both) | ~400 ms one-time |
-| Drain ring buffer + transcribe | **~133 ms** |
-| Gemma cleanup (4B Q4_K_M, Metal) | ~700 ms |
-| AX inject (incl. smart-pad context read) | ~200 ms |
-| **Per-utterance: release → injected** | **~1.04 s** |
+| 2 s utterance | ~300–400 ms |
+| 5 s utterance | ~500–700 ms |
+| 10 s utterance | ~800 ms–1.1 s |
 
-With `--no-cleanup` (skip Gemma):
+Breakdown of a typical 2 s utterance:
 
-| Stage | Wall time |
-| --- | --- |
-| Daemon boot: Parakeet load only | ~800 ms one-time |
-| Warm-up (Parakeet only) | ~45 ms one-time |
-| **Per-utterance: release → injected** | **~330 ms** (transcribe + inject) |
-
-So the trade-off is **~330 ms raw vs ~1040 ms polished** per utterance. Use `--no-cleanup` when you want instant low-latency dictation and don't mind filler words / casing slips.
-
-### Daemon caveats
-
-- Right Option is the default because it's rarely typed alone. Override with `DICTATE_HOTKEY_KEYCODE=0x3E` etc.
-- The tap requires **Accessibility permission**. First daemon boot will prompt; toggle the binary on in System Settings → Privacy & Security → Accessibility and re-run.
-- `cpal::Stream` is `!Send`, so the daemon owns it on a single worker thread. The mic is opened/closed per utterance — cheap, but adds ~10 ms each side.
-- No menu-bar UI yet (see "What's not built (yet)" below). Cues + stderr are the indicator.
-
-## Cargo features
-
-| Feature | Pulls in | Purpose |
-| --- | --- | --- |
-| (default) | ringbuf, cpal, eyre, tokio | Mock-mode + ring-buffer plumbing only — builds in seconds, tests in milliseconds. |
-| `parakeet` | parakeet-rs (CoreML), hound | Real ASR over ONNX Runtime + WAV loader. |
-| `cleaner` | llama-cpp-2 (Metal), encoding_rs | Gemma 3 cleanup engine (Metal GPU). |
-| `ax-inject` | accessibility-sys, core-foundation, core-graphics, arboard | macOS AX text injection + clipboard fallback. |
-| `full` | all of the above | What you want for actual dictation. |
-
-`cargo build --features full --release` is the everyday build. First build compiles ONNX Runtime and llama.cpp from source — budget 5–15 min.
-
-## Quality-of-life behaviors
-
-These run automatically, no flags needed.
-
-- **Smart spacing.** Before injecting, the injector reads `kAXValue` + `kAXSelectedTextRange` of the focused element, derives `char_before` / `char_after` / `last_non_ws_before`, and pads accordingly:
-  - Start of field → capitalize, no leading space
-  - After `. ! ?` → capitalize, leading space
-  - Mid-text (no preceding space) → leading space added
-  - After `(`, `"`, `'`, `[`, `{`, `—` → no leading space
-  - Before `.`, `,`, `)`, `]`, `}` → no trailing space
-- **Defensive cleanup polish.** Strips chat-template artefacts (`<end_of_turn>`, `</s>`), known preambles (`Here's the cleaned text:` etc.), wrapping quotes, markdown emphasis, and collapses internal whitespace.
-- **Clipboard fallback.** If the AX path fails (Electron apps, some Java apps, sandboxed web views silently refuse `kAXValueAttribute` writes), the injector falls back to: save clipboard → write text → synthesize Cmd+V via `CGEvent` → 180 ms settle → restore. Plain-text clipboard contents are restored; rich types are not (a known limitation).
-- **Skip-empty.** No-op when the final text is empty, so an accidentally-empty dictation never errors.
-- **Audio cues.** `Tink` on record start, `Pop` on record stop, `Basso` on inject error. `DICTATE_QUIET=1` to silence.
-
-## Permissions
-
-macOS will prompt for two TCC permissions the first time you exercise the live paths:
-
-1. **Microphone** — needed by cpal. Triggered by the first `dictate` run.
-2. **Accessibility** — needed for AX injection and CGEvent-based clipboard paste. Triggered by the first `inject-test`, `dictate`, or `ax-check` that performs an inject.
-
-Grant in **System Settings → Privacy & Security**. The binary you grant access to is the parent process (your terminal or `target/release/fast-dictate-backend` directly).
-
-## Tests
-
-```bash
-cargo test                        # 17 unit + 2 integration, no models needed
-cargo test --features full        # same set, against the heavier build
+```
+transcribe (Parakeet TDT v3 INT8, CoreML)    ~90 ms
+cleanup    (Gemma 3 1B Q4_K_M, Metal)       ~150 ms
+inject     (AX direct, native apps)           ~5 ms
+                                            ────────
+                                             ~245 ms
 ```
 
-Coverage includes:
-- `text_polish::polish` — preamble stripping, quote peeling, whitespace normalization, chat-token trimming.
-- `smart_pad::smart_pad` — spacing/capitalization decisions for empty field, after `. `, mid-word, after opening punctuation, before closing punctuation.
-- `audio::AudioCaptureEngine` — SPSC ring-buffer concurrency in mock mode.
-- Inference termination — `tokio` drain loop respects the atomic stop flag.
+Inject is ~185 ms for Electron-class apps (VS Code, Slack, Discord, browsers, Notion, Obsidian, Zed, Figma — anything with a renderer process that swallows AX writes). For those we route through clipboard paste, which always works.
+
+## Models
+
+Both fully local. A helper script downloads them:
+
+```bash
+./scripts/download-models.sh
+```
+
+| Model | Size | Role |
+| --- | --- | --- |
+| Parakeet TDT v3 INT8 (ONNX) | 640 MB | ASR — speech → text |
+| Gemma 3 1B-IT Q4_K_M (GGUF) | 770 MB | Cleanup — strip fillers, fix punctuation, preserve domain casing |
+
+Override either via `PARAKEET_MODEL_DIR` / `GEMMA_MODEL_PATH`. Larger cleanup models like Gemma 3 4B give marginally better output but ~3× the latency.
+
+## Quick start
+
+```bash
+# Toolchain (one-time)
+rustup update stable
+xcode-select --install
+brew install cmake
+
+# Get the code + models
+git clone https://github.com/tristan-mcinnis/local-dictation
+cd local-dictation
+./scripts/download-models.sh
+
+# Build (release, full feature set)
+cargo build --features full --release
+
+# Run
+./target/release/fast-dictate-backend daemon
+```
+
+First daemon run prompts for **Microphone** and **Accessibility** permissions. Grant both in System Settings → Privacy & Security, then re-run.
+
+## Features
+
+- **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`).
+- **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
+- **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
+- **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
+- **Live waveform pill.** Small dark rounded pill at the bottom of your cursor's screen, 14 vertical bars driven by real RMS, peak-hold + decay so it feels alive.
+- **Menu-bar icon.** 🎤 idle / 🔴 recording / ⏳ processing, with a Quit item (⌘Q).
+- **Voice command: "press enter".** End a dictation with `press enter` / `press return` / `hit enter` / `hit return` and it injects the body then synthesizes a Return keystroke. Doesn't fire mid-sentence.
+- **Audio cues.** Tink on start, Bottle on stop, Basso on error. Mute with `DICTATE_QUIET=1`.
+
+## Subcommands
+
+| Command | What it does |
+| --- | --- |
+| `daemon` | Push-to-talk daemon — the way to use this for real |
+| `bench [wav]` | Transcribe + clean a WAV, report timings |
+| `dictate <ms>` | Fixed-duration capture (no hotkey) |
+| `inject-test [text]` | AX-only smoke test |
+| `ax-check` | Surface the Accessibility permission prompt |
+
+## Environment knobs
+
+| Var | Effect |
+| --- | --- |
+| `PARAKEET_MODEL_DIR` | Default: `models/parakeet-tdt-v3-int8` |
+| `GEMMA_MODEL_PATH` | Default: `models/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf` |
+| `DICTATE_HOTKEY_KEYCODE` | Default: `0x3D` (Right Option). Other useful values: `0x36` Right ⌘, `0x3E` Right Control |
+| `DICTATE_QUIET` | Set to anything to mute audio cues |
+| `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
+| `INJECT_DIAG` | Log focused element role + PID before every inject |
+
+## Trade-offs (the honest list)
+
+- **English-first.** Parakeet TDT v3 supports multilingual but the cleanup prompt + model are tuned for English.
+- **~300 ms minimum cleanup latency.** Skip it with the `--no-cleanup` flag if you want the raw ~150 ms transcribe-only path.
+- **Electron apps cost ~185 ms** (clipboard paste settle time). Native Cocoa apps inject in ~5 ms.
+- **No voice activity detection.** Recording is bounded by key hold time, not silence.
+- **Plain-text-only clipboard restore.** RTF / images / file URLs on your clipboard at inject time are lost (only matters when the Electron fallback fires).
+- **macOS-only.** cpal + AX + Metal + CoreML are all macOS-specific. Linux/Windows ports would need different runtime + injection layers.
 
 ## Project layout
 
 ```
 src/
-├── audio.rs            # cpal input + SPSC ring buffer + resample to 16 kHz mono
-├── cleaner.rs          # Gemma 3 cleanup via llama-cpp-2 (Metal), then text_polish
-├── clipboard_paste.rs  # save → set → Cmd+V → settle → restore
-├── cues.rs             # afplay-based system sounds
-├── injector.rs         # AX inject: read context → smart_pad → set value → fallback
-├── lib.rs              # module exports
-├── main.rs             # CLI: mock-loop / bench / dictate / inject-test / ax-check
-├── smart_pad.rs        # spacing + capitalization rules (pure, unit-tested)
-├── text_polish.rs      # defensive post-pass on cleaner output (pure, unit-tested)
-└── transcriber.rs      # Parakeet TDT v3 wrapper + WAV loader
-tests/verification.rs   # integration tests
-testdata/               # bundled test WAV (~270 KB)
-scripts/                # model download script
-models/                 # downloaded models live here (gitignored)
+├── audio.rs            cpal input + SPSC ring buffer + RMS levels
+├── cleaner.rs          Gemma cleanup (llama-cpp-2 + Metal)
+├── clipboard_paste.rs  save → set → Cmd+V → restore (+ Return key synth)
+├── cues.rs             afplay system sounds
+├── daemon.rs           push-to-talk loop, CGEventTap, worker thread
+├── injector.rs         AX direct + smart-spacing + Electron clipboard route
+├── menubar.rs          NSStatusItem + floating waveform pill
+├── smart_pad.rs        spacing & capitalization rules
+├── text_polish.rs      strip LLM preamble / quotes / artefacts
+├── transcriber.rs      Parakeet wrapper + WAV loader
+└── voice_commands.rs   trailing "press enter" detection
+tests/verification.rs   ring buffer + drain integration tests
 ```
 
-## What's not built (yet)
+## Tests
 
-Honest list of things a shipping dictation app would have but this backend doesn't:
-
-- ~~**Global hotkey daemon.** No `CGEventTap` push-to-talk listener.~~ **Shipped** — see [Push-to-talk daemon](#push-to-talk-daemon-the-way-to-use-this-for-real) above.
-- **Menu-bar status indicator.** Daemon prints state to stderr and plays audio cues; a real `NSStatusItem` icon (red dot while recording, mic icon idle) is the obvious next add. Skipped because it requires refactoring the run loop from `CFRunLoop::run_current()` to `NSApplication.run()` without breaking the event tap — non-trivial.
-- **`LaunchAgent` auto-start.** Today you start the daemon manually from a terminal; a `~/Library/LaunchAgents/*.plist` would make it boot at login.
-- **Voice activity detection.** Capture is hotkey-controlled (press / release); no silence-based auto-stop within a hold.
-- **Rich-clipboard round-trip.** The clipboard fallback restores plain text only; images/RTF/file URLs on the clipboard at fallback time are lost.
-- **Code signing / notarization.** Not signed; AX prompts identify the binary by path rather than developer name.
-- **Streaming partials.** Parakeet TDT is offline-batch; no mid-utterance partial transcripts. NVIDIA does ship streaming variants — would require a separate Rust binding.
-
-## Why these choices
-
-- **Parakeet over Whisper for English dictation.** Per Vext's published benchmarks (and our own measurements), Parakeet TDT is ~20–50× faster than Whisper at equivalent accuracy on clean English. Whisper is the right call for multilingual.
-- **INT8 ONNX over FP32.** Halves disk + memory, and CoreML can fuse the quantized graph onto the Neural Engine on most M-series chips.
-- **Gemma 3 4B over Gemma 3 1B.** 4B is markedly better at preserving domain-specific casing (`macOS`, `ONNX`, `Rust`) and refusing to "creatively" rewrite. Trade-off: ~3× slower than 1B (~860 ms vs ~315 ms hot). Vext defaults to 4B-class models for the same reason.
-- **`llama-cpp-2` over `llama_cpp`.** The crate named `llama_cpp` (0.3.x) ships a llama.cpp from April 2024 and silently fails to load Gemma 3. `llama-cpp-2` (despite its 0.1.x version number) tracks current llama.cpp.
+```bash
+cargo test                # 17 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/injector/cleaner suites — 24 total
+```
 
 ## License
 
 Dual-licensed under MIT OR Apache-2.0, at your option. See [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).
 
-Models are not redistributed by this repo. Parakeet TDT v3 is © NVIDIA under their license; Gemma 3 is under Google's Gemma terms. Read each model's repo before commercial use.
+Models are not redistributed by this repo. Parakeet TDT v3 is © NVIDIA under their license; Gemma 3 is under Google's Gemma terms. Check each model's repo before commercial use.

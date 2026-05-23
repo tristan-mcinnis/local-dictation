@@ -579,6 +579,11 @@ impl FocusTarget {
             inner: imp::capture_focus_target()?,
         })
     }
+    /// PID of the process that owns the captured focused element, if AX
+    /// disclosed it. Used by the daemon for log output.
+    pub fn inner_pid(&self) -> Option<i32> {
+        self.inner.pid
+    }
 }
 
 #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
@@ -588,6 +593,9 @@ pub struct FocusTarget;
 impl FocusTarget {
     pub fn capture() -> eyre::Result<Self> {
         Ok(Self)
+    }
+    pub fn inner_pid(&self) -> Option<i32> {
+        None
     }
 }
 

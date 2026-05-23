@@ -29,6 +29,45 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Round a Duration to integer milliseconds for log output.
+fn ms(d: Duration) -> u128 {
+    d.as_millis()
+}
+
+/// Format Duration as seconds with 2 decimal places (used for hold time).
+fn secs(d: Duration) -> String {
+    format!("{:.2}s", d.as_secs_f64())
+}
+
+/// Look up an app name from a PID via `ps`. Falls back to the bare PID
+/// if the lookup fails. Used purely for log readability.
+fn app_name(pid: i32) -> String {
+    std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            // `/path/to/Visual Studio Code.app/Contents/MacOS/Code` →
+            // `Visual Studio Code`
+            let trimmed = s.trim();
+            if let Some(idx) = trimmed.find(".app/") {
+                let before = &trimmed[..idx];
+                if let Some(last_slash) = before.rfind('/') {
+                    return before[last_slash + 1..].to_string();
+                }
+                return before.to_string();
+            }
+            // Fallback: basename of the binary path
+            trimmed
+                .rsplit('/')
+                .next()
+                .unwrap_or(trimmed)
+                .to_string()
+        })
+        .unwrap_or_else(|| format!("pid {pid}"))
+}
+
 #[cfg(feature = "cleaner")]
 use crate::cleaner::TextCleanupEngine;
 
@@ -152,9 +191,10 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     std::mem::forget(loop_source);
 
     eprintln!(
-        "[daemon] ready. Hold Right Option (keycode 0x{:x}) to dictate. ⌘Q in the menu-bar item quits.",
+        "[boot] ready · hold Right Option (0x{:x}) to dictate · ⌘Q quits",
         hotkey_keycode
     );
+    eprintln!();
     menubar::set_state(UiState::Idle);
 
     // Hand the main thread to NSApplication. AppKit pumps the same
@@ -185,10 +225,9 @@ fn worker_loop(
     rx: std::sync::mpsc::Receiver<DaemonEvent>,
     config: DaemonConfig,
 ) -> eyre::Result<()> {
-    eprintln!("[daemon] loading Parakeet TDT v3 INT8 from {}", config.parakeet_dir);
     let t_load = Instant::now();
     let mut worker = LocalInferenceWorker::initialize(&config.parakeet_dir)?;
-    eprintln!("[daemon] parakeet loaded in {:?}", t_load.elapsed());
+    eprintln!("[boot] parakeet    loaded in {:>4} ms", ms(t_load.elapsed()));
 
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
@@ -196,12 +235,15 @@ fn worker_loop(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(&config.gemma_path);
-        eprintln!("[daemon] loading cleanup model: {pretty}");
         let t = Instant::now();
         let c = TextCleanupEngine::initialize(&config.gemma_path)?;
-        eprintln!("[daemon] cleanup model loaded in {:?}", t.elapsed());
+        eprintln!(
+            "[boot] cleaner     loaded in {:>4} ms · {pretty}",
+            ms(t.elapsed())
+        );
         Some(c)
     } else {
+        eprintln!("[boot] cleaner     disabled (--no-cleanup)");
         None
     };
 
@@ -212,7 +254,6 @@ fn worker_loop(
 
     // Warm-up: first call pays graph-optimization + CoreML compile / Metal
     // shader compile costs. Pay them now so the first real utterance is hot.
-    eprintln!("[daemon] warming up models...");
     let t_warm = Instant::now();
     let warm_silence = vec![0.0_f32; 16_000]; // 1 s of silence at 16 kHz
     let _ = worker.transcribe_pcm(&warm_silence);
@@ -220,7 +261,7 @@ fn worker_loop(
     if let Some(ref c) = cleaner {
         let _ = rt.block_on(c.process_transcript("warmup")).ok();
     }
-    eprintln!("[daemon] warm-up done in {:?}", t_warm.elapsed());
+    eprintln!("[boot] warm-up     done   in {:>4} ms", ms(t_warm.elapsed()));
 
     // Per-utterance state.
     let mut engine: Option<AudioCaptureEngine> = None;
@@ -232,21 +273,21 @@ fn worker_loop(
         match event {
             DaemonEvent::StartRecording => {
                 if engine.is_some() {
-                    continue; // already recording (key bounced?)
+                    continue;
                 }
                 t_press = Some(Instant::now());
                 let (mut e, c) = AudioCaptureEngine::new(BUFFER_CAPACITY);
                 let r = match e.start_microphone() {
                     Ok(r) => r,
                     Err(err) => {
-                        eprintln!("[daemon] mic open failed: {err:?}");
+                        eprintln!("[err]  mic open failed: {err:?}");
                         cues::play_error();
                         continue;
                     }
                 };
                 cues::play_start();
                 menubar::set_state(UiState::Recording);
-                eprintln!("[daemon] ● recording");
+                eprintln!("▶ recording");
                 engine = Some(e);
                 consumer = Some(c);
                 is_recording = Some(r);
@@ -257,10 +298,8 @@ fn worker_loop(
                 cues::play_stop();
                 menubar::set_state(UiState::Processing);
                 let press_to_release = t_press.take().map(|t| t.elapsed());
-                eprintln!(
-                    "[daemon] ○ stopped after {:?}",
-                    press_to_release.unwrap_or_default()
-                );
+                let held = press_to_release.unwrap_or_default();
+                eprintln!("⏹ stopped · held {}", secs(held));
 
                 // Spawn AX focus capture in parallel with the inference
                 // pipeline. By the time Parakeet+Gemma finish, the focused
@@ -280,16 +319,19 @@ fn worker_loop(
                 let transcript = match rt.block_on(worker.run_inference_pipeline(c, r)) {
                     Ok(t) => t,
                     Err(err) => {
-                        eprintln!("[daemon] transcribe failed: {err:?}");
+                        eprintln!("[err]  transcribe failed: {err:?}");
                         cues::play_error();
                         menubar::set_state(UiState::Idle);
+                        eprintln!();
                         continue;
                     }
                 };
                 let t_transcribe = t_pipeline.elapsed();
 
+                let mut t_cleanup_ms = 0_u128;
                 let final_text = if transcript.trim().is_empty() {
-                    eprintln!("[daemon] empty transcript — skipping");
+                    eprintln!("  skip · empty transcript");
+                    eprintln!();
                     menubar::set_state(UiState::Idle);
                     continue;
                 } else {
@@ -299,34 +341,27 @@ fn worker_loop(
                             let t_clean = Instant::now();
                             match rt.block_on(c.process_transcript(&transcript)) {
                                 Ok(cleaned) => {
-                                    eprintln!(
-                                        "[daemon] cleanup: {:?} | transcribe: {:?} | total: {:?}",
-                                        t_clean.elapsed(),
-                                        t_transcribe,
-                                        t_pipeline.elapsed()
-                                    );
+                                    t_cleanup_ms = ms(t_clean.elapsed());
                                     cleaned
                                 }
                                 Err(err) => {
-                                    eprintln!(
-                                        "[daemon] cleanup failed, using raw transcript: {err:?}"
-                                    );
+                                    eprintln!("[warn] cleanup failed, using raw: {err:?}");
                                     transcript
                                 }
                             }
                         } else {
-                            eprintln!("[daemon] cleanup skipped | transcribe: {t_transcribe:?}");
                             transcript
                         }
                     }
                     #[cfg(not(feature = "cleaner"))]
                     {
-                        eprintln!("[daemon] transcribe: {t_transcribe:?}");
                         transcript
                     }
                 };
 
                 if final_text.trim().is_empty() {
+                    eprintln!("  skip · cleaned to empty");
+                    eprintln!();
                     menubar::set_state(UiState::Idle);
                     continue;
                 }
@@ -334,64 +369,72 @@ fn worker_loop(
                 // Voice command detection: trailing "press enter" is
                 // stripped and turned into a Return keystroke after inject.
                 let (final_text, action) = parse_trailing_command(&final_text);
-                if matches!(action, TrailingAction::PressEnter) {
-                    eprintln!("[daemon] trailing voice command: press enter");
-                }
+                let press_enter = matches!(action, TrailingAction::PressEnter);
 
-                if final_text.trim().is_empty() && !matches!(action, TrailingAction::None) {
-                    // Pure "press enter" with no body: just fire Return.
+                if final_text.trim().is_empty() && press_enter {
                     let _ = crate::clipboard_paste::synthesize_return();
+                    eprintln!("  ↵    bare Return (no body)");
+                    eprintln!();
                     menubar::set_state(UiState::Idle);
                     continue;
                 }
 
-                // Inject using the pre-captured focus target if it's ready
-                // (it almost always is — capture takes 30-150 ms; inference
-                // takes 200-500 ms). Falls back to fresh inject path on
-                // capture failure (e.g. nothing was focused at key release).
+                // Inject using the pre-captured focus target.
                 let t_inject = Instant::now();
-                let inject_result = match target_rx.try_recv() {
+                let (inject_result, target_pid, used_fresh_capture) = match target_rx.try_recv() {
                     Ok(Ok(target)) => {
-                        let ax_wait = t_ax_start.elapsed();
-                        eprintln!(
-                            "[daemon] focus captured in {ax_wait:?} (parallel with inference)"
-                        );
-                        AccessibilityInjector::inject_with_target(target, &final_text)
+                        let pid = target.inner_pid();
+                        (
+                            AccessibilityInjector::inject_with_target(target, &final_text),
+                            pid,
+                            false,
+                        )
                     }
-                    Ok(Err(e)) => {
-                        eprintln!(
-                            "[daemon] focus capture failed ({e:?}); using fresh inject"
-                        );
-                        AccessibilityInjector::inject_text(&final_text)
-                    }
-                    Err(_) => {
-                        // Capture not done yet — block briefly for it.
-                        match target_rx.recv() {
-                            Ok(Ok(t)) => AccessibilityInjector::inject_with_target(t, &final_text),
-                            _ => AccessibilityInjector::inject_text(&final_text),
+                    Ok(Err(_)) => (
+                        AccessibilityInjector::inject_text(&final_text),
+                        None,
+                        true,
+                    ),
+                    Err(_) => match target_rx.recv() {
+                        Ok(Ok(t)) => {
+                            let pid = t.inner_pid();
+                            (
+                                AccessibilityInjector::inject_with_target(t, &final_text),
+                                pid,
+                                false,
+                            )
                         }
-                    }
+                        _ => (AccessibilityInjector::inject_text(&final_text), None, true),
+                    },
                 };
-                if let Err(err) = inject_result {
-                    eprintln!("[daemon] inject failed: {err:?}");
+                let t_inject_ms = ms(t_inject.elapsed());
+
+                // ─── per-utterance summary block ───────────────────────
+                eprintln!(
+                    "  xcr  {:>4} ms · cln {:>4} ms · inj {:>4} ms",
+                    ms(t_transcribe),
+                    t_cleanup_ms,
+                    t_inject_ms
+                );
+                if let Some(pid) = target_pid {
+                    eprintln!("  app  {} (pid {})", app_name(pid), pid);
+                } else if used_fresh_capture {
+                    eprintln!("  app  <fresh capture · target unknown>");
+                }
+                if let Err(err) = &inject_result {
+                    eprintln!("  ✗    inject failed: {err:?}");
                     cues::play_error();
                 } else {
-                    eprintln!(
-                        "[daemon] injected ({} chars) in {:?} → \"{final_text}\"",
-                        final_text.len(),
-                        t_inject.elapsed()
-                    );
-                    if matches!(action, TrailingAction::PressEnter) {
-                        // Small settle delay so the text is actually in
-                        // the field before Return fires.
+                    eprintln!("  ✓    \"{final_text}\"");
+                    if press_enter {
                         std::thread::sleep(Duration::from_millis(40));
-                        if let Err(e) = crate::clipboard_paste::synthesize_return() {
-                            eprintln!("[daemon] synth return failed: {e:?}");
-                        } else {
-                            eprintln!("[daemon] ↵ Return key sent");
+                        match crate::clipboard_paste::synthesize_return() {
+                            Ok(_) => eprintln!("  ↵    Return key sent"),
+                            Err(e) => eprintln!("  ✗    synth return failed: {e:?}"),
                         }
                     }
                 }
+                eprintln!();
                 menubar::set_state(UiState::Idle);
             }
         }
