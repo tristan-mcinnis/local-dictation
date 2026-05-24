@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workflow
+
+Work directly on `main` — no worktrees, no feature branches. After every change, commit it and
+push to `origin/main` in the same step (don't wait to be asked). Keep the working tree clean.
+
 ## What this is
 
 A local-first, push-to-talk dictation daemon for Apple Silicon macOS. Hold a hotkey, speak,
