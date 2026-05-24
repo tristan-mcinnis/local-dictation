@@ -1,44 +1,13 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, Stream};
 use ringbuf::{
-    traits::{Producer, Split},
+    traits::{Consumer, Observer, Producer, Split},
     HeapCons, HeapProd, HeapRb,
 };
-use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+    Arc,
 };
-
-/// How many recent RMS samples we keep for the waveform display.
-/// Matches the number of bars in the floating pill.
-pub const WAVEFORM_BARS: usize = 14;
-
-/// Process-wide ring of recent RMS levels (one per cpal callback chunk).
-/// Written from the cpal audio thread, read from the menu-bar UI timer.
-static AUDIO_LEVELS: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::new());
-
-pub fn push_audio_level(rms: f32) {
-    if let Ok(mut q) = AUDIO_LEVELS.lock() {
-        if q.len() >= WAVEFORM_BARS {
-            q.pop_front();
-        }
-        q.push_back(rms);
-    }
-}
-
-pub fn recent_levels() -> Vec<f32> {
-    AUDIO_LEVELS
-        .lock()
-        .map(|q| q.iter().copied().collect())
-        .unwrap_or_default()
-}
-
-pub fn reset_levels() {
-    if let Ok(mut q) = AUDIO_LEVELS.lock() {
-        q.clear();
-    }
-}
 
 pub const SAMPLE_RATE: u32 = 16_000;
 /// 30 s of headroom (16 000 samples/s · 30) — comfortably bigger than the
@@ -229,7 +198,7 @@ fn push_resampled(
     // pre-resample on native mono so it reflects real microphone activity.
     let sum_sq: f32 = mono.iter().map(|x| x * x).sum();
     let rms = (sum_sq / mono.len() as f32).sqrt();
-    push_audio_level(rms);
+    crate::ui_channel::push_level(rms);
 
     // Linear-interpolate at `stride`. `pos` indexes into the mono buffer.
     // When pos crosses a frame boundary the carry advances by `stride` again.
@@ -246,4 +215,30 @@ fn push_resampled(
     // into the next chunk.
     *pos -= mono.len() as f64;
     *last = *mono.last().unwrap();
+}
+
+/// Drain the SPSC ring buffer into a single contiguous PCM buffer, returning
+/// once `is_recording` is false **and** the buffer has been fully consumed.
+///
+/// This is the system's "when is an utterance done" rule: capture has stopped
+/// *and* every queued sample has been pulled. It lives here, decoupled from
+/// the transcription model, so the termination invariant has exactly one home
+/// — the transcriber composes it with `transcribe_pcm`, and the integration
+/// test exercises this very function instead of a hand-rolled copy.
+pub async fn drain_until_stopped(
+    mut consumer: HeapAudioConsumer,
+    is_recording: Arc<AtomicBool>,
+) -> Vec<f32> {
+    let mut audio_buffer: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize * 5);
+    while is_recording.load(Ordering::SeqCst) || !consumer.is_empty() {
+        let pending = consumer.occupied_len();
+        if pending > 0 {
+            let mut chunk = vec![0.0_f32; pending];
+            let got = consumer.pop_slice(&mut chunk);
+            audio_buffer.extend_from_slice(&chunk[..got]);
+        } else {
+            tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+        }
+    }
+    audio_buffer
 }

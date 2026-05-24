@@ -1,9 +1,5 @@
-use crate::audio::{HeapAudioConsumer, SAMPLE_RATE};
-use ringbuf::traits::{Consumer, Observer};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use crate::audio::{drain_until_stopped, HeapAudioConsumer, SAMPLE_RATE};
+use std::sync::{atomic::AtomicBool, Arc};
 
 #[cfg(feature = "parakeet")]
 use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
@@ -34,25 +30,14 @@ impl LocalInferenceWorker {
     }
 
     /// Drain the SPSC ring buffer until capture stops, then run inference on
-    /// the accumulated samples.
+    /// the accumulated samples. The drain/termination logic lives in
+    /// `audio::drain_until_stopped`; this just composes it with the model.
     pub async fn run_inference_pipeline(
         &mut self,
-        mut consumer: HeapAudioConsumer,
+        consumer: HeapAudioConsumer,
         is_recording: Arc<AtomicBool>,
     ) -> eyre::Result<String> {
-        let mut audio_buffer: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize * 5);
-
-        while is_recording.load(Ordering::SeqCst) || !consumer.is_empty() {
-            let pending = consumer.occupied_len();
-            if pending > 0 {
-                let mut chunk = vec![0.0_f32; pending];
-                let got = consumer.pop_slice(&mut chunk);
-                audio_buffer.extend_from_slice(&chunk[..got]);
-            } else {
-                tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
-            }
-        }
-
+        let audio_buffer = drain_until_stopped(consumer, is_recording).await;
         self.transcribe_pcm(&audio_buffer)
     }
 

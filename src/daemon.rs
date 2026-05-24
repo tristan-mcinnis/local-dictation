@@ -17,9 +17,11 @@ use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
 use crate::corrections::Corrections;
 use crate::cues;
 use crate::injector::{AccessibilityInjector, FocusTarget};
-use crate::menubar::{self, UiState};
+use crate::menubar;
+use crate::refiner::Refiner;
 use crate::transcriber::LocalInferenceWorker;
-use crate::voice_commands::{parse_trailing_command, TrailingAction};
+use crate::ui_channel::{self, UiState};
+use crate::voice_commands::TrailingAction;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -194,7 +196,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         hotkey_keycode
     );
     eprintln!();
-    menubar::set_state(UiState::Idle);
+    ui_channel::set_state(UiState::Idle);
 
     // Hand the main thread to NSApplication. AppKit pumps the same
     // CFRunLoop that our event tap is attached to, so the tap + menu bar +
@@ -268,7 +270,9 @@ fn worker_loop(
     }
     eprintln!("[boot] warm-up     done   in {:>4} ms", ms(t_warm.elapsed()));
 
-    // Load personal corrections dictionary (no-op if no file).
+    // Load personal corrections dictionary (no-op if no file) and wrap it in
+    // the refiner that applies corrections + voice-command parsing in the
+    // canonical order.
     let corrections = match Corrections::load_default() {
         Ok(c) => {
             if c.is_empty() {
@@ -283,6 +287,7 @@ fn worker_loop(
             Corrections::empty()
         }
     };
+    let refiner = Refiner::new(corrections);
 
     // Per-utterance state.
     let mut engine: Option<AudioCaptureEngine> = None;
@@ -307,7 +312,7 @@ fn worker_loop(
                     }
                 };
                 cues::play_start();
-                menubar::set_state(UiState::Recording);
+                ui_channel::set_state(UiState::Recording);
                 eprintln!("▶ recording");
                 engine = Some(e);
                 consumer = Some(c);
@@ -317,7 +322,7 @@ fn worker_loop(
                 let Some(mut e) = engine.take() else { continue };
                 e.stop_capture();
                 cues::play_stop();
-                menubar::set_state(UiState::Processing);
+                ui_channel::set_state(UiState::Processing);
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 let held = press_to_release.unwrap_or_default();
                 eprintln!("⏹ stopped · held {}", secs(held));
@@ -326,7 +331,6 @@ fn worker_loop(
                 // pipeline. By the time Parakeet+Gemma finish, the focused
                 // element is already known — get_focused_element drops off
                 // the critical path.
-                let t_ax_start = Instant::now();
                 let (target_tx, target_rx) =
                     std::sync::mpsc::channel::<eyre::Result<FocusTarget>>();
                 std::thread::spawn(move || {
@@ -342,7 +346,7 @@ fn worker_loop(
                     Err(err) => {
                         eprintln!("[err]  transcribe failed: {err:?}");
                         cues::play_error();
-                        menubar::set_state(UiState::Idle);
+                        ui_channel::set_state(UiState::Idle);
                         eprintln!();
                         continue;
                     }
@@ -353,7 +357,7 @@ fn worker_loop(
                 let final_text = if transcript.trim().is_empty() {
                     eprintln!("  skip · empty transcript");
                     eprintln!();
-                    menubar::set_state(UiState::Idle);
+                    ui_channel::set_state(UiState::Idle);
                     continue;
                 } else {
                     #[cfg(feature = "cleaner")]
@@ -380,30 +384,26 @@ fn worker_loop(
                     }
                 };
 
-                if final_text.trim().is_empty() {
-                    eprintln!("  skip · cleaned to empty");
-                    eprintln!();
-                    menubar::set_state(UiState::Idle);
-                    continue;
-                }
+                // Corrections dictionary + trailing voice-command parsing, in
+                // the canonical order (corrections first). Same transform the
+                // CLI `dictate`/`bench` paths now use, so behaviour matches.
+                let refined = refiner.refine(&final_text);
+                let press_enter = matches!(refined.action, TrailingAction::PressEnter);
 
-                // Apply user corrections dictionary (proper nouns, common
-                // misspellings, domain casing) BEFORE the voice-command
-                // parse so corrections to the trigger phrase don't fire.
-                let final_text = corrections.apply(&final_text);
-
-                // Voice command detection: trailing "press enter" is
-                // stripped and turned into a Return keystroke after inject.
-                let (final_text, action) = parse_trailing_command(&final_text);
-                let press_enter = matches!(action, TrailingAction::PressEnter);
-
-                if final_text.trim().is_empty() && press_enter {
+                if refined.is_bare_action() {
                     let _ = crate::clipboard_paste::synthesize_return();
                     eprintln!("  ↵    bare Return (no body)");
                     eprintln!();
-                    menubar::set_state(UiState::Idle);
+                    ui_channel::set_state(UiState::Idle);
                     continue;
                 }
+                if refined.is_empty() {
+                    eprintln!("  skip · cleaned to empty");
+                    eprintln!();
+                    ui_channel::set_state(UiState::Idle);
+                    continue;
+                }
+                let final_text = refined.text;
 
                 // Inject using the pre-captured focus target.
                 let t_inject = Instant::now();
@@ -453,7 +453,7 @@ fn worker_loop(
                 } else {
                     eprintln!("  ✓    \"{final_text}\"");
                     // Remember it for the menu-bar "Copy last dictation" item.
-                    menubar::set_last_dictation(&final_text);
+                    ui_channel::set_last_dictation(&final_text);
                     // Persist to the browsable dictation history (best-effort;
                     // never blocks or fails the hot path).
                     crate::history::record(&final_text);
@@ -466,7 +466,7 @@ fn worker_loop(
                     }
                 }
                 eprintln!();
-                menubar::set_state(UiState::Idle);
+                ui_channel::set_state(UiState::Idle);
             }
         }
 

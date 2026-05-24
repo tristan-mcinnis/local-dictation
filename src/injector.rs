@@ -164,11 +164,13 @@ mod imp {
         }
     }
 
-    /// Full path: resolve focused element → read context → smart-pad →
-    /// attempt AX inject → fall back to clipboard paste.
+    /// Resolve-now path: find the focused element → read context → smart-pad
+    /// → hand off to the shared write ladder. Used by the systemwide + by-PID
+    /// entry points. The pre-captured-target path (`inject_via_target`) shares
+    /// the same ladder; the only difference is *when* the focus element is
+    /// resolved.
     unsafe fn inject_through(root: AXUIElementRef, text: &str) -> eyre::Result<()> {
         let prof = std::env::var("INJECT_PROFILE").is_ok();
-        let t_total = std::time::Instant::now();
 
         // 1. Focused element.
         let t = std::time::Instant::now();
@@ -195,37 +197,11 @@ mod imp {
         }
         let focused = focused_ref as AXUIElementRef;
 
-        // 2. Context: read current value + caret position. Both may be
-        //    absent (Electron apps, sandboxed web views, some Java apps
-        //    don't expose AXValue) — in that case fall back to our
-        //    remembered last-injected-tail character so consecutive
-        //    utterances still get the right spacing + capitalization.
-        //
-        // Optimization: if the focused app's PID has previously refused
-        // AXValue reads, skip the (~100 ms) round-trip entirely and go
-        // straight to the LAST_TAIL fallback.
-        let t = std::time::Instant::now();
-        let focused_pid = focused_pid_of(focused);
-        if prof { eprintln!("[inject-prof] get_pid:               {:?}  (pid={:?}, blind={:?})",
-            t.elapsed(), focused_pid, focused_pid.map(super::is_ax_blind)); }
-
-        let t = std::time::Instant::now();
+        // 2. Context (with the ax-blind shortcut), then tail fallback when the
+        //    element doesn't expose AXValue (Electron / web views / some Java).
+        let pid = focused_pid_of(focused);
         let (mut immediate_before, mut last_nws_before, char_after) =
-            if let Some(pid) = focused_pid {
-                if super::is_ax_blind(pid) {
-                    (None, None, None)
-                } else {
-                    let ctx = read_caret_context(focused);
-                    if ctx.0.is_none() && ctx.1.is_none() {
-                        super::mark_ax_blind(pid);
-                    }
-                    ctx
-                }
-            } else {
-                read_caret_context(focused)
-            };
-        if prof { eprintln!("[inject-prof] read_caret_context:    {:?}  (immediate={:?}, after={:?})",
-            t.elapsed(), immediate_before, char_after); }
+            read_context_with_blind(focused, pid);
         if immediate_before.is_none() && last_nws_before.is_none() {
             if let Some(tail) = super::recall_tail() {
                 immediate_before = Some(tail);
@@ -240,21 +216,72 @@ mod imp {
             return Ok(());
         }
 
-        // 4. AX write — try SelectedText, then Value.
+        // 4. Shared write ladder. Caller owns `focused`, so release after.
+        let r = write_padded(focused, pid, &padded, prof);
+        cf_release(focused as CFTypeRef);
+        r
+    }
+
+    /// Read caret context while honoring the per-PID ax-blind cache: skip the
+    /// (~100 ms) AXValue round-trip for PIDs we've already learned don't expose
+    /// it, and learn new ones on the fly. Returns
+    /// `(immediate_before, last_nws_before, char_after)`.
+    unsafe fn read_context_with_blind(
+        focused: AXUIElementRef,
+        pid: Option<i32>,
+    ) -> (Option<char>, Option<char>, Option<char>) {
+        match pid {
+            Some(pid) if super::is_ax_blind(pid) => (None, None, None),
+            Some(pid) => {
+                let ctx = read_caret_context(focused);
+                if ctx.0.is_none() && ctx.1.is_none() {
+                    super::mark_ax_blind(pid);
+                }
+                ctx
+            }
+            None => read_caret_context(focused),
+        }
+    }
+
+    /// The single AX write ladder shared by both injection entry points:
+    /// Electron/browser short-circuit → `kAXSelectedText` → `kAXValue` →
+    /// clipboard paste. Records the injected tail on any success. Does **not**
+    /// release `focused` — the caller owns its lifetime.
+    unsafe fn write_padded(
+        focused: AXUIElementRef,
+        pid: Option<i32>,
+        padded: &str,
+        prof: bool,
+    ) -> eyre::Result<()> {
+        let t_total = std::time::Instant::now();
+
+        // Electron / browser targets accept AX writes with kAXErrorSuccess but
+        // never render the text. Route them straight to clipboard paste, which
+        // always works because it goes through the system-level Cmd+V handler.
+        if let Some(pid) = pid {
+            if super::is_clipboard_only_pid(pid) {
+                if prof { eprintln!("[inject-prof] clipboard-only pid {pid} — clipboard paste"); }
+                let r = crate::clipboard_paste::paste_via_clipboard(padded);
+                if r.is_ok() {
+                    super::remember_tail(padded);
+                }
+                return r;
+            }
+        }
+
+        let payload = CFString::new(padded);
+
         let t = std::time::Instant::now();
-        let payload = CFString::new(&padded);
         let sel_attr = CFString::new(kAXSelectedTextAttribute);
         let sel_err = AXUIElementSetAttributeValue(
             focused,
             sel_attr.as_concrete_TypeRef(),
             payload.as_concrete_TypeRef() as CFTypeRef,
         );
-        if prof { eprintln!("[inject-prof] set_selected_text:     {:?}  (err={sel_err})", t.elapsed()); }
-
+        if prof { eprintln!("[inject-prof] set_selected_text: {:?} (err={sel_err})", t.elapsed()); }
         if sel_err == kAXErrorSuccess {
-            cf_release(focused as CFTypeRef);
-            super::remember_tail(&padded);
-            if prof { eprintln!("[inject-prof] TOTAL:                {:?}", t_total.elapsed()); }
+            super::remember_tail(padded);
+            if prof { eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed()); }
             return Ok(());
         }
 
@@ -265,21 +292,20 @@ mod imp {
             val_attr.as_concrete_TypeRef(),
             payload.as_concrete_TypeRef() as CFTypeRef,
         );
-        if prof { eprintln!("[inject-prof] set_value:             {:?}  (err={val_err})", t.elapsed()); }
-        cf_release(focused as CFTypeRef);
-
+        if prof { eprintln!("[inject-prof] set_value: {:?} (err={val_err})", t.elapsed()); }
         if val_err == kAXErrorSuccess {
-            super::remember_tail(&padded);
+            super::remember_tail(padded);
+            if prof { eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed()); }
             return Ok(());
         }
 
-        // 5. Clipboard fallback.
+        // Both AX writes refused — clipboard fallback.
         eprintln!(
             "[inject] AX writes refused (selected={sel_err}, value={val_err}); using clipboard paste"
         );
-        let r = crate::clipboard_paste::paste_via_clipboard(&padded);
+        let r = crate::clipboard_paste::paste_via_clipboard(padded);
         if r.is_ok() {
-            super::remember_tail(&padded);
+            super::remember_tail(padded);
         }
         r
     }
@@ -418,19 +444,7 @@ mod imp {
             // AX-blind apps this returns (None, None, None) quickly.
             let focused_pid = focused_pid_of(focused);
             let (immediate_before, last_nws_before, char_after) =
-                if let Some(pid) = focused_pid {
-                    if super::is_ax_blind(pid) {
-                        (None, None, None)
-                    } else {
-                        let ctx = read_caret_context(focused);
-                        if ctx.0.is_none() && ctx.1.is_none() {
-                            super::mark_ax_blind(pid);
-                        }
-                        ctx
-                    }
-                } else {
-                    read_caret_context(focused)
-                };
+                read_context_with_blind(focused, focused_pid);
 
             // Diagnostic: log what we're about to write into. Enable with
             // INJECT_DIAG=1. Helps explain "no text appears" when an
@@ -468,10 +482,11 @@ mod imp {
     }
 
     /// Write `text` into a pre-captured focus target. Skips the
-    /// get_focused_element + context read costs entirely.
+    /// get_focused_element + context read costs entirely (they were paid in
+    /// parallel with inference at capture time) and routes the actual write
+    /// through the same `write_padded` ladder as the resolve-now path.
     pub fn inject_via_target(target: FocusTargetInner, text: &str) -> eyre::Result<()> {
         let prof = std::env::var("INJECT_PROFILE").is_ok();
-        let t_total = std::time::Instant::now();
 
         // Apply remembered tail fallback if context was empty.
         let (immediate_before, last_nws_before) = if target.immediate_before.is_none()
@@ -488,69 +503,9 @@ mod imp {
             return Ok(());
         }
 
-        // Short-circuit: Electron / browser targets accept AX writes with
-        // kAXErrorSuccess but never render the text. Route them straight
-        // to clipboard paste, which always works because it uses the
-        // system-level Cmd+V handler.
-        if let Some(pid) = target.pid {
-            if super::is_clipboard_only_pid(pid) {
-                if prof {
-                    eprintln!("[inject-prof] (via target) Electron pid {pid} — clipboard paste");
-                }
-                let r = crate::clipboard_paste::paste_via_clipboard(&padded);
-                if r.is_ok() {
-                    super::remember_tail(&padded);
-                }
-                return r;
-            }
-        }
-
-        unsafe {
-            let t = std::time::Instant::now();
-            let payload = CFString::new(&padded);
-            let sel_attr = CFString::new(kAXSelectedTextAttribute);
-            let sel_err = AXUIElementSetAttributeValue(
-                target.focused,
-                sel_attr.as_concrete_TypeRef(),
-                payload.as_concrete_TypeRef() as CFTypeRef,
-            );
-            if prof {
-                eprintln!("[inject-prof] (via target) set_selected_text: {:?} err={sel_err}", t.elapsed());
-            }
-
-            if sel_err == kAXErrorSuccess {
-                super::remember_tail(&padded);
-                if prof { eprintln!("[inject-prof] (via target) TOTAL: {:?}", t_total.elapsed()); }
-                return Ok(());
-            }
-
-            let t = std::time::Instant::now();
-            let val_attr = CFString::new(kAXValueAttribute);
-            let val_err = AXUIElementSetAttributeValue(
-                target.focused,
-                val_attr.as_concrete_TypeRef(),
-                payload.as_concrete_TypeRef() as CFTypeRef,
-            );
-            if prof {
-                eprintln!("[inject-prof] (via target) set_value: {:?} err={val_err}", t.elapsed());
-            }
-
-            if val_err == kAXErrorSuccess {
-                super::remember_tail(&padded);
-                if prof { eprintln!("[inject-prof] (via target) TOTAL: {:?}", t_total.elapsed()); }
-                return Ok(());
-            }
-
-            // Both AX writes failed — fall back to clipboard paste.
-            eprintln!(
-                "[inject] AX writes refused (sel={sel_err}, val={val_err}); using clipboard paste"
-            );
-            let r = crate::clipboard_paste::paste_via_clipboard(&padded);
-            if r.is_ok() {
-                super::remember_tail(&padded);
-            }
-            r
-        }
+        // `target` owns the retained focused element and releases it on drop
+        // when this function returns.
+        unsafe { write_padded(target.focused, target.pid, &padded, prof) }
     }
 }
 
