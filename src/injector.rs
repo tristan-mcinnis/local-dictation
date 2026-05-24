@@ -104,6 +104,41 @@ pub fn is_clipboard_only_pid(pid: i32) -> bool {
     clipboard_only
 }
 
+/// PIDs whose AX write we've *verified* actually rendered (read the value
+/// back and saw our text). Once a PID is here we trust its AX path and skip
+/// the post-write verification read on every subsequent utterance.
+static AX_VERIFIED_PID: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+fn is_ax_verified(pid: i32) -> bool {
+    AX_VERIFIED_PID
+        .lock()
+        .map(|g| g.contains(&pid))
+        .unwrap_or(false)
+}
+
+fn mark_ax_verified(pid: i32) {
+    if let Ok(mut g) = AX_VERIFIED_PID.lock() {
+        if !g.contains(&pid) {
+            g.push(pid);
+        }
+    }
+}
+
+/// Promote a PID to clipboard-only at runtime. Used when an AX write returns
+/// success but the value read-back proves nothing rendered — i.e. an app with
+/// the lying-AX trait that isn't on the static name list. Updates the existing
+/// cache entry (the name lookup will have inserted `false`) or inserts a fresh
+/// `true` so all future injects skip the AX path for this PID.
+fn mark_clipboard_only(pid: i32) {
+    if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
+        if let Some(entry) = cache.iter_mut().find(|(p, _)| *p == pid) {
+            entry.1 = true;
+        } else {
+            cache.push((pid, true));
+        }
+    }
+}
+
 fn remember_tail(text: &str) {
     let tail = text.chars().rev().find(|c| !c.is_whitespace());
     if let Ok(mut g) = LAST_TAIL.lock() {
@@ -299,9 +334,9 @@ mod imp {
         );
         if prof { eprintln!("[inject-prof] set_selected_text: {:?} (err={sel_err})", t.elapsed()); }
         if sel_err == kAXErrorSuccess {
-            super::remember_tail(padded);
+            let r = confirm_or_fallback(focused, pid, padded, prof);
             if prof { eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed()); }
-            return Ok(());
+            return r;
         }
 
         let t = std::time::Instant::now();
@@ -313,9 +348,9 @@ mod imp {
         );
         if prof { eprintln!("[inject-prof] set_value: {:?} (err={val_err})", t.elapsed()); }
         if val_err == kAXErrorSuccess {
-            super::remember_tail(padded);
+            let r = confirm_or_fallback(focused, pid, padded, prof);
             if prof { eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed()); }
-            return Ok(());
+            return r;
         }
 
         // Both AX writes refused — clipboard fallback.
@@ -327,6 +362,87 @@ mod imp {
             super::remember_tail(padded);
         }
         r
+    }
+
+    /// Called after an AX write returns `kAXErrorSuccess`. Some apps (Electron
+    /// web views, native terminals) accept the write and report success but
+    /// their renderer silently discards it — the static name list in
+    /// `is_clipboard_only_pid` only knows the ones we've named. To catch the
+    /// rest automatically, the *first* successful AX write to a PID is verified
+    /// by reading the value back and checking our text actually landed:
+    ///
+    ///   * rendered  → mark the PID AX-verified (skip this check forever after)
+    ///                 and return `Ok`.
+    ///   * vanished  → promote the PID to clipboard-only and paste via Cmd+V
+    ///                 instead, so this and every future utterance render.
+    ///
+    /// PIDs already AX-verified short-circuit with zero extra AX calls, so the
+    /// read-back cost is paid at most once per app. A genuinely-good field that
+    /// doesn't expose a readable value reads as "vanished" and is downgraded to
+    /// clipboard paste — slightly more clipboard churn, but still correct.
+    unsafe fn confirm_or_fallback(
+        focused: AXUIElementRef,
+        pid: Option<i32>,
+        padded: &str,
+        prof: bool,
+    ) -> eyre::Result<()> {
+        let pid = match pid {
+            Some(p) if !super::is_ax_verified(p) => p,
+            // No PID to cache against, or already trusted — believe the success.
+            _ => {
+                super::remember_tail(padded);
+                return Ok(());
+            }
+        };
+
+        if ax_write_rendered(focused, padded) {
+            super::mark_ax_verified(pid);
+            super::remember_tail(padded);
+            return Ok(());
+        }
+
+        if prof {
+            eprintln!(
+                "[inject-prof] AX write reported success but value didn't change (pid {pid}); marking clipboard-only + falling back to Cmd+V"
+            );
+        }
+        super::mark_clipboard_only(pid);
+        let r = crate::clipboard_paste::paste_via_clipboard(padded);
+        if r.is_ok() {
+            super::remember_tail(padded);
+        }
+        r
+    }
+
+    /// True if the focused element's value now contains the text we just wrote.
+    /// The needle is the trimmed payload (smart-pad's leading/trailing spaces
+    /// don't survive into a terminal grid anyway). A missing/unreadable value
+    /// counts as "did not render".
+    unsafe fn ax_write_rendered(focused: AXUIElementRef, padded: &str) -> bool {
+        let needle = padded.trim();
+        if needle.is_empty() {
+            return true;
+        }
+        match read_value(focused) {
+            Some(value) => value.contains(needle),
+            None => false,
+        }
+    }
+
+    /// Read `kAXValue` off an element as a `String`, or `None` if it doesn't
+    /// expose a readable string value.
+    unsafe fn read_value(focused: AXUIElementRef) -> Option<String> {
+        let mut value_ref: CFTypeRef = ptr::null();
+        let val_attr = CFString::new(kAXValueAttribute);
+        let err = AXUIElementCopyAttributeValue(
+            focused,
+            val_attr.as_concrete_TypeRef(),
+            &mut value_ref,
+        );
+        if err != kAXErrorSuccess || value_ref.is_null() {
+            return None;
+        }
+        Some(CFString::wrap_under_create_rule(value_ref as CFStringRef).to_string())
     }
 
     /// Get the PID of the process that owns the focused AXUIElement, or None
@@ -347,17 +463,10 @@ mod imp {
     unsafe fn read_caret_context(
         focused: AXUIElementRef,
     ) -> (Option<char>, Option<char>, Option<char>) {
-        let mut value_ref: CFTypeRef = ptr::null();
-        let val_attr = CFString::new(kAXValueAttribute);
-        let err = AXUIElementCopyAttributeValue(
-            focused,
-            val_attr.as_concrete_TypeRef(),
-            &mut value_ref,
-        );
-        if err != kAXErrorSuccess || value_ref.is_null() {
-            return (None, None, None);
-        }
-        let value_str = CFString::wrap_under_create_rule(value_ref as CFStringRef).to_string();
+        let value_str = match read_value(focused) {
+            Some(v) => v,
+            None => return (None, None, None),
+        };
 
         // Read selected range.
         let mut range_ref: CFTypeRef = ptr::null();
