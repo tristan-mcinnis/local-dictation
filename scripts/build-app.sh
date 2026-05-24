@@ -154,7 +154,7 @@ echo "✓ built: $APP"
 # ── 7. optional install + login item ─────────────────────────────────────────
 if [ "$INSTALL" -eq 1 ]; then
   DEST="/Applications/$APP_NAME.app"
-  echo "• installing to $DEST…"
+  echo "• installing to ${DEST}…"
   rm -rf "$DEST"
   cp -R "$APP" "$DEST"
 
