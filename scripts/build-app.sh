@@ -10,6 +10,10 @@
 #                                           #   model stack into the app (~1.4 GB)
 #   ./scripts/build-app.sh --install        # also copy to /Applications, add a
 #                                           #   Login Item, and launch it
+#   ./scripts/build-app.sh --dmg            # wrap the app in a distributable
+#                                           #   dist/Local-Dictation-<ver>.dmg
+#                                           #   (implies --bundle-models so the
+#                                           #   DMG is self-contained/portable)
 #
 # Flags combine, e.g.  ./scripts/build-app.sh --bundle-models --install
 #
@@ -49,13 +53,22 @@ GEMMA_REL="llm/gemma-3-1b-it"
 
 BUNDLE_MODELS=0
 INSTALL=0
+MAKE_DMG=0
 for arg in "$@"; do
   case "$arg" in
     --bundle-models) BUNDLE_MODELS=1 ;;
     --install)       INSTALL=1 ;;
+    --dmg)           MAKE_DMG=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
+
+# A DMG is meant to be moved/shared, so it must carry its own models — a dev
+# symlink into the repo would dangle the moment the .app leaves this machine.
+if [ "$MAKE_DMG" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 0 ]; then
+  echo "• --dmg implies --bundle-models (a portable DMG must be self-contained)"
+  BUNDLE_MODELS=1
+fi
 
 echo "▶ Local Dictation.app  (v$VERSION)"
 
@@ -158,4 +171,17 @@ OSA
   echo "✓ installed, set to launch at login, and started."
   echo "  First launch: grant Microphone + Accessibility when macOS asks"
   echo "  (System Settings → Privacy & Security)."
+fi
+
+# ── 8. optional distributable DMG ─────────────────────────────────────────────
+if [ "$MAKE_DMG" -eq 1 ]; then
+  DMG="$DIST/Local-Dictation-${VERSION}.dmg"
+  echo "• building DMG…"
+  STAGE="$(mktemp -d -t ld-dmg)"
+  cp -R "$APP" "$STAGE/$APP_NAME.app"
+  ln -s /Applications "$STAGE/Applications"   # drag-to-install affordance
+  rm -f "$DMG"
+  hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+  rm -rf "$STAGE"
+  echo "✓ DMG: $DMG ($(du -sh "$DMG" | cut -f1))"
 fi
