@@ -36,7 +36,6 @@ ax-inject = [
     "dep:objc2-foundation",
     "dep:objc2-app-kit",
     "dep:objc2-core-foundation",
-    "dep:objc2-web-kit",
 ]
 # Convenience: everything on.
 full = ["parakeet", "cleaner", "ax-inject"]
@@ -63,7 +62,7 @@ libc = "0.2"
 # Menu-bar status item. Pulled in only with the ax-inject + parakeet stack
 # (i.e. the daemon path) — the lib build doesn't need it.
 objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSRunLoop", "NSThread"] }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSRunLoop", "NSThread", "NSDate", "NSDateFormatter"] }
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication",
     "NSStatusBar",
@@ -83,11 +82,11 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSGraphics",
     "NSGraphicsContext",
     "NSImage",
+    # Plain native "Dictation History" window: a read-only NSTextView in a
+    # scroll view. No WebView / HTML.
+    "NSText",
+    "NSTextView",
+    "NSScrollView",
+    "NSFont",
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
-# WKWebView for the "Dictation History" window — we render the history as a
-# small styled HTML page rather than hand-building an NSTableView.
-objc2-web-kit = { version = "0.3", optional = true, features = [
-    "WKWebView",
-    "WKWebViewConfiguration",
-] }
