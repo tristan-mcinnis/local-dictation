@@ -151,12 +151,12 @@ pub struct ModelChoice {
     pub path: String,
 }
 
-/// Enumerate cleanup models under `models/llm/<name>/*.gguf` (relative to the
-/// current working directory, matching how the default paths resolve). Each
-/// subdirectory contributes its first `.gguf`. Returns paths canonicalized to
-/// absolute so a selection survives a daemon relaunch regardless of CWD.
+/// Enumerate cleanup models under `<models base>/llm/<name>/*.gguf`, where the
+/// base is resolved bundle-aware (see [`crate::app_paths`]). Each subdirectory
+/// contributes its first `.gguf`. Returns paths canonicalized to absolute so a
+/// selection survives a daemon relaunch regardless of CWD.
 pub fn discover_llm_models() -> Vec<ModelChoice> {
-    discover_llm_models_in(Path::new("models/llm"))
+    discover_llm_models_in(&crate::app_paths::llm_models_dir())
 }
 
 fn discover_llm_models_in(root: &Path) -> Vec<ModelChoice> {

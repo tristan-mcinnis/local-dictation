@@ -67,6 +67,23 @@ cargo build --features full --release
 
 First daemon run prompts for **Microphone** and **Accessibility** permissions. Grant both in System Settings → Privacy & Security, then re-run.
 
+### Install it as a real Mac app
+
+Prefer a double-click app over a terminal command? Build `Local Dictation.app` and drop it in your Applications folder:
+
+```bash
+./scripts/build-app.sh --install
+```
+
+That builds the app, copies it to `/Applications`, sets it to **launch automatically at login**, and starts it. It runs as a **menu-bar app** (no Dock icon) — look for the 🎤 in your menu bar. Grant **Microphone** and **Accessibility** once when macOS asks; because it's a stable signed app bundle, the permissions stick to the app instead of to a terminal window.
+
+```bash
+./scripts/build-app.sh                  # just build it into ./dist (no install)
+./scripts/build-app.sh --bundle-models  # self-contained ~1.4 GB app (for sharing/moving)
+```
+
+By default the app shares the models in `./models` (so rebuilds are instant during development); `--bundle-models` copies the recommended Parakeet + Gemma stack inside the app so it works anywhere.
+
 ### …or hand it to an AI agent
 
 Don't want to think about toolchains, where the model files go, or which build flags to pass? Paste the prompt below into a coding agent running on your Mac — **Claude Code**, **Codex**, **Cursor**, whatever you use. It reads this README, installs the prerequisites, downloads the models, and builds the release binary — then walks you through the one step it *can't* do for you (granting macOS permissions and launching the daemon).
