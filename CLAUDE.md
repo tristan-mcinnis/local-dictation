@@ -1,0 +1,84 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A local-first, push-to-talk dictation daemon for Apple Silicon macOS. Hold a hotkey, speak,
+release — audio is transcribed (Parakeet TDT v3, CoreML), cleaned up (Gemma 3 1B, llama.cpp +
+Metal), and injected at the cursor (macOS Accessibility, with a clipboard fallback for Electron
+apps). Everything runs on-device; nothing hits the network at runtime. The crate is
+`fast-dictate-backend` (lib `fast_dictate_backend` + bin `fast-dictate-backend`).
+
+## Build, run, test
+
+```bash
+./scripts/download-models.sh                 # one-time: fetches Parakeet + Gemma 3 1B into ./models/
+cargo build --features full --release        # the real build — see feature flags below
+./target/release/fast-dictate-backend daemon # run the push-to-talk daemon
+
+cargo test                                   # 61 unit + 2 integration, NO models or features needed
+cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (74 total)
+cargo test --features full <name>            # single test by name substring
+```
+
+Subcommands of the binary: `daemon [--no-cleanup]`, `logs`, `bench [wav]`, `dictate <ms>`,
+`inject-test [text]`, `transform "<instruction>" "<text>"`, `ax-check`, `mock-loop` (default,
+no features). Dispatch is a plain `match` in `src/main.rs`.
+
+## Feature flags are the architecture
+
+The crate is split by Cargo features so the lib and tests build without native/model deps. This
+is the single most important thing to understand before editing — most modules are behind
+`#[cfg(feature = ...)]` and a default `cargo build` compiles almost none of the real app.
+
+- **`parakeet`** — ASR via `parakeet-rs` + `ort` (downloads onnxruntime at build time) + CoreML.
+- **`cleaner`** — Gemma cleanup via `llama-cpp-2` (NOT `llama_cpp` 0.3.x, which vendors an old
+  llama.cpp that can't load Gemma 3) + Metal.
+- **`ax-inject`** — real macOS Accessibility text injection, clipboard fallback, menu-bar status
+  item, floating waveform pill (objc2 / core-graphics / arboard stack).
+- **`full`** = all three. Use this for any real build or when running the feature-gated tests.
+
+When adding code, gate it behind the right feature and keep the default (featureless) build green
+so `cargo test` stays fast and dependency-free.
+
+## Pipeline data flow (the daemon path)
+
+`daemon.rs` owns a `CGEventTap` watching the hotkey modifier + a worker thread. On key release it
+drains audio and runs the pipeline:
+
+```
+audio.rs (cpal + SPSC ring buffer)
+  → transcriber.rs (Parakeet → raw text)
+  → cleaner.rs (Gemma cleanup; skipped if --no-cleanup / cleanup disabled)
+  → text_polish.rs (strip LLM preamble/quotes/artefacts)
+  → refiner.rs (corrections dict + voice-command parse) — shared by daemon & CLI
+  → smart_pad.rs (spacing/capitalization from caret context)
+  → injector.rs (AX direct, or clipboard paste for Electron) + voice_commands keystroke
+```
+
+`ui_channel.rs` carries worker→UI state (recording/processing, last dictation, audio levels) to
+`menubar.rs` (status item, waveform pill, history window). `history.rs` writes every injected
+dictation to SQLite at `~/.config/local-dictation/history.db`. The model is loaded once at boot,
+so config changes (model/hotkey/cleanup) **relaunch** the daemon rather than hot-swapping.
+
+## Config & precedence
+
+User config lives in `~/.config/local-dictation/`:
+- `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`.
+- `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts; blank field falls back to built-in default.
+- `corrections.json` (`corrections.rs`) — word→replacement map applied after cleanup.
+
+Precedence is always **env var > JSON file > built-in default**. Key env knobs:
+`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE` (default `0x3D` Right Option),
+`DICTATE_QUIET`, `DICTATE_PROMPTS_PATH`, `DICTATE_TRANSFORM_PROMPT`, `DICTATE_CLEANUP_PROMPT`,
+`DICTATE_CORRECTIONS_PATH`, `FOCUS_APP`/`INJECT_DIAG` (scripted-test helpers). Models default to
+`models/dictation/parakeet-tdt-v3-int8` and `models/llm/gemma-3-1b-it/...` inside the repo tree.
+
+## Debugging
+
+Structured per-utterance logs (transcribe/cleanup/inject timings, target app, injected text) go to
+`/tmp/dictate-daemon.log` — `tail -f` it, or `fast-dictate-backend logs` to open it. First daemon
+run needs Microphone + Accessibility permissions granted in System Settings; macOS ties
+Accessibility permission to the launching terminal, so the daemon must be started from a real
+terminal (an agent can't grant it). `ax-check` surfaces the permission prompt.
