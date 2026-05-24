@@ -586,6 +586,12 @@ fn worker_loop(
                     .map(crate::injector::is_terminal_pid)
                     .unwrap_or(false);
 
+                // Keep the raw ASR text so the summary block can compare it to
+                // the cleaned output — the only way to tell, after the fact,
+                // whether a short result came from ASR or from the cleanup model
+                // dropping content. Cheap: dictations are short strings.
+                let raw_transcript = transcript.clone();
+
                 let mut t_cleanup_ms = 0_u128;
                 let final_text = {
                     #[cfg(feature = "cleaner")]
@@ -667,6 +673,18 @@ fn worker_loop(
                     eprintln!("  app  {} (pid {})", app_name(pid), pid);
                 } else if used_fresh_capture {
                     eprintln!("  app  <fresh capture · target unknown>");
+                }
+                // Truncation watchdog: if the cleaned text is dramatically
+                // shorter than the raw transcript (>40% dropped), the cleanup
+                // model likely gave up early or summarized — log the raw text so
+                // we can see exactly what was lost. Filler removal alone rarely
+                // exceeds 40%, so this fires on real content loss, not noise.
+                let raw_chars = raw_transcript.chars().count();
+                let final_chars = final_text.chars().count();
+                if raw_chars > 40 && final_chars * 5 < raw_chars * 3 {
+                    eprintln!(
+                        "  ⚠    cleanup shrank text {raw_chars} → {final_chars} chars · raw: \"{raw_transcript}\""
+                    );
                 }
                 if let Err(err) = &inject_result {
                     eprintln!("  ✗    inject failed: {err:?}");
