@@ -565,24 +565,50 @@ fn worker_loop(
                     continue;
                 }
 
+                // Receive the focus target now (capture ran in parallel with
+                // inference and is almost always ready by here). We need the
+                // target app *before* cleanup so we can skip Gemma when the
+                // destination is a terminal — and we reuse this same captured
+                // target for injection, keeping get_focused_element off the
+                // critical path.
+                let captured_target: Option<FocusTarget> = match target_rx.try_recv() {
+                    Ok(Ok(t)) => Some(t),
+                    Ok(Err(_)) => None,
+                    Err(_) => target_rx.recv().ok().and_then(|r| r.ok()),
+                };
+                let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
+                // Terminals draw their own text grid and almost always receive
+                // shell commands, not prose — Gemma cleanup corrupts more than
+                // it helps there, so inject the raw transcript instead. Every
+                // other app keeps the normal formal-cleanup path.
+                #[cfg(feature = "cleaner")]
+                let is_terminal = target_pid
+                    .map(crate::injector::is_terminal_pid)
+                    .unwrap_or(false);
+
                 let mut t_cleanup_ms = 0_u128;
                 let final_text = {
                     #[cfg(feature = "cleaner")]
                     {
-                        if let Some(ref c) = cleaner {
-                            let t_clean = Instant::now();
-                            match rt.block_on(c.process_transcript(&transcript)) {
-                                Ok(cleaned) => {
-                                    t_cleanup_ms = ms(t_clean.elapsed());
-                                    cleaned
-                                }
-                                Err(err) => {
-                                    eprintln!("[warn] cleanup failed, using raw: {err:?}");
-                                    transcript
+                        match cleaner {
+                            Some(ref c) if !is_terminal => {
+                                let t_clean = Instant::now();
+                                match rt.block_on(c.process_transcript(&transcript)) {
+                                    Ok(cleaned) => {
+                                        t_cleanup_ms = ms(t_clean.elapsed());
+                                        cleaned
+                                    }
+                                    Err(err) => {
+                                        eprintln!("[warn] cleanup failed, using raw: {err:?}");
+                                        transcript
+                                    }
                                 }
                             }
-                        } else {
-                            transcript
+                            Some(_) => {
+                                eprintln!("  ⌁    terminal · raw transcript (cleanup skipped)");
+                                transcript
+                            }
+                            None => transcript,
                         }
                     }
                     #[cfg(not(feature = "cleaner"))]
@@ -619,33 +645,14 @@ fn worker_loop(
                 }
                 let final_text = refined.text;
 
-                // Inject using the pre-captured focus target.
+                // Inject using the focus target captured before cleanup.
                 let t_inject = Instant::now();
-                let (inject_result, target_pid, used_fresh_capture) = match target_rx.try_recv() {
-                    Ok(Ok(target)) => {
-                        let pid = target.inner_pid();
-                        (
-                            AccessibilityInjector::inject_with_target(target, &final_text),
-                            pid,
-                            false,
-                        )
-                    }
-                    Ok(Err(_)) => (
-                        AccessibilityInjector::inject_text(&final_text),
-                        None,
-                        true,
+                let (inject_result, used_fresh_capture) = match captured_target {
+                    Some(target) => (
+                        AccessibilityInjector::inject_with_target(target, &final_text),
+                        false,
                     ),
-                    Err(_) => match target_rx.recv() {
-                        Ok(Ok(t)) => {
-                            let pid = t.inner_pid();
-                            (
-                                AccessibilityInjector::inject_with_target(t, &final_text),
-                                pid,
-                                false,
-                            )
-                        }
-                        _ => (AccessibilityInjector::inject_text(&final_text), None, true),
-                    },
+                    None => (AccessibilityInjector::inject_text(&final_text), true),
                 };
                 let t_inject_ms = ms(t_inject.elapsed());
 
