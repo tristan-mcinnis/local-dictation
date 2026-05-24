@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod corrections;
 pub mod cues;
+pub mod history;
 pub mod injector;
 pub mod settings;
 pub mod smart_pad;

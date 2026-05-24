@@ -454,6 +454,9 @@ fn worker_loop(
                     eprintln!("  ✓    \"{final_text}\"");
                     // Remember it for the menu-bar "Copy last dictation" item.
                     menubar::set_last_dictation(&final_text);
+                    // Persist to the browsable dictation history (best-effort;
+                    // never blocks or fails the hot path).
+                    crate::history::record(&final_text);
                     if press_enter {
                         std::thread::sleep(Duration::from_millis(40));
                         match crate::clipboard_paste::synthesize_return() {

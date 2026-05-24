@@ -34,6 +34,7 @@ use objc2_core_foundation::{
     CFRunLoopTimerContext,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -130,6 +131,11 @@ define_class!(
             if !text.is_empty() {
                 copy_to_clipboard(&text);
             }
+        }
+
+        #[unsafe(method(openHistory:))]
+        fn open_history(&self, _sender: *mut AnyObject) {
+            show_history_window();
         }
 
         #[unsafe(method(openCorrections:))]
@@ -280,6 +286,11 @@ fn build_status_item(
 
     let copy_last = action_item(mtm, "Copy last dictation", sel!(copyLast:), "c", actions);
     menu.addItem(&copy_last);
+
+    // Browsable history of past dictations — the friendly counterpart to the
+    // verbose daemon log.
+    let history_item = action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions);
+    menu.addItem(&history_item);
 
     menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
 
@@ -620,6 +631,83 @@ fn open_corrections_folder() {
     } else {
         let _ = std::process::Command::new("open").arg(&dir).status();
     }
+}
+
+// ─── Dictation history window ───────────────────────────────────────────
+//
+// A small titled window hosting a WKWebView. We render the history as a
+// styled HTML page (see `history::render_html`) rather than hand-building an
+// NSTableView — it's far less code and matches the clean card-per-day look.
+// The window + web view are built once and reused; every open re-queries the
+// DB and reloads the page so it always reflects the latest dictations.
+
+struct HistoryUi {
+    window: Retained<NSWindow>,
+    webview: Retained<WKWebView>,
+}
+// Only ever touched on the main thread (created from / used by menu actions),
+// so the raw AppKit pointers are safe to park in a static.
+unsafe impl Send for HistoryUi {}
+unsafe impl Sync for HistoryUi {}
+
+static HISTORY_UI: OnceLock<HistoryUi> = OnceLock::new();
+
+fn history_ui(mtm: MainThreadMarker) -> &'static HistoryUi {
+    HISTORY_UI.get_or_init(|| build_history_window(mtm))
+}
+
+fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 620.0));
+
+    let config = unsafe { WKWebViewConfiguration::new(mtm) };
+    let webview = unsafe {
+        WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config)
+    };
+
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe {
+        window.setTitle(&NSString::from_str("Dictation History"));
+        // Reused across opens — closing must hide, not deallocate it.
+        window.setReleasedWhenClosed(false);
+        window.setContentView(Some(&**webview));
+        window.center();
+    }
+
+    HistoryUi { window, webview }
+}
+
+/// Re-query the history DB, reload the web view, and bring the window forward.
+fn show_history_window() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let ui = history_ui(mtm);
+    let html = crate::history::render_html(&crate::history::recent(1000));
+    unsafe {
+        let _ = ui
+            .webview
+            .loadHTMLString_baseURL(&NSString::from_str(&html), None);
+        ui.window.makeKeyAndOrderFront(None);
+    }
+    // We're an Accessory app (no Dock icon); without an explicit activate the
+    // new window opens behind the frontmost app.
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    unsafe {
+        app.activateIgnoringOtherApps(true)
+    };
 }
 
 /// Build an NSImage from an SF Symbol name. Returns None if the symbol
