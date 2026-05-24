@@ -10,9 +10,11 @@ use std::sync::{
 };
 
 pub const SAMPLE_RATE: u32 = 16_000;
-/// 30 s of headroom (16 000 samples/s · 30) — comfortably bigger than the
-/// longest realistic dictation utterance before the worker drains.
-pub const BUFFER_CAPACITY: usize = 16_000 * 30;
+/// 5 min of headroom (16 000 samples/s · 300). The ring buffer is only drained
+/// after the key is released, so anything spoken past this cap is silently
+/// dropped — keep it generously larger than the longest realistic dictation.
+/// At f32 that's ~18 MB, which is fine.
+pub const BUFFER_CAPACITY: usize = 16_000 * 300;
 
 pub type HeapAudioConsumer = HeapCons<f32>;
 pub type HeapAudioProducer = HeapProd<f32>;
