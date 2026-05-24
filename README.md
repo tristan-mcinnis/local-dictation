@@ -4,6 +4,34 @@ A local dictation app for Apple Silicon. Hold a hotkey, speak, release — clean
 
 **Optimized for lowest latency and highest accuracy**, with the obvious trade-offs: it's English-first, macOS-only, and the cleanup model spends ~300 ms thinking about your text. Everything runs on-device. No network at runtime.
 
+## Quickest setup — hand it to an AI agent
+
+Don't want to think about toolchains, where the model files go, or which build flags to pass? Paste the prompt below into a coding agent running on your Mac — **Claude Code**, **Codex**, **Cursor**, whatever you use. It reads this README, installs the prerequisites, downloads the models, and builds the release binary — then walks you through the one step it *can't* do for you (granting macOS permissions and launching the daemon).
+
+```text
+Set up the "local-dictation" app on this Mac (Apple Silicon) from
+https://github.com/tristan-mcinnis/local-dictation. Read the repo's README,
+then do the setup for me:
+1. Install any missing prerequisites: Rust (via rustup), the Xcode Command
+   Line Tools, and cmake (via Homebrew).
+2. Clone the repo (or just use it if we're already inside it).
+3. Run ./scripts/download-models.sh — it downloads the Parakeet (speech-to-text)
+   and Gemma (cleanup) models into ./models/, which is exactly where the app
+   looks for them. Don't move them.
+4. Build the release binary:  cargo build --features full --release
+Then STOP and give me plain copy-paste instructions for the steps you CAN'T do
+yourself: I have to launch the daemon from MY OWN terminal with
+  ./target/release/fast-dictate-backend daemon
+and grant Microphone + Accessibility permission in System Settings the first
+time it runs. macOS ties Accessibility permission to the terminal that launches
+the process, so you can't start it for me — that part is on me.
+Finally, remind me of the hotkeys: hold Right Option to dictate; for hands-free,
+hold Right Option and tap Space, let go of both, keep talking, then tap Right
+Option once to stop.
+```
+
+Prefer to do it by hand? The [Quick start](#quick-start) below is the same steps, manually.
+
 ## What you actually do
 
 ```bash
@@ -11,6 +39,8 @@ A local dictation app for Apple Silicon. Hold a hotkey, speak, release — clean
 ```
 
 Then **hold Right Option**, speak, release. The cleaned text gets injected wherever your cursor is.
+
+Long thought, or just don't want to hold the key? Use **hands-free mode**: hold Right Option and **tap Space** (a short *pop* confirms), then **let go of both keys and keep talking**. Tap Right Option once more to stop. Recording keeps running with nothing held down.
 
 While you talk, a small dark pill floats at the bottom of your cursor's screen with a **live waveform** driven by your mic — bars rise instantly on each syllable and decay slowly so peaks are visible:
 
@@ -106,7 +136,8 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 
 ## Features
 
-- **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`).
+- **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`), speak, release.
+- **Hands-free mode.** Hold the push-to-talk key and **tap Space** to latch (a *pop* cue confirms), then release both keys and keep talking — recording continues with nothing held. **Tap the push-to-talk key once** to stop and inject. Normal hold-to-talk is unchanged; the latch only engages when you chord Space during a hold. (Space is swallowed while you hold the key, so it never leaks a character into your text.)
 - **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
 - **Menu-bar icon + settings (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click it for a full menu — no env vars or relaunch scripts needed:
   - **Last dictation preview** + **Copy last dictation** (⌘C) — grab what you just dictated.
@@ -117,12 +148,12 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
   - **Open Log** (⌘L), **Export Log to Downloads…**, **Open corrections folder**.
   - **Quit** (⌘Q).
   Settings persist to `~/.config/local-dictation/settings.json`. Changing the model, hotkey, or cleanup toggle relaunches the daemon to apply (the model is loaded once at boot, so a relaunch is cleaner than a live swap). Any env var override (`GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE`) wins over the menu and greys out the matching items.
-- **Audio cues.** Tink on start, Bottle on stop, Basso on error. Mute with `DICTATE_QUIET=1`.
+- **Audio cues.** Tink on start, Bottle on stop, Pop on hands-free latch, Basso on error. Mute with `DICTATE_QUIET=1`.
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
 - **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
 - **Personal corrections dictionary.** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Applied after cleanup, before injection. Case-insensitive match at word boundaries; replacement is verbatim. See `corrections.example.json`.
-- **Voice command: "press enter".** End a dictation with `press enter` / `press return` / `hit enter` / `hit return` and it injects the body then synthesizes a Return keystroke. Doesn't fire mid-sentence.
+- **Inline voice commands.** End a dictation with a recognised phrase and it's stripped from the text and turned into a keystroke after the body is injected: `press enter` / `press return` / `hit enter` / `new line` → **Return**; `new paragraph` → **two Returns**; `press tab` / `hit tab` → **Tab**. And if the *whole* utterance is `scratch that` / `never mind` / `cancel that` / `delete that`, nothing is injected. All matched on word boundaries, so "compress enter" or "let me scratch that itch" never fire.
 - **Dictation history.** Every injected dictation is saved to a tiny SQLite database at `~/.config/local-dictation/history.db`. Open **Dictation History…** from the menu bar for a plain native window listing them newest-first, grouped by day — readable at a glance, unlike the timing-heavy log.
 - **Structured logs.** Aligned per-utterance blocks at `/tmp/dictate-daemon.log` showing transcribe / cleanup / inject timings, the target app name, and the final injected text.
 
@@ -134,7 +165,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 [boot] parakeet    loaded in  757 ms
 [boot] cleaner     loaded in  360 ms · gemma-3-1b-it-Q4_K_M.gguf
 [boot] warm-up     done   in  374 ms
-[boot] ready · hold Right Option (0x3d) to dictate · ⌘Q quits
+[boot] ready · hold Right Option (0x3d) to dictate · Right Option+Space then release = hands-free (tap Right Option to stop) · ⌘Q quits
 
 ▶ recording
 ⏹ stopped · held 2.16s
@@ -212,8 +243,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 44 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner suites — 48 total
+cargo test                # 55 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 68 total
 ```
 
 ## License
