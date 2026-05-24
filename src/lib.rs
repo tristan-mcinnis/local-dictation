@@ -3,6 +3,7 @@ pub mod corrections;
 pub mod cues;
 pub mod history;
 pub mod injector;
+pub mod prompts;
 pub mod refiner;
 pub mod settings;
 pub mod smart_pad;

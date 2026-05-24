@@ -12,48 +12,16 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel},
     sampling::LlamaSampler,
 };
+use crate::prompts::Prompts;
 use std::{
     num::NonZeroU32,
     path::Path,
     sync::{Arc, OnceLock},
 };
 
-const SYSTEM_INSTRUCTION: &str =
-    "You are a real-time dictation cleaner. Edit raw speech-to-text for \
-     written-text readability:\n\
-     - Remove disfluencies: uh, um, er, ah, hmm; 'like' only when used \
-       as filler; 'you know' only when used as filler.\n\
-     - Expand colloquial contractions to their written form: \
-       wanna → want to, gonna → going to, kinda → kind of, sorta → sort of, \
-       gimme → give me, lemme → let me, dunno → don't know, outta → out of, \
-       lotta → lot of, shoulda → should have, coulda → could have, \
-       woulda → would have, y'all → you all.\n\
-     - KEEP standard contractions as-is: don't, it's, won't, can't, I'm, \
-       I'll, we're, etc. — do not over-formalize.\n\
-     - Fix punctuation and capitalization of sentence boundaries.\n\
-     - Preserve domain-specific casing when it appears: Rust, macOS, ONNX, \
-       GitHub, Parakeet, iOS, Apple Silicon, etc.\n\
-     - CRITICAL: Do NOT substitute common words for proper nouns based on \
-       guessed context. If the speaker says 'main', keep 'main' — do not \
-       change to 'Maine'. If they say 'mark', keep 'mark' — do not change \
-       to 'Mark'. Tech terms like 'git', 'npm', 'cd', 'ls', 'main', \
-       'master', 'dev', 'prod', 'api' stay lowercase as written. Only \
-       capitalize when the word is unambiguously a proper noun in context.\n\
-     - Do NOT rephrase, paraphrase, summarize, or add words the speaker \
-       didn't say. Preserve the speaker's voice and word choice.\n\
-     Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
-     no markdown.";
-
-// Transform mode: apply a spoken instruction to a selected passage. Kept
-// deliberately strict about output shape — text_polish strips stragglers, but
-// the less the model editorializes the better the in-place replacement reads.
-const TRANSFORM_INSTRUCTION: &str =
-    "You are a precise text editor. Apply the user's instruction to the text \
-     below and return ONLY the resulting text — no preamble, no explanation, \
-     no quotes, no markdown fences, no commentary. Preserve the original \
-     meaning unless the instruction says otherwise. If the instruction is a \
-     translation, output only the translation. If you cannot apply the \
-     instruction, return the original text unchanged.";
+// The cleanup + transform system prompts live in `prompts.rs` (built-in
+// defaults, overridable via prompts.json / env). The engine loads them once at
+// init into `self.prompts`.
 
 // LlamaBackend can be initialised only once per process. Hold it in a OnceLock
 // so multiple TextCleanupEngine instances share the same backend handle.
@@ -73,6 +41,9 @@ pub struct TextCleanupEngine {
     model: Arc<LlamaModel>,
     chat_template: Arc<LlamaChatTemplate>,
     max_tokens: i32,
+    /// Cleanup + transform system prompts, resolved once at init from
+    /// env / prompts.json / built-in defaults.
+    prompts: Prompts,
 }
 
 impl TextCleanupEngine {
@@ -94,6 +65,7 @@ impl TextCleanupEngine {
             model: Arc::new(model),
             chat_template: Arc::new(chat_template),
             max_tokens: 256,
+            prompts: Prompts::load(),
         })
     }
 
@@ -104,7 +76,7 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let user_msg = format!("{SYSTEM_INSTRUCTION}\n\nRaw transcript:\n{raw}");
+        let user_msg = format!("{}\n\nRaw transcript:\n{raw}", self.prompts.cleanup);
         self.run_chat(user_msg, self.max_tokens, false).await
     }
 
@@ -118,8 +90,10 @@ impl TextCleanupEngine {
         if instruction.is_empty() || selection.is_empty() {
             return Ok(selection.to_string());
         }
-        let user_msg =
-            format!("{TRANSFORM_INSTRUCTION}\n\nInstruction: {instruction}\n\nText:\n{selection}");
+        let user_msg = format!(
+            "{}\n\nInstruction: {instruction}\n\nText:\n{selection}",
+            self.prompts.transform
+        );
         // Give the output room for a rewrite that's somewhat longer than the
         // input (e.g. "expand this"), capped to keep within the context window.
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
