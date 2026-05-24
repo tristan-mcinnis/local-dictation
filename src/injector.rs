@@ -13,35 +13,10 @@
 //!   5. If both AX writes refuse (Electron / some Java apps), fall back to
 //!      save-clipboard → set-clipboard → synthesize Cmd+V → restore.
 
-use crate::smart_pad::{last_non_ws_before, smart_pad};
+use crate::smart_pad::smart_pad;
 use std::sync::Mutex;
 
 pub struct AccessibilityInjector;
-
-/// Process-wide memory of the last character we successfully injected.
-/// When the focused app doesn't expose `kAXValue` (Electron apps,
-/// sandboxed web views, some Java apps), we fall back to using this as
-/// the implicit `char_before` so consecutive utterances still get the
-/// right spacing + capitalization.
-///
-/// Reset on first call (None) → first utterance behaves like "start of
-/// field." Updated to the last char of every successful inject.
-static LAST_TAIL: Mutex<Option<char>> = Mutex::new(None);
-
-/// PID of the focused app that's known to not expose AXValue. Skip the
-/// context read for it on subsequent injects (saves ~100 ms per utterance
-/// in Electron / web-view targets).
-static AX_BLIND_PID: Mutex<Option<i32>> = Mutex::new(None);
-
-fn mark_ax_blind(pid: i32) {
-    if let Ok(mut g) = AX_BLIND_PID.lock() {
-        *g = Some(pid);
-    }
-}
-
-fn is_ax_blind(pid: i32) -> bool {
-    matches!(AX_BLIND_PID.lock().ok().and_then(|g| *g), Some(p) if p == pid)
-}
 
 /// Cache of `pid → ax_write_is_a_lie`. Looked up via `ps` once per PID.
 ///
@@ -102,60 +77,6 @@ pub fn is_clipboard_only_pid(pid: i32) -> bool {
         cache.push((pid, clipboard_only));
     }
     clipboard_only
-}
-
-/// PIDs whose AX write we've *verified* actually rendered (read the value
-/// back and saw our text). Once a PID is here we trust its AX path and skip
-/// the post-write verification read on every subsequent utterance.
-static AX_VERIFIED_PID: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-
-fn is_ax_verified(pid: i32) -> bool {
-    AX_VERIFIED_PID
-        .lock()
-        .map(|g| g.contains(&pid))
-        .unwrap_or(false)
-}
-
-fn mark_ax_verified(pid: i32) {
-    if let Ok(mut g) = AX_VERIFIED_PID.lock() {
-        if !g.contains(&pid) {
-            g.push(pid);
-        }
-    }
-}
-
-/// Promote a PID to clipboard-only at runtime. Used when an AX write returns
-/// success but the value read-back proves nothing rendered — i.e. an app with
-/// the lying-AX trait that isn't on the static name list. Updates the existing
-/// cache entry (the name lookup will have inserted `false`) or inserts a fresh
-/// `true` so all future injects skip the AX path for this PID.
-fn mark_clipboard_only(pid: i32) {
-    if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
-        if let Some(entry) = cache.iter_mut().find(|(p, _)| *p == pid) {
-            entry.1 = true;
-        } else {
-            cache.push((pid, true));
-        }
-    }
-}
-
-fn remember_tail(text: &str) {
-    let tail = text.chars().rev().find(|c| !c.is_whitespace());
-    if let Ok(mut g) = LAST_TAIL.lock() {
-        *g = tail;
-    }
-}
-
-fn recall_tail() -> Option<char> {
-    LAST_TAIL.lock().ok().and_then(|g| *g)
-}
-
-/// Public: clear the cross-utterance state. Useful when the user
-/// switches target apps and the previous tail no longer applies.
-pub fn reset_inject_state() {
-    if let Ok(mut g) = LAST_TAIL.lock() {
-        *g = None;
-    }
 }
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
