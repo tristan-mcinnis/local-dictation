@@ -36,11 +36,18 @@ fn backend() -> eyre::Result<Arc<LlamaBackend>> {
     Ok(BACKEND.get().cloned().unwrap_or(b))
 }
 
+/// Upper bound on the cleanup context window. Gemma 3 1B trains to 32768, but
+/// the KV cache scales with n_ctx, so we cap at 8192 (~6000 words) — far more
+/// than any plausible single push-to-talk dictation, while keeping memory sane.
+const MAX_CTX: u32 = 8192;
+/// Floor for the context window / generation budget. Keeps short utterances on
+/// the same fast path they had before (small KV cache, quick reserve).
+const MIN_CTX: u32 = 2048;
+
 pub struct TextCleanupEngine {
     backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
     chat_template: Arc<LlamaChatTemplate>,
-    max_tokens: i32,
     /// Cleanup + transform system prompts, resolved once at init from
     /// env / prompts.json / built-in defaults.
     prompts: Prompts,
@@ -64,7 +71,6 @@ impl TextCleanupEngine {
             backend,
             model: Arc::new(model),
             chat_template: Arc::new(chat_template),
-            max_tokens: 256,
             prompts: Prompts::load(),
         })
     }
@@ -77,7 +83,23 @@ impl TextCleanupEngine {
             return Ok(String::new());
         }
         let user_msg = format!("{}\n\nRaw transcript:\n{raw}", self.prompts.cleanup);
-        self.run_chat(user_msg, self.max_tokens, false).await
+        // Cleanup never summarizes (the prompt forbids it), so the cleaned text
+        // tracks the input length — stripping filler makes it a touch shorter,
+        // expanding contractions a touch longer. Budget off the raw transcript
+        // with headroom instead of a fixed 256-token cap, which used to chop any
+        // dictation past ~190 words mid-sentence.
+        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
+        self.run_chat(user_msg, budget, false).await
+    }
+
+    /// Rough token count for sizing generation budgets / the context window.
+    /// Uses the model's own tokenizer; falls back to a chars/3 estimate if
+    /// tokenization fails (never on the hot path, but keeps this infallible).
+    fn token_estimate(&self, text: &str) -> usize {
+        self.model
+            .str_to_token(text, AddBos::Never)
+            .map(|t| t.len())
+            .unwrap_or_else(|_| text.chars().count() / 3)
     }
 
     /// Apply a spoken `instruction` to `selection` and return the edited text.
@@ -121,12 +143,6 @@ impl TextCleanupEngine {
         let model = self.model.clone();
 
         tokio::task::spawn_blocking(move || -> eyre::Result<String> {
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(2048));
-            let mut ctx = model
-                .new_context(&backend, ctx_params)
-                .map_err(|e| eyre::eyre!("new_context failed: {e:?}"))?;
-
             let tokens = model
                 .str_to_token(&prompt, AddBos::Always)
                 .map_err(|e| eyre::eyre!("tokenize failed: {e:?}"))?;
@@ -134,7 +150,24 @@ impl TextCleanupEngine {
                 return Ok(String::new());
             }
 
-            let mut batch = LlamaBatch::new(2048, 1);
+            // Size the context to hold the full prompt plus the generation
+            // budget, clamped to [MIN_CTX, MAX_CTX]. A fixed 2048 used to
+            // truncate long dictations: once prompt + output exceeded it, the
+            // tail fell out of context. If the prompt alone is near the cap we
+            // still leave room to generate by shrinking the effective budget.
+            let prompt_len = tokens.len() as u32;
+            let n_ctx = (prompt_len + max_tokens.max(0) as u32 + 16).clamp(MIN_CTX, MAX_CTX);
+            // Never ask for more output tokens than the window can hold.
+            let max_tokens = max_tokens.min(n_ctx.saturating_sub(prompt_len + 16) as i32);
+            let ctx_params = LlamaContextParams::default()
+                .with_n_ctx(NonZeroU32::new(n_ctx))
+                // n_batch must cover the prompt prefill in one decode call.
+                .with_n_batch(n_ctx);
+            let mut ctx = model
+                .new_context(&backend, ctx_params)
+                .map_err(|e| eyre::eyre!("new_context failed: {e:?}"))?;
+
+            let mut batch = LlamaBatch::new(n_ctx as usize, 1);
             let last_idx = (tokens.len() - 1) as i32;
             for (i, tok) in tokens.iter().enumerate() {
                 batch
