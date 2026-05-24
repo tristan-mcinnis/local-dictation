@@ -44,8 +44,11 @@ async fn main() -> eyre::Result<()> {
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
         "logs" => run_logs(),
+        "transform" => {
+            run_transform(args.get(2).cloned(), args.get(3).cloned()).await
+        }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], ax-check, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, mock-loop"
         )),
     }
 }
@@ -341,6 +344,39 @@ fn gemma_path() -> String {
     // Precedence: GEMMA_MODEL_PATH env > settings.json > built-in default.
     use fast_dictate_backend::settings::{Settings, DEFAULT_GEMMA_REL};
     Settings::load().resolve_gemma(DEFAULT_GEMMA_REL)
+}
+
+/// `transform "<instruction>" "<text>"` — run the warm-Gemma transform path on
+/// the command line, no audio/AX. Lets transform-mode prompting be eyeballed
+/// (and tuned) without speaking into the daemon.
+#[cfg(feature = "cleaner")]
+async fn run_transform(instruction: Option<String>, text: Option<String>) -> eyre::Result<()> {
+    use fast_dictate_backend::cleaner::TextCleanupEngine;
+    use fast_dictate_backend::settings::{Settings, DEFAULT_GEMMA_REL};
+
+    let (Some(instruction), Some(text)) = (instruction, text) else {
+        return Err(eyre::eyre!(
+            "usage: transform \"<instruction>\" \"<text to transform>\""
+        ));
+    };
+    let gemma = Settings::load().resolve_gemma(DEFAULT_GEMMA_REL);
+    println!("[transform] gemma: {gemma}");
+    let t = std::time::Instant::now();
+    let cleaner = TextCleanupEngine::initialize(&gemma)?;
+    println!("[transform] loaded in {:?}", t.elapsed());
+
+    let t = std::time::Instant::now();
+    let out = cleaner.transform(&instruction, &text).await?;
+    println!("[transform] instruction : {instruction:?}");
+    println!("[transform] input       : {text:?}");
+    println!("[transform] output ({:?}): {out:?}", t.elapsed());
+    println!("\n{out}");
+    Ok(())
+}
+
+#[cfg(not(feature = "cleaner"))]
+async fn run_transform(_i: Option<String>, _t: Option<String>) -> eyre::Result<()> {
+    Err(eyre::eyre!("transform requires the `cleaner` feature"))
 }
 
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
