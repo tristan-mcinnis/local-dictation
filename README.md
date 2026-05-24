@@ -7,23 +7,9 @@
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 ![On-device](https://img.shields.io/badge/network%20at%20runtime-none-success)
 
-<!--
-DEMO GIF GOES HERE. Record a ~5–8 s screen capture and save it to docs/demo.gif, then
-replace this comment with:  ![local-dictation demo](docs/demo.gif)
-
-What to show, in one take:
-  1. Cursor sitting in a real app (Notes / a code editor / Slack).
-  2. Press & hold Right Option — the dark waveform pill appears at the bottom of the screen
-     and the menu-bar icon flips to recording.
-  3. Say a sentence with a filler word or two ("um, so the meeting is, like, at three").
-  4. Release — the cleaned sentence lands at the cursor (fillers gone, punctuation right).
-  5. Optional second beat: select that text, hold Shift+Right Option, say "make this more
-     concise", release — watch it rewrite in place.
-
-Capture tips: record the full screen at retina, 30 FPS; trim dead air; keep it under ~6 MB so
-it loads fast on GitHub. `gifski` or QuickTime → ffmpeg both work. The whole point is that a
-visitor *sees* the value in 5 seconds without reading a word — so lead the file with it.
--->
+<p align="center">
+  <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release — cleaned text lands at the cursor" width="600">
+</p>
 
 > **Heads-up:** this is a personal tool I built for my own daily driving on an Apple Silicon Mac, shared openly in case it's useful to you. It's not a packaged product — there's no signed installer, you build it from source, and it's tuned to how *I* dictate. If that fits, you'll probably like it; if you want a one-click app, see the alternatives below.
 
