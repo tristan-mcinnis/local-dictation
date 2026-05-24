@@ -25,16 +25,19 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSImage, NSMenu, NSMenuItem,
-    NSScreen, NSStatusBar, NSStatusItem, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowLevel, NSWindowStyleMask,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSMenu, NSMenuItem,
+    NSScreen, NSScrollView, NSStatusBar, NSStatusItem, NSTextView, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
     CFRunLoopTimerContext,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
-use objc2_web_kit::{WKWebView, WKWebViewConfiguration};
+use objc2_foundation::{
+    MainThreadMarker, NSDate, NSDateFormatter, NSObject, NSPoint, NSRect, NSSize, NSString,
+};
+
+use crate::history::Entry;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -635,15 +638,14 @@ fn open_corrections_folder() {
 
 // ─── Dictation history window ───────────────────────────────────────────
 //
-// A small titled window hosting a WKWebView. We render the history as a
-// styled HTML page (see `history::render_html`) rather than hand-building an
-// NSTableView — it's far less code and matches the clean card-per-day look.
-// The window + web view are built once and reused; every open re-queries the
-// DB and reloads the page so it always reflects the latest dictations.
+// A plain, small native window: a read-only NSTextView inside a scroll view.
+// No WebView, no HTML — just monospaced text grouped by day, which keeps the
+// time column aligned and the whole thing lightweight. Built once and reused;
+// every open re-queries the DB and rewrites the text.
 
 struct HistoryUi {
     window: Retained<NSWindow>,
-    webview: Retained<WKWebView>,
+    text_view: Retained<NSTextView>,
 }
 // Only ever touched on the main thread (created from / used by menu actions),
 // so the raw AppKit pointers are safe to park in a static.
@@ -657,12 +659,27 @@ fn history_ui(mtm: MainThreadMarker) -> &'static HistoryUi {
 }
 
 fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 620.0));
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 560.0));
 
-    let config = unsafe { WKWebViewConfiguration::new(mtm) };
-    let webview = unsafe {
-        WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config)
-    };
+    // `scrollableTextView` hands back a fully-wired NSScrollView whose
+    // document view is an NSTextView, with sizing/scrolling already set up.
+    let scroll = NSTextView::scrollableTextView(mtm);
+    let text_view: Retained<NSTextView> = scroll
+        .documentView()
+        .and_then(|v| v.downcast::<NSTextView>().ok())
+        .expect("scrollableTextView always has an NSTextView document view");
+    unsafe {
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        text_view.setEditable(false);
+        text_view.setSelectable(true); // let the user select / copy text
+        text_view.setRichText(false);
+        // Fixed-pitch font so the "hh:mm a" time column lines up.
+        if let Some(font) = NSFont::userFixedPitchFontOfSize(12.0) {
+            text_view.setFont(Some(&font));
+        }
+        text_view.setTextContainerInset(NSSize::new(14.0, 14.0));
+    }
 
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
@@ -681,26 +698,22 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         window.setTitle(&NSString::from_str("Dictation History"));
         // Reused across opens — closing must hide, not deallocate it.
         window.setReleasedWhenClosed(false);
-        window.setContentView(Some(&**webview));
+        window.setContentView(Some(&**scroll));
         window.center();
     }
 
-    HistoryUi { window, webview }
+    HistoryUi { window, text_view }
 }
 
-/// Re-query the history DB, reload the web view, and bring the window forward.
+/// Re-query the history DB, refresh the text, and bring the window forward.
 fn show_history_window() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
     let ui = history_ui(mtm);
-    let html = crate::history::render_html(&crate::history::recent(1000));
-    unsafe {
-        let _ = ui
-            .webview
-            .loadHTMLString_baseURL(&NSString::from_str(&html), None);
-        ui.window.makeKeyAndOrderFront(None);
-    }
+    let text = render_history_text(&crate::history::recent(1000));
+    ui.text_view.setString(&NSString::from_str(&text));
+    unsafe { ui.window.makeKeyAndOrderFront(None) };
     // We're an Accessory app (no Dock icon); without an explicit activate the
     // new window opens behind the frontmost app.
     let app = NSApplication::sharedApplication(mtm);
@@ -708,6 +721,50 @@ fn show_history_window() {
     unsafe {
         app.activateIgnoringOtherApps(true)
     };
+}
+
+/// Format the history as plain text grouped by local calendar day, newest
+/// first — e.g.
+///
+/// ```text
+/// MAY 22, 2026
+///
+///   05:37 PM   I take your suggestions on what we should do.
+///   05:35 PM   Is it running right now? Can you open it up for me?
+/// ```
+///
+/// `NSDateFormatter` renders dates/times in the user's locale + timezone.
+fn render_history_text(entries: &[Entry]) -> String {
+    if entries.is_empty() {
+        return "\n  No dictations yet.\n\n  Hold your hotkey and speak — they’ll show up here.\n"
+            .to_string();
+    }
+
+    let day_fmt = NSDateFormatter::new();
+    day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
+    let time_fmt = NSDateFormatter::new();
+    time_fmt.setDateFormat(Some(&NSString::from_str("hh:mm a")));
+
+    let mut out = String::new();
+    let mut last_day: Option<String> = None;
+    for e in entries {
+        let date = unsafe { NSDate::dateWithTimeIntervalSince1970(e.created_at as f64) };
+        let day = day_fmt.stringFromDate(&date).to_string().to_uppercase();
+        let time = time_fmt.stringFromDate(&date).to_string();
+
+        if last_day.as_deref() != Some(day.as_str()) {
+            if last_day.is_some() {
+                out.push('\n');
+            }
+            out.push_str(&day);
+            out.push_str("\n\n");
+            last_day = Some(day);
+        }
+        // Collapse internal newlines so each dictation stays on one line.
+        let text = e.text.replace('\n', " ");
+        out.push_str(&format!("  {time}   {text}\n"));
+    }
+    out
 }
 
 /// Build an NSImage from an SF Symbol name. Returns None if the symbol
@@ -987,5 +1044,38 @@ fn position_pill_at_cursor_screen(window: &NSWindow) {
         let x = chosen.origin.x + (chosen.size.width - win_frame.size.width) / 2.0;
         let y = chosen.origin.y + 80.0;
         window.setFrameOrigin(NSPoint::new(x, y));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_text_empty() {
+        let s = render_history_text(&[]);
+        assert!(s.contains("No dictations yet"));
+    }
+
+    #[test]
+    fn render_text_groups_by_day_newest_first() {
+        // Two entries ~a day apart. We assert structure (a header line, the
+        // two-space row indent) without pinning exact times, since formatting
+        // is locale/timezone dependent.
+        let entries = vec![
+            Entry { text: "second day line".into(), created_at: 1_747_900_000 },
+            Entry { text: "first day line".into(), created_at: 1_747_900_000 - 90_000 },
+        ];
+        let s = render_history_text(&entries);
+        eprintln!("\n----- render_history_text -----\n{s}-------------------------------");
+        // Two distinct uppercase day headers (different calendar days).
+        let headers = s.lines().filter(|l| l.contains(202.to_string().as_str()) && l == &l.to_uppercase() && !l.starts_with(' ')).count();
+        assert!(headers >= 2, "expected >=2 day headers, got {headers} in:\n{s}");
+        // Rows are indented two spaces and carry the text.
+        assert!(s.contains("  ") && s.contains("second day line"));
+        // Newest first.
+        let i_new = s.find("second day line").unwrap();
+        let i_old = s.find("first day line").unwrap();
+        assert!(i_new < i_old, "newest entry should come first");
     }
 }
