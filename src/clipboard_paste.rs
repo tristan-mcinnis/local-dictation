@@ -18,11 +18,24 @@ const KEY_V: CGKeyCode = 9;
 const KEY_RETURN: CGKeyCode = 36;
 const KEY_TAB: CGKeyCode = 48;
 // Time the OS needs to actually consume the synthesized Cmd+V and let the
-// receiving app pull from the pasteboard before we restore. Bumped from the
-// original 180 ms: under GPU load right after Gemma inference the target app's
-// paste handler can run late, and restoring the clipboard too early made it
-// paste stale/empty content — one cause of "records but doesn't paste".
-const PASTE_SETTLE_MS: u64 = 260;
+// receiving app pull from the pasteboard before we restore. Under GPU load
+// right after Gemma inference the target app's paste handler can run late, and
+// restoring the clipboard too early makes it paste stale/empty/partial content
+// — the main cause of "records but doesn't paste everything".
+//
+// The wait is *adaptive*: a fixed delay that's fine for a short phrase is too
+// short for a multi-paragraph dictation (more text → the receiving app's paste
+// handler takes longer to pull + render before our restore clobbers the
+// pasteboard). Scale a base delay by text length, capped so we never stall the
+// hot path unreasonably.
+const PASTE_SETTLE_BASE_MS: u64 = 280;
+const PASTE_SETTLE_MAX_MS: u64 = 1500;
+
+/// Settle time before restoring the clipboard, scaled by paste size.
+/// `+1 ms per ~3 chars` on top of the base, clamped to the max.
+fn paste_settle_ms(text_chars: usize) -> u64 {
+    (PASTE_SETTLE_BASE_MS + (text_chars as u64) / 3).min(PASTE_SETTLE_MAX_MS)
+}
 
 /// Build a CGEvent source that does **not** merge the live hardware modifier
 /// state into the events we post.
@@ -52,7 +65,7 @@ pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
 
     synthesize_cmd_v()?;
 
-    std::thread::sleep(Duration::from_millis(PASTE_SETTLE_MS));
+    std::thread::sleep(Duration::from_millis(paste_settle_ms(text.chars().count())));
 
     if let Some(orig) = saved {
         let _ = cb.set_text(orig);
