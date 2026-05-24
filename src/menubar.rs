@@ -308,8 +308,9 @@ fn build_status_item(
 
     let settings = Settings::load();
     // Defined output-format presets (keys of prompts.json `formats`). Empty
-    // unless the user has set some, in which case we surface a picker.
-    let format_names = crate::prompts::Prompts::load().format_names();
+    // unless the user has set some, in which case we surface a picker. Uses the
+    // non-logging loader so building the menu doesn't re-emit the boot summary.
+    let format_names = crate::prompts::Prompts::load_quiet().format_names();
 
     // ── Last dictation preview (disabled label) + Copy ──────────────────
     let last_item = unsafe {
