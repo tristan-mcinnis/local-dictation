@@ -22,12 +22,14 @@ use crate::refiner::Refiner;
 use crate::transcriber::LocalInferenceWorker;
 use crate::ui_channel::{self, UiState};
 use crate::voice_commands::TrailingAction;
+use core_foundation::base::TCFType;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CallbackResult, EventField,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::raw::c_void;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,6 +80,88 @@ use crate::cleaner::TextCleanupEngine;
 // Default. Override at startup by setting DICTATE_HOTKEY_KEYCODE.
 const DEFAULT_HOTKEY_KEYCODE: i64 = 0x3D;
 
+// Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
+const SPACE_KEYCODE: i64 = 0x31;
+
+// Hands-free latch state machine, shared with the event-tap callback:
+//
+//   ST_IDLE ─PTT press─▶ ST_HOLDING ─release─▶ ST_IDLE              (normal PTT)
+//                            │ +Space chord
+//                            ▼
+//                     ST_HOLDING_ARMED ─release─▶ ST_LATCHED
+//                                                     │ PTT tap
+//                                                     ▼
+//                                               ST_STOPPING_TAP ─release─▶ ST_IDLE
+//
+// In ST_LATCHED the keys are physically up but the mic keeps recording; the
+// next PTT tap stops + processes the utterance. The transition logic lives in
+// the pure `ptt_transition` fn below so it can be unit-tested without a tap.
+const ST_IDLE: u8 = 0;
+const ST_HOLDING: u8 = 1;
+const ST_HOLDING_ARMED: u8 = 2;
+const ST_LATCHED: u8 = 3;
+const ST_STOPPING_TAP: u8 = 4;
+
+/// A normalised hotkey/space event fed to the latch state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PttInput {
+    /// The PTT modifier transitioned to held. `shift` = Shift co-held (the
+    /// transform-selection gesture), read only when starting a fresh utterance.
+    HotkeyPress { shift: bool },
+    /// The PTT modifier transitioned to released.
+    HotkeyRelease,
+    /// Space went down (only meaningful while the PTT key is held).
+    SpaceDown,
+}
+
+/// What the state machine wants the caller to do, alongside the new state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PttDecision {
+    Nothing,
+    /// Begin capture. `transform` carries the Shift-at-press gesture.
+    Start { transform: bool },
+    /// End capture and run the pipeline.
+    Stop,
+    /// First Space of a hold: arm hands-free (cue) and swallow the Space.
+    ArmLatch,
+    /// Subsequent Space while already armed: just swallow it.
+    SwallowSpace,
+}
+
+/// Pure transition table for the hands-free latch. Given the current state and
+/// an input, returns the next state and the side effect to perform. Keeping
+/// this free of any CG / channel types makes the whole gesture unit-testable.
+fn ptt_transition(state: u8, input: PttInput) -> (u8, PttDecision) {
+    match (state, input) {
+        (ST_IDLE, PttInput::HotkeyPress { shift }) => {
+            (ST_HOLDING, PttDecision::Start { transform: shift })
+        }
+        (ST_HOLDING, PttInput::SpaceDown) => (ST_HOLDING_ARMED, PttDecision::ArmLatch),
+        (ST_HOLDING_ARMED, PttInput::SpaceDown) => (ST_HOLDING_ARMED, PttDecision::SwallowSpace),
+        (ST_HOLDING, PttInput::HotkeyRelease) => (ST_IDLE, PttDecision::Stop),
+        // Armed → keys released: stay recording hands-free.
+        (ST_HOLDING_ARMED, PttInput::HotkeyRelease) => (ST_LATCHED, PttDecision::Nothing),
+        // A PTT tap ends a hands-free session.
+        (ST_LATCHED, PttInput::HotkeyPress { .. }) => (ST_STOPPING_TAP, PttDecision::Stop),
+        (ST_STOPPING_TAP, PttInput::HotkeyRelease) => (ST_IDLE, PttDecision::Nothing),
+        // Any other combination is a no-op (e.g. stray Space when not holding,
+        // re-press while already holding, release in IDLE).
+        (s, _) => (s, PttDecision::Nothing),
+    }
+}
+
+// Raw CFMachPortRef of the live event tap, stashed after creation so the
+// callback can re-enable the tap if macOS ever disables it. Active taps can be
+// killed by a slow callback or certain user input; without re-enabling, the
+// hotkey would silently die. Null until the tap exists.
+static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+extern "C" {
+    /// CoreGraphics: enable or disable a previously-created event tap.
+    /// `void CGEventTapEnable(CFMachPortRef tap, bool enable);`
+    fn CGEventTapEnable(tap: *const c_void, enable: bool);
+}
+
 /// Configuration for the daemon. Built from CLI args / env vars in main.rs.
 pub struct DaemonConfig {
     pub parakeet_dir: String,
@@ -114,6 +198,9 @@ enum DaemonEvent {
     /// is an instruction to rewrite the current selection, not text to insert.
     StartRecording { transform: bool },
     StopRecording,
+    /// PTT + Space chord recognised mid-hold: the session became hands-free, so
+    /// releasing the keys won't stop recording. Worker just plays the cue.
+    LatchArmed,
 }
 
 pub fn run(config: DaemonConfig) -> eyre::Result<()> {
@@ -148,32 +235,104 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // non-Option hotkey would never register a press (the old code checked
     // the Alternate bit unconditionally).
     let hotkey_flag = keycode_to_modifier_flag(hotkey_keycode);
-    let currently_pressed = Arc::new(AtomicBool::new(false));
-    let pressed_for_callback = currently_pressed.clone();
+
+    // Hands-free latch state shared with the callback. `state` is the ST_*
+    // machine driven by `ptt_transition`; `space_down` lets us swallow the
+    // Space key-up that matches a swallowed key-down so no stray space ever
+    // lands in the focused field.
+    let state = Arc::new(AtomicU8::new(ST_IDLE));
+    let space_down = Arc::new(AtomicBool::new(false));
+    let state_cb = state.clone();
+    let space_down_cb = space_down.clone();
 
     // Install CGEventTap manually so we can hand the main thread over to
     // NSApplication.run() (needed for the menu-bar item + floating pill).
+    //
+    // This is an ACTIVE tap (not ListenOnly) because hands-free mode must
+    // *swallow* the Space key while the PTT key is held — otherwise the held
+    // modifier + Space would insert a character (e.g. Option+Space → nbsp).
+    // The callback stays trivial (atomics + non-blocking channel sends) so it
+    // can never stall the input stream; TapDisabled events re-enable the tap.
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
-        CGEventTapOptions::ListenOnly,
-        vec![CGEventType::FlagsChanged],
-        move |_proxy, _etype, event| {
-            let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-            if keycode == hotkey_keycode {
-                let flags = event.get_flags();
-                let is_set_now = flags.contains(hotkey_flag);
-                let was_pressed = pressed_for_callback.load(Ordering::SeqCst);
-                if is_set_now && !was_pressed {
-                    pressed_for_callback.store(true, Ordering::SeqCst);
-                    // Shift co-held at press → transform mode (rewrite the
-                    // selection). The user holds Shift *before* the PTT key.
-                    let transform = flags.contains(CGEventFlags::CGEventFlagShift);
-                    let _ = tx_for_callback.send(DaemonEvent::StartRecording { transform });
-                } else if !is_set_now && was_pressed {
-                    pressed_for_callback.store(false, Ordering::SeqCst);
-                    let _ = tx_for_callback.send(DaemonEvent::StopRecording);
+        CGEventTapOptions::Default,
+        vec![
+            CGEventType::FlagsChanged,
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+        ],
+        move |_proxy, etype, event| {
+            match etype {
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
+                    // macOS disabled the tap — re-arm it so the hotkey lives on.
+                    let p = TAP_PORT.load(Ordering::SeqCst);
+                    if !p.is_null() {
+                        unsafe { CGEventTapEnable(p, true) };
+                    }
                 }
+                CGEventType::FlagsChanged => {
+                    let keycode =
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    if keycode != hotkey_keycode {
+                        return CallbackResult::Keep;
+                    }
+                    let flags = event.get_flags();
+                    let input = if flags.contains(hotkey_flag) {
+                        // Shift co-held at press → transform mode (rewrite the
+                        // selection). The user holds Shift *before* the PTT key.
+                        PttInput::HotkeyPress {
+                            shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                        }
+                    } else {
+                        PttInput::HotkeyRelease
+                    };
+                    let (next, decision) = ptt_transition(state_cb.load(Ordering::SeqCst), input);
+                    state_cb.store(next, Ordering::SeqCst);
+                    match decision {
+                        PttDecision::Start { transform } => {
+                            let _ =
+                                tx_for_callback.send(DaemonEvent::StartRecording { transform });
+                        }
+                        PttDecision::Stop => {
+                            let _ = tx_for_callback.send(DaemonEvent::StopRecording);
+                        }
+                        _ => {}
+                    }
+                    // FlagsChanged is never swallowed — let the modifier through.
+                }
+                CGEventType::KeyDown => {
+                    let keycode =
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    if keycode == SPACE_KEYCODE {
+                        let (next, decision) =
+                            ptt_transition(state_cb.load(Ordering::SeqCst), PttInput::SpaceDown);
+                        state_cb.store(next, Ordering::SeqCst);
+                        match decision {
+                            PttDecision::ArmLatch => {
+                                // Chord recognised: cue + swallow so the
+                                // Option+Space character never reaches the field.
+                                let _ = tx_for_callback.send(DaemonEvent::LatchArmed);
+                                space_down_cb.store(true, Ordering::SeqCst);
+                                return CallbackResult::Drop;
+                            }
+                            PttDecision::SwallowSpace => {
+                                space_down_cb.store(true, Ordering::SeqCst);
+                                return CallbackResult::Drop;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                CGEventType::KeyUp => {
+                    let keycode =
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    if keycode == SPACE_KEYCODE && space_down_cb.swap(false, Ordering::SeqCst) {
+                        // Swallow the key-up matching a swallowed key-down.
+                        return CallbackResult::Drop;
+                    }
+                }
+                _ => {}
             }
             CallbackResult::Keep
         },
@@ -183,6 +342,13 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             "failed to install CGEventTap — Accessibility permission missing or revoked"
         )
     })?;
+
+    // Stash the tap's port so the callback can re-enable it after a
+    // system-initiated disable (see TapDisabled handling above).
+    TAP_PORT.store(
+        tap.mach_port().as_concrete_TypeRef() as *mut c_void,
+        Ordering::SeqCst,
+    );
 
     let loop_source = tap
         .mach_port()
@@ -196,9 +362,9 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     std::mem::forget(loop_source);
 
     eprintln!(
-        "[boot] ready · hold {} (0x{:x}) to dictate · ⌘Q quits",
-        crate::settings::hotkey_name(hotkey_keycode),
-        hotkey_keycode
+        "[boot] ready · hold {key} (0x{hotkey_keycode:x}) to dictate · \
+         {key}+Space then release = hands-free (tap {key} to stop) · ⌘Q quits",
+        key = crate::settings::hotkey_name(hotkey_keycode),
     );
     eprintln!();
     ui_channel::set_state(UiState::Idle);
@@ -304,6 +470,12 @@ fn worker_loop(
 
     while let Ok(event) = rx.recv() {
         match event {
+            DaemonEvent::LatchArmed => {
+                // Hands-free engaged mid-hold: the mic keeps running once the
+                // keys are released. Just give audible feedback + a log line.
+                cues::play_latch();
+                eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
+            }
             DaemonEvent::StartRecording { transform } => {
                 if engine.is_some() {
                     continue;
@@ -587,5 +759,154 @@ fn execute_trailing_action(action: &TrailingAction) {
     match (action, result) {
         (_, Ok(())) => eprintln!("  ↵    {action:?} sent"),
         (_, Err(e)) => eprintln!("  ✗    {action:?} failed: {e:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive the state machine through a sequence of inputs, returning the
+    /// (state, decision) at each step plus the final state. Mirrors exactly
+    /// what the event-tap callback does: feed input, store next state.
+    fn run(inputs: &[PttInput]) -> (Vec<PttDecision>, u8) {
+        let mut state = ST_IDLE;
+        let mut decisions = Vec::new();
+        for &input in inputs {
+            let (next, decision) = ptt_transition(state, input);
+            state = next;
+            decisions.push(decision);
+        }
+        (decisions, state)
+    }
+
+    #[test]
+    fn normal_ptt_press_and_release() {
+        // Hold then release: start on press, stop on release, back to idle.
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyRelease,
+        ]);
+        assert_eq!(
+            decisions,
+            vec![PttDecision::Start { transform: false }, PttDecision::Stop]
+        );
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn shift_press_starts_transform() {
+        let (decisions, _) = run(&[PttInput::HotkeyPress { shift: true }]);
+        assert_eq!(decisions, vec![PttDecision::Start { transform: true }]);
+    }
+
+    #[test]
+    fn hands_free_full_gesture() {
+        // Hold PTT, chord Space, release both, then tap PTT to stop.
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false }, // Start
+            PttInput::SpaceDown,                    // ArmLatch (cue + swallow)
+            PttInput::HotkeyRelease,                // → Latched, keep recording
+            PttInput::HotkeyPress { shift: false }, // tap → Stop
+            PttInput::HotkeyRelease,                // → Idle, no-op
+        ]);
+        assert_eq!(
+            decisions,
+            vec![
+                PttDecision::Start { transform: false },
+                PttDecision::ArmLatch,
+                PttDecision::Nothing,
+                PttDecision::Stop,
+                PttDecision::Nothing,
+            ]
+        );
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn release_order_space_before_ptt_still_latches() {
+        // Arming only needs the Space chord while holding; releasing the PTT
+        // afterwards latches regardless of when Space physically came up.
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false },
+            PttInput::SpaceDown,
+            PttInput::HotkeyRelease,
+        ]);
+        assert_eq!(decisions.last(), Some(&PttDecision::Nothing));
+        assert_eq!(end, ST_LATCHED);
+    }
+
+    #[test]
+    fn repeated_space_while_armed_is_swallowed_not_re_cued() {
+        // A second Space during the same hold must still be swallowed, but
+        // emits SwallowSpace (no fresh cue) rather than ArmLatch.
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false },
+            PttInput::SpaceDown,
+            PttInput::SpaceDown,
+        ]);
+        assert_eq!(
+            decisions,
+            vec![
+                PttDecision::Start { transform: false },
+                PttDecision::ArmLatch,
+                PttDecision::SwallowSpace,
+            ]
+        );
+        assert_eq!(end, ST_HOLDING_ARMED);
+    }
+
+    #[test]
+    fn stray_space_when_idle_is_passed_through() {
+        // Space with no PTT held must NOT be swallowed (Nothing) so normal
+        // typing is unaffected.
+        let (decisions, end) = run(&[PttInput::SpaceDown]);
+        assert_eq!(decisions, vec![PttDecision::Nothing]);
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn space_during_latched_session_passes_through() {
+        // Once hands-free, the keys are up; a Space is a real keystroke and
+        // must not be swallowed or change state.
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false },
+            PttInput::SpaceDown,
+            PttInput::HotkeyRelease, // Latched
+            PttInput::SpaceDown,     // real space
+        ]);
+        assert_eq!(decisions.last(), Some(&PttDecision::Nothing));
+        assert_eq!(end, ST_LATCHED);
+    }
+
+    #[test]
+    fn re_press_while_holding_is_noop() {
+        // A spurious second press event while already holding does nothing
+        // (and never starts a second recording).
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false },
+        ]);
+        assert_eq!(
+            decisions,
+            vec![PttDecision::Start { transform: false }, PttDecision::Nothing]
+        );
+        assert_eq!(end, ST_HOLDING);
+    }
+
+    #[test]
+    fn normal_then_handsfree_back_to_back() {
+        // A plain hold/release, then a hands-free session — state returns to
+        // idle cleanly between them.
+        let (_decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyRelease, // Stop → Idle
+            PttInput::HotkeyPress { shift: false },
+            PttInput::SpaceDown,
+            PttInput::HotkeyRelease, // Latched
+            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyRelease, // Stop → Idle
+        ]);
+        assert_eq!(end, ST_IDLE);
     }
 }

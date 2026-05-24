@@ -22,6 +22,13 @@ pub fn play_cancel() {
     play("Funk");
 }
 
+/// Hands-free latch armed: PTT + Space was chorded, so recording keeps running
+/// after the keys are released. A short distinct blip meaning "you can let go
+/// now — tap PTT once to stop."
+pub fn play_latch() {
+    play("Pop");
+}
+
 pub fn play_error() {
     play("Basso");
 }
