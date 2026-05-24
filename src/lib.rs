@@ -3,10 +3,12 @@ pub mod corrections;
 pub mod cues;
 pub mod history;
 pub mod injector;
+pub mod refiner;
 pub mod settings;
 pub mod smart_pad;
 pub mod text_polish;
 pub mod transcriber;
+pub mod ui_channel;
 pub mod voice_commands;
 
 #[cfg(feature = "cleaner")]

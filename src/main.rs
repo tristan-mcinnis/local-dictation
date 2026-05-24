@@ -107,6 +107,26 @@ fn inject_with_optional_focus(text: &str) -> eyre::Result<()> {
     AccessibilityInjector::inject_into_pid(pid, text)
 }
 
+/// Apply the same deterministic refinement the daemon uses — personal
+/// corrections dictionary, then trailing voice-command parsing — to a
+/// cleaned transcript, returning the body to inject. This keeps the
+/// `bench` / `dictate` subcommands faithful to production instead of
+/// silently skipping corrections + commands. The CLI paths don't execute
+/// the trailing action (no key synthesis); we just note it.
+#[cfg(feature = "parakeet")]
+fn refine_for_cli(cleaned: &str) -> String {
+    use fast_dictate_backend::corrections::Corrections;
+    use fast_dictate_backend::refiner::Refiner;
+    use fast_dictate_backend::voice_commands::TrailingAction;
+
+    let corrections = Corrections::load_default().unwrap_or_else(|_| Corrections::empty());
+    let refined = Refiner::new(corrections).refine(cleaned);
+    if refined.action != TrailingAction::None {
+        println!("[refine] parsed trailing command {:?} (not executed in CLI mode)", refined.action);
+    }
+    refined.text
+}
+
 /// Open the daemon log in the user's default text editor / Console.app.
 /// Same path the menu-bar "Open Log" item uses.
 fn run_logs() -> eyre::Result<()> {
@@ -230,6 +250,7 @@ async fn run_bench(wav_path: &str) -> eyre::Result<()> {
     #[cfg(not(feature = "cleaner"))]
     let final_text = transcript;
 
+    let final_text = refine_for_cli(&final_text);
     inject_with_optional_focus(&final_text)?;
     Ok(())
 }
@@ -295,6 +316,7 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
     #[cfg(not(feature = "cleaner"))]
     let final_text = transcript;
 
+    let final_text = refine_for_cli(&final_text);
     if final_text.trim().is_empty() {
         println!("[dictate] empty result — skipping injection");
         return Ok(());

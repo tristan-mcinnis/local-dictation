@@ -1,4 +1,4 @@
-use fast_dictate_backend::audio::AudioCaptureEngine;
+use fast_dictate_backend::audio::{drain_until_stopped, AudioCaptureEngine};
 use ringbuf::{
     traits::{Consumer, Observer, Producer, Split},
     HeapRb,
@@ -31,8 +31,11 @@ fn test_lock_free_ring_buffer_concurrency() {
 
 #[tokio::test]
 async fn test_inference_termination_logic() {
+    // Exercise the PRODUCTION drain function (`audio::drain_until_stopped`),
+    // not a hand-rolled copy — so this test actually guards the real
+    // "capture stopped AND buffer empty" termination rule.
     let rb = HeapRb::<f32>::new(1000);
-    let (mut prod, mut cons) = rb.split();
+    let (mut prod, cons) = rb.split();
 
     let is_recording = Arc::new(AtomicBool::new(true));
 
@@ -45,17 +48,7 @@ async fn test_inference_termination_logic() {
         flag.store(false, Ordering::SeqCst);
     });
 
-    let mut audio_buffer = Vec::new();
-    while is_recording.load(Ordering::SeqCst) || !cons.is_empty() {
-        let pending = cons.occupied_len();
-        if pending > 0 {
-            let mut chunk = vec![0.0_f32; pending];
-            let got = cons.pop_slice(&mut chunk);
-            audio_buffer.extend_from_slice(&chunk[..got]);
-        } else {
-            tokio::time::sleep(tokio::time::Duration::from_millis(2)).await;
-        }
-    }
+    let audio_buffer = drain_until_stopped(cons, is_recording).await;
 
     assert_eq!(
         audio_buffer.len(),

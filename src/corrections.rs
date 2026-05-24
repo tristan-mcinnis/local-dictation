@@ -49,6 +49,15 @@ impl Corrections {
         Self::default()
     }
 
+    /// Build directly from a key→replacement map. Keys are lowercased so
+    /// matching stays case-insensitive (mirroring `load_from`). Useful for
+    /// tests and for callers that source corrections from somewhere other
+    /// than the JSON file.
+    pub fn from_map(map: HashMap<String, String>) -> Self {
+        let map = map.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
+        Self { map }
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::settings::{self, Settings};
+use crate::ui_channel::{self, UiState};
 
 const LOG_PATH: &str = "/tmp/dictate-daemon.log";
 
@@ -56,33 +57,8 @@ const BAR_GAP: f64 = 2.0;
 const BAR_MAX_H: f64 = 26.0;
 const BAR_MIN_H: f64 = 2.0;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum UiState {
-    Idle = 0,
-    Recording = 1,
-    Processing = 2,
-}
-
-static SHARED_STATE: AtomicU8 = AtomicU8::new(0);
-
-/// The last successfully-injected text, for the "Copy last dictation" item.
-static LAST_DICTATION: Mutex<String> = Mutex::new(String::new());
-
-pub fn set_state(state: UiState) {
-    SHARED_STATE.store(state as u8, Ordering::SeqCst);
-}
-
-/// Record the most recent injected text (called by the worker thread).
-pub fn set_last_dictation(text: &str) {
-    if let Ok(mut g) = LAST_DICTATION.lock() {
-        *g = text.to_string();
-    }
-}
-
-fn last_dictation() -> String {
-    LAST_DICTATION.lock().map(|g| g.clone()).unwrap_or_default()
-}
+// The worker→UI state (current `UiState`, last dictation, audio levels) lives
+// in `crate::ui_channel`. The menu bar is purely the reader side here.
 
 struct UiGlobals {
     status_item: Retained<NSStatusItem>,
@@ -130,7 +106,7 @@ define_class!(
 
         #[unsafe(method(copyLast:))]
         fn copy_last(&self, _sender: *mut AnyObject) {
-            let text = last_dictation();
+            let text = ui_channel::last_dictation();
             if !text.is_empty() {
                 copy_to_clipboard(&text);
             }
@@ -511,7 +487,7 @@ fn build_hotkey_submenu(
 
 /// Title for the disabled preview item, truncated for the menu.
 fn last_dictation_label() -> String {
-    let text = last_dictation();
+    let text = ui_channel::last_dictation();
     if text.is_empty() {
         return "No dictation yet".to_string();
     }
@@ -864,19 +840,15 @@ fn install_poll_timer() {
             Some(g) => g,
             None => return,
         };
-        let now = SHARED_STATE.load(Ordering::SeqCst);
+        let state = ui_channel::state();
+        let now = state as u8;
         let prev = globals.last_state.swap(now, Ordering::SeqCst);
         if now != prev {
-            let state = match now {
-                1 => UiState::Recording,
-                2 => UiState::Processing,
-                _ => UiState::Idle,
-            };
             apply_state_transition(globals, state);
         }
         // Always update bar heights when pill is visible — drives the
         // waveform animation.
-        if now == 1 || now == 2 {
+        if matches!(state, UiState::Recording | UiState::Processing) {
             update_bars(globals);
         }
     }
@@ -941,7 +913,7 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                     .last_item
                     .setTitle(&NSString::from_str(&last_dictation_label()));
             }
-            crate::audio::reset_levels();
+            ui_channel::reset_levels();
             collapse_bars(globals);
             unsafe { globals.pill_window.orderOut(None) };
         }
@@ -953,7 +925,7 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
 }
 
 fn update_bars(globals: &UiGlobals) {
-    let levels = crate::audio::recent_levels();
+    let levels = ui_channel::recent_levels();
     let mut displayed = match globals.displayed_heights.lock() {
         Ok(g) => g,
         Err(_) => return,

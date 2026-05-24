@@ -191,7 +191,7 @@ Two ways to configure the daemon, in order of precedence:
 
 ```
 src/
-├── audio.rs            cpal input + SPSC ring buffer + RMS levels
+├── audio.rs            cpal input + SPSC ring buffer + drain_until_stopped
 ├── cleaner.rs          Gemma cleanup (llama-cpp-2 + Metal)
 ├── clipboard_paste.rs  save → set → Cmd+V → restore (+ Return key synth)
 ├── cues.rs             afplay system sounds
@@ -199,10 +199,12 @@ src/
 ├── history.rs          SQLite dictation history (record / recent)
 ├── injector.rs         AX direct + smart-spacing + Electron clipboard route
 ├── menubar.rs          NSStatusItem menu (model/hotkey/cleanup/history) + pill + history window
+├── refiner.rs          corrections + voice-command parse (shared by daemon & CLI)
 ├── settings.rs         ~/.config/local-dictation/settings.json load/save
 ├── smart_pad.rs        spacing & capitalization rules
 ├── text_polish.rs      strip LLM preamble / quotes / artefacts
 ├── transcriber.rs      Parakeet wrapper + WAV loader
+├── ui_channel.rs       worker→UI state / last-dictation / audio levels
 └── voice_commands.rs   trailing "press enter" detection
 tests/verification.rs   ring buffer + drain integration tests
 ```
@@ -210,8 +212,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 39 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner suites — 43 total
+cargo test                # 44 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner suites — 48 total
 ```
 
 ## License

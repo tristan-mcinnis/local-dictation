@@ -16,8 +16,26 @@ use std::time::Duration;
 const KEY_V: CGKeyCode = 9;
 const KEY_RETURN: CGKeyCode = 36;
 // Time the OS needs to actually consume the synthesized Cmd+V and let the
-// receiving app pull from the pasteboard before we restore.
-const PASTE_SETTLE_MS: u64 = 180;
+// receiving app pull from the pasteboard before we restore. Bumped from the
+// original 180 ms: under GPU load right after Gemma inference the target app's
+// paste handler can run late, and restoring the clipboard too early made it
+// paste stale/empty content — one cause of "records but doesn't paste".
+const PASTE_SETTLE_MS: u64 = 260;
+
+/// Build a CGEvent source that does **not** merge the live hardware modifier
+/// state into the events we post.
+///
+/// This is the crux of the intermittent-paste bug: the push-to-talk hotkey is
+/// a *modifier* key (Right Option by default). With `HIDSystemState` the
+/// synthesized Cmd+V inherits whatever modifiers are physically down at post
+/// time, so if Option hasn't fully registered as released yet the event
+/// becomes Cmd+Option+V — which is not the paste shortcut, so nothing pastes.
+/// `Private` gives us an isolated state table, so the only modifiers on the
+/// event are the ones we set explicitly.
+fn clean_event_source() -> eyre::Result<CGEventSource> {
+    CGEventSource::new(CGEventSourceStateID::Private)
+        .map_err(|_| eyre::eyre!("CGEventSource::new failed"))
+}
 
 pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
     let mut cb = Clipboard::new()
@@ -44,8 +62,7 @@ pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
 }
 
 fn synthesize_cmd_v() -> eyre::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| eyre::eyre!("CGEventSource::new failed"))?;
+    let source = clean_event_source()?;
 
     let key_down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
         .map_err(|_| eyre::eyre!("CGEvent keydown create failed"))?;
@@ -54,7 +71,8 @@ fn synthesize_cmd_v() -> eyre::Result<()> {
 
     let key_up = CGEvent::new_keyboard_event(source, KEY_V, false)
         .map_err(|_| eyre::eyre!("CGEvent keyup create failed"))?;
-    key_up.set_flags(CGEventFlags::CGEventFlagCommand);
+    // Clear the command flag on key-up so we don't leave a dangling modifier.
+    key_up.set_flags(CGEventFlags::CGEventFlagNull);
     key_up.post(CGEventTapLocation::HID);
 
     Ok(())
@@ -64,15 +82,18 @@ fn synthesize_cmd_v() -> eyre::Result<()> {
 /// ends with "press enter" — the daemon strips the trigger phrase and
 /// calls this after the cleaned text is in the field.
 pub fn synthesize_return() -> eyre::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| eyre::eyre!("CGEventSource::new failed"))?;
+    let source = clean_event_source()?;
 
     let down = CGEvent::new_keyboard_event(source.clone(), KEY_RETURN, true)
         .map_err(|_| eyre::eyre!("Return keydown create failed"))?;
+    // Post with no modifier flags — a held push-to-talk modifier must not
+    // turn this Return into e.g. Option-Return (insert newline / no submit).
+    down.set_flags(CGEventFlags::CGEventFlagNull);
     down.post(CGEventTapLocation::HID);
 
     let up = CGEvent::new_keyboard_event(source, KEY_RETURN, false)
         .map_err(|_| eyre::eyre!("Return keyup create failed"))?;
+    up.set_flags(CGEventFlags::CGEventFlagNull);
     up.post(CGEventTapLocation::HID);
 
     Ok(())
