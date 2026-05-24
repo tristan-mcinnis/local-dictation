@@ -110,7 +110,9 @@ impl DaemonConfig {
 
 #[derive(Debug)]
 enum DaemonEvent {
-    StartRecording,
+    /// `transform` is set when Shift was co-held at press time — the utterance
+    /// is an instruction to rewrite the current selection, not text to insert.
+    StartRecording { transform: bool },
     StopRecording,
 }
 
@@ -164,7 +166,10 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                 let was_pressed = pressed_for_callback.load(Ordering::SeqCst);
                 if is_set_now && !was_pressed {
                     pressed_for_callback.store(true, Ordering::SeqCst);
-                    let _ = tx_for_callback.send(DaemonEvent::StartRecording);
+                    // Shift co-held at press → transform mode (rewrite the
+                    // selection). The user holds Shift *before* the PTT key.
+                    let transform = flags.contains(CGEventFlags::CGEventFlagShift);
+                    let _ = tx_for_callback.send(DaemonEvent::StartRecording { transform });
                 } else if !is_set_now && was_pressed {
                     pressed_for_callback.store(false, Ordering::SeqCst);
                     let _ = tx_for_callback.send(DaemonEvent::StopRecording);
@@ -294,13 +299,16 @@ fn worker_loop(
     let mut consumer: Option<crate::audio::HeapAudioConsumer> = None;
     let mut is_recording: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     let mut t_press: Option<Instant> = None;
+    // Whether the in-flight utterance is a transform instruction (Shift held).
+    let mut transform_mode = false;
 
     while let Ok(event) = rx.recv() {
         match event {
-            DaemonEvent::StartRecording => {
+            DaemonEvent::StartRecording { transform } => {
                 if engine.is_some() {
                     continue;
                 }
+                transform_mode = transform;
                 t_press = Some(Instant::now());
                 let (mut e, c) = AudioCaptureEngine::new(BUFFER_CAPACITY);
                 let r = match e.start_microphone() {
@@ -320,6 +328,10 @@ fn worker_loop(
             }
             DaemonEvent::StopRecording => {
                 let Some(mut e) = engine.take() else { continue };
+                // Capture (and reset) whether this utterance is a transform.
+                #[allow(unused_variables)]
+                let transform = transform_mode;
+                transform_mode = false;
                 e.stop_capture();
                 cues::play_stop();
                 ui_channel::set_state(UiState::Processing);
@@ -353,13 +365,36 @@ fn worker_loop(
                 };
                 let t_transcribe = t_pipeline.elapsed();
 
-                let mut t_cleanup_ms = 0_u128;
-                let final_text = if transcript.trim().is_empty() {
+                if transcript.trim().is_empty() {
                     eprintln!("  skip · empty transcript");
                     eprintln!();
                     ui_channel::set_state(UiState::Idle);
                     continue;
-                } else {
+                }
+
+                // ─── Transform mode (Shift + push-to-talk) ───────────────
+                // The utterance is an *instruction*: rewrite the current
+                // selection in place rather than insert text. Handled entirely
+                // via a Cmd+C/Cmd+V clipboard round-trip so it works even in
+                // AX-blind apps (Electron, terminals).
+                #[cfg(feature = "cleaner")]
+                if transform {
+                    match cleaner {
+                        Some(ref c) => handle_transform(&rt, c, &transcript),
+                        None => {
+                            eprintln!(
+                                "  ✗    transform needs the cleanup engine (running with --no-cleanup)"
+                            );
+                            cues::play_error();
+                        }
+                    }
+                    eprintln!();
+                    ui_channel::set_state(UiState::Idle);
+                    continue;
+                }
+
+                let mut t_cleanup_ms = 0_u128;
+                let final_text = {
                     #[cfg(feature = "cleaner")]
                     {
                         if let Some(ref c) = cleaner {
@@ -388,11 +423,18 @@ fn worker_loop(
                 // the canonical order (corrections first). Same transform the
                 // CLI `dictate`/`bench` paths now use, so behaviour matches.
                 let refined = refiner.refine(&final_text);
-                let press_enter = matches!(refined.action, TrailingAction::PressEnter);
+                let action = refined.action.clone();
 
+                // Whole-utterance cancel ("scratch that") — inject nothing.
+                if matches!(action, TrailingAction::Cancel) {
+                    eprintln!("  ⌫    scratch that · discarded");
+                    eprintln!();
+                    ui_channel::set_state(UiState::Idle);
+                    continue;
+                }
                 if refined.is_bare_action() {
-                    let _ = crate::clipboard_paste::synthesize_return();
-                    eprintln!("  ↵    bare Return (no body)");
+                    execute_trailing_action(&action);
+                    eprintln!("  ↵    bare command (no body)");
                     eprintln!();
                     ui_channel::set_state(UiState::Idle);
                     continue;
@@ -457,12 +499,10 @@ fn worker_loop(
                     // Persist to the browsable dictation history (best-effort;
                     // never blocks or fails the hot path).
                     crate::history::record(&final_text);
-                    if press_enter {
+                    if !matches!(action, TrailingAction::None) {
+                        // Let the field commit the injected text before the key.
                         std::thread::sleep(Duration::from_millis(40));
-                        match crate::clipboard_paste::synthesize_return() {
-                            Ok(_) => eprintln!("  ↵    Return key sent"),
-                            Err(e) => eprintln!("  ✗    synth return failed: {e:?}"),
-                        }
+                        execute_trailing_action(&action);
                     }
                 }
                 eprintln!();
@@ -476,4 +516,76 @@ fn worker_loop(
     }
 
     Ok(())
+}
+
+/// Transform mode: read the focused app's current selection, apply the spoken
+/// `instruction` to it with the warm Gemma engine, and paste the result over
+/// the selection. Read + replace both go through the clipboard so it works in
+/// AX-blind apps. All failures are logged + cue'd; never fatal.
+#[cfg(feature = "cleaner")]
+fn handle_transform(
+    rt: &tokio::runtime::Runtime,
+    cleaner: &TextCleanupEngine,
+    instruction: &str,
+) {
+    let selection = match crate::clipboard_paste::copy_selection_via_clipboard() {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            eprintln!("  ✗    transform: nothing selected — select text first");
+            cues::play_error();
+            return;
+        }
+        Err(e) => {
+            eprintln!("  ✗    transform: couldn't read selection: {e:?}");
+            cues::play_error();
+            return;
+        }
+    };
+    eprintln!("  ✎    \"{}\"  ·  {} chars selected", instruction.trim(), selection.chars().count());
+
+    let t = Instant::now();
+    let result = match rt.block_on(cleaner.transform(instruction, &selection)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  ✗    transform failed: {e:?}");
+            cues::play_error();
+            return;
+        }
+    };
+    let result = result.trim();
+    if result.is_empty() {
+        eprintln!("  ✗    transform produced no output; selection left unchanged");
+        cues::play_error();
+        return;
+    }
+
+    match crate::clipboard_paste::paste_via_clipboard(result) {
+        Ok(()) => eprintln!("  ✓    transformed in {} ms → \"{result}\"", ms(t.elapsed())),
+        Err(e) => {
+            eprintln!("  ✗    transform paste failed: {e:?}");
+            cues::play_error();
+        }
+    }
+}
+
+/// Run a trailing voice command's keystroke(s). `None`/`Cancel` are no-ops
+/// (the caller handles `Cancel` earlier). Errors are logged, never fatal.
+fn execute_trailing_action(action: &TrailingAction) {
+    use crate::clipboard_paste::{synthesize_return, synthesize_tab};
+    let result = match action {
+        TrailingAction::None | TrailingAction::Cancel => return,
+        TrailingAction::PressEnter => synthesize_return(),
+        TrailingAction::NewParagraph => {
+            // Two Returns, with a beat between so apps that debounce key
+            // repeat still register both.
+            let first = synthesize_return();
+            std::thread::sleep(Duration::from_millis(15));
+            first.and(synthesize_return())
+        }
+        TrailingAction::PressTab => synthesize_tab(),
+    };
+    match (action, result) {
+        (_, Ok(())) => eprintln!("  ↵    {action:?} sent"),
+        (_, Err(e)) => eprintln!("  ✗    {action:?} failed: {e:?}"),
+    }
 }

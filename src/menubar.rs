@@ -24,17 +24,17 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSMenu, NSMenuItem,
-    NSScreen, NSScrollView, NSStatusBar, NSStatusItem, NSTextView, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
+    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSLineBreakMode,
+    NSMenu, NSMenuItem, NSScreen, NSScrollView, NSStatusBar, NSStatusItem, NSTextAlignment,
+    NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
     CFRunLoopTimerContext,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSDate, NSDateFormatter, NSObject, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSObject, NSPoint, NSRect, NSSize, NSString,
 };
 
 use crate::history::Entry;
@@ -117,6 +117,15 @@ define_class!(
             show_history_window();
         }
 
+        // A row in the history window was clicked. Its `tag` indexes into
+        // HISTORY_ENTRIES (the texts shown, newest first); copy the full,
+        // untruncated text and confirm via the window subtitle.
+        #[unsafe(method(copyHistoryEntry:))]
+        fn copy_history_entry(&self, sender: *mut AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            copy_history_entry_at(tag);
+        }
+
         #[unsafe(method(openCorrections:))]
         fn open_corrections(&self, _sender: *mut AnyObject) {
             open_corrections_folder();
@@ -156,7 +165,31 @@ impl MenuActions {
     }
 }
 
+// ─── Flipped container for the history list ─────────────────────────────
+//
+// NSView's default coordinate origin is bottom-left, which makes a top-down
+// list (newest dictation first, at the top, scrolled into view) awkward.
+// Overriding `isFlipped` to true puts the origin at the top-left so rows
+// stack downward and the scroll view shows the top by default.
+define_class!(
+    #[unsafe(super(NSView))]
+    #[name = "FDFlippedView"]
+    struct FlippedView;
+
+    impl FlippedView {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
 static GLOBALS: OnceLock<UiGlobals> = OnceLock::new();
+
+/// The texts currently shown in the history window, newest first. A clicked
+/// row carries its index here as its `tag`, so the click handler can copy the
+/// full (untruncated) text even though the row only displays one line.
+static HISTORY_ENTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub fn init_and_run() -> eyre::Result<()> {
     let mtm = MainThreadMarker::new()
@@ -614,14 +647,19 @@ fn open_corrections_folder() {
 
 // ─── Dictation history window ───────────────────────────────────────────
 //
-// A plain, small native window: a read-only NSTextView inside a scroll view.
-// No WebView, no HTML — just monospaced text grouped by day, which keeps the
-// time column aligned and the whole thing lightweight. Built once and reused;
-// every open re-queries the DB and rewrites the text.
+// A plain, small native window: a scrollable list of past dictations grouped
+// by day. Each dictation is a borderless NSButton — click it to copy the full
+// text to the clipboard (the window subtitle confirms what was copied). The
+// row shows one truncated line; the full text lives in the button's tooltip
+// and is what gets copied. No WebView, no HTML — just AppKit views, built once
+// and reused; every open re-queries the DB and rebuilds the rows.
 
 struct HistoryUi {
     window: Retained<NSWindow>,
-    text_view: Retained<NSTextView>,
+    scroll: Retained<NSScrollView>,
+    /// Flipped document view that holds the day-header labels and per-entry
+    /// buttons. Rebuilt from scratch on every open.
+    doc: Retained<FlippedView>,
 }
 // Only ever touched on the main thread (created from / used by menu actions),
 // so the raw AppKit pointers are safe to park in a static.
@@ -635,27 +673,27 @@ fn history_ui(mtm: MainThreadMarker) -> &'static HistoryUi {
 }
 
 fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 560.0));
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 580.0));
 
-    // `scrollableTextView` hands back a fully-wired NSScrollView whose
-    // document view is an NSTextView, with sizing/scrolling already set up.
-    let scroll = NSTextView::scrollableTextView(mtm);
-    let text_view: Retained<NSTextView> = scroll
-        .documentView()
-        .and_then(|v| v.downcast::<NSTextView>().ok())
-        .expect("scrollableTextView always has an NSTextView document view");
+    let scroll: Retained<NSScrollView> =
+        unsafe { msg_send![NSScrollView::alloc(mtm), initWithFrame: frame] };
     unsafe {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
-        text_view.setEditable(false);
-        text_view.setSelectable(true); // let the user select / copy text
-        text_view.setRichText(false);
-        // Fixed-pitch font so the "hh:mm a" time column lines up.
-        if let Some(font) = NSFont::userFixedPitchFontOfSize(12.0) {
-            text_view.setFont(Some(&font));
-        }
-        text_view.setTextContainerInset(NSSize::new(14.0, 14.0));
+        scroll.setDrawsBackground(true);
+        scroll.setBackgroundColor(&NSColor::controlBackgroundColor());
     }
+
+    // Document view starts the size of the clip area; rebuild_history_list
+    // resizes its height to fit the rows.
+    let content = unsafe { scroll.contentSize() };
+    let doc: Retained<FlippedView> = unsafe {
+        msg_send![
+            FlippedView::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), content)
+        ]
+    };
+    unsafe { scroll.setDocumentView(Some(&*doc)) };
 
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
@@ -672,24 +710,39 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
     };
     unsafe {
         window.setTitle(&NSString::from_str("Dictation History"));
+        // Titlebar hint at what clicking does (refreshed to confirm on copy).
+        let hint = NSString::from_str("Click any entry to copy it");
+        let _: () = msg_send![&*window, setSubtitle: &*hint];
         // Reused across opens — closing must hide, not deallocate it.
         window.setReleasedWhenClosed(false);
-        window.setContentView(Some(&**scroll));
+        window.setContentView(Some(&*scroll));
         window.center();
     }
 
-    HistoryUi { window, text_view }
+    HistoryUi { window, scroll, doc }
 }
 
-/// Re-query the history DB, refresh the text, and bring the window forward.
+/// Re-query the history DB, rebuild the list, and bring the window forward.
 fn show_history_window() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
     let ui = history_ui(mtm);
-    let text = render_history_text(&crate::history::recent(1000));
-    ui.text_view.setString(&NSString::from_str(&text));
-    unsafe { ui.window.makeKeyAndOrderFront(None) };
+    let entries = crate::history::recent(1000);
+
+    // Stash the full texts, newest first, so a clicked row (carrying its index
+    // as its tag) can copy the untruncated text.
+    if let Ok(mut store) = HISTORY_ENTRIES.lock() {
+        *store = entries.iter().map(|e| e.text.clone()).collect();
+    }
+    rebuild_history_list(mtm, ui, &entries);
+
+    // Reset the subtitle hint for the fresh open.
+    unsafe {
+        let hint = NSString::from_str("Click any entry to copy it");
+        let _: () = msg_send![&*ui.window, setSubtitle: &*hint];
+        ui.window.makeKeyAndOrderFront(None);
+    }
     // We're an Accessory app (no Dock icon); without an explicit activate the
     // new window opens behind the frontmost app.
     let app = NSApplication::sharedApplication(mtm);
@@ -699,48 +752,173 @@ fn show_history_window() {
     };
 }
 
-/// Format the history as plain text grouped by local calendar day, newest
-/// first — e.g.
-///
-/// ```text
-/// MAY 22, 2026
-///
-///   05:37 PM   I take your suggestions on what we should do.
-///   05:35 PM   Is it running right now? Can you open it up for me?
-/// ```
-///
-/// `NSDateFormatter` renders dates/times in the user's locale + timezone.
-fn render_history_text(entries: &[Entry]) -> String {
-    if entries.is_empty() {
-        return "\n  No dictations yet.\n\n  Hold your hotkey and speak — they’ll show up here.\n"
-            .to_string();
+/// Copy the stored history text at `tag` (its index in HISTORY_ENTRIES) to the
+/// clipboard and confirm via the window subtitle. Out-of-range/empty are no-ops.
+fn copy_history_entry_at(tag: isize) {
+    if tag < 0 {
+        return;
     }
+    let text = HISTORY_ENTRIES
+        .lock()
+        .ok()
+        .and_then(|g| g.get(tag as usize).cloned());
+    let Some(text) = text else { return };
+    if text.trim().is_empty() {
+        return;
+    }
+    copy_to_clipboard(&text);
 
+    // Confirm in the titlebar: "Copied “<short preview>…”".
+    if let Some(ui) = HISTORY_UI.get() {
+        let flat = text.replace('\n', " ");
+        let preview: String = flat.chars().take(42).collect();
+        let ellipsis = if flat.chars().count() > 42 { "…" } else { "" };
+        let msg = format!("Copied “{preview}{ellipsis}”");
+        unsafe {
+            let s = NSString::from_str(&msg);
+            let _: () = msg_send![&*ui.window, setSubtitle: &*s];
+        }
+    }
+}
+
+/// One rendered row: either a day header or a single dictation. `index` is the
+/// entry's position in the (newest-first) input — the same index used as the
+/// button's `tag` and as the key into HISTORY_ENTRIES.
+#[derive(Debug)]
+enum HistoryRow {
+    Day(String),
+    Item {
+        time: String,
+        text: String,
+        index: usize,
+    },
+}
+
+/// Group entries by local calendar day (newest first) into a flat row list.
+/// `NSDateFormatter` renders dates/times in the user's locale + timezone.
+fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
     let day_fmt = NSDateFormatter::new();
     day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
     let time_fmt = NSDateFormatter::new();
     time_fmt.setDateFormat(Some(&NSString::from_str("hh:mm a")));
 
-    let mut out = String::new();
+    let mut rows = Vec::new();
     let mut last_day: Option<String> = None;
-    for e in entries {
+    for (i, e) in entries.iter().enumerate() {
         let date = unsafe { NSDate::dateWithTimeIntervalSince1970(e.created_at as f64) };
         let day = day_fmt.stringFromDate(&date).to_string().to_uppercase();
         let time = time_fmt.stringFromDate(&date).to_string();
-
         if last_day.as_deref() != Some(day.as_str()) {
-            if last_day.is_some() {
-                out.push('\n');
-            }
-            out.push_str(&day);
-            out.push_str("\n\n");
+            rows.push(HistoryRow::Day(day.clone()));
             last_day = Some(day);
         }
-        // Collapse internal newlines so each dictation stays on one line.
+        // Collapse internal newlines so each dictation stays on one row.
         let text = e.text.replace('\n', " ");
-        out.push_str(&format!("  {time}   {text}\n"));
+        rows.push(HistoryRow::Item {
+            time,
+            text,
+            index: i,
+        });
     }
-    out
+    rows
+}
+
+/// Tear down and rebuild the day-grouped list of clickable rows.
+fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]) {
+    const MX: f64 = 14.0; // horizontal margin
+    const TOP: f64 = 10.0; // top padding
+    const ROW_H: f64 = 22.0; // one dictation row
+    const HEADER_H: f64 = 28.0; // one day header
+    const DAY_GAP: f64 = 8.0; // extra space above each day after the first
+
+    let doc = &ui.doc;
+    let content = unsafe { ui.scroll.contentSize() };
+    let width = content.width.max(200.0);
+    let row_w = width - 2.0 * MX;
+
+    // Clear previous rows.
+    let empty: Retained<NSArray<NSView>> = NSArray::new();
+    unsafe { doc.setSubviews(&empty) };
+
+    if entries.is_empty() {
+        let label = NSTextField::labelWithString(
+            &NSString::from_str("No dictations yet — hold your hotkey and speak."),
+            mtm,
+        );
+        label.setFrame(NSRect::new(
+            NSPoint::new(MX, TOP + 6.0),
+            NSSize::new(row_w, 20.0),
+        ));
+        unsafe { label.setTextColor(Some(&NSColor::secondaryLabelColor())) };
+        unsafe { doc.addSubview(&label) };
+        doc.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(width, content.height.max(60.0)),
+        ));
+        return;
+    }
+
+    // The shared action target whose copyHistoryEntry: handles row clicks.
+    let actions = GLOBALS.get().map(|g| &g._actions);
+
+    let mut y = TOP;
+    for row in history_rows(entries) {
+        match row {
+            HistoryRow::Day(day) => {
+                if y > TOP {
+                    y += DAY_GAP;
+                }
+                let label = NSTextField::labelWithString(&NSString::from_str(&day), mtm);
+                label.setFrame(NSRect::new(NSPoint::new(MX, y), NSSize::new(row_w, 18.0)));
+                label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
+                unsafe { label.setTextColor(Some(&NSColor::secondaryLabelColor())) };
+                unsafe { doc.addSubview(&label) };
+                y += HEADER_H;
+            }
+            HistoryRow::Item { time, text, index } => {
+                let title = format!("{time}   {text}");
+                let btn: Retained<NSButton> = unsafe {
+                    msg_send![
+                        NSButton::alloc(mtm),
+                        initWithFrame: NSRect::new(NSPoint::new(MX, y), NSSize::new(row_w, ROW_H))
+                    ]
+                };
+                btn.setTitle(&NSString::from_str(&title));
+                btn.setBordered(false);
+                btn.setAlignment(NSTextAlignment::Left);
+                if let Some(font) = NSFont::userFixedPitchFontOfSize(12.0) {
+                    btn.setFont(Some(&font));
+                }
+                // Single line, truncate the tail; the full text is the tooltip
+                // and the copy payload.
+                if let Some(cell) = btn.cell() {
+                    cell.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+                }
+                let full = entries
+                    .get(index)
+                    .map(|e| e.text.as_str())
+                    .unwrap_or(text.as_str());
+                btn.setToolTip(Some(&NSString::from_str(full)));
+                unsafe {
+                    if let Some(a) = actions {
+                        let _: () = msg_send![&*btn, setTarget: &**a];
+                        let _: () = msg_send![&*btn, setAction: sel!(copyHistoryEntry:)];
+                    }
+                    let _: () = msg_send![&*btn, setTag: index as isize];
+                    doc.addSubview(&btn);
+                }
+                y += ROW_H;
+            }
+        }
+    }
+
+    let total = y + TOP;
+    doc.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width, total.max(content.height)),
+    ));
+    // Flipped view: (0,0) is the top, so this shows the newest entries.
+    unsafe { doc.scrollPoint(NSPoint::new(0.0, 0.0)) };
 }
 
 /// Build an NSImage from an SF Symbol name. Returns None if the symbol
@@ -1059,30 +1237,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn render_text_empty() {
-        let s = render_history_text(&[]);
-        assert!(s.contains("No dictations yet"));
+    fn rows_empty() {
+        assert!(history_rows(&[]).is_empty());
     }
 
     #[test]
-    fn render_text_groups_by_day_newest_first() {
-        // Two entries ~a day apart. We assert structure (a header line, the
-        // two-space row indent) without pinning exact times, since formatting
+    fn rows_group_by_day_newest_first() {
+        // Two entries ~a day apart. We assert structure (a header per day, item
+        // ordering and indices) without pinning exact times, since formatting
         // is locale/timezone dependent.
         let entries = vec![
             Entry { text: "second day line".into(), created_at: 1_747_900_000 },
             Entry { text: "first day line".into(), created_at: 1_747_900_000 - 90_000 },
         ];
-        let s = render_history_text(&entries);
-        eprintln!("\n----- render_history_text -----\n{s}-------------------------------");
-        // Two distinct uppercase day headers (different calendar days).
-        let headers = s.lines().filter(|l| l.contains(202.to_string().as_str()) && l == &l.to_uppercase() && !l.starts_with(' ')).count();
-        assert!(headers >= 2, "expected >=2 day headers, got {headers} in:\n{s}");
-        // Rows are indented two spaces and carry the text.
-        assert!(s.contains("  ") && s.contains("second day line"));
-        // Newest first.
-        let i_new = s.find("second day line").unwrap();
-        let i_old = s.find("first day line").unwrap();
-        assert!(i_new < i_old, "newest entry should come first");
+        let rows = history_rows(&entries);
+        eprintln!("\n----- history_rows -----\n{rows:#?}\n------------------------");
+
+        // Two distinct day headers (different calendar days).
+        let headers = rows
+            .iter()
+            .filter(|r| matches!(r, HistoryRow::Day(_)))
+            .count();
+        assert_eq!(headers, 2, "expected one header per day, got {headers}");
+
+        // Items appear newest-first, carrying their original entry index, and
+        // each row's text matches its slot.
+        let items: Vec<(usize, &str)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                HistoryRow::Item { index, text, .. } => Some((*index, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items, vec![(0, "second day line"), (1, "first day line")]);
     }
 }

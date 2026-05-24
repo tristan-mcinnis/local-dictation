@@ -44,6 +44,17 @@ const SYSTEM_INSTRUCTION: &str =
      Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
      no markdown.";
 
+// Transform mode: apply a spoken instruction to a selected passage. Kept
+// deliberately strict about output shape — text_polish strips stragglers, but
+// the less the model editorializes the better the in-place replacement reads.
+const TRANSFORM_INSTRUCTION: &str =
+    "You are a precise text editor. Apply the user's instruction to the text \
+     below and return ONLY the resulting text — no preamble, no explanation, \
+     no quotes, no markdown fences, no commentary. Preserve the original \
+     meaning unless the instruction says otherwise. If the instruction is a \
+     translation, output only the translation. If you cannot apply the \
+     instruction, return the original text unchanged.";
+
 // LlamaBackend can be initialised only once per process. Hold it in a OnceLock
 // so multiple TextCleanupEngine instances share the same backend handle.
 static BACKEND: OnceLock<Arc<LlamaBackend>> = OnceLock::new();
@@ -86,17 +97,45 @@ impl TextCleanupEngine {
         })
     }
 
-    /// Run cleanup on a Tokio blocking thread (llama.cpp's decode loop is sync
-    /// and CPU/GPU bound).
+    /// Clean a raw dictation transcript for readability. Runs on a Tokio
+    /// blocking thread (llama.cpp's decode loop is sync and CPU/GPU bound).
     pub async fn process_transcript(&self, raw_text: &str) -> eyre::Result<String> {
         let raw = raw_text.trim();
         if raw.is_empty() {
             return Ok(String::new());
         }
-
-        // Build the chat using the model's own bundled template. Works for
-        // Gemma / Llama 3 / Qwen-ChatML / SmolLM without per-family hardcoding.
         let user_msg = format!("{SYSTEM_INSTRUCTION}\n\nRaw transcript:\n{raw}");
+        self.run_chat(user_msg, self.max_tokens, false).await
+    }
+
+    /// Apply a spoken `instruction` to `selection` and return the edited text.
+    /// This is the transform mode (Shift + push-to-talk): the user selects
+    /// text, speaks an instruction ("make this concise", "translate to
+    /// Spanish", "turn into bullet points"), and the model rewrites it in
+    /// place. Same warm Gemma engine as cleanup, different prompt.
+    pub async fn transform(&self, instruction: &str, selection: &str) -> eyre::Result<String> {
+        let instruction = instruction.trim();
+        if instruction.is_empty() || selection.is_empty() {
+            return Ok(selection.to_string());
+        }
+        let user_msg =
+            format!("{TRANSFORM_INSTRUCTION}\n\nInstruction: {instruction}\n\nText:\n{selection}");
+        // Give the output room for a rewrite that's somewhat longer than the
+        // input (e.g. "expand this"), capped to keep within the context window.
+        let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
+        // Preserve line structure: transforms may legitimately be lists/paras.
+        self.run_chat(user_msg, budget, true).await
+    }
+
+    /// Shared generation core: build the prompt with the model's bundled chat
+    /// template, decode up to `max_tokens`, and polish the result. Works for
+    /// Gemma / Llama 3 / Qwen-ChatML / SmolLM without per-family hardcoding.
+    async fn run_chat(
+        &self,
+        user_msg: String,
+        max_tokens: i32,
+        preserve_newlines: bool,
+    ) -> eyre::Result<String> {
         let messages = vec![LlamaChatMessage::new("user".into(), user_msg)
             .map_err(|e| eyre::eyre!("invalid chat message: {e:?}"))?];
         let prompt = self
@@ -106,7 +145,6 @@ impl TextCleanupEngine {
 
         let backend = self.backend.clone();
         let model = self.model.clone();
-        let max_tokens = self.max_tokens;
 
         tokio::task::spawn_blocking(move || -> eyre::Result<String> {
             let ctx_params = LlamaContextParams::default()
@@ -165,8 +203,13 @@ impl TextCleanupEngine {
             }
 
             // Defensive polish: strip preamble, peel wrapping quotes,
-            // collapse whitespace, drop chat-template artefacts.
-            Ok(crate::text_polish::polish(&out))
+            // collapse whitespace, drop chat-template artefacts. Transform
+            // mode keeps line breaks (lists/paragraphs); cleanup flattens them.
+            Ok(if preserve_newlines {
+                crate::text_polish::polish_multiline(&out)
+            } else {
+                crate::text_polish::polish(&out)
+            })
         })
         .await
         .map_err(|e| eyre::eyre!("blocking task join failed: {e}"))?

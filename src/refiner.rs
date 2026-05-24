@@ -42,10 +42,17 @@ impl RefinedDictation {
         self.text.trim().is_empty()
     }
 
-    /// True when the only thing to do is the trailing action — no body text.
-    /// (e.g. the user said just "press enter".)
+    /// True when the only thing to do is synthesize a keystroke — no body text.
+    /// (e.g. the user said just "press enter" or "new paragraph".) `Cancel` is
+    /// deliberately excluded: it means "do nothing", not "press a key".
     pub fn is_bare_action(&self) -> bool {
-        self.is_empty() && self.action != TrailingAction::None
+        self.is_empty()
+            && matches!(
+                self.action,
+                TrailingAction::PressEnter
+                    | TrailingAction::NewParagraph
+                    | TrailingAction::PressTab
+            )
     }
 }
 
@@ -128,5 +135,24 @@ mod tests {
         assert!(out.is_empty());
         assert!(!out.is_bare_action());
         assert_eq!(out.action, TrailingAction::None);
+    }
+
+    #[test]
+    fn cancel_is_empty_but_not_a_bare_action() {
+        // "scratch that" must inject nothing AND must not synthesize a key.
+        let r = refiner(&[]);
+        let out = r.refine("scratch that");
+        assert!(out.is_empty());
+        assert!(!out.is_bare_action());
+        assert_eq!(out.action, TrailingAction::Cancel);
+    }
+
+    #[test]
+    fn bare_new_paragraph_is_a_bare_action() {
+        let r = refiner(&[]);
+        let out = r.refine("new paragraph");
+        assert!(out.is_empty());
+        assert!(out.is_bare_action());
+        assert_eq!(out.action, TrailingAction::NewParagraph);
     }
 }

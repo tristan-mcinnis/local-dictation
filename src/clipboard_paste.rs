@@ -13,8 +13,10 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::time::Duration;
 
 // US ANSI virtual key codes.
+const KEY_C: CGKeyCode = 8;
 const KEY_V: CGKeyCode = 9;
 const KEY_RETURN: CGKeyCode = 36;
+const KEY_TAB: CGKeyCode = 48;
 // Time the OS needs to actually consume the synthesized Cmd+V and let the
 // receiving app pull from the pasteboard before we restore. Bumped from the
 // original 180 ms: under GPU load right after Gemma inference the target app's
@@ -61,6 +63,63 @@ pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Time the OS needs to consume a synthesized Cmd+C and populate the
+/// pasteboard with the selection before we read it back.
+const COPY_SETTLE_MS: u64 = 140;
+
+/// Grab the focused app's current selection via a Cmd+C round-trip, returning
+/// `None` when nothing is selected. Used by transform mode to read the text the
+/// user wants rewritten — universal across AX-blind apps (Electron, terminals)
+/// where reading `kAXSelectedText` is unreliable, since Cmd+C always works.
+///
+/// The original clipboard is saved and restored. A unique sentinel is placed
+/// before the copy so an unchanged pasteboard (nothing was selected) is
+/// distinguishable from a real empty selection.
+pub fn copy_selection_via_clipboard() -> eyre::Result<Option<String>> {
+    const SENTINEL: &str = "\u{2063}__dictate_selection_probe__\u{2063}";
+    let mut cb = Clipboard::new().map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
+    let saved = cb.get_text().ok();
+
+    cb.set_text(SENTINEL)
+        .map_err(|e| eyre::eyre!("Clipboard::set_text(sentinel) failed: {e}"))?;
+    synthesize_cmd_c()?;
+    std::thread::sleep(Duration::from_millis(COPY_SETTLE_MS));
+
+    let after = cb.get_text().unwrap_or_default();
+
+    // Restore the user's clipboard regardless of outcome.
+    match &saved {
+        Some(orig) => {
+            let _ = cb.set_text(orig);
+        }
+        None => {
+            let _ = cb.set_text("");
+        }
+    }
+
+    if after == SENTINEL || after.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(after))
+    }
+}
+
+fn synthesize_cmd_c() -> eyre::Result<()> {
+    let source = clean_event_source()?;
+
+    let down = CGEvent::new_keyboard_event(source.clone(), KEY_C, true)
+        .map_err(|_| eyre::eyre!("Cmd+C keydown create failed"))?;
+    down.set_flags(CGEventFlags::CGEventFlagCommand);
+    down.post(CGEventTapLocation::HID);
+
+    let up = CGEvent::new_keyboard_event(source, KEY_C, false)
+        .map_err(|_| eyre::eyre!("Cmd+C keyup create failed"))?;
+    up.set_flags(CGEventFlags::CGEventFlagNull);
+    up.post(CGEventTapLocation::HID);
+
+    Ok(())
+}
+
 fn synthesize_cmd_v() -> eyre::Result<()> {
     let source = clean_event_source()?;
 
@@ -78,23 +137,36 @@ fn synthesize_cmd_v() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Synthesize a Return key press + release. Used when the dictated text
-/// ends with "press enter" — the daemon strips the trigger phrase and
-/// calls this after the cleaned text is in the field.
-pub fn synthesize_return() -> eyre::Result<()> {
+/// Synthesize a bare key press + release with no modifier flags.
+///
+/// Posting with `CGEventFlagNull` is load-bearing: a held push-to-talk
+/// modifier must not turn this into e.g. Option-Return (insert newline / no
+/// submit) or Option-Tab (app switch). `clean_event_source` plus an explicit
+/// null flag guarantee the event carries only the key itself.
+fn synthesize_plain_key(key: CGKeyCode) -> eyre::Result<()> {
     let source = clean_event_source()?;
 
-    let down = CGEvent::new_keyboard_event(source.clone(), KEY_RETURN, true)
-        .map_err(|_| eyre::eyre!("Return keydown create failed"))?;
-    // Post with no modifier flags — a held push-to-talk modifier must not
-    // turn this Return into e.g. Option-Return (insert newline / no submit).
+    let down = CGEvent::new_keyboard_event(source.clone(), key, true)
+        .map_err(|_| eyre::eyre!("keydown create failed"))?;
     down.set_flags(CGEventFlags::CGEventFlagNull);
     down.post(CGEventTapLocation::HID);
 
-    let up = CGEvent::new_keyboard_event(source, KEY_RETURN, false)
-        .map_err(|_| eyre::eyre!("Return keyup create failed"))?;
+    let up = CGEvent::new_keyboard_event(source, key, false)
+        .map_err(|_| eyre::eyre!("keyup create failed"))?;
     up.set_flags(CGEventFlags::CGEventFlagNull);
     up.post(CGEventTapLocation::HID);
 
     Ok(())
+}
+
+/// Synthesize a Return key press + release. Used for trailing voice commands
+/// ("press enter", "new line") after the body text is in the field.
+pub fn synthesize_return() -> eyre::Result<()> {
+    synthesize_plain_key(KEY_RETURN)
+}
+
+/// Synthesize a Tab key press + release ("press tab" voice command) — useful
+/// for advancing between form fields by voice.
+pub fn synthesize_tab() -> eyre::Result<()> {
+    synthesize_plain_key(KEY_TAB)
 }

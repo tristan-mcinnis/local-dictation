@@ -1,35 +1,72 @@
-//! Trailing voice commands that get stripped from injected text and
-//! turned into actions (synthesized keystrokes).
+//! Voice commands that get stripped from injected text and turned into
+//! actions (synthesized keystrokes), or that cancel the whole utterance.
 //!
-//! Currently supports:
-//!   * "press enter" / "press return" / "hit enter" → posts a Return key
-//!     after injecting the rest of the text.
+//! Two kinds, both designed to keep false positives near zero:
 //!
-//! Strict suffix match — the command must be at the very end of the
-//! cleaned transcript (allowing trailing punctuation / whitespace), so
-//! sentences like "I want to press enter on the keyboard" don't trigger.
+//!   * **Trailing key commands** — a recognised phrase at the *very end* of
+//!     the utterance (allowing trailing punctuation / whitespace) is stripped
+//!     and turned into a keystroke run after the body is injected:
+//!       - "press enter" / "press return" / "hit enter" / "new line" → Return
+//!       - "new paragraph" → two Returns
+//!       - "press tab" / "hit tab" → Tab
+//!     The suffix is matched on a word boundary, so "compress enter" or
+//!     "I want to press enter on the keyboard" do not fire.
+//!
+//!   * **Whole-utterance cancel** — when the *entire* utterance is exactly a
+//!     cancel phrase ("scratch that", "never mind", "cancel that",
+//!     "delete that"), nothing is injected. Requiring an exact match keeps
+//!     "let me scratch that itch" from being swallowed.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrailingAction {
     None,
+    /// Press Return once ("press enter", "new line", …).
     PressEnter,
+    /// Press Return twice ("new paragraph").
+    NewParagraph,
+    /// Press Tab once ("press tab").
+    PressTab,
+    /// Discard the whole utterance — inject nothing ("scratch that", …).
+    Cancel,
 }
 
-/// Inspect cleaned text. If it ends with a known voice command, strip the
-/// command (and only its own trailing punctuation) and return the body +
-/// the action for the daemon to execute.
+/// Phrases that, when they form the *entire* utterance, cancel it.
+const CANCEL_PHRASES: &[&str] = &["scratch that", "cancel that", "never mind", "delete that"];
+
+/// Trailing key-command phrases, longest first so "new paragraph" is tested
+/// before "new line" would ever shadow it. Each maps to the action to run
+/// after the body is injected.
+const TRAILING_PHRASES: &[(&str, TrailingAction)] = &[
+    ("press enter", TrailingAction::PressEnter),
+    ("press return", TrailingAction::PressEnter),
+    ("hit enter", TrailingAction::PressEnter),
+    ("hit return", TrailingAction::PressEnter),
+    ("new paragraph", TrailingAction::NewParagraph),
+    ("new line", TrailingAction::PressEnter),
+    ("newline", TrailingAction::PressEnter),
+    ("press tab", TrailingAction::PressTab),
+    ("hit tab", TrailingAction::PressTab),
+];
+
+/// Inspect cleaned text. If the whole thing is a cancel phrase, or it ends
+/// with a known trailing command, return the body to inject (possibly empty)
+/// plus the action for the daemon to execute.
 pub fn parse_trailing_command(text: &str) -> (String, TrailingAction) {
-    // The match works on a lower-cased copy that has trailing whitespace +
-    // sentence-final punctuation stripped, so "...press enter." still
-    // matches. The body returned to the caller, though, keeps its OWN
-    // trailing punctuation — only the command phrase + the body/command
-    // separator (whitespace) is removed.
+    // Work on a lower-cased copy with trailing whitespace + sentence-final
+    // punctuation stripped, so "...press enter." still matches. The body
+    // returned to the caller keeps its OWN trailing punctuation — only the
+    // command phrase + the separating whitespace is removed.
     let trimmed = text.trim_end_matches(|c: char| {
         c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
     });
     let lower_trimmed = trimmed.to_lowercase();
 
-    for phrase in &["press enter", "press return", "hit enter", "hit return"] {
+    // Whole-utterance cancel: the entire utterance must BE a cancel phrase.
+    if CANCEL_PHRASES.contains(&lower_trimmed.as_str()) {
+        return (String::new(), TrailingAction::Cancel);
+    }
+
+    for (phrase, action) in TRAILING_PHRASES {
         if !lower_trimmed.ends_with(phrase) {
             continue;
         }
@@ -46,7 +83,7 @@ pub fn parse_trailing_command(text: &str) -> (String, TrailingAction) {
         // Strip only the separating whitespace between body and command,
         // not the body's own sentence-ending punctuation.
         let body = trimmed[..phrase_start].trim_end().to_string();
-        return (body, TrailingAction::PressEnter);
+        return (body, action.clone());
     }
     (text.to_string(), TrailingAction::None)
 }
@@ -102,5 +139,47 @@ mod tests {
         let (body, act) = parse_trailing_command("press enter");
         assert_eq!(body, "");
         assert_eq!(act, TrailingAction::PressEnter);
+    }
+
+    #[test]
+    fn new_line_maps_to_press_enter() {
+        let (body, act) = parse_trailing_command("first item new line");
+        assert_eq!(body, "first item");
+        assert_eq!(act, TrailingAction::PressEnter);
+    }
+
+    #[test]
+    fn new_paragraph_is_distinct_from_new_line() {
+        let (body, act) = parse_trailing_command("end of section. New paragraph");
+        assert_eq!(body, "end of section.");
+        assert_eq!(act, TrailingAction::NewParagraph);
+    }
+
+    #[test]
+    fn press_tab_fires() {
+        let (body, act) = parse_trailing_command("username press tab");
+        assert_eq!(body, "username");
+        assert_eq!(act, TrailingAction::PressTab);
+    }
+
+    #[test]
+    fn cancel_requires_whole_utterance() {
+        let (body, act) = parse_trailing_command("Scratch that.");
+        assert_eq!(act, TrailingAction::Cancel);
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn cancel_does_not_fire_mid_sentence() {
+        // A cancel word inside a real sentence must pass through untouched.
+        let (body, act) = parse_trailing_command("let me scratch that itch");
+        assert_eq!(act, TrailingAction::None);
+        assert_eq!(body, "let me scratch that itch");
+    }
+
+    #[test]
+    fn never_mind_cancels() {
+        let (_, act) = parse_trailing_command("never mind");
+        assert_eq!(act, TrailingAction::Cancel);
     }
 }

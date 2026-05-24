@@ -32,9 +32,22 @@ const TRAILING_ARTEFACTS: &[&str] = &[
     "<|endoftext|>",
 ];
 
-/// Strip LLM artefacts, trim whitespace, collapse internal runs, peel
-/// wrapping quotes. Returns the polished string.
+/// Strip LLM artefacts, trim whitespace, collapse internal runs to single
+/// spaces (newlines included), peel wrapping quotes. For single-utterance
+/// dictation cleanup, where a stray newline would inject an accidental break.
 pub fn polish(raw: &str) -> String {
+    polish_with(raw, false)
+}
+
+/// Like [`polish`] but preserves line structure — intra-line space runs are
+/// collapsed and runs of 3+ blank lines squeezed to one, but single/double
+/// newlines survive. For transform mode, where the result may legitimately be
+/// a bullet list or multiple paragraphs.
+pub fn polish_multiline(raw: &str) -> String {
+    polish_with(raw, true)
+}
+
+fn polish_with(raw: &str, preserve_newlines: bool) -> String {
     let mut s = raw.to_string();
 
     // 1. Strip known trailing chat-template tokens.
@@ -61,12 +74,49 @@ pub fn polish(raw: &str) -> String {
     // 4. Strip markdown emphasis around the whole string (**foo** / *foo* / _foo_).
     s = peel_markdown_emphasis(&s);
 
-    // 5. Collapse all internal whitespace runs to a single space. Dictation
-    //    cleanup is usually a single utterance — preserving \n would inject
-    //    accidental paragraph breaks.
-    s = collapse_whitespace(&s);
+    // 5. Collapse whitespace. Single-utterance cleanup flattens everything to
+    //    spaces; transform mode keeps line structure (bullet lists, paragraphs).
+    s = if preserve_newlines {
+        collapse_whitespace_keep_newlines(&s)
+    } else {
+        collapse_whitespace(&s)
+    };
 
     s.trim().to_string()
+}
+
+/// Collapse intra-line space/tab runs to a single space and trim each line,
+/// but keep newlines — squeezing any run of 3+ into a single blank line so the
+/// model can't inject runaway vertical gaps.
+fn collapse_whitespace_keep_newlines(s: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut blank_run = 0usize;
+    for line in s.lines() {
+        let mut collapsed = String::with_capacity(line.len());
+        let mut prev_ws = false;
+        for c in line.chars() {
+            if c == ' ' || c == '\t' {
+                if !prev_ws {
+                    collapsed.push(' ');
+                    prev_ws = true;
+                }
+            } else {
+                collapsed.push(c);
+                prev_ws = false;
+            }
+        }
+        let collapsed = collapsed.trim().to_string();
+        if collapsed.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                lines.push(collapsed); // at most one blank line in a row
+            }
+        } else {
+            blank_run = 0;
+            lines.push(collapsed);
+        }
+    }
+    lines.join("\n")
 }
 
 fn peel_wrapping_quotes(s: &str) -> String {
@@ -155,5 +205,30 @@ mod tests {
     fn empty_in_empty_out() {
         assert_eq!(polish(""), "");
         assert_eq!(polish("   \n  "), "");
+    }
+
+    #[test]
+    fn multiline_preserves_list_newlines() {
+        // The transform path must keep line structure that `polish` flattens.
+        assert_eq!(
+            polish_multiline("* Buy milk\n* Buy eggs\n* Buy bread"),
+            "* Buy milk\n* Buy eggs\n* Buy bread"
+        );
+    }
+
+    #[test]
+    fn multiline_collapses_intra_line_spaces_and_extra_blanks() {
+        assert_eq!(
+            polish_multiline("para one\n\n\n\npara  two"),
+            "para one\n\npara two"
+        );
+    }
+
+    #[test]
+    fn multiline_still_strips_preamble_and_artefacts() {
+        assert_eq!(
+            polish_multiline("Sure! line one\nline two<end_of_turn>"),
+            "line one\nline two"
+        );
     }
 }
