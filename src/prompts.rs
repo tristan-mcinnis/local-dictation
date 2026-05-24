@@ -27,28 +27,31 @@ use std::path::PathBuf;
 /// colloquial contractions, preserve domain casing, never paraphrase. Lives
 /// here (not in `cleaner.rs`) so all prompt text is in one place.
 pub const DEFAULT_CLEANUP: &str =
-    "You are a real-time dictation cleaner. Edit raw speech-to-text for \
-     written-text readability:\n\
-     - Remove disfluencies: uh, um, er, ah, hmm; 'like' only when used \
-       as filler; 'you know' only when used as filler.\n\
-     - Expand colloquial contractions to their written form: \
-       wanna → want to, gonna → going to, kinda → kind of, sorta → sort of, \
-       gimme → give me, lemme → let me, dunno → don't know, outta → out of, \
-       lotta → lot of, shoulda → should have, coulda → could have, \
-       woulda → would have, y'all → you all.\n\
+    "You are a real-time dictation cleaner. Turn raw speech-to-text into clean \
+     written text. Make only these edits:\n\
+     - Remove ALL filler and disfluencies wherever they occur, INCLUDING at \
+       the very start of the text: uh, um, er, ah, hmm; a leading 'so', \
+       'okay', 'well', 'yeah', or 'right' used only as throat-clearing; \
+       'like' and 'you know' when used as filler.\n\
+     - Remove false starts and stray repeated words ('the the' → 'the').\n\
+     - Expand colloquial contractions: wanna → want to, gonna → going to, \
+       gotta → got to, kinda → kind of, sorta → sort of, gimme → give me, \
+       lemme → let me, dunno → don't know, outta → out of, lotta → lot of, \
+       shoulda → should have, coulda → could have, woulda → would have, \
+       y'all → you all.\n\
      - KEEP standard contractions as-is: don't, it's, won't, can't, I'm, \
-       I'll, we're, etc. — do not over-formalize.\n\
-     - Fix punctuation and capitalization of sentence boundaries.\n\
-     - Preserve domain-specific casing when it appears: Rust, macOS, ONNX, \
-       GitHub, Parakeet, iOS, Apple Silicon, etc.\n\
-     - CRITICAL: Do NOT substitute common words for proper nouns based on \
-       guessed context. If the speaker says 'main', keep 'main' — do not \
-       change to 'Maine'. If they say 'mark', keep 'mark' — do not change \
-       to 'Mark'. Tech terms like 'git', 'npm', 'cd', 'ls', 'main', \
-       'master', 'dev', 'prod', 'api' stay lowercase as written. Only \
-       capitalize when the word is unambiguously a proper noun in context.\n\
-     - Do NOT rephrase, paraphrase, summarize, or add words the speaker \
-       didn't say. Preserve the speaker's voice and word choice.\n\
+       I'll, we're.\n\
+     - Add sentence punctuation, capitalize the first letter of each \
+       sentence, and ALWAYS capitalize the standalone pronoun 'I'.\n\
+     - Preserve domain casing when present: Rust, macOS, ONNX, GitHub, \
+       Parakeet, iOS, Apple Silicon.\n\
+     - CRITICAL: never swap a common word for a similar-sounding proper \
+       noun. 'main' stays 'main' (not 'Maine'); 'mark' stays 'mark'. Tech \
+       tokens like git, npm, cd, ls, main, master, dev, prod, api stay \
+       lowercase exactly as written. Only capitalize a word that is \
+       unambiguously a proper noun.\n\
+     - Keep EVERY content word the speaker said. Do NOT rephrase, paraphrase, \
+       summarize, translate, answer, or add anything.\n\
      Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
      no markdown.";
 
@@ -62,13 +65,73 @@ pub const DEFAULT_CLEANUP: &str =
 pub const DEFAULT_TRANSFORM: &str =
     "You are a precise text editor. Apply the user's instruction to the text \
      below and follow it faithfully — even when that means adding, removing, \
-     rephrasing, expanding, or restructuring content. Do not minimize your \
-     changes: if the instruction asks for more items, more detail, or a longer \
-     result, produce it. Only keep the original wording and detail where the \
-     instruction does not ask you to change them. If the instruction is a \
-     translation, output only the translation. Return ONLY the resulting text \
-     — no preamble, no explanation, no quotes, no markdown fences, no \
-     commentary.";
+     rephrasing, expanding, restructuring, or translating. Do not minimize \
+     your changes: if the instruction asks for more items, more detail, or a \
+     longer result, produce it.\n\
+     - Honor the output shape the instruction implies: if it asks for \
+       bullets, items, or steps — or the text is already a list — return one \
+       item per line ('- ' for bullets, '1.', '2.', '3.' for numbered \
+       steps), never a single run-on paragraph.\n\
+     - If the instruction names a specific number of items (e.g. 'four \
+       bullets'), produce exactly that many.\n\
+     - If the instruction is a translation, output only the translation.\n\
+     - Keep the original wording only where the instruction does not ask you \
+       to change it.\n\
+     Return ONLY the resulting text — no preamble, no explanation, no quotes, \
+     no markdown fences, no commentary.";
+
+/// Built-in output-format presets, available out of the box (the menu bar's
+/// "Output format" submenu). When one is active it REPLACES the cleanup prompt
+/// for normal dictation. A user's `prompts.json` `formats` map is overlaid on
+/// top of these (same key overrides; new keys add), so these are sensible
+/// defaults rather than a locked set. Tuned against Gemma 3 1B in
+/// `prompts-lab/` — see that directory's README for the methodology.
+pub const DEFAULT_FORMATS: &[(&str, &str)] = &[
+    (
+        "numbered",
+        "Rewrite this dictation as a numbered list. Put each distinct item or \
+         step the speaker actually mentioned on its own line, numbered '1.', \
+         '2.', '3.' and so on. Fix grammar and punctuation, remove filler, and \
+         keep the speaker's own wording. Do NOT add, merge, summarize, or \
+         invent items, and do NOT add an introductory or closing line. Output \
+         ONLY the numbered list — no preamble, no heading, no commentary.",
+    ),
+    (
+        "bullets",
+        "Rewrite this dictation as a tight bulleted list. Put each distinct \
+         idea the speaker actually mentioned exactly once on its own line, \
+         starting with '- '. Fix grammar, remove filler, use parallel \
+         phrasing, and keep the speaker's wording. Do NOT repeat, add, or \
+         invent items. Output ONLY the bullets — no preamble, no heading, no \
+         commentary.",
+    ),
+    (
+        "email",
+        "Rewrite this dictation as a clear, concise email body. Fix grammar \
+         and punctuation, use complete sentences and short paragraphs, and \
+         keep a professional but natural tone. Do NOT add a subject line, a \
+         greeting, a sign-off, or any bracketed placeholder like [Your Name] \
+         — write the body only. Output ONLY the email body — no preamble, no \
+         quotes, no markdown.",
+    ),
+    (
+        "code",
+        "Clean this dictation into a terse technical note suitable for a \
+         commit message or code comment. Fix punctuation; preserve every \
+         identifier, path, and domain casing exactly (macOS, ONNX, GitHub, \
+         snake_case, CamelCase). Do NOT add explanation, headings, quotes, or \
+         markdown code fences. Output ONLY the cleaned text.",
+    ),
+];
+
+/// The built-in format presets as an owned map (lowercased keys), used as the
+/// base that a user's `prompts.json` `formats` overlays onto.
+pub fn default_formats() -> HashMap<String, String> {
+    DEFAULT_FORMATS
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
 
 /// Cap on the number of vocabulary terms appended to the cleanup prompt, so a
 /// large corrections dictionary can't balloon the prompt (and the KV cache).
@@ -205,12 +268,19 @@ impl Prompts {
         file_transform: Option<String>,
         file_formats: HashMap<String, String>,
     ) -> Self {
-        let formats = file_formats
-            .into_iter()
-            .filter(|(k, v)| !k.starts_with('_') && !v.trim().is_empty())
-            .map(|(k, v)| (k.trim().to_lowercase(), v))
-            .filter(|(k, _)| !k.is_empty())
-            .collect();
+        // Start from the built-in presets and overlay the user's file formats:
+        // a matching key overrides the default, a new key adds a preset. Blank
+        // values and `_`-comment keys are dropped (they can't blank a preset).
+        let mut formats = default_formats();
+        for (k, v) in file_formats {
+            if k.starts_with('_') || v.trim().is_empty() {
+                continue;
+            }
+            let k = k.trim().to_lowercase();
+            if !k.is_empty() {
+                formats.insert(k, v);
+            }
+        }
         Self {
             cleanup: pick(env_cleanup, file_cleanup, DEFAULT_CLEANUP),
             transform: pick(env_transform, file_transform, DEFAULT_TRANSFORM),
@@ -263,7 +333,17 @@ mod tests {
         let p = Prompts::resolve(None, None, None, None, no_formats());
         assert_eq!(p.cleanup, DEFAULT_CLEANUP);
         assert_eq!(p.transform, DEFAULT_TRANSFORM);
-        assert!(p.formats.is_empty());
+        // The built-in format presets are available out of the box.
+        assert_eq!(
+            p.format_names(),
+            vec![
+                "bullets".to_string(),
+                "code".to_string(),
+                "email".to_string(),
+                "numbered".to_string(),
+            ]
+        );
+        assert!(p.cleanup_for(Some("numbered")).contains("numbered list"));
     }
 
     #[test]
@@ -315,24 +395,37 @@ mod tests {
     }
 
     #[test]
-    fn formats_selected_case_insensitively_else_default() {
+    fn file_formats_overlay_builtin_defaults() {
         let mut formats = HashMap::new();
-        formats.insert("Email".into(), "Write it as an email.".into());
-        formats.insert("bullets".into(), "Turn it into bullets.".into());
+        formats.insert("Email".into(), "Write it as an email.".into()); // overrides default
+        formats.insert("legal".into(), "Make it legalese.".into()); // adds a new preset
         formats.insert("blank".into(), "   ".into()); // dropped: blank value
         formats.insert("_note".into(), "ignored".into()); // dropped: comment key
         let p = Prompts::resolve(None, None, None, None, formats);
 
-        // Keys are normalised to lowercase; lookup is case-insensitive.
+        // File key (case-insensitively) overrides the built-in default.
         assert_eq!(p.cleanup_for(Some("email")), "Write it as an email.");
         assert_eq!(p.cleanup_for(Some("EMAIL")), "Write it as an email.");
-        assert_eq!(p.cleanup_for(Some("bullets")), "Turn it into bullets.");
-        // Unknown / blank / no preset all fall back to the default cleanup.
-        assert_eq!(p.cleanup_for(Some("code")), DEFAULT_CLEANUP);
+        // A new file preset is added alongside the built-ins.
+        assert_eq!(p.cleanup_for(Some("legal")), "Make it legalese.");
+        // Untouched built-ins still resolve to their preset (not the default).
+        assert!(p.cleanup_for(Some("numbered")).contains("numbered list"));
+        assert!(p.cleanup_for(Some("bullets")).contains("bulleted list"));
+        // Unknown name / blank-valued file key / no preset → default cleanup.
+        assert_eq!(p.cleanup_for(Some("nonexistent")), DEFAULT_CLEANUP);
         assert_eq!(p.cleanup_for(Some("blank")), DEFAULT_CLEANUP);
         assert_eq!(p.cleanup_for(None), DEFAULT_CLEANUP);
-        // Blank-valued and `_`-prefixed presets were filtered out.
-        assert_eq!(p.format_names(), vec!["bullets".to_string(), "email".to_string()]);
+        // Built-ins + the added "legal" preset; blank/`_` keys filtered out.
+        assert_eq!(
+            p.format_names(),
+            vec![
+                "bullets".to_string(),
+                "code".to_string(),
+                "email".to_string(),
+                "legal".to_string(),
+                "numbered".to_string(),
+            ]
+        );
     }
 
     #[test]
