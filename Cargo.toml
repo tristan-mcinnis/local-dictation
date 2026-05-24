@@ -36,6 +36,7 @@ ax-inject = [
     "dep:objc2-foundation",
     "dep:objc2-app-kit",
     "dep:objc2-core-foundation",
+    "dep:objc2-web-kit",
 ]
 # Convenience: everything on.
 full = ["parakeet", "cleaner", "ax-inject"]
@@ -47,6 +48,9 @@ eyre = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Lightweight on-device dictation history store. `bundled` compiles SQLite
+# from source so we don't depend on the system libsqlite3 version.
+rusqlite = { version = "0.39", features = ["bundled"] }
 parakeet-rs = { version = "0.3", optional = true, features = ["coreml"] }
 hound = { version = "3.5", optional = true }
 llama-cpp-2 = { version = "0.1", optional = true, default-features = false, features = ["metal"] }
@@ -81,3 +85,9 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSImage",
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
+# WKWebView for the "Dictation History" window — we render the history as a
+# small styled HTML page rather than hand-building an NSTableView.
+objc2-web-kit = { version = "0.3", optional = true, features = [
+    "WKWebView",
+    "WKWebViewConfiguration",
+] }
