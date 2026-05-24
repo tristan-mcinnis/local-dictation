@@ -66,7 +66,7 @@ Things that work well with the default (1B) model: rephrasing, tightening or exp
 
 ### Editable prompts
 
-The two system prompts — **transform** (above) and **cleanup** (the always-on dictation tidy-up) — are editable. Copy [`prompts.example.json`](./prompts.example.json) to `~/.config/local-dictation/prompts.json` and edit either field; the example file ships with the current defaults and inline notes. Both fields are optional, and a blank string falls back to the built-in default, so a partial file is fine.
+The two system prompts — **transform** (above) and **cleanup** (the always-on dictation tidy-up) — are editable. The quickest way in is the menu bar: **Edit cleanup prompts…** opens `~/.config/local-dictation/prompts.json` in your text editor, creating it the first time pre-filled with the currently-active prompts and inline notes — so you start from working text, not a blank file. (Prefer to do it by hand? Copy [`prompts.example.json`](./prompts.example.json) to that path instead.) Both fields are optional, and a blank string falls back to the built-in default, so a partial file is fine.
 
 ```jsonc
 // ~/.config/local-dictation/prompts.json
@@ -171,6 +171,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
   - **Cleanup model ▸** — checkable submenu of every model under `models/llm/`; pick one and the daemon relaunches on it.
   - **Push-to-talk key ▸** — Right Option / Command / Control / Shift.
   - **Cleanup enabled** — toggle LLM cleanup on/off (raw transcript when off).
+  - **Edit cleanup prompts…** — opens `prompts.json` in your text editor, seeded the first time with the currently-active cleanup + transform system prompts (with inline notes) so there's real text to edit. Save, then relaunch (e.g. toggle Cleanup enabled off/on) to apply. See [Editable prompts](#editable-prompts).
   - **Open Log** (⌘L), **Export Log to Downloads…**, **Open corrections folder**.
   - **Quit** (⌘Q).
   Settings persist to `~/.config/local-dictation/settings.json`. Changing the model, hotkey, or cleanup toggle relaunches the daemon to apply (the model is loaded once at boot, so a relaunch is cleaner than a live swap). Any env var override (`GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE`) wins over the menu and greys out the matching items.
