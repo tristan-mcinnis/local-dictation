@@ -102,32 +102,12 @@ const ST_HOLDING_ARMED: u8 = 2;
 const ST_LATCHED: u8 = 3;
 const ST_STOPPING_TAP: u8 = 4;
 
-/// Which of the three "verbs on the same button" the user invoked, decided by
-/// the modifier co-held at PTT-press time:
-///
-///   * **Dictate** — PTT alone: transcribe + clean + inject at the cursor.
-///   * **Transform** — Shift + PTT: rewrite the current selection in place.
-///   * **Agent** — Control + PTT: interpret a spoken command (Phase 0: a stub
-///     that transcribes + logs; the tool-calling loop lands in later phases).
-///
-/// The modifier is read once, at the press that begins a fresh utterance — the
-/// gesture is "hold the modifier, then press the PTT key," symmetric across
-/// Transform and Agent. See `mode_for_flags` for the (collision-guarded) flag
-/// → mode mapping.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CaptureMode {
-    Dictate,
-    Transform,
-    Agent,
-}
-
 /// A normalised hotkey/space event fed to the latch state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PttInput {
-    /// The PTT modifier transitioned to held. `mode` is the verb chosen by the
-    /// co-held modifier (Shift→Transform, Control→Agent, else Dictate), read
-    /// only when starting a fresh utterance.
-    HotkeyPress { mode: CaptureMode },
+    /// The PTT modifier transitioned to held. `shift` = Shift co-held (the
+    /// transform-selection gesture), read only when starting a fresh utterance.
+    HotkeyPress { shift: bool },
     /// The PTT modifier transitioned to released.
     HotkeyRelease,
     /// Space went down (only meaningful while the PTT key is held).
@@ -138,8 +118,8 @@ enum PttInput {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PttDecision {
     Nothing,
-    /// Begin capture. `mode` carries the verb chosen at press time.
-    Start { mode: CaptureMode },
+    /// Begin capture. `transform` carries the Shift-at-press gesture.
+    Start { transform: bool },
     /// End capture and run the pipeline.
     Stop,
     /// First Space of a hold: arm hands-free (cue) and swallow the Space.
@@ -153,8 +133,8 @@ enum PttDecision {
 /// this free of any CG / channel types makes the whole gesture unit-testable.
 fn ptt_transition(state: u8, input: PttInput) -> (u8, PttDecision) {
     match (state, input) {
-        (ST_IDLE, PttInput::HotkeyPress { mode }) => {
-            (ST_HOLDING, PttDecision::Start { mode })
+        (ST_IDLE, PttInput::HotkeyPress { shift }) => {
+            (ST_HOLDING, PttDecision::Start { transform: shift })
         }
         (ST_HOLDING, PttInput::SpaceDown) => (ST_HOLDING_ARMED, PttDecision::ArmLatch),
         (ST_HOLDING_ARMED, PttInput::SpaceDown) => (ST_HOLDING_ARMED, PttDecision::SwallowSpace),
@@ -214,9 +194,9 @@ impl DaemonConfig {
 
 #[derive(Debug)]
 enum DaemonEvent {
-    /// `mode` is the verb chosen by the modifier co-held at press time
-    /// (Dictate / Transform / Agent). See [`CaptureMode`].
-    StartRecording { mode: CaptureMode },
+    /// `transform` is set when Shift was co-held at press time — the utterance
+    /// is an instruction to rewrite the current selection, not text to insert.
+    StartRecording { transform: bool },
     StopRecording,
     /// PTT + Space chord recognised mid-hold: the session became hands-free, so
     /// releasing the keys won't stop recording. Worker just plays the cue.
@@ -299,11 +279,10 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     }
                     let flags = event.get_flags();
                     let input = if flags.contains(hotkey_flag) {
-                        // A co-held modifier at press time selects the verb:
-                        // Control→Agent, Shift→Transform, else Dictate. The user
-                        // holds the modifier *before* the PTT key.
+                        // Shift co-held at press → transform mode (rewrite the
+                        // selection). The user holds Shift *before* the PTT key.
                         PttInput::HotkeyPress {
-                            mode: mode_for_flags(flags, hotkey_flag),
+                            shift: flags.contains(CGEventFlags::CGEventFlagShift),
                         }
                     } else {
                         PttInput::HotkeyRelease
@@ -311,8 +290,9 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     let (next, decision) = ptt_transition(state_cb.load(Ordering::SeqCst), input);
                     state_cb.store(next, Ordering::SeqCst);
                     match decision {
-                        PttDecision::Start { mode } => {
-                            let _ = tx_for_callback.send(DaemonEvent::StartRecording { mode });
+                        PttDecision::Start { transform } => {
+                            let _ =
+                                tx_for_callback.send(DaemonEvent::StartRecording { transform });
                         }
                         PttDecision::Stop => {
                             let _ = tx_for_callback.send(DaemonEvent::StopRecording);
@@ -386,11 +366,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
          {key}+Space then release = hands-free (tap {key} to stop) · ⌘Q quits",
         key = crate::settings::hotkey_name(hotkey_keycode),
     );
-    eprintln!(
-        "[boot] modes · {key} = dictate · Shift+{key} = transform selection · \
-         Control+{key} = agent (Phase-0 stub)",
-        key = crate::settings::hotkey_name(hotkey_keycode),
-    );
     eprintln!();
     ui_channel::set_state(UiState::Idle);
 
@@ -421,27 +396,6 @@ fn keycode_to_modifier_flag(keycode: i64) -> CGEventFlags {
         0x3B | 0x3E => CGEventFlags::CGEventFlagControl,   // Left / Right Control
         0x38 | 0x3C => CGEventFlags::CGEventFlagShift,     // Left / Right Shift
         _ => CGEventFlags::CGEventFlagAlternate,
-    }
-}
-
-/// Decide the capture verb from the modifier flags present when the PTT key is
-/// pressed. Control → Agent, Shift → Transform, neither → Dictate (Control wins
-/// if both are somehow held).
-///
-/// `hotkey_flag` is the flag bit the PTT key *itself* toggles. We never treat a
-/// modifier as a mode-selector when it's the PTT key's own flag — otherwise a
-/// user who rebinds the hotkey to Right Control (or Right Shift) would have
-/// every press misread as Agent (or Transform). In that case the collision is
-/// resolved in favour of plain Dictate, keeping the rebound key usable.
-fn mode_for_flags(flags: CGEventFlags, hotkey_flag: CGEventFlags) -> CaptureMode {
-    let ctrl = CGEventFlags::CGEventFlagControl;
-    let shift = CGEventFlags::CGEventFlagShift;
-    if hotkey_flag != ctrl && flags.contains(ctrl) {
-        CaptureMode::Agent
-    } else if hotkey_flag != shift && flags.contains(shift) {
-        CaptureMode::Transform
-    } else {
-        CaptureMode::Dictate
     }
 }
 
@@ -511,9 +465,8 @@ fn worker_loop(
     let mut consumer: Option<crate::audio::HeapAudioConsumer> = None;
     let mut is_recording: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
     let mut t_press: Option<Instant> = None;
-    // The verb for the in-flight utterance, set at press from the co-held
-    // modifier (Dictate / Transform / Agent) and reset after each utterance.
-    let mut mode = CaptureMode::Dictate;
+    // Whether the in-flight utterance is a transform instruction (Shift held).
+    let mut transform_mode = false;
 
     while let Ok(event) = rx.recv() {
         match event {
@@ -523,18 +476,11 @@ fn worker_loop(
                 cues::play_latch();
                 eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
             }
-            DaemonEvent::StartRecording { mode: m } => {
+            DaemonEvent::StartRecording { transform } => {
                 if engine.is_some() {
                     continue;
                 }
-                mode = m;
-                // Tint the pill for the whole gesture: blue in agent mode,
-                // neutral otherwise.
-                ui_channel::set_accent(if matches!(m, CaptureMode::Agent) {
-                    ui_channel::Accent::Agent
-                } else {
-                    ui_channel::Accent::Normal
-                });
+                transform_mode = transform;
                 t_press = Some(Instant::now());
                 let (mut e, c) = AudioCaptureEngine::new(BUFFER_CAPACITY);
                 let r = match e.start_microphone() {
@@ -547,23 +493,17 @@ fn worker_loop(
                 };
                 cues::play_start();
                 ui_channel::set_state(UiState::Recording);
-                eprintln!(
-                    "▶ recording{}",
-                    match m {
-                        CaptureMode::Dictate => "",
-                        CaptureMode::Transform => " · transform",
-                        CaptureMode::Agent => " · agent",
-                    }
-                );
+                eprintln!("▶ recording");
                 engine = Some(e);
                 consumer = Some(c);
                 is_recording = Some(r);
             }
             DaemonEvent::StopRecording => {
                 let Some(mut e) = engine.take() else { continue };
-                // Capture (and reset) the verb for this utterance.
-                let mode_now = mode;
-                mode = CaptureMode::Dictate;
+                // Capture (and reset) whether this utterance is a transform.
+                #[allow(unused_variables)]
+                let transform = transform_mode;
+                transform_mode = false;
                 e.stop_capture();
                 cues::play_stop();
                 ui_channel::set_state(UiState::Processing);
@@ -604,31 +544,13 @@ fn worker_loop(
                     continue;
                 }
 
-                // ─── Agent mode (Control + push-to-talk) ─────────────────
-                // Phase 0 scaffolding: the gesture is recognised and the spoken
-                // command transcribed, but the tool-calling loop isn't wired up
-                // yet (see the voice-cockpit spec, Phase 2). For now we log the
-                // command so the dispatch path can be exercised end-to-end —
-                // nothing is injected and no tools run. Lives before the cleaner
-                // branch so it works in every feature configuration.
-                if matches!(mode_now, CaptureMode::Agent) {
-                    eprintln!("  🤖   agent (stub) · command: \"{}\"", transcript.trim());
-                    eprintln!(
-                        "       agent mode is Phase-0 scaffolding — no tools wired yet; \
-                         see the voice-cockpit spec"
-                    );
-                    eprintln!();
-                    ui_channel::set_state(UiState::Idle);
-                    continue;
-                }
-
                 // ─── Transform mode (Shift + push-to-talk) ───────────────
                 // The utterance is an *instruction*: rewrite the current
                 // selection in place rather than insert text. Handled entirely
                 // via a Cmd+C/Cmd+V clipboard round-trip so it works even in
                 // AX-blind apps (Electron, terminals).
                 #[cfg(feature = "cleaner")]
-                if matches!(mode_now, CaptureMode::Transform) {
+                if transform {
                     match cleaner {
                         Some(ref c) => handle_transform(&rt, c, &transcript),
                         None => {
@@ -887,69 +809,36 @@ mod tests {
     fn normal_ptt_press_and_release() {
         // Hold then release: start on press, stop on release, back to idle.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::HotkeyRelease,
         ]);
         assert_eq!(
             decisions,
-            vec![PttDecision::Start { mode: CaptureMode::Dictate }, PttDecision::Stop]
+            vec![PttDecision::Start { transform: false }, PttDecision::Stop]
         );
         assert_eq!(end, ST_IDLE);
     }
 
     #[test]
     fn shift_press_starts_transform() {
-        let (decisions, _) = run(&[PttInput::HotkeyPress { mode: CaptureMode::Transform }]);
-        assert_eq!(decisions, vec![PttDecision::Start { mode: CaptureMode::Transform }]);
-    }
-
-    #[test]
-    fn control_press_starts_agent() {
-        let (decisions, _) = run(&[PttInput::HotkeyPress { mode: CaptureMode::Agent }]);
-        assert_eq!(decisions, vec![PttDecision::Start { mode: CaptureMode::Agent }]);
-    }
-
-    #[test]
-    fn mode_for_flags_maps_each_modifier() {
-        let opt = CGEventFlags::CGEventFlagAlternate; // default PTT key's own flag
-        let ctrl = CGEventFlags::CGEventFlagControl;
-        let shift = CGEventFlags::CGEventFlagShift;
-
-        // PTT alone (only the Option flag) → Dictate.
-        assert_eq!(mode_for_flags(opt, opt), CaptureMode::Dictate);
-        // Control co-held → Agent.
-        assert_eq!(mode_for_flags(opt | ctrl, opt), CaptureMode::Agent);
-        // Shift co-held → Transform.
-        assert_eq!(mode_for_flags(opt | shift, opt), CaptureMode::Transform);
-        // Both: Control wins (Agent).
-        assert_eq!(mode_for_flags(opt | ctrl | shift, opt), CaptureMode::Agent);
-    }
-
-    #[test]
-    fn mode_for_flags_collision_guard() {
-        let ctrl = CGEventFlags::CGEventFlagControl;
-        let shift = CGEventFlags::CGEventFlagShift;
-        // If the user rebinds the PTT key to Right Control, holding it sets the
-        // Control flag — but that must read as plain Dictate, not Agent.
-        assert_eq!(mode_for_flags(ctrl, ctrl), CaptureMode::Dictate);
-        // Likewise a Right-Shift PTT key reads as Dictate, not Transform.
-        assert_eq!(mode_for_flags(shift, shift), CaptureMode::Dictate);
+        let (decisions, _) = run(&[PttInput::HotkeyPress { shift: true }]);
+        assert_eq!(decisions, vec![PttDecision::Start { transform: true }]);
     }
 
     #[test]
     fn hands_free_full_gesture() {
         // Hold PTT, chord Space, release both, then tap PTT to stop.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate }, // Start
+            PttInput::HotkeyPress { shift: false }, // Start
             PttInput::SpaceDown,                    // ArmLatch (cue + swallow)
             PttInput::HotkeyRelease,                // → Latched, keep recording
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate }, // tap → Stop
+            PttInput::HotkeyPress { shift: false }, // tap → Stop
             PttInput::HotkeyRelease,                // → Idle, no-op
         ]);
         assert_eq!(
             decisions,
             vec![
-                PttDecision::Start { mode: CaptureMode::Dictate },
+                PttDecision::Start { transform: false },
                 PttDecision::ArmLatch,
                 PttDecision::Nothing,
                 PttDecision::Stop,
@@ -964,7 +853,7 @@ mod tests {
         // Arming only needs the Space chord while holding; releasing the PTT
         // afterwards latches regardless of when Space physically came up.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::SpaceDown,
             PttInput::HotkeyRelease,
         ]);
@@ -977,14 +866,14 @@ mod tests {
         // A second Space during the same hold must still be swallowed, but
         // emits SwallowSpace (no fresh cue) rather than ArmLatch.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::SpaceDown,
             PttInput::SpaceDown,
         ]);
         assert_eq!(
             decisions,
             vec![
-                PttDecision::Start { mode: CaptureMode::Dictate },
+                PttDecision::Start { transform: false },
                 PttDecision::ArmLatch,
                 PttDecision::SwallowSpace,
             ]
@@ -1006,7 +895,7 @@ mod tests {
         // Once hands-free, the keys are up; a Space is a real keystroke and
         // must not be swallowed or change state.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::SpaceDown,
             PttInput::HotkeyRelease, // Latched
             PttInput::SpaceDown,     // real space
@@ -1020,12 +909,12 @@ mod tests {
         // A spurious second press event while already holding does nothing
         // (and never starts a second recording).
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false },
         ]);
         assert_eq!(
             decisions,
-            vec![PttDecision::Start { mode: CaptureMode::Dictate }, PttDecision::Nothing]
+            vec![PttDecision::Start { transform: false }, PttDecision::Nothing]
         );
         assert_eq!(end, ST_HOLDING);
     }
@@ -1035,12 +924,12 @@ mod tests {
         // A plain hold/release, then a hands-free session — state returns to
         // idle cleanly between them.
         let (_decisions, end) = run(&[
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::HotkeyRelease, // Stop → Idle
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::SpaceDown,
             PttInput::HotkeyRelease, // Latched
-            PttInput::HotkeyPress { mode: CaptureMode::Dictate },
+            PttInput::HotkeyPress { shift: false },
             PttInput::HotkeyRelease, // Stop → Idle
         ]);
         assert_eq!(end, ST_IDLE);

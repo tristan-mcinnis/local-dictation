@@ -8,7 +8,7 @@
 ![On-device](https://img.shields.io/badge/network%20at%20runtime-none-success)
 
 <p align="center">
-  <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release — cleaned text lands at the cursor" width="600">
+  <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release — cleaned text lands at the cursor" width="420">
 </p>
 
 > **Heads-up:** this is a personal tool I built for my own daily driving on an Apple Silicon Mac, shared openly in case it's useful to you. It's not a packaged product — there's no signed installer, you build it from source, and it's tuned to how *I* dictate. If that fits, you'll probably like it; if you want a one-click app, see the alternatives below.
@@ -100,13 +100,11 @@ Long thought, or just don't want to hold the key? Use **hands-free mode**: hold 
 
 While you talk, a small dark pill floats at the bottom of your cursor's screen with a **live waveform** driven by your mic — bars rise instantly on each syllable and decay slowly so peaks are visible:
 
-```
-        ╭─────────────────────────╮
-        │   ▎▍▆█▇▅▎▏ ▍▆▇▄▎       │   ← live mic, ~30 FPS
-        ╰─────────────────────────╯
-```
+<p align="center">
+  <img src="docs/pill.png" alt="the floating waveform pill, live mic waveform at ~30 FPS" width="260">
+</p>
 
-A small **menu-bar icon** mirrors the state: 🎤 idle · 🔴 recording · ⏳ processing. Subtle audio cues (Tink on start, Bottle on stop) confirm key transitions without being noisy.
+A small **menu-bar icon** mirrors the state — a monochrome SF Symbol that follows your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Subtle audio cues (Tink on start, Bottle on stop) confirm key transitions without being noisy.
 
 ## Transform selected text by voice
 
@@ -133,18 +131,6 @@ The two system prompts — **transform** (above) and **cleanup** (the always-on 
 ```
 
 Prompts are read once when the daemon starts, so **edit, then relaunch** to test a change. The boot log prints `prompts cleanup=… · transform=…` (`default` or `custom`) so you can confirm your file took effect. Precedence is **env var > `prompts.json` > built-in default** — set `DICTATE_TRANSFORM_PROMPT` / `DICTATE_CLEANUP_PROMPT` for a one-off scripted experiment, or `DICTATE_PROMPTS_PATH` to point at a different file.
-
-## Agent mode (preview)
-
-There's a **third verb on the same button**. Same push-to-talk key, scoped by which modifier you hold first:
-
-| Gesture | Mode | What happens |
-| --- | --- | --- |
-| Right Option | **Dictate** | transcribe → clean → inject at the cursor |
-| **Shift** + Right Option | **Transform** | rewrite the current selection in place |
-| **Control** + Right Option | **Agent** | interpret a spoken *command* |
-
-Hold **Control + Right Option** (Control first, then the push-to-talk key — same shape as the Shift transform gesture), speak a command, release. The waveform pill turns **blue** in agent mode so you always know which verb you're in. Today this is **Phase-0 scaffolding**: the gesture is recognised and your command is transcribed and logged to `/tmp/dictate-daemon.log`, but the local tool-calling loop isn't wired up yet — nothing is injected and no tools run. The dispatch path is in place so the agent brain (a local Gemma tool loop, fully on-device) can land behind it without touching the hot Dictate/Transform paths. Control is chosen because Control+Option is almost never a system shortcut, so holding it while you talk won't fire side effects. (If you rebind the push-to-talk key itself to Right Control or Right Shift, that key reverts to plain Dictate — the modifier can't be both the trigger and the mode selector.)
 
 ## Verified performance
 
@@ -210,7 +196,7 @@ and can be downloaded into `models/llm/<name>/` to appear in the picker.
 
 - **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`), speak, release.
 - **Hands-free mode.** Hold the push-to-talk key and **tap Space** to latch (a *pop* cue confirms), then release both keys and keep talking — recording continues with nothing held. **Tap the push-to-talk key once** to stop and inject. Normal hold-to-talk is unchanged; the latch only engages when you chord Space during a hold. (Space is swallowed while you hold the key, so it never leaks a character into your text.)
-- **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling. In **agent mode** the pill (bars + border) tints **blue** so the mode is unmistakable, and when the agent *speaks* a reply it switches to a distinct center-out "assistant talking" waveform that pulses from the middle — visually separate from the left→right mic waveform, so you can tell who's talking.
+- **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
 - **Menu-bar icon + settings (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click it for a full menu — no env vars or relaunch scripts needed:
   - **Last dictation preview** + **Copy last dictation** (⌘C) — grab what you just dictated.
   - **Dictation History…** (⌘H) — opens a small native window listing past dictations, newest first, grouped by day. The friendly counterpart to the log: just the text and when, nothing else.
@@ -327,7 +313,7 @@ tests/verification.rs   ring buffer + drain integration tests
 
 ```bash
 cargo test                # 64 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 78 total
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 75 total
 ```
 
 ## License

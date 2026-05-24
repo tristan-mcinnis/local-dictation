@@ -35,10 +35,6 @@ pub enum UiState {
     Idle = 0,
     Recording = 1,
     Processing = 2,
-    /// The agent is speaking a response (TTS playback). Drives a distinct
-    /// center-out "assistant talking" waveform, separate from the mic-driven
-    /// Recording waveform.
-    Speaking = 3,
 }
 
 impl UiState {
@@ -47,27 +43,7 @@ impl UiState {
         match v {
             1 => UiState::Recording,
             2 => UiState::Processing,
-            3 => UiState::Speaking,
             _ => UiState::Idle,
-        }
-    }
-}
-
-/// Visual accent for the pill, orthogonal to [`UiState`]. Agent mode tints the
-/// pill blue (recording *and* speaking) so the mode is unmistakable; everything
-/// else stays neutral. Read by the pill renderer alongside the state.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[repr(u8)]
-pub enum Accent {
-    Normal = 0,
-    Agent = 1,
-}
-
-impl Accent {
-    pub fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Accent::Agent,
-            _ => Accent::Normal,
         }
     }
 }
@@ -77,9 +53,6 @@ impl Accent {
 pub const WAVEFORM_BARS: usize = 14;
 
 static SHARED_STATE: AtomicU8 = AtomicU8::new(0);
-
-/// Current pill accent (Normal / Agent). Set by the worker at capture start.
-static SHARED_ACCENT: AtomicU8 = AtomicU8::new(0);
 
 /// The last successfully-injected text, for the "Copy last dictation" item.
 static LAST_DICTATION: Mutex<String> = Mutex::new(String::new());
@@ -93,18 +66,6 @@ static AUDIO_LEVELS: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::new());
 /// Broadcast a new UI state.
 pub fn set_state(state: UiState) {
     SHARED_STATE.store(state as u8, Ordering::SeqCst);
-}
-
-/// Set the pill accent (Normal / Agent). The worker calls this at the start of
-/// a capture so the pill tints for the whole gesture, and resets it on return
-/// to idle.
-pub fn set_accent(accent: Accent) {
-    SHARED_ACCENT.store(accent as u8, Ordering::SeqCst);
-}
-
-/// Current pill accent.
-pub fn accent() -> Accent {
-    Accent::from_u8(SHARED_ACCENT.load(Ordering::SeqCst))
 }
 
 /// Record the most recent injected text.
