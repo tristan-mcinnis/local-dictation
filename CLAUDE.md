@@ -97,8 +97,12 @@ audio.rs (cpal + SPSC ring buffer)
   → injector.rs (AX direct, or clipboard paste for Electron) + voice_commands keystroke
 ```
 
-`ui_channel.rs` carries worker→UI state (recording/processing, last dictation, audio levels) to
-`menubar.rs` (status item, waveform pill, history window). `history.rs` writes every injected
+`ui_channel.rs` carries worker→UI state (recording/processing/**speaking**, last dictation, audio
+levels) plus an orthogonal **`Accent` (Normal/Agent)** to `menubar.rs` (status item, waveform pill,
+history window). The pill renderer tints the bars + border **blue** when accent is Agent, and the
+**`Speaking`** state drives a distinct center-out "assistant talking" waveform (vs the left→right
+mic waveform) — driven by TTS amplitude once that lands. The worker sets the accent at capture
+start from `CaptureMode`. `history.rs` writes every injected
 dictation to SQLite at `~/.config/local-dictation/history.db`. The model is loaded once at boot,
 so config changes (model/hotkey/cleanup) **relaunch** the daemon rather than hot-swapping.
 
