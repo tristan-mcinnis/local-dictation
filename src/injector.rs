@@ -43,15 +43,24 @@ fn is_ax_blind(pid: i32) -> bool {
     matches!(AX_BLIND_PID.lock().ok().and_then(|g| *g), Some(p) if p == pid)
 }
 
-/// Cache of `pid → uses_electron_ax_quirks`. Looked up via `ps` once per
-/// PID. Electron apps (VS Code, Cursor, Slack, Discord, Claude Code,
-/// browsers etc.) report AX TextField role and accept kAXSelectedText
-/// writes with kAXErrorSuccess, but their renderer never receives the
-/// text — so we always route them through clipboard paste.
-static ELECTRON_CACHE: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
+/// Cache of `pid → ax_write_is_a_lie`. Looked up via `ps` once per PID.
+///
+/// Two families of apps report an editable AX role (AXTextField / AXTextArea)
+/// and accept `kAXSelectedText` writes with `kAXErrorSuccess`, but their
+/// renderer never actually receives the text — so the write silently
+/// vanishes ("records but doesn't paste"). We route both straight to
+/// clipboard paste, which goes through the system-level Cmd+V handler and
+/// always works:
+///   1. Electron / Chromium web views (VS Code, Cursor, Slack, Discord,
+///      Claude, Notion, Chrome, Brave, Arc, Obsidian, Zed, Figma …).
+///   2. GPU/native terminal emulators (Ghostty, Terminal.app, iTerm2,
+///      WezTerm, kitty, Alacritty) — they draw their own text grid and
+///      ignore AX writes, confirmed via INJECT_PROFILE: Ghostty returns
+///      err=0 on set_selected_text yet nothing renders.
+static CLIPBOARD_ONLY_CACHE: Mutex<Vec<(i32, bool)>> = Mutex::new(Vec::new());
 
 pub fn is_clipboard_only_pid(pid: i32) -> bool {
-    if let Ok(cache) = ELECTRON_CACHE.lock() {
+    if let Ok(cache) = CLIPBOARD_ONLY_CACHE.lock() {
         for &(p, v) in cache.iter() {
             if p == pid {
                 return v;
@@ -79,10 +88,20 @@ pub fn is_clipboard_only_pid(pid: i32) -> bool {
         || comm.contains("/obsidian")
         || comm.contains("/zed")
         || comm.contains("/figma");
-    if let Ok(mut cache) = ELECTRON_CACHE.lock() {
-        cache.push((pid, is_electron));
+    // Native terminal emulators: own-drawn text grids that accept but ignore
+    // AX writes. The `/term` anchor catches Terminal.app and iTerm2's exec
+    // (`.../macos/iterm2`); the rest match their app/exec name.
+    let is_terminal = comm.contains("/ghostty")
+        || comm.contains("/terminal")
+        || comm.contains("/iterm")
+        || comm.contains("/wezterm")
+        || comm.contains("/kitty")
+        || comm.contains("/alacritty");
+    let clipboard_only = is_electron || is_terminal;
+    if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
+        cache.push((pid, clipboard_only));
     }
-    is_electron
+    clipboard_only
 }
 
 fn remember_tail(text: &str) {
