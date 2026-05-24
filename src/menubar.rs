@@ -437,10 +437,11 @@ fn build_model_submenu(
     }
 
     // Effective active path: settings choice, or the canonicalized default.
+    let default_gemma = crate::app_paths::gemma_default_path();
     let effective = settings.gemma_model.clone().unwrap_or_else(|| {
-        std::fs::canonicalize(settings::DEFAULT_GEMMA_REL)
+        std::fs::canonicalize(&default_gemma)
             .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| settings::DEFAULT_GEMMA_REL.to_string())
+            .unwrap_or(default_gemma)
     });
 
     for choice in &models {

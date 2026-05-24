@@ -28,8 +28,35 @@ cargo test --features full <name>            # single test by name substring
 ```
 
 Subcommands of the binary: `daemon [--no-cleanup]`, `logs`, `bench [wav]`, `dictate <ms>`,
-`inject-test [text]`, `transform "<instruction>" "<text>"`, `ax-check`, `mock-loop` (default,
-no features). Dispatch is a plain `match` in `src/main.rs`.
+`inject-test [text]`, `transform "<instruction>" "<text>"`, `ax-check`, `mock-loop`. Dispatch is a
+plain `match` in `src/main.rs`. The default subcommand is `mock-loop` from the CLI, but **`daemon`
+when the binary is running inside a `.app` bundle** (a double-clicked app gets no args) — see
+`app_paths::running_in_bundle`.
+
+## Packaging as a Mac app (`Local Dictation.app`)
+
+The end-user artifact is a double-clickable menu-bar app, built by `scripts/build-app.sh`:
+
+```bash
+./scripts/build-app.sh                  # dev: tiny app; models shared from ./models via a symlink
+./scripts/build-app.sh --bundle-models  # ship: copies ONLY the recommended stack (~1.4 GB) into the app
+./scripts/build-app.sh --install        # also copy to /Applications, add Login Item, launch it
+```
+
+The bundle is `dist/Local Dictation.app` — `LSUIElement` menu-bar agent (no Dock icon), ad-hoc
+signed, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
+(`com.tristanmcinnis.local-dictation`). Icon is rendered from an SF Symbol by
+`scripts/make-icon.swift`. Because it's a stable signed bundle, macOS attributes Microphone +
+Accessibility to the app itself (granted once), instead of to whatever terminal launched it.
+Ad-hoc signing means a *rebuild* changes the signature hash and macOS may re-ask — a real
+Developer ID would make grants stick. When bundled, the daemon redirects stdout/stderr to
+`/tmp/dictate-daemon.log` (no terminal to print to).
+
+**Model resolution** (`src/app_paths.rs`), in order: `DICTATE_MODELS_DIR` env >
+`<app>/Contents/Resources/models` (shipped, self-contained) > `~/Library/Application
+Support/Local Dictation/models` (dev symlink → repo) > `./models` (repo-relative, for `cargo run`).
+Per-model env overrides (`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`) and `settings.json` still win.
+TODO (someday): let end users drop in / switch alternate cleanup models.
 
 ## Feature flags are the architecture
 

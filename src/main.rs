@@ -9,17 +9,20 @@ use fast_dictate_backend::cues;
 #[cfg(feature = "parakeet")]
 use std::time::Instant;
 
-// Default model locations — kept inside the project tree so they're
-// discoverable + cached alongside the code.
-#[cfg(feature = "parakeet")]
-const PARAKEET_DEFAULT_REL: &str = "models/dictation/parakeet-tdt-v3-int8";
-
 // cpal::Stream is !Send on macOS — pin the runtime to one thread so the
 // engine can stay put.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> eyre::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let subcommand = args.get(1).map(String::as_str).unwrap_or("mock-loop");
+    // A double-clicked `.app` is launched with no arguments — when we detect
+    // we're running from inside a bundle, the daemon *is* the app, so default
+    // to it. From the repo/CLI the default stays `mock-loop` (harmless probe).
+    let default_cmd = if fast_dictate_backend::app_paths::running_in_bundle() {
+        "daemon"
+    } else {
+        "mock-loop"
+    };
+    let subcommand = args.get(1).map(String::as_str).unwrap_or(default_cmd);
 
     match subcommand {
         "mock-loop" => run_mock_loop().await,
@@ -336,14 +339,16 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
 
 #[cfg(feature = "parakeet")]
 fn parakeet_dir() -> String {
-    std::env::var("PARAKEET_MODEL_DIR").unwrap_or_else(|_| PARAKEET_DEFAULT_REL.to_string())
+    // Precedence: PARAKEET_MODEL_DIR env > bundle/App-Support/repo default.
+    std::env::var("PARAKEET_MODEL_DIR")
+        .unwrap_or_else(|_| fast_dictate_backend::app_paths::parakeet_default_dir())
 }
 
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
 fn gemma_path() -> String {
-    // Precedence: GEMMA_MODEL_PATH env > settings.json > built-in default.
-    use fast_dictate_backend::settings::{Settings, DEFAULT_GEMMA_REL};
-    Settings::load().resolve_gemma(DEFAULT_GEMMA_REL)
+    // Precedence: GEMMA_MODEL_PATH env > settings.json > bundle-aware default.
+    use fast_dictate_backend::settings::Settings;
+    Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path())
 }
 
 /// `transform "<instruction>" "<text>"` — run the warm-Gemma transform path on
@@ -352,14 +357,14 @@ fn gemma_path() -> String {
 #[cfg(feature = "cleaner")]
 async fn run_transform(instruction: Option<String>, text: Option<String>) -> eyre::Result<()> {
     use fast_dictate_backend::cleaner::TextCleanupEngine;
-    use fast_dictate_backend::settings::{Settings, DEFAULT_GEMMA_REL};
+    use fast_dictate_backend::settings::Settings;
 
     let (Some(instruction), Some(text)) = (instruction, text) else {
         return Err(eyre::eyre!(
             "usage: transform \"<instruction>\" \"<text to transform>\""
         ));
     };
-    let gemma = Settings::load().resolve_gemma(DEFAULT_GEMMA_REL);
+    let gemma = Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
     println!("[transform] gemma: {gemma}");
     let t = std::time::Instant::now();
     let cleaner = TextCleanupEngine::initialize(&gemma)?;
@@ -379,9 +384,34 @@ async fn run_transform(_i: Option<String>, _t: Option<String>) -> eyre::Result<(
     Err(eyre::eyre!("transform requires the `cleaner` feature"))
 }
 
+/// When launched from a `.app` (Finder / login item) there's no terminal, so
+/// `eprintln!` output would vanish. Point stdout+stderr at the same log file
+/// the menu's relaunch path uses, so the structured per-utterance log works
+/// from the very first launch. No-op when not bundled (keep terminal output).
+#[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
+fn redirect_stdio_to_log_if_bundled() {
+    use std::os::unix::io::AsRawFd;
+    if !fast_dictate_backend::app_paths::running_in_bundle() {
+        return;
+    }
+    if let Ok(f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/dictate-daemon.log")
+    {
+        unsafe {
+            libc::dup2(f.as_raw_fd(), 1);
+            libc::dup2(f.as_raw_fd(), 2);
+        }
+        // Leak the handle so the fd stays valid for the process's lifetime.
+        std::mem::forget(f);
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
 async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run, DaemonConfig};
+    redirect_stdio_to_log_if_bundled();
     // IMPORTANT: must call daemon::run on the OS main thread (NSApp.run()
     // refuses to start otherwise). We're already on the main thread thanks
     // to #[tokio::main(flavor = "current_thread")] — DO NOT wrap in

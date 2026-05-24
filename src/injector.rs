@@ -13,7 +13,11 @@
 //!   5. If both AX writes refuse (Electron / some Java apps), fall back to
 //!      save-clipboard → set-clipboard → synthesize Cmd+V → restore.
 
-use crate::smart_pad::{last_non_ws_before, smart_pad};
+use crate::smart_pad::smart_pad;
+// Only the real AX-injection `imp` module uses caret-context probing; gate the
+// import to that build so the default (featureless) build stays warning-clean.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+use crate::smart_pad::last_non_ws_before;
 use std::sync::Mutex;
 
 pub struct AccessibilityInjector;
@@ -26,19 +30,27 @@ pub struct AccessibilityInjector;
 ///
 /// Reset on first call (None) → first utterance behaves like "start of
 /// field." Updated to the last char of every successful inject.
+///
+/// These caret-context / verification helpers are only ever called from the
+/// `imp` module, so they're gated behind the same feature — otherwise a
+/// default (featureless) build flags them as dead code.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 static LAST_TAIL: Mutex<Option<char>> = Mutex::new(None);
 
 /// PID of the focused app that's known to not expose AXValue. Skip the
 /// context read for it on subsequent injects (saves ~100 ms per utterance
 /// in Electron / web-view targets).
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 static AX_BLIND_PID: Mutex<Option<i32>> = Mutex::new(None);
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn mark_ax_blind(pid: i32) {
     if let Ok(mut g) = AX_BLIND_PID.lock() {
         *g = Some(pid);
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn is_ax_blind(pid: i32) -> bool {
     matches!(AX_BLIND_PID.lock().ok().and_then(|g| *g), Some(p) if p == pid)
 }
@@ -122,8 +134,10 @@ pub fn is_terminal_pid(pid: i32) -> bool {
 /// PIDs whose AX write we've *verified* actually rendered (read the value
 /// back and saw our text). Once a PID is here we trust its AX path and skip
 /// the post-write verification read on every subsequent utterance.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 static AX_VERIFIED_PID: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn is_ax_verified(pid: i32) -> bool {
     AX_VERIFIED_PID
         .lock()
@@ -131,6 +145,7 @@ fn is_ax_verified(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn mark_ax_verified(pid: i32) {
     if let Ok(mut g) = AX_VERIFIED_PID.lock() {
         if !g.contains(&pid) {
@@ -144,6 +159,7 @@ fn mark_ax_verified(pid: i32) {
 /// the lying-AX trait that isn't on the static name list. Updates the existing
 /// cache entry (the name lookup will have inserted `false`) or inserts a fresh
 /// entry so all future injects skip the AX path for this PID.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn mark_clipboard_only(pid: i32) {
     if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
         if let Some(entry) = cache.iter_mut().find(|(p, _, _)| *p == pid) {
@@ -154,6 +170,7 @@ fn mark_clipboard_only(pid: i32) {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn remember_tail(text: &str) {
     let tail = text.chars().rev().find(|c| !c.is_whitespace());
     if let Ok(mut g) = LAST_TAIL.lock() {
@@ -161,12 +178,14 @@ fn remember_tail(text: &str) {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn recall_tail() -> Option<char> {
     LAST_TAIL.lock().ok().and_then(|g| *g)
 }
 
 /// Public: clear the cross-utterance state. Useful when the user
 /// switches target apps and the previous tail no longer applies.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub fn reset_inject_state() {
     if let Ok(mut g) = LAST_TAIL.lock() {
         *g = None;

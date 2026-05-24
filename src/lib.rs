@@ -1,3 +1,4 @@
+pub mod app_paths;
 pub mod audio;
 pub mod corrections;
 pub mod cues;
