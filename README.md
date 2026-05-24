@@ -52,6 +52,32 @@ While you talk, a small dark pill floats at the bottom of your cursor's screen w
 
 A small **menu-bar icon** mirrors the state: 🎤 idle · 🔴 recording · ⏳ processing. Subtle audio cues (Tink on start, Bottle on stop) confirm key transitions without being noisy.
 
+## Transform selected text by voice
+
+Beyond dictating new text, you can **edit text you've already got** by voice. Select a passage, then hold **Shift + Right Option** (Shift first, then the push-to-talk key), speak an instruction, and release. The selection is read, rewritten by the same warm Gemma model, and pasted back in place — works even in Electron/terminal apps, because the read + write both go through the clipboard.
+
+```
+select text → hold Shift+Right Option → say "make this more concise" → release
+```
+
+Things that work well with the default (1B) model: rephrasing, tightening or expanding, changing tone, fixing grammar, reformatting (e.g. "turn this into bullet points"), and translation ("translate to Spanish").
+
+**It comes down to the prompt.** The model only sees your spoken instruction plus the selected text, wrapped in a *system prompt*. The built-in transform prompt is deliberately permissive — it follows your instruction even when that means *adding* content, so "turn these two bullets into four" actually expands rather than playing it safe. If a transform under- or over-does it, that prompt is the dial to turn (see [Editable prompts](#editable-prompts)). Keep in mind it's a 1B model: small, fast, and occasionally literal — short selections give it little to work with, so expansion instructions land better when there's some substance to build on.
+
+### Editable prompts
+
+The two system prompts — **transform** (above) and **cleanup** (the always-on dictation tidy-up) — are editable. Copy [`prompts.example.json`](./prompts.example.json) to `~/.config/local-dictation/prompts.json` and edit either field; the example file ships with the current defaults and inline notes. Both fields are optional, and a blank string falls back to the built-in default, so a partial file is fine.
+
+```jsonc
+// ~/.config/local-dictation/prompts.json
+{
+  "transform": "Rewrite the selected text exactly as I instruct. ...",
+  "cleanup":   "Clean up this dictation for readability. ..."
+}
+```
+
+Prompts are read once when the daemon starts, so **edit, then relaunch** to test a change. The boot log prints `prompts cleanup=… · transform=…` (`default` or `custom`) so you can confirm your file took effect. Precedence is **env var > `prompts.json` > built-in default** — set `DICTATE_TRANSFORM_PROMPT` / `DICTATE_CLEANUP_PROMPT` for a one-off scripted experiment, or `DICTATE_PROMPTS_PATH` to point at a different file.
+
 ## Verified performance
 
 Measured on Apple Silicon, hot path after warm-up, end-to-end from key release to text injected:
@@ -151,6 +177,8 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 - **Audio cues.** Tink on start, Bottle on stop, Pop on hands-free latch, Basso on error. Mute with `DICTATE_QUIET=1`.
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
+- **Transform selected text by voice.** Select text, hold **Shift + Right Option**, speak an instruction ("make this concise", "turn into bullet points", "translate to Spanish"), release — the selection is rewritten in place via the warm Gemma model. See [Transform selected text by voice](#transform-selected-text-by-voice).
+- **Editable prompts.** The transform and cleanup system prompts live in `~/.config/local-dictation/prompts.json` (copy [`prompts.example.json`](./prompts.example.json)); tune how the model behaves without touching code. See [Editable prompts](#editable-prompts).
 - **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
 - **Personal corrections dictionary.** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Applied after cleanup, before injection. Case-insensitive match at word boundaries; replacement is verbatim. See `corrections.example.json`.
 - **Inline voice commands.** End a dictation with a recognised phrase and it's stripped from the text and turned into a keystroke after the body is injected: `press enter` / `press return` / `hit enter` / `new line` → **Return**; `new paragraph` → **two Returns**; `press tab` / `hit tab` → **Tab**. And if the *whole* utterance is `scratch that` / `never mind` / `cancel that` / `delete that`, nothing is injected. All matched on word boundaries, so "compress enter" or "let me scratch that itch" never fire.
@@ -197,6 +225,7 @@ Two ways to configure the daemon, in order of precedence:
 
 1. **Env vars** (below) — win over everything; best for scripted launches.
 2. **`~/.config/local-dictation/settings.json`** — written by the menu bar; holds `gemma_model`, `hotkey_keycode`, `cleanup_enabled`. You rarely edit it by hand.
+   - **`~/.config/local-dictation/prompts.json`** (separate, hand-edited) — the transform + cleanup system prompts. See [Editable prompts](#editable-prompts).
 3. **Built-in defaults.**
 
 | Var | Effect |
@@ -208,6 +237,9 @@ Two ways to configure the daemon, in order of precedence:
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
 | `DICTATE_CORRECTIONS_PATH` | Override the corrections JSON path (default: `~/.config/local-dictation/corrections.json`) |
+| `DICTATE_PROMPTS_PATH` | Override the prompts JSON path (default: `~/.config/local-dictation/prompts.json`) |
+| `DICTATE_TRANSFORM_PROMPT` | Inline override for the transform system prompt (wins over `prompts.json`) |
+| `DICTATE_CLEANUP_PROMPT` | Inline override for the cleanup system prompt (wins over `prompts.json`) |
 
 ## Trade-offs (the honest list)
 
@@ -230,6 +262,7 @@ src/
 ├── history.rs          SQLite dictation history (record / recent)
 ├── injector.rs         AX direct + smart-spacing + Electron clipboard route
 ├── menubar.rs          NSStatusItem menu (model/hotkey/cleanup/history) + pill + history window
+├── prompts.rs          editable transform + cleanup system prompts (prompts.json)
 ├── refiner.rs          corrections + voice-command parse (shared by daemon & CLI)
 ├── settings.rs         ~/.config/local-dictation/settings.json load/save
 ├── smart_pad.rs        spacing & capitalization rules
@@ -243,8 +276,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 55 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 68 total
+cargo test                # 61 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 74 total
 ```
 
 ## License
