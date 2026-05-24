@@ -66,6 +66,22 @@ impl Corrections {
         self.map.is_empty()
     }
 
+    /// The distinct replacement values — i.e. the *target* spellings the user
+    /// cares about (`Lingzi`, `macOS`, `GitHub`, …). Feeding these to the
+    /// cleanup model as a "known vocabulary" hint stops it from "correcting"
+    /// them away before the post-cleanup substitution even runs. Order is
+    /// unspecified; duplicates are collapsed.
+    pub fn replacement_values(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for v in self.map.values() {
+            if seen.insert(v.as_str()) {
+                out.push(v.clone());
+            }
+        }
+        out
+    }
+
     /// Load from the default path. Honors `DICTATE_CORRECTIONS_PATH` if
     /// set, else `~/.config/local-dictation/corrections.json`. Returns
     /// an empty dictionary (without error) if the file doesn't exist.

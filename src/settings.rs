@@ -57,6 +57,10 @@ pub struct Settings {
     /// Whether LLM cleanup runs. `None` ⇒ enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cleanup_enabled: Option<bool>,
+    /// Active formatting preset name (matches a key in `prompts.json`'s
+    /// `formats` map). `None`/blank ⇒ the default cleanup prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_format: Option<String>,
 }
 
 impl Settings {
@@ -119,6 +123,24 @@ impl Settings {
             return code;
         }
         self.hotkey_keycode.unwrap_or(default)
+    }
+
+    /// Resolve the active formatting preset: `DICTATE_FORMAT` env > settings >
+    /// none. Blank/whitespace is treated as unset. The returned name is matched
+    /// (case-insensitively) against `prompts.json`'s `formats` keys by the
+    /// cleanup engine; an unknown name simply falls back to default cleanup.
+    pub fn resolve_format(&self) -> Option<String> {
+        if let Ok(v) = std::env::var("DICTATE_FORMAT") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+        self.active_format
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
     }
 
     /// Resolve whether cleanup should run, given a CLI `--no-cleanup` flag.
@@ -240,6 +262,24 @@ mod tests {
             let mut s2 = Settings::default();
             s2.gemma_model = Some("chosen.gguf".to_string());
             assert_eq!(s2.resolve_gemma("default.gguf"), "chosen.gguf");
+        }
+    }
+
+    #[test]
+    fn resolve_format_from_settings_when_no_env() {
+        // Hermetic: only assert the settings/blank behaviour when the env knob
+        // isn't set (env is process-global).
+        if std::env::var_os("DICTATE_FORMAT").is_none() {
+            let s = Settings::default();
+            assert_eq!(s.resolve_format(), None);
+
+            let mut s2 = Settings::default();
+            s2.active_format = Some("email".into());
+            assert_eq!(s2.resolve_format(), Some("email".into()));
+
+            let mut s3 = Settings::default();
+            s3.active_format = Some("   ".into()); // blank ⇒ unset
+            assert_eq!(s3.resolve_format(), None);
         }
     }
 

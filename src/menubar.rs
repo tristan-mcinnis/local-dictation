@@ -161,6 +161,24 @@ define_class!(
             let current = Settings::load().cleanup_enabled.unwrap_or(true);
             write_settings_and_relaunch(move |set| set.cleanup_enabled = Some(!current));
         }
+
+        #[unsafe(method(selectFormat:))]
+        fn select_format(&self, sender: *mut AnyObject) {
+            // representedObject holds the preset name; the empty string means
+            // "Default (no preset)", which clears the setting.
+            let name = unsafe {
+                let obj: *mut AnyObject = msg_send![sender, representedObject];
+                if obj.is_null() {
+                    String::new()
+                } else {
+                    let s: &NSString = &*(obj as *const NSString);
+                    s.to_string()
+                }
+            };
+            write_settings_and_relaunch(move |set| {
+                set.active_format = if name.is_empty() { None } else { Some(name.clone()) };
+            });
+        }
     }
 );
 
@@ -289,6 +307,9 @@ fn build_status_item(
     unsafe { menu.setAutoenablesItems(false) };
 
     let settings = Settings::load();
+    // Defined output-format presets (keys of prompts.json `formats`). Empty
+    // unless the user has set some, in which case we surface a picker.
+    let format_names = crate::prompts::Prompts::load().format_names();
 
     // ── Last dictation preview (disabled label) + Copy ──────────────────
     let last_item = unsafe {
@@ -369,6 +390,25 @@ fn build_status_item(
         "",
         actions,
     ));
+
+    // ── Output-format preset submenu (only when presets are defined) ─────
+    // The user defines named presets (email / bullets / code) under `formats`
+    // in prompts.json; this picks which one cleanup uses. Hidden entirely when
+    // none are defined so the menu stays uncluttered for the common case.
+    if !format_names.is_empty() {
+        let format_parent = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Output format"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { format_parent.setEnabled(true) };
+        let format_submenu = build_format_submenu(mtm, actions, &settings, &format_names);
+        unsafe { format_parent.setSubmenu(Some(&format_submenu)) };
+        menu.addItem(&format_parent);
+    }
 
     menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
 
@@ -475,6 +515,87 @@ fn build_model_submenu(
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
                 &NSString::from_str("(locked by GEMMA_MODEL_PATH env var)"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        unsafe { note.setEnabled(false) };
+        submenu.addItem(&note);
+    }
+
+    submenu
+}
+
+/// Build the output-format picker. A "Default (no preset)" row clears the
+/// active format; each defined preset gets a checkable row. The active one is
+/// checked. `DICTATE_FORMAT` env locks the picker (disabled + note), mirroring
+/// the model / hotkey submenus.
+fn build_format_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+    names: &[String],
+) -> Retained<NSMenu> {
+    let submenu = NSMenu::new(mtm);
+    unsafe { submenu.setAutoenablesItems(false) };
+
+    let env_locked = std::env::var_os("DICTATE_FORMAT").is_some();
+    let active = settings.active_format.clone().unwrap_or_default();
+
+    // "Default (no preset)" — empty representedObject clears the setting.
+    let default_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Default (no preset)"),
+            Some(sel!(selectFormat:)),
+            &NSString::from_str(""),
+        )
+    };
+    unsafe {
+        default_item.setTarget(Some(actions));
+        default_item.setEnabled(!env_locked);
+        let rep_ns = NSString::from_str("");
+        let rep: &AnyObject = &rep_ns;
+        default_item.setRepresentedObject(Some(rep));
+        default_item.setState(if !env_locked && active.trim().is_empty() {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+    }
+    submenu.addItem(&default_item);
+    submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+
+    for name in names {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(name),
+                Some(sel!(selectFormat:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(actions));
+            item.setEnabled(!env_locked);
+            let rep_ns = NSString::from_str(name);
+            let rep: &AnyObject = &rep_ns;
+            item.setRepresentedObject(Some(rep));
+            item.setState(if !env_locked && active.eq_ignore_ascii_case(name) {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+        }
+        submenu.addItem(&item);
+    }
+
+    if env_locked {
+        submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+        let note = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("(locked by DICTATE_FORMAT env var)"),
                 None,
                 &NSString::from_str(""),
             )

@@ -22,8 +22,8 @@ apps). Everything runs on-device; nothing hits the network at runtime. The crate
 cargo build --features full --release        # the real build — see feature flags below
 ./target/release/fast-dictate-backend daemon # run the push-to-talk daemon
 
-cargo test                                   # 61 unit + 2 integration, NO models or features needed
-cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (74 total)
+cargo test                                   # 64 unit + 2 integration, NO models or features needed
+cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (78 total)
 cargo test --features full <name>            # single test by name substring
 ```
 
@@ -79,8 +79,13 @@ so `cargo test` stays fast and dependency-free.
 
 ## Pipeline data flow (the daemon path)
 
-`daemon.rs` owns a `CGEventTap` watching the hotkey modifier + a worker thread. On key release it
-drains audio and runs the pipeline:
+`daemon.rs` owns a `CGEventTap` watching the hotkey modifier + a worker thread. The modifier
+co-held at press time selects one of three verbs (`CaptureMode` in `daemon.rs`): **Dictate** (PTT
+alone), **Transform** (Shift+PTT, rewrite the selection), **Agent** (Control+PTT). The flag→mode
+map is the pure, unit-tested `mode_for_flags` (with a collision guard so a Control/Shift-bound PTT
+key still dictates). Agent mode is **Phase-0 scaffolding** — it transcribes + logs the command and
+returns; no tool loop yet (see the voice-cockpit spec). On key release Dictate drains audio and
+runs the pipeline:
 
 ```
 audio.rs (cpal + SPSC ring buffer)
@@ -100,13 +105,14 @@ so config changes (model/hotkey/cleanup) **relaunch** the daemon rather than hot
 ## Config & precedence
 
 User config lives in `~/.config/local-dictation/`:
-- `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`.
-- `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts; blank field falls back to built-in default.
-- `corrections.json` (`corrections.rs`) — word→replacement map applied after cleanup.
+- `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`.
+- `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts, plus an optional `formats` map of named output-shape presets (email/bullets/code). The active preset (`active_format`/`DICTATE_FORMAT`) replaces the cleanup prompt for normal dictation; unknown/blank falls back to default. Blank field falls back to built-in default.
+- `corrections.json` (`corrections.rs`) — word→replacement map. Applied verbatim after cleanup **and** fed (target spellings only) into the cleanup prompt as a known-vocabulary hint via `prompts::vocabulary_suffix` (the cleaner builds the effective cleanup prompt once at init).
 
 Precedence is always **env var > JSON file > built-in default**. Key env knobs:
 `PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE` (default `0x3D` Right Option),
-`DICTATE_QUIET`, `DICTATE_PROMPTS_PATH`, `DICTATE_TRANSFORM_PROMPT`, `DICTATE_CLEANUP_PROMPT`,
+`DICTATE_FORMAT` (active output-format preset), `DICTATE_QUIET`, `DICTATE_PROMPTS_PATH`,
+`DICTATE_TRANSFORM_PROMPT`, `DICTATE_CLEANUP_PROMPT`,
 `DICTATE_CORRECTIONS_PATH`, `FOCUS_APP`/`INJECT_DIAG` (scripted-test helpers). Models default to
 `models/dictation/parakeet-tdt-v3-int8` and `models/llm/gemma-3-1b-it/...` inside the repo tree.
 

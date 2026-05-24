@@ -134,6 +134,18 @@ The two system prompts — **transform** (above) and **cleanup** (the always-on 
 
 Prompts are read once when the daemon starts, so **edit, then relaunch** to test a change. The boot log prints `prompts cleanup=… · transform=…` (`default` or `custom`) so you can confirm your file took effect. Precedence is **env var > `prompts.json` > built-in default** — set `DICTATE_TRANSFORM_PROMPT` / `DICTATE_CLEANUP_PROMPT` for a one-off scripted experiment, or `DICTATE_PROMPTS_PATH` to point at a different file.
 
+## Agent mode (preview)
+
+There's a **third verb on the same button**. Same push-to-talk key, scoped by which modifier you hold first:
+
+| Gesture | Mode | What happens |
+| --- | --- | --- |
+| Right Option | **Dictate** | transcribe → clean → inject at the cursor |
+| **Shift** + Right Option | **Transform** | rewrite the current selection in place |
+| **Control** + Right Option | **Agent** | interpret a spoken *command* |
+
+Hold **Control + Right Option** (Control first, then the push-to-talk key — same shape as the Shift transform gesture), speak a command, release. Today this is **Phase-0 scaffolding**: the gesture is recognised and your command is transcribed and logged to `/tmp/dictate-daemon.log`, but the local tool-calling loop isn't wired up yet — nothing is injected and no tools run. The dispatch path is in place so the agent brain (a local Gemma tool loop, fully on-device) can land behind it without touching the hot Dictate/Transform paths. Control is chosen because Control+Option is almost never a system shortcut, so holding it while you talk won't fire side effects. (If you rebind the push-to-talk key itself to Right Control or Right Shift, that key reverts to plain Dictate — the modifier can't be both the trigger and the mode selector.)
+
 ## Verified performance
 
 Measured on Apple Silicon, hot path after warm-up, end-to-end from key release to text injected:
@@ -204,6 +216,7 @@ and can be downloaded into `models/llm/<name>/` to appear in the picker.
   - **Dictation History…** (⌘H) — opens a small native window listing past dictations, newest first, grouped by day. The friendly counterpart to the log: just the text and when, nothing else.
   - **Cleanup model ▸** — checkable submenu of every model under `models/llm/`; pick one and the daemon relaunches on it.
   - **Push-to-talk key ▸** — Right Option / Command / Control / Shift.
+  - **Output format ▸** — pick an output-shape preset (email / bullets / code / …) defined in `prompts.json`, or *Default (no preset)*. Only shown once you've defined a `formats` block.
   - **Cleanup enabled** — toggle LLM cleanup on/off (raw transcript when off).
   - **Edit cleanup prompts…** — opens `prompts.json` in your text editor, seeded the first time with the currently-active cleanup + transform system prompts (with inline notes) so there's real text to edit. Save, then relaunch (e.g. toggle Cleanup enabled off/on) to apply. See [Editable prompts](#editable-prompts).
   - **Open Log** (⌘L), **Export Log to Downloads…**, **Open corrections folder**.
@@ -215,7 +228,8 @@ and can be downloaded into `models/llm/<name>/` to appear in the picker.
 - **Transform selected text by voice.** Select text, hold **Shift + Right Option**, speak an instruction ("make this concise", "turn into bullet points", "translate to Spanish"), release — the selection is rewritten in place via the warm Gemma model. See [Transform selected text by voice](#transform-selected-text-by-voice).
 - **Editable prompts.** The transform and cleanup system prompts live in `~/.config/local-dictation/prompts.json` (copy [`prompts.example.json`](./prompts.example.json)); tune how the model behaves without touching code. See [Editable prompts](#editable-prompts).
 - **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
-- **Personal corrections dictionary.** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Applied after cleanup, before injection. Case-insensitive match at word boundaries; replacement is verbatim. See `corrections.example.json`.
+- **Personal corrections dictionary (now dictionary-aware).** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Two things happen with it: (1) the target spellings are fed to the cleanup model up front as a *known-vocabulary* hint, so Gemma stops "correcting" your proper nouns and casing away in the first place; and (2) the map is still applied verbatim after cleanup as a backstop. Case-insensitive match at word boundaries; the hint is capped so a huge dictionary can't bloat the prompt. See `corrections.example.json`.
+- **Output-format presets.** Define named cleanup styles (`email`, `bullets`, `code`, …) under a `formats` object in `prompts.json`, then pick the active one from the menu bar's **Output format** submenu (or set `DICTATE_FORMAT`). When a preset is active it replaces the default cleanup prompt for normal dictation, so the same speech can land as an email body, a bullet list, or a terse code note. Unknown/blank presets fall back to the default cleanup; the menu only appears once you've defined at least one. See the `formats` block in [`prompts.example.json`](./prompts.example.json).
 - **Inline voice commands.** End a dictation with a recognised phrase and it's stripped from the text and turned into a keystroke after the body is injected: `press enter` / `press return` / `hit enter` / `new line` → **Return**; `new paragraph` → **two Returns**; `press tab` / `hit tab` → **Tab**. And if the *whole* utterance is `scratch that` / `never mind` / `cancel that` / `delete that`, nothing is injected. All matched on word boundaries, so "compress enter" or "let me scratch that itch" never fire.
 - **Dictation history.** Every injected dictation is saved to a tiny SQLite database at `~/.config/local-dictation/history.db`. Open **Dictation History…** from the menu bar for a plain native window listing them newest-first, grouped by day — readable at a glance, unlike the timing-heavy log.
 - **Structured logs.** Aligned per-utterance blocks at `/tmp/dictate-daemon.log` showing transcribe / cleanup / inject timings, the target app name, and the final injected text.
@@ -259,7 +273,7 @@ and can be downloaded into `models/llm/<name>/` to appear in the picker.
 Two ways to configure the daemon, in order of precedence:
 
 1. **Env vars** (below) — win over everything; best for scripted launches.
-2. **`~/.config/local-dictation/settings.json`** — written by the menu bar; holds `gemma_model`, `hotkey_keycode`, `cleanup_enabled`. You rarely edit it by hand.
+2. **`~/.config/local-dictation/settings.json`** — written by the menu bar; holds `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`. You rarely edit it by hand.
    - **`~/.config/local-dictation/prompts.json`** (separate, hand-edited) — the transform + cleanup system prompts. See [Editable prompts](#editable-prompts).
 3. **Built-in defaults.**
 
@@ -271,6 +285,7 @@ Two ways to configure the daemon, in order of precedence:
 | `DICTATE_QUIET` | Set to anything to mute audio cues |
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
+| `DICTATE_FORMAT` | Active output-format preset name (matches a key in `prompts.json`'s `formats`). Overrides the menu's Output-format picker. Unknown/blank ⇒ default cleanup. |
 | `DICTATE_CORRECTIONS_PATH` | Override the corrections JSON path (default: `~/.config/local-dictation/corrections.json`) |
 | `DICTATE_PROMPTS_PATH` | Override the prompts JSON path (default: `~/.config/local-dictation/prompts.json`) |
 | `DICTATE_TRANSFORM_PROMPT` | Inline override for the transform system prompt (wins over `prompts.json`) |
@@ -311,8 +326,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 61 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 74 total
+cargo test                # 64 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 78 total
 ```
 
 ## License

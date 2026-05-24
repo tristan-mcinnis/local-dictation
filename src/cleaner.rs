@@ -51,6 +51,11 @@ pub struct TextCleanupEngine {
     /// Cleanup + transform system prompts, resolved once at init from
     /// env / prompts.json / built-in defaults.
     prompts: Prompts,
+    /// The effective cleanup system prompt: the default (or active formatting
+    /// preset) cleanup prompt with the personal "known vocabulary" suffix
+    /// already appended. Built once at init so the hot path just formats the
+    /// transcript onto it.
+    cleanup_prompt: String,
 }
 
 impl TextCleanupEngine {
@@ -67,11 +72,40 @@ impl TextCleanupEngine {
         let chat_template = model
             .chat_template(None)
             .map_err(|e| eyre::eyre!("chat_template lookup failed: {e:?}"))?;
+        let prompts = Prompts::load();
+
+        // Resolve the active formatting preset (env > settings.json > none) and
+        // pick its cleanup prompt, falling back to the default. An unknown name
+        // just yields the default cleanup — see `Prompts::cleanup_for`.
+        let active_format = crate::settings::Settings::load().resolve_format();
+        let base_cleanup = prompts.cleanup_for(active_format.as_deref()).to_string();
+        if let Some(name) = &active_format {
+            let applied = prompts.format_names().iter().any(|f| f.eq_ignore_ascii_case(name));
+            eprintln!(
+                "[boot] format      {name} ({})",
+                if applied { "applied" } else { "unknown — using default cleanup" }
+            );
+        }
+
+        // Dictionary-aware cleanup: append the user's known vocabulary (the
+        // target spellings in corrections.json) so the model stops "correcting"
+        // proper nouns and domain casing away. Best-effort — a missing or
+        // unreadable corrections file just means no suffix.
+        let vocab = crate::corrections::Corrections::load_default()
+            .map(|c| c.replacement_values())
+            .unwrap_or_default();
+        let mut cleanup_prompt = base_cleanup;
+        if let Some(suffix) = crate::prompts::vocabulary_suffix(&vocab) {
+            eprintln!("[boot] vocab       {} term(s) fed to cleanup prompt", vocab.len().min(crate::prompts::MAX_VOCAB_TERMS));
+            cleanup_prompt.push_str(&suffix);
+        }
+
         Ok(Self {
             backend,
             model: Arc::new(model),
             chat_template: Arc::new(chat_template),
-            prompts: Prompts::load(),
+            prompts,
+            cleanup_prompt,
         })
     }
 
@@ -82,7 +116,7 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let user_msg = format!("{}\n\nRaw transcript:\n{raw}", self.prompts.cleanup);
+        let user_msg = format!("{}\n\nRaw transcript:\n{raw}", self.cleanup_prompt);
         // Cleanup never summarizes (the prompt forbids it), so the cleaned text
         // tracks the input length — stripping filler makes it a touch shorter,
         // expanding contractions a touch longer. Budget off the raw transcript
