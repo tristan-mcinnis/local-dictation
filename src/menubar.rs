@@ -846,10 +846,13 @@ fn install_poll_timer() {
         if now != prev {
             apply_state_transition(globals, state);
         }
-        // Always update bar heights when pill is visible — drives the
-        // waveform animation.
-        if matches!(state, UiState::Recording | UiState::Processing) {
-            update_bars(globals);
+        // Drive the waveform while the pill is visible. Recording feeds the
+        // bars from live mic RMS; Processing has no mic input, so we run a
+        // synthetic "thinking" wave instead of letting the bars sit frozen.
+        match state {
+            UiState::Recording => update_bars(globals),
+            UiState::Processing => animate_processing_bars(globals),
+            UiState::Idle => {}
         }
     }
 
@@ -966,13 +969,49 @@ fn update_bars(globals: &UiGlobals) {
             current * 0.78 + target * 0.22
         };
         displayed[i] = new_h;
-
-        let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
-        let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
-        let y = (PILL_H - new_h) / 2.0;
-        let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, new_h));
-        unsafe { bar.setFrame(new_frame) };
+        set_bar_height(bar, i, new_h);
     }
+}
+
+/// Synthetic "thinking" waveform shown while the pipeline transcribes / cleans
+/// up. No mic samples arrive during Processing, so without this the bars decay
+/// to a flat line and the pill looks frozen. We drive the same white bars with
+/// a sine wave that travels left→right across them — still a waveform, no new
+/// colors, but unmistakably animated so the user sees work is happening.
+fn animate_processing_bars(globals: &UiGlobals) {
+    let mut displayed = match globals.displayed_heights.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    // Continuous wall-clock phase so the wave keeps moving every tick,
+    // independent of frame timing.
+    let t = CFAbsoluteTimeGetCurrent();
+    const SPEED: f64 = 5.5; // radians/sec — ~0.9 sweeps per second
+    const SPACING: f64 = 0.55; // radians/bar — ~1.2 wavelengths across the row
+    // Calm amplitude (peaks ~60% of full) so it reads as "thinking", not a
+    // loud audio signal.
+    let amp = (BAR_MAX_H * 0.6 - BAR_MIN_H) / 2.0;
+    let mid = BAR_MIN_H + amp;
+
+    for (i, bar) in globals.bars.iter().enumerate() {
+        let wave = (t * SPEED - i as f64 * SPACING).sin();
+        let target = mid + amp * wave;
+        // Ease toward the target so the hand-off from the live recording
+        // waveform glides in rather than snapping.
+        let new_h = displayed[i] * 0.6 + target * 0.4;
+        displayed[i] = new_h;
+        set_bar_height(bar, i, new_h);
+    }
+}
+
+/// Position bar `i` at height `h`, vertically centered within the pill.
+fn set_bar_height(bar: &NSView, i: usize, h: f64) {
+    let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
+    let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
+    let y = (PILL_H - h) / 2.0;
+    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, h));
+    unsafe { bar.setFrame(frame) };
 }
 
 fn collapse_bars(globals: &UiGlobals) {
@@ -982,11 +1021,7 @@ fn collapse_bars(globals: &UiGlobals) {
         }
     }
     for (i, bar) in globals.bars.iter().enumerate() {
-        let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
-        let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
-        let y = (PILL_H - BAR_MIN_H) / 2.0;
-        let f = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, BAR_MIN_H));
-        unsafe { bar.setFrame(f) };
+        set_bar_height(bar, i, BAR_MIN_H);
     }
 }
 
