@@ -5,8 +5,9 @@
 //! waveform driven by mic RMS. Hidden when idle.
 //!
 //! The status-item menu exposes the settings a GUI user would expect —
-//! cleanup model, push-to-talk key, cleanup on/off — plus quality-of-life
-//! items (copy last dictation, open/export log, corrections folder).
+//! cleanup model, push-to-talk key, cleanup on/off, edit cleanup prompts —
+//! plus quality-of-life items (copy last dictation, open/export log,
+//! corrections folder).
 //! Settings-changing items write `settings.json` and relaunch the daemon
 //! so the change takes effect; the model load makes in-process swapping not
 //! worth the complexity.
@@ -129,6 +130,11 @@ define_class!(
         #[unsafe(method(openCorrections:))]
         fn open_corrections(&self, _sender: *mut AnyObject) {
             open_corrections_folder();
+        }
+
+        #[unsafe(method(editPrompts:))]
+        fn edit_prompts(&self, _sender: *mut AnyObject) {
+            open_prompts_file();
         }
 
         #[unsafe(method(selectModel:))]
@@ -351,6 +357,18 @@ fn build_status_item(
         });
     }
     menu.addItem(&cleanup_item);
+
+    // ── Edit the cleanup / transform system prompts ─────────────────────
+    // Opens prompts.json in a text editor (seeded with the live prompts the
+    // first time, so there's real text to edit). Sits right under the cleanup
+    // controls because it's the knob that shapes what cleanup/transform do.
+    menu.addItem(&action_item(
+        mtm,
+        "Edit cleanup prompts…",
+        sel!(editPrompts:),
+        "",
+        actions,
+    ));
 
     menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
 
@@ -643,6 +661,61 @@ fn open_corrections_folder() {
     } else {
         let _ = std::process::Command::new("open").arg(&dir).status();
     }
+}
+
+/// Open the user's `prompts.json` (cleanup + transform system prompts) in a
+/// text editor. The file is optional — the daemon falls back to built-in
+/// defaults when it's missing — so the first time it doesn't exist we seed it
+/// with the *currently active* prompts plus inline `_`-comments. That way the
+/// user edits real, working text instead of staring at a blank file, and the
+/// seeded values round-trip through `Prompts::load()` unchanged.
+///
+/// Edits take effect on the next daemon launch (prompts are read once at
+/// startup), so the comment tells the user to relaunch — e.g. toggle "Cleanup
+/// enabled" off and on, which relaunches the daemon.
+fn open_prompts_file() {
+    let Some(path) = crate::prompts::Prompts::config_path() else {
+        eprintln!("[menu] cannot resolve prompts.json path (no $HOME?)");
+        return;
+    };
+
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let prompts = crate::prompts::Prompts::load();
+        let esc = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+        let seed = format!(
+            "{{\n  \"_comment\": {},\n\n  \"_cleanup\": {},\n  \"cleanup\": {},\n\n  \"_transform\": {},\n  \"transform\": {}\n}}\n",
+            esc(
+                "Edit the two system prompts below, then save. Changes take effect on the \
+                 next daemon launch — toggle \u{201C}Cleanup enabled\u{201D} off and on \
+                 (or quit and relaunch the daemon) to reload them. Blank or delete a field \
+                 to restore that prompt\u{2019}s built-in default. \u{201C}_\u{201D}-prefixed \
+                 keys are comments and are ignored."
+            ),
+            esc(
+                "Always-on cleanup: tidies every normal dictation. Keep it conservative — \
+                 its job is to clean up speech-to-text, not to rewrite or summarize."
+            ),
+            esc(&prompts.cleanup),
+            esc(
+                "Transform mode (Shift + push-to-talk): you select text, speak an \
+                 instruction, and the model rewrites the selection in place."
+            ),
+            esc(&prompts.transform),
+        );
+        if let Err(e) = std::fs::write(&path, seed) {
+            eprintln!("[menu] failed to seed prompts.json ({}): {e}", path.display());
+            // Still try to open whatever exists / the folder below.
+        }
+    }
+
+    // `open -t` opens in the default text editor (TextEdit), matching Open Log.
+    let _ = std::process::Command::new("open")
+        .arg("-t")
+        .arg(&path)
+        .status();
 }
 
 // ─── Dictation history window ───────────────────────────────────────────
