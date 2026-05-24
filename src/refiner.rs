@@ -54,6 +54,44 @@ impl RefinedDictation {
                     | TrailingAction::PressTab
             )
     }
+
+    /// Collapse this refined dictation into the single terminal decision the
+    /// caller should act on. This is the four-way branch the daemon used to
+    /// open-code (cancel → discard, bare command → keystroke, empty → skip,
+    /// else inject); concentrating it here makes it unit-testable without
+    /// audio, models, or AX, and keeps the daemon's hot path a flat `match`.
+    pub fn outcome(self) -> DictationOutcome {
+        if matches!(self.action, TrailingAction::Cancel) {
+            // "scratch that" — inject nothing AND synthesize no key.
+            return DictationOutcome::Discard;
+        }
+        if self.is_bare_action() {
+            return DictationOutcome::BareAction(self.action);
+        }
+        if self.is_empty() {
+            return DictationOutcome::Skip;
+        }
+        DictationOutcome::Inject {
+            text: self.text,
+            action: self.action,
+        }
+    }
+}
+
+/// The terminal decision for one refined utterance — what the caller actually
+/// does with it. `Discard` (a cancel phrase) and `Skip` (cleaned to nothing)
+/// both inject nothing, but stay distinct so callers can log/observe them
+/// differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DictationOutcome {
+    /// User cancelled ("scratch that"): inject nothing, press no key.
+    Discard,
+    /// No body, just a keystroke to synthesize ("press enter" on its own).
+    BareAction(TrailingAction),
+    /// Inject `text`, then run `action` afterwards (`action` may be `None`).
+    Inject { text: String, action: TrailingAction },
+    /// Nothing left to do — empty body with no action.
+    Skip,
 }
 
 /// Applies corrections then voice-command parsing to cleaned transcripts.
@@ -154,5 +192,52 @@ mod tests {
         assert!(out.is_empty());
         assert!(out.is_bare_action());
         assert_eq!(out.action, TrailingAction::NewParagraph);
+    }
+
+    #[test]
+    fn outcome_inject_carries_body_and_action() {
+        let r = refiner(&[("teh", "the")]);
+        let out = r.refine("teh cat press enter").outcome();
+        assert_eq!(
+            out,
+            DictationOutcome::Inject {
+                text: "the cat".to_string(),
+                action: TrailingAction::PressEnter,
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_inject_with_no_trailing_action() {
+        let r = refiner(&[]);
+        let out = r.refine("just some text").outcome();
+        assert_eq!(
+            out,
+            DictationOutcome::Inject {
+                text: "just some text".to_string(),
+                action: TrailingAction::None,
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_cancel_is_discard() {
+        let r = refiner(&[]);
+        assert_eq!(r.refine("scratch that").outcome(), DictationOutcome::Discard);
+    }
+
+    #[test]
+    fn outcome_bare_command_is_bare_action() {
+        let r = refiner(&[]);
+        assert_eq!(
+            r.refine("press tab").outcome(),
+            DictationOutcome::BareAction(TrailingAction::PressTab)
+        );
+    }
+
+    #[test]
+    fn outcome_empty_is_skip() {
+        let r = refiner(&[]);
+        assert_eq!(r.refine("   ").outcome(), DictationOutcome::Skip);
     }
 }

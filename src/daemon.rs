@@ -18,7 +18,7 @@ use crate::corrections::Corrections;
 use crate::cues;
 use crate::injector::{AccessibilityInjector, FocusTarget};
 use crate::menubar;
-use crate::refiner::Refiner;
+use crate::refiner::{DictationOutcome, Refiner};
 use crate::transcriber::LocalInferenceWorker;
 use crate::ui_channel::{self, UiState};
 use crate::voice_commands::TrailingAction;
@@ -626,30 +626,33 @@ fn worker_loop(
                 // Corrections dictionary + trailing voice-command parsing, in
                 // the canonical order (corrections first). Same transform the
                 // CLI `dictate`/`bench` paths now use, so behaviour matches.
-                let refined = refiner.refine(&final_text);
-                let action = refined.action.clone();
-
-                // Whole-utterance cancel ("scratch that") — inject nothing.
-                if matches!(action, TrailingAction::Cancel) {
-                    eprintln!("  ⌫    scratch that · discarded");
-                    eprintln!();
-                    ui_channel::set_state(UiState::Idle);
-                    continue;
-                }
-                if refined.is_bare_action() {
-                    execute_trailing_action(&action);
-                    eprintln!("  ↵    bare command (no body)");
-                    eprintln!();
-                    ui_channel::set_state(UiState::Idle);
-                    continue;
-                }
-                if refined.is_empty() {
-                    eprintln!("  skip · cleaned to empty");
-                    eprintln!();
-                    ui_channel::set_state(UiState::Idle);
-                    continue;
-                }
-                let final_text = refined.text;
+                // Classify the refined utterance into one terminal decision
+                // (discard / bare-action / skip / inject). The branching lives
+                // in `RefinedDictation::outcome`, unit-tested without audio; the
+                // three non-inject arms log + return to idle, leaving the hot
+                // path below to handle only the inject case.
+                let (final_text, action) = match refiner.refine(&final_text).outcome() {
+                    DictationOutcome::Discard => {
+                        eprintln!("  ⌫    scratch that · discarded");
+                        eprintln!();
+                        ui_channel::set_state(UiState::Idle);
+                        continue;
+                    }
+                    DictationOutcome::BareAction(action) => {
+                        execute_trailing_action(&action);
+                        eprintln!("  ↵    bare command (no body)");
+                        eprintln!();
+                        ui_channel::set_state(UiState::Idle);
+                        continue;
+                    }
+                    DictationOutcome::Skip => {
+                        eprintln!("  skip · cleaned to empty");
+                        eprintln!();
+                        ui_channel::set_state(UiState::Idle);
+                        continue;
+                    }
+                    DictationOutcome::Inject { text, action } => (text, action),
+                };
 
                 // Inject using the focus target captured before cleanup.
                 let t_inject = Instant::now();

@@ -66,13 +66,7 @@ pub struct Settings {
 impl Settings {
     /// `~/.config/local-dictation/settings.json` (None if `$HOME` is unset).
     pub fn config_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("local-dictation")
-                .join("settings.json"),
-        )
+        crate::app_paths::config_file("settings.json")
     }
 
     /// Load settings, returning an empty (all-`None`) struct when the file is
