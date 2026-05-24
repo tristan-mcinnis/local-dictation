@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::settings::{self, Settings};
-use crate::ui_channel::{self, UiState};
+use crate::ui_channel::{self, Accent, UiState};
 
 const LOG_PATH: &str = "/tmp/dictate-daemon.log";
 
@@ -66,6 +66,8 @@ struct UiGlobals {
     pill_window: Retained<NSWindow>,
     bars: Vec<Retained<NSView>>,
     last_state: AtomicU8,
+    /// Last accent applied to the bars, so we only recolour on change.
+    last_accent: AtomicU8,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
     /// slowly toward the new RMS sample — gives the snappy bouncing
     /// feel of real audio meters.
@@ -231,6 +233,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         pill_window,
         bars,
         last_state: AtomicU8::new(255),
+        last_accent: AtomicU8::new(255),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
         icon_idle: built.icon_idle,
         icon_recording: built.icon_recording,
@@ -1220,12 +1223,21 @@ fn install_poll_timer() {
         if now != prev {
             apply_state_transition(globals, state);
         }
+        // Recolour the bars when the accent flips (agent ⇄ normal). Cheap, and
+        // only on change, so the 30 FPS tick stays light.
+        let accent = ui_channel::accent();
+        let prev_acc = globals.last_accent.swap(accent as u8, Ordering::SeqCst);
+        if accent as u8 != prev_acc {
+            recolor_bars(globals, accent);
+        }
         // Drive the waveform while the pill is visible. Recording feeds the
         // bars from live mic RMS; Processing has no mic input, so we run a
-        // synthetic "thinking" wave instead of letting the bars sit frozen.
+        // synthetic "thinking" wave; Speaking shows the center-out "assistant
+        // talking" pulse (driven by TTS amplitude once that lands).
         match state {
             UiState::Recording => update_bars(globals),
             UiState::Processing => animate_processing_bars(globals),
+            UiState::Speaking => animate_speaking_bars(globals),
             UiState::Idle => {}
         }
     }
@@ -1265,7 +1277,9 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
     let icon = match state {
         UiState::Idle => &globals.icon_idle,
         UiState::Recording => &globals.icon_recording,
-        UiState::Processing => &globals.icon_processing,
+        // Speaking reuses the animated waveform glyph (assistant is active but
+        // not capturing) — the pill's center-out wave is the real signal.
+        UiState::Processing | UiState::Speaking => &globals.icon_processing,
     };
     if let Some(button) = globals.status_item.button(mtm) {
         if let Some(img) = icon {
@@ -1275,7 +1289,7 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             let fallback = match state {
                 UiState::Idle => "◯",
                 UiState::Recording => "●",
-                UiState::Processing => "◌",
+                UiState::Processing | UiState::Speaking => "◌",
             };
             unsafe { button.setTitle(&NSString::from_str(fallback)) };
         }
@@ -1294,7 +1308,7 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             collapse_bars(globals);
             unsafe { globals.pill_window.orderOut(None) };
         }
-        UiState::Recording | UiState::Processing => {
+        UiState::Recording | UiState::Processing | UiState::Speaking => {
             position_pill_at_cursor_screen(&globals.pill_window);
             unsafe { globals.pill_window.orderFrontRegardless() };
         }
@@ -1376,6 +1390,74 @@ fn animate_processing_bars(globals: &UiGlobals) {
         let new_h = displayed[i] * 0.6 + target * 0.4;
         displayed[i] = new_h;
         set_bar_height(bar, i, new_h);
+    }
+}
+
+/// "Assistant talking" waveform shown while the agent speaks (TTS playback):
+/// a symmetric pulse that swells from the center outward, deliberately unlike
+/// the left→right-scrolling mic waveform so you can tell *who* is talking at a
+/// glance. Amplitude follows the TTS output level when present (it "lip-syncs"
+/// to the voice), and falls back to a gentle breathing pulse when no level has
+/// arrived yet.
+fn animate_speaking_bars(globals: &UiGlobals) {
+    let mut displayed = match globals.displayed_heights.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let levels = ui_channel::recent_levels();
+    let t = CFAbsoluteTimeGetCurrent();
+
+    // Overall energy: the most recent TTS RMS (same gate/curve as the mic
+    // path), or a synthetic breathing pulse before any audio level lands.
+    let energy = match levels.last() {
+        Some(&l) if l >= 0.003 => (((l - 0.003) * 25.0) as f64).powf(0.45).min(1.0),
+        Some(_) => 0.0,
+        None => 0.45 + 0.35 * (t * 5.0).sin().abs(),
+    };
+
+    let center = (BAR_COUNT as f64 - 1.0) / 2.0;
+    for (i, bar) in globals.bars.iter().enumerate() {
+        // 0 at the center bars, →1 at the edges: taller in the middle.
+        let d = (i as f64 - center).abs() / center;
+        let falloff = 1.0 - 0.8 * d;
+        // A little traveling shimmer so a steady energy still looks alive.
+        let shimmer = 0.88 + 0.12 * (t * 7.0 - i as f64 * 0.5).sin();
+        let target = BAR_MIN_H + energy * falloff * shimmer * (BAR_MAX_H - BAR_MIN_H);
+        let new_h = displayed[i] * 0.55 + target * 0.45;
+        displayed[i] = new_h;
+        set_bar_height(bar, i, new_h);
+    }
+}
+
+/// Recolour every bar to match the current accent: a clear blue in agent mode,
+/// the default near-white otherwise. Called only when the accent changes.
+fn recolor_bars(globals: &UiGlobals, accent: Accent) {
+    let (r, g, b) = match accent {
+        Accent::Agent => (0.32, 0.60, 1.0),   // blue — "agent"
+        Accent::Normal => (0.92, 0.92, 0.95), // near-white — dictate/transform
+    };
+    for bar in &globals.bars {
+        unsafe {
+            let layer: *mut objc2::runtime::AnyObject = msg_send![&**bar, layer];
+            let color = NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, b, 1.0);
+            let cg: *mut objc2::runtime::AnyObject = msg_send![&*color, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: cg];
+        }
+    }
+    // Tint the pill border to match, so the whole pill reads as agent-blue.
+    if let Some(view) = globals.pill_window.contentView() {
+        unsafe {
+            let layer: *mut objc2::runtime::AnyObject = msg_send![&*view, layer];
+            if !layer.is_null() {
+                let (br, bg, bb, ba) = match accent {
+                    Accent::Agent => (0.32, 0.60, 1.0, 0.85),
+                    Accent::Normal => (0.45, 0.45, 0.50, 0.65),
+                };
+                let color = NSColor::colorWithCalibratedRed_green_blue_alpha(br, bg, bb, ba);
+                let cg: *mut objc2::runtime::AnyObject = msg_send![&*color, CGColor];
+                let _: () = msg_send![layer, setBorderColor: cg];
+            }
+        }
     }
 }
 

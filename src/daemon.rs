@@ -528,6 +528,13 @@ fn worker_loop(
                     continue;
                 }
                 mode = m;
+                // Tint the pill for the whole gesture: blue in agent mode,
+                // neutral otherwise.
+                ui_channel::set_accent(if matches!(m, CaptureMode::Agent) {
+                    ui_channel::Accent::Agent
+                } else {
+                    ui_channel::Accent::Normal
+                });
                 t_press = Some(Instant::now());
                 let (mut e, c) = AudioCaptureEngine::new(BUFFER_CAPACITY);
                 let r = match e.start_microphone() {
