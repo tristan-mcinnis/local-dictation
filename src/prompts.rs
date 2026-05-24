@@ -150,27 +150,12 @@ impl Prompts {
         )
     }
 
-    /// Load prompts, applying env > file > default. Never errors: a missing or
-    /// corrupt file degrades to defaults (a parse error is logged, not fatal).
+    /// Load prompts, applying env > file > default, and log a one-line boot
+    /// summary. Never errors: a missing or corrupt file degrades to defaults (a
+    /// parse error is logged, not fatal). Use [`Self::load_quiet`] for readers
+    /// (e.g. the menu bar) that just need the values without re-logging.
     pub fn load() -> Self {
-        let file = Self::config_path()
-            .and_then(|p| std::fs::read_to_string(&p).ok().map(|body| (p, body)))
-            .and_then(|(p, body)| match serde_json::from_str::<PromptsFile>(&body) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    eprintln!("[warn] prompts parse failed ({}): {e}", p.display());
-                    None
-                }
-            })
-            .unwrap_or_default();
-
-        let resolved = Self::resolve(
-            std::env::var("DICTATE_CLEANUP_PROMPT").ok(),
-            file.cleanup,
-            std::env::var("DICTATE_TRANSFORM_PROMPT").ok(),
-            file.transform,
-            file.formats,
-        );
+        let resolved = Self::load_quiet();
 
         // Tell the user which prompts are customised — useful when testing a
         // tweaked prompt (confirms the file actually took effect).
@@ -188,6 +173,29 @@ impl Prompts {
             src(&resolved.transform, DEFAULT_TRANSFORM),
         );
         resolved
+    }
+
+    /// Same resolution as [`Self::load`] but without the boot-summary log line.
+    /// A parse error is still surfaced (it's a real problem, not noise).
+    pub fn load_quiet() -> Self {
+        let file = Self::config_path()
+            .and_then(|p| std::fs::read_to_string(&p).ok().map(|body| (p, body)))
+            .and_then(|(p, body)| match serde_json::from_str::<PromptsFile>(&body) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!("[warn] prompts parse failed ({}): {e}", p.display());
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        Self::resolve(
+            std::env::var("DICTATE_CLEANUP_PROMPT").ok(),
+            file.cleanup,
+            std::env::var("DICTATE_TRANSFORM_PROMPT").ok(),
+            file.transform,
+            file.formats,
+        )
     }
 
     /// Pure resolution so the precedence is unit-testable without touching real
