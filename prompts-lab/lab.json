@@ -1,0 +1,183 @@
+{
+  "_comment": "Data-driven spec for examples/prompt_lab.rs. Edit candidates + cases, then `cargo run --release --features cleaner --example prompt_lab`. No recompile needed unless lib code (text_polish, cleaner) changed.",
+  "reps": 2,
+
+  "cleanup_candidates": {
+    "baseline": "You are a real-time dictation cleaner. Edit raw speech-to-text for written-text readability:\n- Remove disfluencies: uh, um, er, ah, hmm; 'like' only when used as filler; 'you know' only when used as filler.\n- Expand colloquial contractions to their written form: wanna → want to, gonna → going to, kinda → kind of, sorta → sort of, gimme → give me, lemme → let me, dunno → don't know, outta → out of, lotta → lot of, shoulda → should have, coulda → could have, woulda → would have, y'all → you all.\n- KEEP standard contractions as-is: don't, it's, won't, can't, I'm, I'll, we're, etc. — do not over-formalize.\n- Fix punctuation and capitalization of sentence boundaries.\n- Preserve domain-specific casing when it appears: Rust, macOS, ONNX, GitHub, Parakeet, iOS, Apple Silicon, etc.\n- CRITICAL: Do NOT substitute common words for proper nouns based on guessed context. If the speaker says 'main', keep 'main' — do not change to 'Maine'. If they say 'mark', keep 'mark' — do not change to 'Mark'. Tech terms like 'git', 'npm', 'cd', 'ls', 'main', 'master', 'dev', 'prod', 'api' stay lowercase as written. Only capitalize when the word is unambiguously a proper noun in context.\n- Do NOT rephrase, paraphrase, summarize, or add words the speaker didn't say. Preserve the speaker's voice and word choice.\nOutput ONLY the cleaned text — no preamble, no commentary, no quotes, no markdown.",
+
+    "v2": "You are a real-time dictation cleaner. Turn raw speech-to-text into clean written text. Make only these edits:\n- Remove ALL filler and disfluencies wherever they occur, INCLUDING at the very start of the text: uh, um, er, ah, hmm; a leading 'so', 'okay', 'well', 'yeah', or 'right' used only as throat-clearing; 'like' and 'you know' when used as filler.\n- Remove false starts and stray repeated words ('the the' → 'the').\n- Expand colloquial contractions: wanna → want to, gonna → going to, gotta → got to, kinda → kind of, sorta → sort of, gimme → give me, lemme → let me, dunno → don't know, outta → out of, lotta → lot of, shoulda → should have, coulda → could have, woulda → would have, y'all → you all.\n- KEEP standard contractions as-is: don't, it's, won't, can't, I'm, I'll, we're.\n- Add sentence punctuation, capitalize the first letter of each sentence, and ALWAYS capitalize the standalone pronoun 'I'.\n- Preserve domain casing when present: Rust, macOS, ONNX, GitHub, Parakeet, iOS, Apple Silicon.\n- CRITICAL: never swap a common word for a similar-sounding proper noun. 'main' stays 'main' (not 'Maine'); 'mark' stays 'mark'. Tech tokens like git, npm, cd, ls, main, master, dev, prod, api stay lowercase exactly as written. Only capitalize a word that is unambiguously a proper noun.\n- Keep EVERY content word the speaker said. Do NOT rephrase, paraphrase, summarize, translate, answer, or add anything.\nOutput ONLY the cleaned text — no preamble, no commentary, no quotes, no markdown."
+  },
+
+  "transform_candidates": {
+    "baseline": "You are a precise text editor. Apply the user's instruction to the text below and follow it faithfully — even when that means adding, removing, rephrasing, expanding, or restructuring content. Do not minimize your changes: if the instruction asks for more items, more detail, or a longer result, produce it. Only keep the original wording and detail where the instruction does not ask you to change them. If the instruction is a translation, output only the translation. Return ONLY the resulting text — no preamble, no explanation, no quotes, no markdown fences, no commentary.",
+
+    "v2": "You are a precise text editor. Apply the user's instruction to the text below and follow it faithfully — even when that means adding, removing, rephrasing, expanding, restructuring, or translating. Do not minimize your changes: if the instruction asks for more items, more detail, or a longer result, produce it.\n- Honor the output shape the instruction implies: if it asks for bullets, items, or steps — or the text is already a list — return one item per line ('- ' for bullets, '1.', '2.', '3.' for numbered steps), never a single run-on paragraph.\n- If the instruction names a specific number of items (e.g. 'four bullets'), produce exactly that many.\n- If the instruction is a translation, output only the translation.\n- Keep the original wording only where the instruction does not ask you to change it.\nReturn ONLY the resulting text — no preamble, no explanation, no quotes, no markdown fences, no commentary."
+  },
+
+  "format_candidates": {
+    "numbered": "Rewrite this dictation as a numbered list. Put each distinct item or step the speaker actually mentioned on its own line, numbered '1.', '2.', '3.' and so on. Fix grammar and punctuation, remove filler, and keep the speaker's own wording. Do NOT add, merge, summarize, or invent items, and do NOT add an introductory or closing line. Output ONLY the numbered list — no preamble, no heading, no commentary.",
+    "bullets": "Rewrite this dictation as a tight bulleted list. Put each distinct idea the speaker actually mentioned exactly once on its own line, starting with '- '. Fix grammar, remove filler, use parallel phrasing, and keep the speaker's wording. Do NOT repeat, add, or invent items. Output ONLY the bullets — no preamble, no heading, no commentary.",
+    "email": "Rewrite this dictation as a clear, concise email body. Fix grammar and punctuation, use complete sentences and short paragraphs, and keep a professional but natural tone. Do NOT add a subject line, a greeting, a sign-off, or any bracketed placeholder like [Your Name] — write the body only. Output ONLY the email body — no preamble, no quotes, no markdown.",
+    "code": "Clean this dictation into a terse technical note suitable for a commit message or code comment. Fix punctuation; preserve every identifier, path, and domain casing exactly (macOS, ONNX, GitHub, snake_case, CamelCase). Do NOT add explanation, headings, quotes, or markdown code fences. Output ONLY the cleaned text."
+  },
+
+  "cleanup_cases": [
+    {
+      "id": "disfluency-basic",
+      "category": "disfluency",
+      "input": "so um I think we should uh ship the the thing tomorrow you know",
+      "checks": { "no_preamble": true, "single_line": true, "must_not_contain": ["um", " uh ", "hmm"], "max_len_ratio": 1.3 }
+    },
+    {
+      "id": "filler-like",
+      "category": "disfluency",
+      "input": "it was like really slow and like the build like took forever",
+      "checks": { "no_preamble": true, "single_line": true, "must_contain": ["slow", "build"] }
+    },
+    {
+      "id": "colloquial-contractions",
+      "category": "contractions",
+      "input": "we're gonna wanna refactor this kinda soon and I dunno if we gotta rewrite it",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["I"], "expand": [["gonna", "going to"], ["wanna", "want to"]] }
+    },
+    {
+      "id": "standard-contractions-kept",
+      "category": "contractions",
+      "input": "I don't think it's ready and we can't ship it yet because I'm not sure",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["don't", "it's", "can't", "I'm"] }
+    },
+    {
+      "id": "proper-noun-main",
+      "category": "proper-nouns",
+      "input": "okay so let's merge this branch into main and then push to dev",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["main", "dev"], "must_not_contain": ["Maine"] }
+    },
+    {
+      "id": "tech-casing",
+      "category": "proper-nouns",
+      "input": "we run it on macos with onnx and the parakeet model from github",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["macOS", "ONNX", "GitHub"] }
+    },
+    {
+      "id": "tech-commands-lowercase",
+      "category": "proper-nouns",
+      "input": "just run git status then npm install and cd into the api folder",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["git", "npm", "cd", "api"] }
+    },
+    {
+      "id": "run-on-punctuation",
+      "category": "punctuation",
+      "input": "the meeting went well we covered the roadmap then we talked about hiring then we ran out of time so we will continue next week",
+      "checks": { "no_preamble": true, "single_line": true, "must_contain": ["."], "max_len_ratio": 1.3 }
+    },
+    {
+      "id": "already-clean-noop",
+      "category": "idempotence",
+      "input": "The deployment finished successfully and all tests passed.",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["deployment", "tests"], "max_len_ratio": 1.25 }
+    },
+    {
+      "id": "numbers-and-units",
+      "category": "numbers",
+      "input": "we need about 3 servers each with 16 gigs of ram and a 2 terabyte disk",
+      "checks": { "no_preamble": true, "single_line": true, "must_contain": ["3", "16"] }
+    },
+    {
+      "id": "multi-sentence",
+      "category": "general",
+      "input": "um yeah so the the issue is the cache keeps growing uh we never evict anything and like eventually it just eats all the memory and the process dies you know",
+      "checks": { "no_preamble": true, "single_line": true, "must_not_contain": ["um", " uh "], "must_contain": ["cache", "memory"], "max_len_ratio": 1.25 }
+    },
+    {
+      "id": "no-hallucinated-content",
+      "category": "faithfulness",
+      "input": "send me the report when you get a chance",
+      "checks": { "no_preamble": true, "single_line": true, "must_contain": ["report"], "max_len_ratio": 1.6 }
+    }
+  ],
+
+  "transform_cases": [
+    {
+      "id": "translate-spanish",
+      "category": "translate",
+      "instruction": "translate to Spanish",
+      "input": "The build is broken and we need to fix it before the release.",
+      "checks": { "no_preamble": true, "must_not_contain": ["The build is broken"] }
+    },
+    {
+      "id": "make-concise",
+      "category": "rewrite",
+      "instruction": "make this more concise",
+      "input": "I just wanted to reach out and let you know that I think that we should probably consider maybe rescheduling the meeting to a later time if that works for everyone involved.",
+      "checks": { "no_preamble": true, "must_contain": ["meeting"], "max_len_ratio": 0.9 }
+    },
+    {
+      "id": "expand-bullets",
+      "category": "expand",
+      "instruction": "turn these two bullets into four bullets with more detail",
+      "input": "- Set up CI\n- Write tests",
+      "checks": { "no_preamble": true, "min_lines": 4, "line_kind": "bullet" }
+    },
+    {
+      "id": "make-numbered",
+      "category": "list",
+      "instruction": "rewrite this as a numbered list of steps",
+      "input": "First clone the repo then install the dependencies then run the build and finally start the server.",
+      "checks": { "no_preamble": true, "min_lines": 3, "line_kind": "numbered" }
+    },
+    {
+      "id": "formal-tone",
+      "category": "rewrite",
+      "instruction": "make this more formal and professional",
+      "input": "hey just checking if you got my last email about the thing",
+      "checks": { "no_preamble": true, "must_not_contain": ["hey just"] }
+    },
+    {
+      "id": "fix-grammar",
+      "category": "rewrite",
+      "instruction": "fix the grammar",
+      "input": "me and him was going to the store but we dont has no time",
+      "checks": { "no_preamble": true, "must_not_contain": ["dont has", "has no time"] }
+    },
+    {
+      "id": "summarize",
+      "category": "summarize",
+      "instruction": "summarize this in one sentence",
+      "input": "The quarterly numbers came in above expectations. Revenue grew 12 percent driven mostly by the new enterprise tier. Churn was flat. Costs rose slightly because of the cloud migration but that is a one time expense.",
+      "checks": { "no_preamble": true, "max_len_ratio": 1.0 }
+    }
+  ],
+
+  "format_cases": [
+    {
+      "id": "numbered-steps",
+      "format": "numbered",
+      "input": "okay so to deploy you first build the release then you copy it to the server then you restart the service and then you check the logs",
+      "checks": { "no_preamble": true, "min_lines": 3, "line_kind": "numbered" }
+    },
+    {
+      "id": "numbered-shopping",
+      "format": "numbered",
+      "input": "I need to pick up milk and then eggs and then some bread and also coffee",
+      "checks": { "no_preamble": true, "min_lines": 3, "line_kind": "numbered" }
+    },
+    {
+      "id": "bullets-ideas",
+      "format": "bullets",
+      "input": "the main risks are the timeline is tight the budget is unclear and we don't have enough engineers",
+      "checks": { "no_preamble": true, "min_lines": 3, "line_kind": "bullet" }
+    },
+    {
+      "id": "email-body",
+      "format": "email",
+      "input": "um hey so I wanted to follow up on the proposal we talked about last week can you let me know if you had a chance to review it and what you think",
+      "checks": { "no_preamble": true, "must_not_contain": ["um ", "subject:", "[your name]"] }
+    },
+    {
+      "id": "code-commit",
+      "format": "code",
+      "input": "so this fixes the bug where the cache in the parakeet transcriber on macos would grow without bound",
+      "checks": { "no_preamble": true, "single_line": true, "must_keep": ["macOS", "Parakeet"] }
+    }
+  ]
+}

@@ -307,9 +307,10 @@ fn build_status_item(
     unsafe { menu.setAutoenablesItems(false) };
 
     let settings = Settings::load();
-    // Defined output-format presets (keys of prompts.json `formats`). Empty
-    // unless the user has set some, in which case we surface a picker. Uses the
-    // non-logging loader so building the menu doesn't re-emit the boot summary.
+    // Output-format presets: the built-in set (numbered / bullets / email /
+    // code) plus any the user added/overrode in prompts.json `formats`. Uses
+    // the non-logging loader so building the menu doesn't re-emit the boot
+    // summary.
     let format_names = crate::prompts::Prompts::load_quiet().format_names();
 
     // ── Last dictation preview (disabled label) + Copy ──────────────────
@@ -392,10 +393,10 @@ fn build_status_item(
         actions,
     ));
 
-    // ── Output-format preset submenu (only when presets are defined) ─────
-    // The user defines named presets (email / bullets / code) under `formats`
-    // in prompts.json; this picks which one cleanup uses. Hidden entirely when
-    // none are defined so the menu stays uncluttered for the common case.
+    // ── Output-format preset submenu ────────────────────────────────────
+    // Built-in presets (numbered / bullets / email / code) plus any the user
+    // added in prompts.json `formats`; this picks which one cleanup uses.
+    // `format_names` is non-empty out of the box, so the submenu always shows.
     if !format_names.is_empty() {
         let format_parent = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(

@@ -56,6 +56,11 @@ pub struct TextCleanupEngine {
     /// already appended. Built once at init so the hot path just formats the
     /// transcript onto it.
     cleanup_prompt: String,
+    /// True when an output-format preset (numbered / bullets / email / …) is
+    /// active. List-style presets need their line breaks preserved, so the
+    /// cleanup path keeps newlines instead of flattening to one line as plain
+    /// single-utterance dictation does.
+    format_active: bool,
 }
 
 impl TextCleanupEngine {
@@ -79,11 +84,12 @@ impl TextCleanupEngine {
         // just yields the default cleanup — see `Prompts::cleanup_for`.
         let active_format = crate::settings::Settings::load().resolve_format();
         let base_cleanup = prompts.cleanup_for(active_format.as_deref()).to_string();
+        let mut format_active = false;
         if let Some(name) = &active_format {
-            let applied = prompts.format_names().iter().any(|f| f.eq_ignore_ascii_case(name));
+            format_active = prompts.format_names().iter().any(|f| f.eq_ignore_ascii_case(name));
             eprintln!(
                 "[boot] format      {name} ({})",
-                if applied { "applied" } else { "unknown — using default cleanup" }
+                if format_active { "applied" } else { "unknown — using default cleanup" }
             );
         }
 
@@ -106,6 +112,7 @@ impl TextCleanupEngine {
             chat_template: Arc::new(chat_template),
             prompts,
             cleanup_prompt,
+            format_active,
         })
     }
 
@@ -123,7 +130,12 @@ impl TextCleanupEngine {
         // with headroom instead of a fixed 256-token cap, which used to chop any
         // dictation past ~190 words mid-sentence.
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        self.run_chat(user_msg, budget, false).await
+        // Plain dictation flattens to one line; an active format preset
+        // (numbered / bullets / email) keeps its line structure.
+        let cleaned = self.run_chat(user_msg, budget, self.format_active).await?;
+        // Deterministic mechanics the 1B does unreliably (leading "um", lone
+        // lowercase "i") — cheap, exact, and always safe on speech.
+        Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
     }
 
     /// Rough token count for sizing generation budgets / the context window.
@@ -134,6 +146,52 @@ impl TextCleanupEngine {
             .str_to_token(text, AddBos::Never)
             .map(|t| t.len())
             .unwrap_or_else(|_| text.chars().count() / 3)
+    }
+
+    /// Evaluate an arbitrary candidate **cleanup** system prompt against a raw
+    /// transcript, using the exact framing + budget the production cleanup path
+    /// uses. The model is already loaded, so the prompt-lab harness
+    /// (`examples/prompt_lab.rs`) can A/B many candidate prompts over a corpus
+    /// without paying the model-load cost per candidate. `preserve_newlines`
+    /// lets the lab exercise list-style presets (numbered / bullets), which
+    /// must keep their line breaks — see [`Self::process_transcript`], which
+    /// flattens for single-utterance dictation.
+    pub async fn eval_cleanup(
+        &self,
+        cleanup_prompt: &str,
+        raw: &str,
+        preserve_newlines: bool,
+    ) -> eyre::Result<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        let user_msg = format!("{cleanup_prompt}\n\nRaw transcript:\n{raw}");
+        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
+        let cleaned = self.run_chat(user_msg, budget, preserve_newlines).await?;
+        // Mirror production: apply the same deterministic speech-mechanics pass
+        // so the lab measures what the daemon would actually inject.
+        Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
+    }
+
+    /// Evaluate an arbitrary candidate **transform** system prompt against an
+    /// instruction + selection, mirroring [`Self::transform`]'s framing and
+    /// budget. Companion to [`Self::eval_cleanup`] for the prompt-lab harness.
+    pub async fn eval_transform(
+        &self,
+        transform_prompt: &str,
+        instruction: &str,
+        selection: &str,
+    ) -> eyre::Result<String> {
+        let instruction = instruction.trim();
+        if instruction.is_empty() || selection.is_empty() {
+            return Ok(selection.to_string());
+        }
+        let user_msg = format!(
+            "{transform_prompt}\n\nInstruction: {instruction}\n\nText:\n{selection}"
+        );
+        let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
+        self.run_chat(user_msg, budget, true).await
     }
 
     /// Apply a spoken `instruction` to `selection` and return the edited text.
