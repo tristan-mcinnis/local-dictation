@@ -110,6 +110,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 - **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
 - **Menu-bar icon + settings (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click it for a full menu — no env vars or relaunch scripts needed:
   - **Last dictation preview** + **Copy last dictation** (⌘C) — grab what you just dictated.
+  - **Dictation History…** (⌘H) — opens a small native window listing past dictations, newest first, grouped by day. The friendly counterpart to the log: just the text and when, nothing else.
   - **Cleanup model ▸** — checkable submenu of every model under `models/llm/`; pick one and the daemon relaunches on it.
   - **Push-to-talk key ▸** — Right Option / Command / Control / Shift.
   - **Cleanup enabled** — toggle LLM cleanup on/off (raw transcript when off).
@@ -122,6 +123,7 @@ First daemon run prompts for **Microphone** and **Accessibility** permissions. G
 - **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
 - **Personal corrections dictionary.** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Applied after cleanup, before injection. Case-insensitive match at word boundaries; replacement is verbatim. See `corrections.example.json`.
 - **Voice command: "press enter".** End a dictation with `press enter` / `press return` / `hit enter` / `hit return` and it injects the body then synthesizes a Return keystroke. Doesn't fire mid-sentence.
+- **Dictation history.** Every injected dictation is saved to a tiny SQLite database at `~/.config/local-dictation/history.db`. Open **Dictation History…** from the menu bar for a plain native window listing them newest-first, grouped by day — readable at a glance, unlike the timing-heavy log.
 - **Structured logs.** Aligned per-utterance blocks at `/tmp/dictate-daemon.log` showing transcribe / cleanup / inject timings, the target app name, and the final injected text.
 
 ## What the log looks like
@@ -194,8 +196,9 @@ src/
 ├── clipboard_paste.rs  save → set → Cmd+V → restore (+ Return key synth)
 ├── cues.rs             afplay system sounds
 ├── daemon.rs           push-to-talk loop, CGEventTap, worker thread
+├── history.rs          SQLite dictation history (record / recent)
 ├── injector.rs         AX direct + smart-spacing + Electron clipboard route
-├── menubar.rs          NSStatusItem menu (model/hotkey/cleanup picker) + pill
+├── menubar.rs          NSStatusItem menu (model/hotkey/cleanup/history) + pill + history window
 ├── settings.rs         ~/.config/local-dictation/settings.json load/save
 ├── smart_pad.rs        spacing & capitalization rules
 ├── text_polish.rs      strip LLM preamble / quotes / artefacts
@@ -207,8 +210,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 17 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/injector/cleaner suites — 24 total
+cargo test                # 39 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner suites — 43 total
 ```
 
 ## License
