@@ -1,10 +1,73 @@
 # local-dictation
 
-A local dictation app for Apple Silicon. Hold a hotkey, speak, release — cleaned text appears at your cursor.
+**Hold a hotkey, speak, release — cleaned text appears at your cursor.** A local-first dictation app for Apple Silicon, optimized for the lowest latency and highest accuracy I could get end-to-end. Everything runs on-device; nothing touches the network at runtime.
 
-**Optimized for lowest latency and highest accuracy**, with the obvious trade-offs: it's English-first, macOS-only, and the cleanup model spends ~300 ms thinking about your text. Everything runs on-device. No network at runtime.
+![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
+![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
+![On-device](https://img.shields.io/badge/network%20at%20runtime-none-success)
 
-## Quickest setup — hand it to an AI agent
+<!--
+DEMO GIF GOES HERE. Record a ~5–8 s screen capture and save it to docs/demo.gif, then
+replace this comment with:  ![local-dictation demo](docs/demo.gif)
+
+What to show, in one take:
+  1. Cursor sitting in a real app (Notes / a code editor / Slack).
+  2. Press & hold Right Option — the dark waveform pill appears at the bottom of the screen
+     and the menu-bar icon flips to recording.
+  3. Say a sentence with a filler word or two ("um, so the meeting is, like, at three").
+  4. Release — the cleaned sentence lands at the cursor (fillers gone, punctuation right).
+  5. Optional second beat: select that text, hold Shift+Right Option, say "make this more
+     concise", release — watch it rewrite in place.
+
+Capture tips: record the full screen at retina, 30 FPS; trim dead air; keep it under ~6 MB so
+it loads fast on GitHub. `gifski` or QuickTime → ffmpeg both work. The whole point is that a
+visitor *sees* the value in 5 seconds without reading a word — so lead the file with it.
+-->
+
+> **Heads-up:** this is a personal tool I built for my own daily driving on an Apple Silicon Mac, shared openly in case it's useful to you. It's not a packaged product — there's no signed installer, you build it from source, and it's tuned to how *I* dictate. If that fits, you'll probably like it; if you want a one-click app, see the alternatives below.
+
+## Why this instead of …
+
+There are good dictation tools already. This one exists because I wanted a specific combination the others don't quite hit: **fully on-device, sub-400 ms, and hackable down to the system prompt.**
+
+| | local-dictation | Built-in macOS dictation | Cloud tools (e.g. Wispr Flow) | Local apps (e.g. superwhisper, MacWhisper) |
+| --- | --- | --- | --- | --- |
+| Runs fully on-device | ✅ | ✅ | ❌ (audio leaves your Mac) | ✅ |
+| End-to-end latency | ~300–400 ms (2 s clip) | variable | network-bound | varies |
+| LLM cleanup of fillers/punctuation | ✅ (Gemma, on-device) | ❌ | ✅ | some |
+| Edit *selected* text by voice | ✅ | ❌ | partial | rare |
+| Editable system prompts | ✅ (plain JSON) | ❌ | ❌ | ❌ |
+| Open source, free | ✅ MIT/Apache | n/a | ❌ | mostly ❌ |
+| Polished, one-click install | ❌ (build from source) | ✅ | ✅ | ✅ |
+
+*(Competitor capabilities as I understood them at the time of writing — check their current versions.)* The short version: if you want zero setup and a maintained app, the others win. If you want every millisecond and the ability to rewrite the model's behaviour by editing a text file, that's this.
+
+## Get started
+
+The fastest path by hand (≈ a couple minutes plus model download):
+
+```bash
+# Toolchain (one-time)
+rustup update stable
+xcode-select --install
+brew install cmake
+
+# Get the code + models
+git clone https://github.com/tristan-mcinnis/local-dictation
+cd local-dictation
+./scripts/download-models.sh
+
+# Build (release, full feature set)
+cargo build --features full --release
+
+# Run
+./target/release/fast-dictate-backend daemon
+```
+
+First daemon run prompts for **Microphone** and **Accessibility** permissions. Grant both in System Settings → Privacy & Security, then re-run.
+
+### …or hand it to an AI agent
 
 Don't want to think about toolchains, where the model files go, or which build flags to pass? Paste the prompt below into a coding agent running on your Mac — **Claude Code**, **Codex**, **Cursor**, whatever you use. It reads this README, installs the prerequisites, downloads the models, and builds the release binary — then walks you through the one step it *can't* do for you (granting macOS permissions and launching the daemon).
 
@@ -30,15 +93,9 @@ hold Right Option and tap Space, let go of both, keep talking, then tap Right
 Option once to stop.
 ```
 
-Prefer to do it by hand? The [Quick start](#quick-start) below is the same steps, manually.
+## How you use it
 
-## What you actually do
-
-```bash
-./target/release/fast-dictate-backend daemon
-```
-
-Then **hold Right Option**, speak, release. The cleaned text gets injected wherever your cursor is.
+With the daemon running (`./target/release/fast-dictate-backend daemon`), **hold Right Option**, speak, release. The cleaned text gets injected wherever your cursor is.
 
 Long thought, or just don't want to hold the key? Use **hands-free mode**: hold Right Option and **tap Space** (a short *pop* confirms), then **let go of both keys and keep talking**. Tap Right Option once more to stop. Recording keeps running with nothing held down.
 
@@ -137,28 +194,6 @@ You don't have to edit anything to switch — pick a different model from the
 **menu bar** (see below), or set `GEMMA_MODEL_PATH` for a scripted launch. The
 download script fetches only Parakeet + Gemma 3 1B; the other four are optional
 and can be downloaded into `models/llm/<name>/` to appear in the picker.
-
-## Quick start
-
-```bash
-# Toolchain (one-time)
-rustup update stable
-xcode-select --install
-brew install cmake
-
-# Get the code + models
-git clone https://github.com/tristan-mcinnis/local-dictation
-cd local-dictation
-./scripts/download-models.sh
-
-# Build (release, full feature set)
-cargo build --features full --release
-
-# Run
-./target/release/fast-dictate-backend daemon
-```
-
-First daemon run prompts for **Microphone** and **Accessibility** permissions. Grant both in System Settings → Privacy & Security, then re-run.
 
 ## Features
 
