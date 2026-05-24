@@ -45,7 +45,20 @@ There are good dictation tools already. This one exists because I wanted a speci
 
 ## Get started
 
-The fastest path by hand (≈ a couple minutes plus model download):
+**The easy way — one script.** Clone the repo and run the installer:
+
+```bash
+git clone https://github.com/tristan-mcinnis/local-dictation
+cd local-dictation
+./install.sh
+```
+
+`install.sh` checks your prerequisites (installing Rust / cmake for you if you say yes), downloads the models, builds the app, drops **Local Dictation.app** into `/Applications`, sets it to **launch at login**, and starts it. It's safe to re-run. The only thing it can't do for you is grant macOS permissions — the first launch asks for **Microphone** and **Accessibility**; grant both in System Settings → Privacy & Security. Look for the 🎤 in your menu bar.
+
+> Heads-up: the app is ad-hoc signed (no paid Apple Developer ID), so after you *rebuild* it macOS may occasionally re-ask for those two permissions. A few seconds in System Settings — that's the only catch.
+
+<details>
+<summary><b>The manual way</b> (run the daemon from a terminal, or build the app yourself)</summary>
 
 ```bash
 # Toolchain (one-time)
@@ -61,50 +74,33 @@ cd local-dictation
 # Build (release, full feature set)
 cargo build --features full --release
 
-# Run
+# Either: run the daemon straight from the terminal …
 ./target/release/fast-dictate-backend daemon
-```
 
-First daemon run prompts for **Microphone** and **Accessibility** permissions. Grant both in System Settings → Privacy & Security, then re-run.
-
-### Install it as a real Mac app
-
-Prefer a double-click app over a terminal command? Build `Local Dictation.app` and drop it in your Applications folder:
-
-```bash
-./scripts/build-app.sh --install
-```
-
-That builds the app, copies it to `/Applications`, sets it to **launch automatically at login**, and starts it. It runs as a **menu-bar app** (no Dock icon) — look for the 🎤 in your menu bar. Grant **Microphone** and **Accessibility** once when macOS asks; because it's a stable signed app bundle, the permissions stick to the app instead of to a terminal window.
-
-```bash
-./scripts/build-app.sh                  # just build it into ./dist (no install)
+# … or build the .app bundle yourself:
+./scripts/build-app.sh                  # build into ./dist (no install)
+./scripts/build-app.sh --install        # + copy to /Applications, login item, launch
 ./scripts/build-app.sh --bundle-models  # self-contained ~1.4 GB app (for sharing/moving)
 ```
 
-By default the app shares the models in `./models` (so rebuilds are instant during development); `--bundle-models` copies the recommended Parakeet + Gemma stack inside the app so it works anywhere.
+Running the daemon directly from a terminal prompts for Microphone + Accessibility tied to *that terminal*; the `.app` is the cleaner path because the permissions attach to the app itself. By default the app shares the models in `./models` (instant rebuilds during development); `--bundle-models` copies the recommended Parakeet + Gemma stack inside the app so it works anywhere.
+
+</details>
 
 ### …or hand it to an AI agent
 
-Don't want to think about toolchains, where the model files go, or which build flags to pass? Paste the prompt below into a coding agent running on your Mac — **Claude Code**, **Codex**, **Cursor**, whatever you use. It reads this README, installs the prerequisites, downloads the models, and builds the release binary — then walks you through the one step it *can't* do for you (granting macOS permissions and launching the daemon).
+Don't want to touch a terminal at all? Paste the prompt below into a coding agent running on your Mac — **Claude Code**, **Codex**, **Cursor**, whatever you use. It clones the repo and runs the installer for you, then walks you through the one step it *can't* do (granting macOS permissions).
 
 ```text
 Set up the "local-dictation" app on this Mac (Apple Silicon) from
-https://github.com/tristan-mcinnis/local-dictation. Read the repo's README,
-then do the setup for me:
-1. Install any missing prerequisites: Rust (via rustup), the Xcode Command
-   Line Tools, and cmake (via Homebrew).
-2. Clone the repo (or just use it if we're already inside it).
-3. Run ./scripts/download-models.sh — it downloads the Parakeet (speech-to-text)
-   and Gemma (cleanup) models into ./models/, which is exactly where the app
-   looks for them. Don't move them.
-4. Build the release binary:  cargo build --features full --release
-Then STOP and give me plain copy-paste instructions for the steps you CAN'T do
-yourself: I have to launch the daemon from MY OWN terminal with
-  ./target/release/fast-dictate-backend daemon
-and grant Microphone + Accessibility permission in System Settings the first
-time it runs. macOS ties Accessibility permission to the terminal that launches
-the process, so you can't start it for me — that part is on me.
+https://github.com/tristan-mcinnis/local-dictation:
+1. Clone the repo (or use it if we're already inside it).
+2. Run ./install.sh — it checks prerequisites, downloads the models, builds
+   "Local Dictation.app", installs it to /Applications, and sets it to launch
+   at login. Answer "yes" to any prompts about installing Rust or cmake.
+Then STOP and tell me the one thing you can't do for me: on first launch macOS
+asks for Microphone + Accessibility permission, and I have to grant both in
+System Settings → Privacy & Security myself (you can't grant them for me).
 Finally, remind me of the hotkeys: hold Right Option to dictate; for hands-free,
 hold Right Option and tap Space, let go of both, keep talking, then tap Right
 Option once to stop.

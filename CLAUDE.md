@@ -35,7 +35,10 @@ when the binary is running inside a `.app` bundle** (a double-clicked app gets n
 
 ## Packaging as a Mac app (`Local Dictation.app`)
 
-The end-user artifact is a double-clickable menu-bar app, built by `scripts/build-app.sh`:
+End users run **`./install.sh`** (repo root) — a one-shot installer that checks
+prerequisites (Rust/CLT/cmake), downloads models if missing, then calls
+`build-app.sh --install`. It's idempotent. The app itself is built by
+`scripts/build-app.sh`:
 
 ```bash
 ./scripts/build-app.sh                  # dev: tiny app; models shared from ./models via a symlink
