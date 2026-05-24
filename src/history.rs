@@ -40,13 +40,7 @@ pub struct Entry {
 
 /// `~/.config/local-dictation/history.db` (None if `$HOME` is unset).
 fn db_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join(".config")
-            .join("local-dictation")
-            .join("history.db"),
-    )
+    crate::app_paths::config_file("history.db")
 }
 
 /// Open the history DB, creating the directory, file and schema as needed.

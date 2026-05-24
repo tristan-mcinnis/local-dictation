@@ -141,13 +141,7 @@ impl Prompts {
         if let Some(p) = std::env::var_os("DICTATE_PROMPTS_PATH") {
             return Some(PathBuf::from(p));
         }
-        let home = std::env::var_os("HOME")?;
-        Some(
-            PathBuf::from(home)
-                .join(".config")
-                .join("local-dictation")
-                .join("prompts.json"),
-        )
+        crate::app_paths::config_file("prompts.json")
     }
 
     /// Load prompts, applying env > file > default, and log a one-line boot

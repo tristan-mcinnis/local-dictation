@@ -770,10 +770,9 @@ fn export_log_to_downloads() {
 }
 
 fn open_corrections_folder() {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(dir) = crate::app_paths::config_dir() else {
         return;
     };
-    let dir = PathBuf::from(home).join(".config").join("local-dictation");
     let _ = std::fs::create_dir_all(&dir);
     let corrections = dir.join("corrections.json");
     if corrections.exists() {

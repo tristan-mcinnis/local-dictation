@@ -42,6 +42,22 @@ pub fn app_support_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home).join("Library/Application Support/Local Dictation"))
 }
 
+/// `~/.config/local-dictation` — the single user-config directory shared by
+/// `settings.json`, `prompts.json`, `corrections.json` and `history.db`.
+/// `None` only when `$HOME` is unset. This is the one place the config
+/// location is defined; every module resolves through it rather than
+/// re-joining the path itself (see CLAUDE.md "Config & precedence").
+pub fn config_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".config").join("local-dictation"))
+}
+
+/// A named file inside [`config_dir`], e.g. `config_file("settings.json")`.
+/// `None` only when `$HOME` is unset.
+pub fn config_file(name: &str) -> Option<PathBuf> {
+    Some(config_dir()?.join(name))
+}
+
 /// Base directory containing the `dictation/` and `llm/` model trees.
 /// See the module docs for the resolution order.
 pub fn models_base_dir() -> PathBuf {
@@ -83,4 +99,20 @@ pub fn gemma_default_path() -> String {
 /// Directory the menu's model picker scans for cleanup models (`<base>/llm`).
 pub fn llm_models_dir() -> PathBuf {
     models_base_dir().join("llm")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_file_lives_under_config_dir() {
+        // Only assert the shape when $HOME is set (it is in CI / dev shells).
+        if let Some(dir) = config_dir() {
+            assert!(dir.ends_with("local-dictation"));
+            let f = config_file("settings.json").expect("HOME set ⇒ Some");
+            assert_eq!(f.parent(), Some(dir.as_path()));
+            assert_eq!(f.file_name().and_then(|s| s.to_str()), Some("settings.json"));
+        }
+    }
 }

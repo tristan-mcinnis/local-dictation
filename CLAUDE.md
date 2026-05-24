@@ -99,7 +99,10 @@ so config changes (model/hotkey/cleanup) **relaunch** the daemon rather than hot
 
 ## Config & precedence
 
-User config lives in `~/.config/local-dictation/`:
+User config lives in `~/.config/local-dictation/` — the directory is resolved in
+**one** place (`app_paths::config_dir` / `config_file`), so every consumer
+(`settings.rs`, `prompts.rs`, `corrections.rs`, `history.rs`, the menu bar) shares
+the same location rather than re-joining the path:
 - `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`.
 - `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts, plus an optional `formats` map of named output-shape presets (email/bullets/code). The active preset (`active_format`/`DICTATE_FORMAT`) replaces the cleanup prompt for normal dictation; unknown/blank falls back to default. Blank field falls back to built-in default.
 - `corrections.json` (`corrections.rs`) — word→replacement map. Applied verbatim after cleanup **and** fed (target spellings only) into the cleanup prompt as a known-vocabulary hint via `prompts::vocabulary_suffix` (the cleaner builds the effective cleanup prompt once at init).

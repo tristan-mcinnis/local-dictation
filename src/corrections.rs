@@ -33,7 +33,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Default, Debug, Clone)]
 pub struct Corrections {
@@ -89,13 +89,9 @@ impl Corrections {
         if let Ok(p) = std::env::var("DICTATE_CORRECTIONS_PATH") {
             return Self::load_from(Path::new(&p));
         }
-        let Some(home) = std::env::var_os("HOME") else {
+        let Some(path) = crate::app_paths::config_file("corrections.json") else {
             return Ok(Self::empty());
         };
-        let path = PathBuf::from(home)
-            .join(".config")
-            .join("local-dictation")
-            .join("corrections.json");
         if !path.exists() {
             return Ok(Self::empty());
         }
