@@ -197,9 +197,9 @@ mod imp {
     use super::*;
     use accessibility_sys::{
         kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute,
-        kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute,
+        kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute, kAXTitleAttribute,
         kAXTrustedCheckOptionPrompt, kAXValueAttribute, kAXValueTypeCFRange,
-        AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
+        kAXWindowAttribute, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
         AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
         AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
@@ -463,6 +463,49 @@ mod imp {
         }
     }
 
+    /// Read a string-valued attribute off an element, or `None` if absent.
+    unsafe fn read_string_attr(elem: AXUIElementRef, attr: &str) -> Option<String> {
+        let mut value_ref: CFTypeRef = ptr::null();
+        let cf_attr = CFString::new(attr);
+        let err =
+            AXUIElementCopyAttributeValue(elem, cf_attr.as_concrete_TypeRef(), &mut value_ref);
+        if err != kAXErrorSuccess || value_ref.is_null() {
+            return None;
+        }
+        Some(CFString::wrap_under_create_rule(value_ref as CFStringRef).to_string())
+    }
+
+    /// Harvest visible text near the focus for vocabulary extraction: the
+    /// focused element's value (the document/field you're editing) plus the
+    /// containing window's title. Best-effort — returns `None` only when AX
+    /// discloses nothing. Runs in the parallel focus-capture thread, so its cost
+    /// is hidden behind the inference pipeline.
+    unsafe fn harvest_screen_text(focused: AXUIElementRef) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = read_value(focused) {
+            parts.push(v);
+        }
+        // Window title: focused element → kAXWindow → kAXTitle.
+        let mut window_ref: CFTypeRef = ptr::null();
+        let window_attr = CFString::new(kAXWindowAttribute);
+        let err = AXUIElementCopyAttributeValue(
+            focused,
+            window_attr.as_concrete_TypeRef(),
+            &mut window_ref,
+        );
+        if err == kAXErrorSuccess && !window_ref.is_null() {
+            if let Some(title) = read_string_attr(window_ref as AXUIElementRef, kAXTitleAttribute) {
+                parts.push(title);
+            }
+            cf_release(window_ref);
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
     /// Read `kAXValue` off an element as a `String`, or `None` if it doesn't
     /// expose a readable string value.
     unsafe fn read_value(focused: AXUIElementRef) -> Option<String> {
@@ -566,6 +609,9 @@ mod imp {
         pub immediate_before: Option<char>,
         pub last_nws_before: Option<char>,
         pub char_after: Option<char>,
+        /// Visible text near the focus (field value + window title), harvested
+        /// at capture time for screen-context vocabulary. `None` in AX-blind apps.
+        pub screen_text: Option<String>,
     }
 
     impl Drop for FocusTargetInner {
@@ -607,6 +653,9 @@ mod imp {
             let focused_pid = focused_pid_of(focused);
             let (immediate_before, last_nws_before, char_after) =
                 read_context_with_blind(focused, focused_pid);
+            // Harvest visible text for screen-context vocabulary while we hold
+            // the element. AX-blind apps return None here, same as the caret read.
+            let screen_text = harvest_screen_text(focused);
 
             // Diagnostic: log what we're about to write into. Enable with
             // INJECT_DIAG=1. Helps explain "no text appears" when an
@@ -639,6 +688,7 @@ mod imp {
                 immediate_before,
                 last_nws_before,
                 char_after,
+                screen_text,
             })
         }
     }
@@ -700,6 +750,21 @@ impl FocusTarget {
     /// disclosed it. Used by the daemon for log output.
     pub fn inner_pid(&self) -> Option<i32> {
         self.inner.pid
+    }
+
+    /// Up to `cap` proper-noun / domain-term candidates harvested from the
+    /// visible text near the focus (field value + window title), for the
+    /// screen-context vocabulary fed to cleanup. Empty in AX-blind apps.
+    pub fn screen_terms(&self, cap: usize) -> Vec<String> {
+        match &self.inner.screen_text {
+            Some(t) => crate::screen_context::extract_terms(t, cap),
+            None => Vec::new(),
+        }
+    }
+
+    /// The raw harvested screen text, for the `context-probe` diagnostic.
+    pub fn screen_text(&self) -> Option<&str> {
+        self.inner.screen_text.as_deref()
     }
 }
 

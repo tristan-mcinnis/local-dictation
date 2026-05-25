@@ -132,6 +132,26 @@ async fn main() -> eyre::Result<()> {
 
     println!("\nCACHED vs UNCACHED on baseline = the realized prefix-cache win.");
     println!("+N vocab (cached) vs baseline CACHED = per-utterance vocab cost.");
+
+    // ---- END-TO-END: screen-context vocabulary fixes proper nouns ----
+    // Simulate the on-screen text the daemon would harvest (the doc you're
+    // editing), extract terms from it exactly as the daemon does, then run the
+    // real production method with those terms and confirm the names get fixed.
+    use fast_dictate_backend::screen_context::extract_terms;
+    println!("\n=== END-TO-END: screen-context vocabulary ===");
+    // Names that are NOT in corrections.json, so the only thing that can fix
+    // them is the harvested screen text (isolates the screen-context effect).
+    let screen = "Meeting notes — Saoirse Kavanagh, project Nimbari. Reviewing the \
+                  Vakthorn proposal with Eilish.";
+    let terms = extract_terms(screen, 16);
+    println!("  harvested screen text: {screen:?}");
+    println!("  extracted terms: {}", terms.join(", "));
+    let raw = "i talked to saoirse kavanagh about the nimbari project and the vakthorn proposal with eilish";
+    let without = engine.process_transcript_with_vocab(raw, &[]).await?;
+    let with = engine.process_transcript_with_vocab(raw, &terms).await?;
+    println!("  raw:            {raw:?}");
+    println!("  WITHOUT vocab:  {without:?}");
+    println!("  WITH vocab:     {with:?}");
     Ok(())
 }
 

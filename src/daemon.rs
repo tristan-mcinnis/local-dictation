@@ -80,6 +80,13 @@ use crate::cleaner::TextCleanupEngine;
 // Default. Override at startup by setting DICTATE_HOTKEY_KEYCODE.
 const DEFAULT_HOTKEY_KEYCODE: i64 = 0x3D;
 
+/// How many screen-harvested proper nouns to feed the cleanup prompt. Kept small
+/// on purpose: measurement (examples/latency_lab) showed the accuracy win is
+/// fully realized by ~20 terms, while larger lists both cost prefill latency and
+/// start distracting the 1B model from basic cleanup. Combined with the curated
+/// corrections vocabulary, this stays well under that regression threshold.
+const SCREEN_VOCAB_CAP: usize = 16;
+
 // Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
 const SPACE_KEYCODE: i64 = 0x31;
 
@@ -602,14 +609,28 @@ fn worker_loop(
                 // dropping content. Cheap: dictations are short strings.
                 let raw_transcript = transcript.clone();
 
+                // Screen-context vocabulary: proper nouns harvested (during the
+                // parallel focus capture, so off the critical path) from the
+                // focused field + window title. Fed to cleanup so Gemma spells
+                // on-screen names the way they appear instead of as similar-
+                // sounding common words. Empty in AX-blind apps.
+                #[cfg(feature = "cleaner")]
+                let screen_vocab: Vec<String> = captured_target
+                    .as_ref()
+                    .map(|t| t.screen_terms(SCREEN_VOCAB_CAP))
+                    .unwrap_or_default();
+
                 let mut t_cleanup_ms = 0_u128;
                 let final_text = {
                     #[cfg(feature = "cleaner")]
                     {
                         match cleaner {
                             Some(ref c) if !is_terminal => {
+                                if !screen_vocab.is_empty() {
+                                    eprintln!("  ⌕    screen vocab: {}", screen_vocab.join(", "));
+                                }
                                 let t_clean = Instant::now();
-                                match rt.block_on(c.process_transcript(&transcript)) {
+                                match rt.block_on(c.process_transcript_with_vocab(&transcript, &screen_vocab)) {
                                     Ok(cleaned) => {
                                         t_cleanup_ms = ms(t_clean.elapsed());
                                         cleaned

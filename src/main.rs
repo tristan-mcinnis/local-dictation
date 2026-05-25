@@ -41,6 +41,7 @@ async fn main() -> eyre::Result<()> {
             run_dictate(duration_ms).await
         }
         "ax-check" => run_ax_check(),
+        "context-probe" => run_context_probe(),
         "inject-test" => run_inject_test(args.get(2).cloned()),
         "daemon" => run_daemon(args.iter().any(|a| a == "--no-cleanup")).await,
         "synth-press" => run_synth_press(
@@ -51,7 +52,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, context-probe, mock-loop"
         )),
     }
 }
@@ -164,6 +165,44 @@ fn run_ax_check() -> eyre::Result<()> {
         println!("           the entry for this binary on, then re-run.");
     }
     Ok(())
+}
+
+/// Diagnostic for screen-context vocabulary: wait a few seconds (so you can
+/// click into the app you want to test), capture the focused element exactly as
+/// the daemon does, and print the harvested screen text + the proper-noun terms
+/// that would be fed to cleanup. The only way to verify AX coverage live, since
+/// Accessibility is tied to the launching terminal.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+fn run_context_probe() -> eyre::Result<()> {
+    use fast_dictate_backend::injector::FocusTarget;
+    println!("[context-probe] click into the app/field you want to test — capturing in 4s...");
+    for n in (1..=4).rev() {
+        println!("  {n}...");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    let target = FocusTarget::capture()?;
+    println!("[context-probe] focused pid: {:?}", target.inner_pid());
+    match target.screen_text() {
+        Some(text) => {
+            let preview: String = text.chars().take(400).collect();
+            println!("[context-probe] harvested screen text ({} chars):\n  {preview:?}", text.len());
+        }
+        None => println!("[context-probe] no screen text exposed (AX-blind app, e.g. Electron/terminal)"),
+    }
+    let terms = target.screen_terms(16);
+    if terms.is_empty() {
+        println!("[context-probe] extracted terms: <none>");
+    } else {
+        println!("[context-probe] extracted terms ({}): {}", terms.len(), terms.join(", "));
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+fn run_context_probe() -> eyre::Result<()> {
+    Err(eyre::eyre!(
+        "`context-probe` requires the `ax-inject` cargo feature (try --features full)"
+    ))
 }
 
 #[cfg(not(feature = "parakeet"))]

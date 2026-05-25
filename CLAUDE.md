@@ -28,7 +28,9 @@ cargo test --features full <name>            # single test by name substring
 ```
 
 Subcommands of the binary: `daemon [--no-cleanup]`, `logs`, `bench [wav]`, `dictate <ms>`,
-`inject-test [text]`, `transform "<instruction>" "<text>"`, `ax-check`, `mock-loop`. Dispatch is a
+`inject-test [text]`, `transform "<instruction>" "<text>"`, `ax-check`, `context-probe`,
+`mock-loop`. (`context-probe` waits 4 s then prints the proper-noun terms harvested from the
+focused window — the live check for screen-context vocabulary.) Dispatch is a
 plain `match` in `src/main.rs`. The default subcommand is `mock-loop` from the CLI, but **`daemon`
 when the binary is running inside a `.app` bundle** (a double-clicked app gets no args) — see
 `app_paths::running_in_bundle`.
@@ -138,7 +140,7 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 the same location rather than re-joining the path:
 - `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`.
 - `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts, plus a `formats` map of named output-shape presets. Four presets ship built-in (`numbered`/`bullets`/`email`/`code`, in `DEFAULT_FORMATS`); a user's `prompts.json` `formats` map overlays them (same key overrides, new key adds). The active preset (`active_format`/`DICTATE_FORMAT`) replaces the cleanup prompt for normal dictation, and list presets keep their line breaks (the cleanup path preserves newlines when a preset is active); unknown/blank falls back to default. The default cleanup/transform prompts are tuned against Gemma 3 1B in `prompts-lab/` (a data-driven eval harness, `examples/prompt_lab.rs`); a deterministic `text_polish::fix_speech_mechanics` pass handles leftover filler + lone "i" so the prompt doesn't have to.
-- `corrections.json` (`corrections.rs`) — word→replacement map. Applied verbatim after cleanup **and** fed (target spellings only) into the cleanup prompt as a known-vocabulary hint via `prompts::vocabulary_suffix` (the cleaner builds the effective cleanup prompt once at init).
+- `corrections.json` (`corrections.rs`) — word→replacement map. Applied verbatim after cleanup **and** fed (target spellings only) into the cleanup prompt as a known-vocabulary hint via `prompts::vocabulary_suffix`. The cleanup *instructions* are the cached/warmed prefix; the vocabulary block is appended **per-utterance** (so the prefix cache reuses the instructions every time, and the vocab too when unchanged). Alongside the curated corrections terms, `screen_context.rs` harvests proper nouns from the focused window (field value + title, read in the parallel focus capture so it's off the critical path) — `extract_terms` ranks mixed-case/identifier/proper-noun tokens, caps at `SCREEN_VOCAB_CAP=16`, and the daemon passes them to `cleaner::process_transcript_with_vocab`. This stops Gemma from substituting similar-sounding names (measured: "Saoirse"→"Seamus" without it, correct with it). Verify coverage live with `context-probe`.
 
 Precedence is always **env var > JSON file > built-in default**. Key env knobs:
 `PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE` (default `0x3D` Right Option),
