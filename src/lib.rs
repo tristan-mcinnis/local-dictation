@@ -7,6 +7,7 @@ pub mod history;
 pub mod injector;
 pub mod prompts;
 pub mod refiner;
+pub mod screen_context;
 pub mod settings;
 pub mod smart_pad;
 pub mod text_polish;

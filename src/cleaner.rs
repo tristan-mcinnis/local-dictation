@@ -85,11 +85,15 @@ pub struct TextCleanupEngine {
     /// Cleanup + transform system prompts, resolved once at init from
     /// env / prompts.json / built-in defaults.
     prompts: Prompts,
-    /// The effective cleanup system prompt: the default (or active formatting
-    /// preset) cleanup prompt with the personal "known vocabulary" suffix
-    /// already appended. Built once at init so the hot path just formats the
-    /// transcript onto it.
+    /// The cleanup system prompt instructions (default or active formatting
+    /// preset), WITHOUT any vocabulary suffix. This is the constant, cacheable
+    /// prefix the worker warms once at boot; per-utterance vocabulary is
+    /// appended after it (see [`Self::process_transcript_with_vocab`]).
     cleanup_prompt: String,
+    /// The user's curated "known vocabulary" (the target spellings in
+    /// corrections.json). Combined with any per-utterance screen-harvested
+    /// terms into the vocabulary block appended to each cleanup prompt.
+    static_vocab: Vec<String>,
     /// True when an output-format preset (numbered / bullets / email / …) is
     /// active. List-style presets need their line breaks preserved, so the
     /// cleanup path keeps newlines instead of flattening to one line as plain
@@ -154,19 +158,22 @@ impl TextCleanupEngine {
         // target spellings in corrections.json) so the model stops "correcting"
         // proper nouns and domain casing away. Best-effort — a missing or
         // unreadable corrections file just means no suffix.
-        let vocab = crate::corrections::Corrections::load_default()
+        let static_vocab = crate::corrections::Corrections::load_default()
             .map(|c| c.replacement_values())
             .unwrap_or_default();
-        let mut cleanup_prompt = base_cleanup;
-        if let Some(suffix) = crate::prompts::vocabulary_suffix(&vocab) {
-            eprintln!("[boot] vocab       {} term(s) fed to cleanup prompt", vocab.len().min(crate::prompts::MAX_VOCAB_TERMS));
-            cleanup_prompt.push_str(&suffix);
+        if !static_vocab.is_empty() {
+            eprintln!(
+                "[boot] vocab       {} curated term(s) + per-utterance screen terms",
+                static_vocab.len().min(crate::prompts::MAX_VOCAB_TERMS)
+            );
         }
+        let cleanup_prompt = base_cleanup;
 
         // Spawn the worker that owns the persistent context. Warm it with the
-        // cleanup prompt's framing (empty transcript) so the constant
-        // instruction block is already in the KV cache before the first
-        // dictation — the first utterance is then as fast as the rest.
+        // cleanup *instructions* + framing (no vocabulary, empty transcript) so
+        // the constant instruction block is in the KV cache before the first
+        // dictation. Vocabulary is appended per-utterance after this prefix, so
+        // the worker still reuses the warmed instructions every time.
         let warm_prompt = Self::template_user_msg(
             &model,
             &chat_template,
@@ -195,6 +202,7 @@ impl TextCleanupEngine {
             chat_template,
             prompts,
             cleanup_prompt,
+            static_vocab,
             format_active,
             job_tx: Some(job_tx),
             worker: Some(worker),
@@ -218,11 +226,40 @@ impl TextCleanupEngine {
     /// Clean a raw dictation transcript for readability. Runs on the persistent
     /// cleanup worker thread (llama.cpp's decode loop is sync and CPU/GPU bound).
     pub async fn process_transcript(&self, raw_text: &str) -> eyre::Result<String> {
+        self.process_transcript_with_vocab(raw_text, &[]).await
+    }
+
+    /// Like [`Self::process_transcript`] but with extra per-utterance vocabulary
+    /// (proper nouns harvested from the focused window — see
+    /// [`crate::screen_context`]). The curated corrections vocabulary and these
+    /// screen terms are combined into one "known vocabulary" block appended
+    /// after the cached instruction prefix, so the model preserves on-screen
+    /// spellings instead of substituting similar-sounding common words. The
+    /// instruction prefix is still reused from the KV cache every time; only the
+    /// vocabulary block (when it changes) and the transcript are re-decoded.
+    pub async fn process_transcript_with_vocab(
+        &self,
+        raw_text: &str,
+        screen_vocab: &[String],
+    ) -> eyre::Result<String> {
         let raw = raw_text.trim();
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let user_msg = format!("{}\n\nRaw transcript:\n{raw}", self.cleanup_prompt);
+        let mut prompt_body = self.cleanup_prompt.clone();
+        // Curated corrections first (high-trust), then screen-harvested terms.
+        // `vocabulary_suffix` dedups case-insensitively (first-seen casing wins)
+        // and caps the total, so a noisy screen can't balloon the prompt.
+        if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
+            let mut combined =
+                Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
+            combined.extend_from_slice(&self.static_vocab);
+            combined.extend_from_slice(screen_vocab);
+            if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
+                prompt_body.push_str(&suffix);
+            }
+        }
+        let user_msg = format!("{prompt_body}\n\nRaw transcript:\n{raw}");
         // Cleanup never summarizes (the prompt forbids it), so the cleaned text
         // tracks the input length — stripping filler makes it a touch shorter,
         // expanding contractions a touch longer. Budget off the raw transcript
