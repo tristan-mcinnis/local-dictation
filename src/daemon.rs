@@ -492,6 +492,10 @@ fn worker_loop(
                     }
                 };
                 cues::play_start();
+                // Mute any other system audio for the duration of capture +
+                // processing; restored on every StopRecording exit path below
+                // via the RestoreOnDrop guard.
+                crate::audio_duck::mute();
                 ui_channel::set_state(UiState::Recording);
                 eprintln!("▶ recording");
                 engine = Some(e);
@@ -500,6 +504,12 @@ fn worker_loop(
             }
             DaemonEvent::StopRecording => {
                 let Some(mut e) = engine.take() else { continue };
+                // Un-mute other audio when this arm exits — by any path
+                // (transcribe error, empty/discarded utterance, transform,
+                // or successful inject). The guard's Drop runs on every
+                // `continue` and the normal fall-through, so the restore can't
+                // be forgotten on a new code path.
+                let _unmute = crate::audio_duck::RestoreOnDrop;
                 // Capture (and reset) whether this utterance is a transform.
                 #[allow(unused_variables)]
                 let transform = transform_mode;
