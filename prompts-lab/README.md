@@ -21,6 +21,13 @@ It loads the model once, runs every case in [`lab.json`](lab.json), scores each
 output against per-case heuristic checks, and writes a Markdown report + a raw
 JSONL of every generation to `results/` (gitignored — they're build artifacts).
 
+Once you've found prompts you like, apply them to the live app without a
+rebuild: copy them into `~/.config/local-dictation/prompts.json` and run
+`../scripts/reload-daemon.sh` (the daemon reads config at boot, so a relaunch is
+all it needs). Only changing the *built-in defaults* (`DEFAULT_*` in
+`src/prompts.rs`) needs `../scripts/build-app.sh --install`. See the "Iterating
+fast" section of the repo `CLAUDE.md`.
+
 The runner is [`../examples/prompt_lab.rs`](../examples/prompt_lab.rs); it calls
 `TextCleanupEngine::eval_cleanup` / `eval_transform`, which mirror the exact
 framing and token budget the production daemon uses, so the lab measures what
