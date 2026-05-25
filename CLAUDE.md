@@ -121,6 +121,15 @@ audio.rs (cpal + SPSC ring buffer)
 dictation to SQLite at `~/.config/local-dictation/history.db`. The model is loaded once at boot,
 so config changes (model/hotkey/cleanup) **relaunch** the daemon rather than hot-swapping.
 
+`cleaner.rs` runs Gemma on a **dedicated worker thread that owns one persistent
+`LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in
+a struct). The worker tracks the resident token sequence and **reuses the shared KV-cache
+prefix** with each new prompt (`clear_kv_cache_seq` wipes only the divergent tail), so the
+~400-token constant cleanup instructions are decoded once at boot and reused — ~85 ms off
+every utterance. Reuse is generic (token-sequence comparison, no hardcoded template) and
+verified bit-identical to a from-scratch decode by the prefix-cache parity test in
+`examples/latency_lab.rs`. `eval_cleanup_uncached` forces a full prefill for that test.
+
 ## Config & precedence
 
 User config lives in `~/.config/local-dictation/` — the directory is resolved in

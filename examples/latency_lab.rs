@@ -93,28 +93,69 @@ async fn main() -> eyre::Result<()> {
 
     const REPS: usize = 5;
 
+    // ---- PARITY: cached KV-reuse output must equal a from-scratch decode ----
+    // If Gemma's sliding-window attention broke prefix reuse, this is where it
+    // shows up. We interleave runs so the cached run actually reuses a resident
+    // prefix (the prior run), which is the real production condition.
+    println!("\n=== PARITY: cached vs uncached (must match) ===");
+    let mut parity_ok = true;
+    for (tname, raw) in &transcripts {
+        // Prime residency with a different transcript so `cached` exercises a
+        // real partial-reuse, then compare.
+        let _ = engine.eval_cleanup(&prompt_baseline, "warm the cache with something else", false).await?;
+        let cached = engine.eval_cleanup(&prompt_baseline, raw, false).await?;
+        let uncached = engine.eval_cleanup_uncached(&prompt_baseline, raw, false).await?;
+        let ok = cached == uncached;
+        parity_ok &= ok;
+        println!("  {tname:<8} {}", if ok { "✅ identical".to_string() } else { format!("❌ DIFFER\n    cached:   {cached:?}\n    uncached: {uncached:?}") });
+    }
+    println!("  → parity: {}", if parity_ok { "ALL MATCH" } else { "MISMATCH — prefix reuse is UNSAFE" });
+
+    // ---- LATENCY: realized cached win + vocab cost ----
     for (tname, raw) in &transcripts {
         println!("\n=== transcript: {tname} ({} chars) ===", raw.len());
-        for (vname, prompt) in &variants {
-            // One warm-up (discarded), then REPS timed runs; report median-ish mean.
-            let _ = engine.eval_cleanup(prompt, raw, false).await?;
-            let mut times = Vec::with_capacity(REPS);
-            let mut last = String::new();
-            for _ in 0..REPS {
-                let t = Instant::now();
-                last = engine.eval_cleanup(prompt, raw, false).await?;
-                times.push(t.elapsed().as_secs_f64() * 1000.0);
-            }
-            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let mean = times.iter().sum::<f64>() / times.len() as f64;
-            let min = times[0];
-            let max = times[times.len() - 1];
+
+        // Cached vs uncached on the SAME baseline prompt = the realized win.
+        for (label, no_reuse) in [("baseline CACHED", false), ("baseline UNCACHED", true)] {
+            let _ = run_timed(&engine, &prompt_baseline, raw, no_reuse, 1).await?; // warm
+            let (mean, min, max, last) = run_timed(&engine, &prompt_baseline, raw, no_reuse, REPS).await?;
+            println!("  {label:<38} mean {mean:7.1} ms  (min {min:6.1}, max {max:6.1})");
+            if no_reuse { println!("      → {last:?}"); }
+        }
+        // Vocab cost (cached path, as it'd run in production).
+        for (vname, prompt) in [("+ 20 vocab terms (cached)", &prompt_vocab20), ("+ 64 vocab terms (cached)", &prompt_vocab64)] {
+            let _ = run_timed(&engine, prompt, raw, false, 1).await?;
+            let (mean, min, max, _l) = run_timed(&engine, prompt, raw, false, REPS).await?;
             println!("  {vname:<38} mean {mean:7.1} ms  (min {min:6.1}, max {max:6.1})");
-            println!("      → {last:?}");
         }
     }
 
-    println!("\nNote: baseline − minimal ≈ instruction-prefill cost ≈ prefix-cache ceiling.");
-    println!("      +20/+64 minus baseline ≈ the per-utterance cost of vocab injection.");
+    println!("\nCACHED vs UNCACHED on baseline = the realized prefix-cache win.");
+    println!("+N vocab (cached) vs baseline CACHED = per-utterance vocab cost.");
     Ok(())
+}
+
+#[cfg(feature = "cleaner")]
+async fn run_timed(
+    engine: &fast_dictate_backend::cleaner::TextCleanupEngine,
+    prompt: &str,
+    raw: &str,
+    no_reuse: bool,
+    reps: usize,
+) -> eyre::Result<(f64, f64, f64, String)> {
+    use std::time::Instant;
+    let mut times = Vec::with_capacity(reps);
+    let mut last = String::new();
+    for _ in 0..reps {
+        let t = Instant::now();
+        last = if no_reuse {
+            engine.eval_cleanup_uncached(prompt, raw, false).await?
+        } else {
+            engine.eval_cleanup(prompt, raw, false).await?
+        };
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    Ok((mean, times[0], times[times.len() - 1], last))
 }
