@@ -209,6 +209,7 @@ and can be downloaded into `models/llm/<name>/` to appear in the picker.
   - **Quit** (⌘Q).
   Settings persist to `~/.config/local-dictation/settings.json`. Changing the model, hotkey, or cleanup toggle relaunches the daemon to apply (the model is loaded once at boot, so a relaunch is cleaner than a live swap). Any env var override (`GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE`) wins over the menu and greys out the matching items.
 - **Audio cues.** Tink on start, Bottle on stop, Pop on hands-free latch, Basso on error. Mute with `DICTATE_QUIET=1`.
+- **Mutes other audio while you talk.** The moment you start a capture, any audio already playing through your Mac's output (music, a video, a call) is muted, then restored the instant the utterance is fully handled — dictation injected, transform pasted, or the path bailed out. It's conservative: if your output was *already* muted, it's left muted on release rather than un-muted behind your back. Implemented with the same `osascript` output-mute the menu bar's volume control uses (no extra dependency). Disable with `DICTATE_NO_MUTE=1`.
 - **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
 - **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
 - **Transform selected text by voice.** Select text, hold **Shift + Right Option**, speak an instruction ("make this concise", "turn into bullet points", "translate to Spanish"), release — the selection is rewritten in place via the warm Gemma model. See [Transform selected text by voice](#transform-selected-text-by-voice).
@@ -269,6 +270,7 @@ Two ways to configure the daemon, in order of precedence:
 | `GEMMA_MODEL_PATH` | Cleanup model. Default: `models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf`. Overrides the menu's model picker. |
 | `DICTATE_HOTKEY_KEYCODE` | Default: `0x3D` (Right Option). Also handled: `0x36` Right ⌘, `0x3E` Right Control, `0x3C` Right Shift. The daemon watches the matching modifier flag, so any of these register a hold correctly. Overrides the menu's key picker. |
 | `DICTATE_QUIET` | Set to anything to mute audio cues |
+| `DICTATE_NO_MUTE` | Set to anything to stop muting other system audio during capture (the default is to mute it while you dictate and restore on release) |
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
 | `DICTATE_FORMAT` | Active output-format preset name (matches a key in `prompts.json`'s `formats`). Overrides the menu's Output-format picker. Unknown/blank ⇒ default cleanup. |
@@ -291,6 +293,7 @@ Two ways to configure the daemon, in order of precedence:
 ```
 src/
 ├── audio.rs            cpal input + SPSC ring buffer + drain_until_stopped
+├── audio_duck.rs       mute other system output during capture, restore after
 ├── cleaner.rs          Gemma cleanup (llama-cpp-2 + Metal)
 ├── clipboard_paste.rs  save → set → Cmd+V → restore (+ Return key synth)
 ├── cues.rs             afplay system sounds
@@ -312,8 +315,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 64 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 75 total
+cargo test                # 80 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 93 total
 ```
 
 ## License

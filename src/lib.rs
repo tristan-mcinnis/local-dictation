@@ -1,5 +1,6 @@
 pub mod app_paths;
 pub mod audio;
+pub mod audio_duck;
 pub mod corrections;
 pub mod cues;
 pub mod history;
