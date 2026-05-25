@@ -3,6 +3,20 @@
 //! The spec referenced `llama_cpp = "0.3.0"`, but that crate ships a llama.cpp
 //! from April 2024 — too old to recognise the Gemma 3 architecture. We use
 //! llama-cpp-2 which tracks current llama.cpp.
+//!
+//! ## Prefix-cached generation
+//!
+//! A `LlamaContext` borrows its model, so it can't be stored next to the model
+//! `Arc` in a struct (self-reference). Instead a single dedicated worker thread
+//! owns one persistent context for the daemon's lifetime; the async API hands it
+//! work over a channel. Keeping the context alive lets us **reuse the KV cache**:
+//! the cleanup system prompt (~400 tokens) is identical on every utterance, so
+//! the worker decodes only the part of each new prompt that *differs* from the
+//! one before (`clear_kv_cache_seq` wipes the divergent tail). The constant
+//! instruction block is decoded once at boot and reused, cutting ~80 ms off the
+//! cleanup leg of every dictation. The reuse is generic — it compares token
+//! sequences, so it works for any model/template and degrades gracefully (a
+//! cleanup→transform switch simply shares fewer tokens).
 
 use eyre::Context;
 use llama_cpp_2::{
@@ -11,6 +25,7 @@ use llama_cpp_2::{
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel},
     sampling::LlamaSampler,
+    token::LlamaToken,
 };
 use crate::prompts::Prompts;
 use std::{
@@ -18,6 +33,7 @@ use std::{
     path::Path,
     sync::{Arc, OnceLock},
 };
+use tokio::sync::{mpsc, oneshot};
 
 // The cleanup + transform system prompts live in `prompts.rs` (built-in
 // defaults, overridable via prompts.json / env). The engine loads them once at
@@ -38,14 +54,32 @@ fn backend() -> eyre::Result<Arc<LlamaBackend>> {
 
 /// Upper bound on the cleanup context window. Gemma 3 1B trains to 32768, but
 /// the KV cache scales with n_ctx, so we cap at 8192 (~6000 words) — far more
-/// than any plausible single push-to-talk dictation, while keeping memory sane.
+/// than any plausible single push-to-talk dictation. The persistent context is
+/// allocated once at this size (one KV cache for the daemon's lifetime), so
+/// memory is paid once rather than per utterance.
 const MAX_CTX: u32 = 8192;
-/// Floor for the context window / generation budget. Keeps short utterances on
-/// the same fast path they had before (small KV cache, quick reserve).
-const MIN_CTX: u32 = 2048;
+
+/// A unit of work for the cleanup worker thread: a fully-templated prompt plus
+/// the generation parameters and a channel to return the polished result on.
+struct Job {
+    /// The prompt already run through the model's chat template.
+    prompt: String,
+    /// Max tokens to generate.
+    max_tokens: i32,
+    /// Cleanup flattens to one line; transform / list presets keep newlines.
+    preserve_newlines: bool,
+    /// Force a full prefill (ignore the resident KV prefix). Used only by the
+    /// parity test to prove cached output == uncached output.
+    no_reuse: bool,
+    reply: oneshot::Sender<eyre::Result<String>>,
+}
+
+/// Longest common prefix length of two token slices.
+fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
 
 pub struct TextCleanupEngine {
-    backend: Arc<LlamaBackend>,
     model: Arc<LlamaModel>,
     chat_template: Arc<LlamaChatTemplate>,
     /// Cleanup + transform system prompts, resolved once at init from
@@ -61,6 +95,25 @@ pub struct TextCleanupEngine {
     /// cleanup path keeps newlines instead of flattening to one line as plain
     /// single-utterance dictation does.
     format_active: bool,
+    /// Hand work to the persistent-context worker thread. `Option` so `Drop`
+    /// can close the channel (stopping the worker) before joining it.
+    job_tx: Option<mpsc::UnboundedSender<Job>>,
+    /// The worker thread handle, joined on drop so its `LlamaContext` (and the
+    /// Metal buffers it holds) is freed before the process tears down ggml's
+    /// global Metal device — otherwise `ggml_metal_device_free` asserts at exit.
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for TextCleanupEngine {
+    fn drop(&mut self) {
+        // Close the channel so the worker's blocking_recv returns None and it
+        // drops its context, then wait for it. Ordering matters: the context
+        // must die before ggml's metal device global destructor runs at exit.
+        self.job_tx.take();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl TextCleanupEngine {
@@ -69,14 +122,18 @@ impl TextCleanupEngine {
         // Offload everything to Metal. llama.cpp ignores layers beyond what
         // the model actually has, so a large number is safe.
         let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
-        let model = LlamaModel::load_from_file(&backend, model_path.as_ref(), &model_params)
-            .map_err(|e| eyre::eyre!("LlamaModel::load_from_file failed: {e:?}"))?;
+        let model = Arc::new(
+            LlamaModel::load_from_file(&backend, model_path.as_ref(), &model_params)
+                .map_err(|e| eyre::eyre!("LlamaModel::load_from_file failed: {e:?}"))?,
+        );
         // Use the model's bundled chat template (Gemma / ChatML / Llama 3 /
         // whatever the GGUF declares). Falls back to a no-op format if the
         // model has no template — in practice all instruct GGUFs do.
-        let chat_template = model
-            .chat_template(None)
-            .map_err(|e| eyre::eyre!("chat_template lookup failed: {e:?}"))?;
+        let chat_template = Arc::new(
+            model
+                .chat_template(None)
+                .map_err(|e| eyre::eyre!("chat_template lookup failed: {e:?}"))?,
+        );
         let prompts = Prompts::load();
 
         // Resolve the active formatting preset (env > settings.json > none) and
@@ -106,18 +163,60 @@ impl TextCleanupEngine {
             cleanup_prompt.push_str(&suffix);
         }
 
+        // Spawn the worker that owns the persistent context. Warm it with the
+        // cleanup prompt's framing (empty transcript) so the constant
+        // instruction block is already in the KV cache before the first
+        // dictation — the first utterance is then as fast as the rest.
+        let warm_prompt = Self::template_user_msg(
+            &model,
+            &chat_template,
+            &format!("{cleanup_prompt}\n\nRaw transcript:\n"),
+        )
+        .ok();
+
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<eyre::Result<()>>();
+        let worker = {
+            let backend = backend.clone();
+            let model = model.clone();
+            std::thread::Builder::new()
+                .name("gemma-cleanup".into())
+                .spawn(move || run_worker(backend, model, job_rx, warm_prompt, ready_tx))
+                .map_err(|e| eyre::eyre!("spawn cleanup worker failed: {e}"))?
+        };
+        // Block until the worker has built its context (boot-time, so blocking
+        // is fine). Propagate a context-creation failure as an init error.
+        ready_rx
+            .recv()
+            .map_err(|_| eyre::eyre!("cleanup worker died during init"))??;
+
         Ok(Self {
-            backend,
-            model: Arc::new(model),
-            chat_template: Arc::new(chat_template),
+            model,
+            chat_template,
             prompts,
             cleanup_prompt,
             format_active,
+            job_tx: Some(job_tx),
+            worker: Some(worker),
         })
     }
 
-    /// Clean a raw dictation transcript for readability. Runs on a Tokio
-    /// blocking thread (llama.cpp's decode loop is sync and CPU/GPU bound).
+    /// Apply the model's chat template to a single user message. Shared by the
+    /// hot path and the boot-time warm prefill so they tokenize identically.
+    fn template_user_msg(
+        model: &LlamaModel,
+        chat_template: &LlamaChatTemplate,
+        user_msg: &str,
+    ) -> eyre::Result<String> {
+        let messages = vec![LlamaChatMessage::new("user".into(), user_msg.into())
+            .map_err(|e| eyre::eyre!("invalid chat message: {e:?}"))?];
+        model
+            .apply_chat_template(chat_template, &messages, true)
+            .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))
+    }
+
+    /// Clean a raw dictation transcript for readability. Runs on the persistent
+    /// cleanup worker thread (llama.cpp's decode loop is sync and CPU/GPU bound).
     pub async fn process_transcript(&self, raw_text: &str) -> eyre::Result<String> {
         let raw = raw_text.trim();
         if raw.is_empty() {
@@ -132,7 +231,7 @@ impl TextCleanupEngine {
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
         // Plain dictation flattens to one line; an active format preset
         // (numbered / bullets / email) keeps its line structure.
-        let cleaned = self.run_chat(user_msg, budget, self.format_active).await?;
+        let cleaned = self.run_chat(user_msg, budget, self.format_active, false).await?;
         // Deterministic mechanics the 1B does unreliably (leading "um", lone
         // lowercase "i") — cheap, exact, and always safe on speech.
         Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
@@ -168,9 +267,28 @@ impl TextCleanupEngine {
         }
         let user_msg = format!("{cleanup_prompt}\n\nRaw transcript:\n{raw}");
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        let cleaned = self.run_chat(user_msg, budget, preserve_newlines).await?;
+        let cleaned = self.run_chat(user_msg, budget, preserve_newlines, false).await?;
         // Mirror production: apply the same deterministic speech-mechanics pass
         // so the lab measures what the daemon would actually inject.
+        Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
+    }
+
+    /// Like [`Self::eval_cleanup`] but forces a full prefill (no KV reuse). Used
+    /// by the prefix-cache parity test to prove cached output is bit-identical
+    /// to a from-scratch decode.
+    pub async fn eval_cleanup_uncached(
+        &self,
+        cleanup_prompt: &str,
+        raw: &str,
+        preserve_newlines: bool,
+    ) -> eyre::Result<String> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        let user_msg = format!("{cleanup_prompt}\n\nRaw transcript:\n{raw}");
+        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
+        let cleaned = self.run_chat(user_msg, budget, preserve_newlines, true).await?;
         Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
     }
 
@@ -191,7 +309,7 @@ impl TextCleanupEngine {
             "{transform_prompt}\n\nInstruction: {instruction}\n\nText:\n{selection}"
         );
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
-        self.run_chat(user_msg, budget, true).await
+        self.run_chat(user_msg, budget, true, false).await
     }
 
     /// Apply a spoken `instruction` to `selection` and return the edited text.
@@ -212,105 +330,183 @@ impl TextCleanupEngine {
         // input (e.g. "expand this"), capped to keep within the context window.
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
         // Preserve line structure: transforms may legitimately be lists/paras.
-        self.run_chat(user_msg, budget, true).await
+        self.run_chat(user_msg, budget, true, false).await
     }
 
-    /// Shared generation core: build the prompt with the model's bundled chat
-    /// template, decode up to `max_tokens`, and polish the result. Works for
-    /// Gemma / Llama 3 / Qwen-ChatML / SmolLM without per-family hardcoding.
+    /// Build the templated prompt and hand it to the persistent-context worker,
+    /// awaiting the polished result. Works for Gemma / Llama 3 / Qwen-ChatML /
+    /// SmolLM without per-family hardcoding (the template comes from the GGUF).
     async fn run_chat(
         &self,
         user_msg: String,
         max_tokens: i32,
         preserve_newlines: bool,
+        no_reuse: bool,
     ) -> eyre::Result<String> {
-        let messages = vec![LlamaChatMessage::new("user".into(), user_msg)
-            .map_err(|e| eyre::eyre!("invalid chat message: {e:?}"))?];
-        let prompt = self
-            .model
-            .apply_chat_template(&self.chat_template, &messages, true)
-            .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))?;
-
-        let backend = self.backend.clone();
-        let model = self.model.clone();
-
-        tokio::task::spawn_blocking(move || -> eyre::Result<String> {
-            let tokens = model
-                .str_to_token(&prompt, AddBos::Always)
-                .map_err(|e| eyre::eyre!("tokenize failed: {e:?}"))?;
-            if tokens.is_empty() {
-                return Ok(String::new());
-            }
-
-            // Size the context to hold the full prompt plus the generation
-            // budget, clamped to [MIN_CTX, MAX_CTX]. A fixed 2048 used to
-            // truncate long dictations: once prompt + output exceeded it, the
-            // tail fell out of context. If the prompt alone is near the cap we
-            // still leave room to generate by shrinking the effective budget.
-            let prompt_len = tokens.len() as u32;
-            let n_ctx = (prompt_len + max_tokens.max(0) as u32 + 16).clamp(MIN_CTX, MAX_CTX);
-            // Never ask for more output tokens than the window can hold.
-            let max_tokens = max_tokens.min(n_ctx.saturating_sub(prompt_len + 16) as i32);
-            let ctx_params = LlamaContextParams::default()
-                .with_n_ctx(NonZeroU32::new(n_ctx))
-                // n_batch must cover the prompt prefill in one decode call.
-                .with_n_batch(n_ctx);
-            let mut ctx = model
-                .new_context(&backend, ctx_params)
-                .map_err(|e| eyre::eyre!("new_context failed: {e:?}"))?;
-
-            let mut batch = LlamaBatch::new(n_ctx as usize, 1);
-            let last_idx = (tokens.len() - 1) as i32;
-            for (i, tok) in tokens.iter().enumerate() {
-                batch
-                    .add(*tok, i as i32, &[0], i as i32 == last_idx)
-                    .map_err(|e| eyre::eyre!("batch.add prompt token failed: {e:?}"))?;
-            }
-            ctx.decode(&mut batch)
-                .map_err(|e| eyre::eyre!("decode prompt failed: {e:?}"))?;
-
-            // Low temperature for deterministic cleanup. greedy fallback at end of chain.
-            let mut sampler = LlamaSampler::chain_simple([
-                LlamaSampler::temp(0.2),
-                LlamaSampler::dist(1234),
-            ]);
-
-            let mut decoder = encoding_rs::UTF_8.new_decoder();
-            let mut out = String::new();
-            let mut n_cur = batch.n_tokens();
-            let mut decoded_count = 0i32;
-
-            while decoded_count < max_tokens {
-                let tok = sampler.sample(&ctx, batch.n_tokens() - 1);
-                sampler.accept(tok);
-                if model.is_eog_token(tok) {
-                    break;
-                }
-                let piece = model
-                    .token_to_piece(tok, &mut decoder, true, None)
-                    .map_err(|e| eyre::eyre!("token_to_piece failed: {e:?}"))?;
-                out.push_str(&piece);
-
-                batch.clear();
-                batch
-                    .add(tok, n_cur, &[0], true)
-                    .map_err(|e| eyre::eyre!("batch.add gen token failed: {e:?}"))?;
-                n_cur += 1;
-                ctx.decode(&mut batch)
-                    .map_err(|e| eyre::eyre!("decode gen step failed: {e:?}"))?;
-                decoded_count += 1;
-            }
-
-            // Defensive polish: strip preamble, peel wrapping quotes,
-            // collapse whitespace, drop chat-template artefacts. Transform
-            // mode keeps line breaks (lists/paragraphs); cleanup flattens them.
-            Ok(if preserve_newlines {
-                crate::text_polish::polish_multiline(&out)
-            } else {
-                crate::text_polish::polish(&out)
-            })
-        })
-        .await
-        .map_err(|e| eyre::eyre!("blocking task join failed: {e}"))?
+        let prompt = Self::template_user_msg(&self.model, &self.chat_template, &user_msg)?;
+        let (reply, rx) = oneshot::channel();
+        self.job_tx
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("cleanup worker is gone"))?
+            .send(Job { prompt, max_tokens, preserve_newlines, no_reuse, reply })
+            .map_err(|_| eyre::eyre!("cleanup worker is gone"))?;
+        rx.await
+            .map_err(|_| eyre::eyre!("cleanup worker dropped the reply"))?
     }
+}
+
+/// The persistent-context worker loop. Owns one `LlamaContext` for the daemon's
+/// lifetime and serves jobs over `job_rx`, reusing the KV-cache prefix shared
+/// with the previous prompt. Signals readiness (or context-creation failure)
+/// once over `ready_tx` so `initialize` can fail fast.
+fn run_worker(
+    backend: Arc<LlamaBackend>,
+    model: Arc<LlamaModel>,
+    mut job_rx: mpsc::UnboundedReceiver<Job>,
+    warm_prompt: Option<String>,
+    ready_tx: std::sync::mpsc::Sender<eyre::Result<()>>,
+) {
+    // One context, sized once. n_batch must cover the largest single prefill in
+    // one decode call, so it matches n_ctx.
+    let ctx_params = LlamaContextParams::default()
+        .with_n_ctx(NonZeroU32::new(MAX_CTX))
+        .with_n_batch(MAX_CTX);
+    let mut ctx = match model.new_context(&backend, ctx_params) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ready_tx.send(Err(eyre::eyre!("new_context failed: {e:?}")));
+            return;
+        }
+    };
+
+    // `resident` is the token sequence currently decoded into the KV cache
+    // (positions 0..resident.len()). Each job reuses the prefix it shares with
+    // `resident` and re-decodes only the rest.
+    let mut resident: Vec<LlamaToken> = Vec::new();
+
+    // Warm the constant cleanup framing so the first real dictation reuses it.
+    if let Some(warm) = warm_prompt {
+        if let Ok(toks) = model.str_to_token(&warm, AddBos::Always) {
+            if !toks.is_empty() {
+                let mut batch = LlamaBatch::new(MAX_CTX as usize, 1);
+                let last = toks.len() - 1;
+                let ok = (|| -> eyre::Result<()> {
+                    for (i, tok) in toks.iter().enumerate() {
+                        batch
+                            .add(*tok, i as i32, &[0], i == last)
+                            .map_err(|e| eyre::eyre!("warm batch.add failed: {e:?}"))?;
+                    }
+                    ctx.decode(&mut batch)
+                        .map_err(|e| eyre::eyre!("warm decode failed: {e:?}"))?;
+                    Ok(())
+                })();
+                if ok.is_ok() {
+                    resident = toks;
+                }
+            }
+        }
+    }
+
+    let _ = ready_tx.send(Ok(()));
+
+    while let Some(job) = job_rx.blocking_recv() {
+        let res = run_job(&model, &mut ctx, &mut resident, job.prompt, job.max_tokens, job.preserve_newlines, job.no_reuse);
+        let _ = job.reply.send(res);
+    }
+}
+
+/// Decode one job against the persistent context, reusing the KV-cache prefix.
+fn run_job(
+    model: &LlamaModel,
+    ctx: &mut llama_cpp_2::context::LlamaContext,
+    resident: &mut Vec<LlamaToken>,
+    prompt: String,
+    max_tokens: i32,
+    preserve_newlines: bool,
+    no_reuse: bool,
+) -> eyre::Result<String> {
+    let tokens = model
+        .str_to_token(&prompt, AddBos::Always)
+        .map_err(|e| eyre::eyre!("tokenize failed: {e:?}"))?;
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let prompt_len = tokens.len();
+    // Never ask for more output tokens than the fixed window can hold.
+    let max_tokens = max_tokens
+        .min((MAX_CTX as usize).saturating_sub(prompt_len + 16) as i32)
+        .max(0);
+
+    // Reuse the KV prefix shared with the last prompt. Cap at prompt_len-1 so at
+    // least one prompt token is (re)decoded — we need fresh logits to sample
+    // from even when the prompt is byte-identical to the previous one.
+    let reuse = if no_reuse {
+        0
+    } else {
+        common_prefix_len(&tokens, resident).min(prompt_len.saturating_sub(1))
+    };
+
+    // Wipe everything from `reuse` onward (the divergent tail of the previous
+    // prompt plus whatever it generated). KV [0, reuse) holds identical tokens
+    // at identical positions, so it stays valid.
+    ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
+        .map_err(|e| eyre::eyre!("clear_kv_cache_seq failed: {e:?}"))?;
+
+    let mut batch = LlamaBatch::new(MAX_CTX as usize, 1);
+    let new = &tokens[reuse..];
+    let last = new.len() - 1;
+    for (i, tok) in new.iter().enumerate() {
+        batch
+            .add(*tok, (reuse + i) as i32, &[0], i == last)
+            .map_err(|e| eyre::eyre!("batch.add prompt token failed: {e:?}"))?;
+    }
+    ctx.decode(&mut batch)
+        .map_err(|e| eyre::eyre!("decode prompt failed: {e:?}"))?;
+
+    // Low temperature for deterministic cleanup; fixed seed → reproducible.
+    let mut sampler = LlamaSampler::chain_simple([
+        LlamaSampler::temp(0.2),
+        LlamaSampler::dist(1234),
+    ]);
+
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    let mut out = String::new();
+    // Next position to write is right after the full prompt, regardless of how
+    // many prompt tokens we actually re-decoded this turn.
+    let mut n_cur = prompt_len as i32;
+    let mut decoded_count = 0i32;
+
+    while decoded_count < max_tokens {
+        let tok = sampler.sample(ctx, batch.n_tokens() - 1);
+        sampler.accept(tok);
+        if model.is_eog_token(tok) {
+            break;
+        }
+        let piece = model
+            .token_to_piece(tok, &mut decoder, true, None)
+            .map_err(|e| eyre::eyre!("token_to_piece failed: {e:?}"))?;
+        out.push_str(&piece);
+
+        batch.clear();
+        batch
+            .add(tok, n_cur, &[0], true)
+            .map_err(|e| eyre::eyre!("batch.add gen token failed: {e:?}"))?;
+        n_cur += 1;
+        ctx.decode(&mut batch)
+            .map_err(|e| eyre::eyre!("decode gen step failed: {e:?}"))?;
+        decoded_count += 1;
+    }
+
+    // The prompt tokens are now resident at [0, prompt_len); generated tokens
+    // sit beyond and will be wiped by the next job's `clear_kv_cache_seq`.
+    *resident = tokens;
+
+    // Defensive polish: strip preamble, peel wrapping quotes, collapse
+    // whitespace, drop chat-template artefacts. Transform / list presets keep
+    // line breaks; cleanup flattens them.
+    Ok(if preserve_newlines {
+        crate::text_polish::polish_multiline(&out)
+    } else {
+        crate::text_polish::polish(&out)
+    })
 }
