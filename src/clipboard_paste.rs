@@ -15,8 +15,10 @@ use std::time::Duration;
 // US ANSI virtual key codes.
 const KEY_C: CGKeyCode = 8;
 const KEY_V: CGKeyCode = 9;
+const KEY_Z: CGKeyCode = 6;
 const KEY_RETURN: CGKeyCode = 36;
 const KEY_TAB: CGKeyCode = 48;
+const KEY_ESCAPE: CGKeyCode = 53;
 // Time the OS needs to actually consume the synthesized Cmd+V and let the
 // receiving app pull from the pasteboard before we restore. Under GPU load
 // right after Gemma inference the target app's paste handler can run late, and
@@ -182,4 +184,29 @@ pub fn synthesize_return() -> eyre::Result<()> {
 /// for advancing between form fields by voice.
 pub fn synthesize_tab() -> eyre::Result<()> {
     synthesize_plain_key(KEY_TAB)
+}
+
+/// Synthesize an Escape key press + release ("press escape" voice command) —
+/// dismiss dialogs, clear a field, or leave an editor's insert mode by voice.
+pub fn synthesize_escape() -> eyre::Result<()> {
+    synthesize_plain_key(KEY_ESCAPE)
+}
+
+/// Synthesize Cmd+Z ("undo that" voice command) to revert the previous action.
+/// Same flag discipline as Cmd+V: set Command only on key-down, clear on key-up
+/// so a held push-to-talk modifier can't turn it into a different chord.
+pub fn synthesize_undo() -> eyre::Result<()> {
+    let source = clean_event_source()?;
+
+    let down = CGEvent::new_keyboard_event(source.clone(), KEY_Z, true)
+        .map_err(|_| eyre::eyre!("Cmd+Z keydown create failed"))?;
+    down.set_flags(CGEventFlags::CGEventFlagCommand);
+    down.post(CGEventTapLocation::HID);
+
+    let up = CGEvent::new_keyboard_event(source, KEY_Z, false)
+        .map_err(|_| eyre::eyre!("Cmd+Z keyup create failed"))?;
+    up.set_flags(CGEventFlags::CGEventFlagNull);
+    up.post(CGEventTapLocation::HID);
+
+    Ok(())
 }
