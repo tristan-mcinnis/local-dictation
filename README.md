@@ -11,7 +11,7 @@
   <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release — cleaned text lands at the cursor" width="420">
 </p>
 
-> **Heads-up:** this is a personal tool I built for my own daily driving on an Apple Silicon Mac, shared openly in case it's useful to you. It's not a packaged product — there's no signed installer, you build it from source, and it's tuned to how *I* dictate. If that fits, you'll probably like it; if you want a one-click app, see the alternatives below.
+> **Heads-up:** this is a personal tool I built for my own daily driving on an Apple Silicon Mac, shared openly in case it's useful to you. There's a prebuilt `.dmg` you can download, but it's only **ad-hoc signed** (no paid Apple Developer ID), so macOS needs a one-time Gatekeeper override — and the whole thing is tuned to how *I* dictate. If that fits, you'll probably like it; if you want a polished one-click app, see the alternatives below.
 
 ## Why this instead of …
 
@@ -31,7 +31,15 @@ There are good dictation tools already. This one exists because I wanted a speci
 
 ## Get started
 
-**The easy way — one script.** Clone the repo and run the installer:
+**Easiest — download the app.** Grab **Local Dictation.dmg** from the [latest release](https://github.com/tristan-mcinnis/local-dictation/releases/latest), open it, and drag **Local Dictation.app** into `/Applications`. It's a self-contained ~1.2 GB bundle (Parakeet + Gemma included), so there's no toolchain to install. Because it's ad-hoc signed, Gatekeeper blocks it on first open — clear the quarantine flag once:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Local Dictation.app"
+```
+
+Then launch it, grant **Microphone** + **Accessibility** in System Settings → Privacy & Security, and look for the 🎤 in your menu bar.
+
+**Build from source — one script.** Clone the repo and run the installer:
 
 ```bash
 git clone https://github.com/tristan-mcinnis/local-dictation
@@ -73,9 +81,10 @@ Running the daemon directly from a terminal prompts for Microphone + Accessibili
 
 </details>
 
-### …or hand it to an AI agent
+<details>
+<summary><b>…or hand it to an AI agent</b> (paste this into Claude Code / Codex / Cursor)</summary>
 
-Don't want to touch a terminal at all? Paste the prompt below into a coding agent running on your Mac — **Claude Code**, **Codex**, **Cursor**, whatever you use. It clones the repo and runs the installer for you, then walks you through the one step it *can't* do (granting macOS permissions).
+Don't want to touch a terminal at all? Paste the prompt below into a coding agent running on your Mac. It clones the repo and runs the installer for you, then walks you through the one step it *can't* do (granting macOS permissions).
 
 ```text
 Set up the "local-dictation" app on this Mac (Apple Silicon) from
@@ -91,6 +100,8 @@ Finally, remind me of the hotkeys: hold Right Option to dictate; for hands-free,
 hold Right Option and tap Space, let go of both, keep talking, then tap Right
 Option once to stop.
 ```
+
+</details>
 
 ## How you use it
 
@@ -114,9 +125,9 @@ Beyond dictating new text, you can **edit text you've already got** by voice. Se
 select text → hold Shift+Right Option → say "make this more concise" → release
 ```
 
-Things that work well with the default (1B) model: rephrasing, tightening or expanding, changing tone, fixing grammar, reformatting (e.g. "turn this into bullet points"), and translation ("translate to Spanish").
+Things that work well with the default (1B) model: rephrasing, tightening or expanding, changing tone, fixing grammar, reformatting ("turn this into bullet points"), and translation ("translate to Spanish").
 
-**It comes down to the prompt.** The model only sees your spoken instruction plus the selected text, wrapped in a *system prompt*. The built-in transform prompt is deliberately permissive — it follows your instruction even when that means *adding* content, so "turn these two bullets into four" actually expands rather than playing it safe. If a transform under- or over-does it, that prompt is the dial to turn (see [Editable prompts](#editable-prompts)). Keep in mind it's a 1B model: small, fast, and occasionally literal — short selections give it little to work with, so expansion instructions land better when there's some substance to build on.
+**It comes down to the prompt.** The built-in transform prompt is deliberately permissive — it follows your instruction even when that means *adding* content, so "turn these two bullets into four" expands rather than playing it safe. If a transform under- or over-does it, that prompt is the dial to turn (see [Editable prompts](#editable-prompts)). It's a 1B model, so it's occasionally literal — short selections give it little to build on.
 
 ### Editable prompts
 
@@ -169,11 +180,7 @@ Both fully local. A helper script downloads the two defaults:
 
 ### Why Gemma 3 1B is the default cleanup model
 
-Five GGUF cleanup models were tried on conversational English dictation. The
-job is small — drop fillers, fix punctuation/casing, expand `gonna → going to`
-— so the question was the smallest model that does it *without* mangling
-meaning or domain casing. Sizes are Q4_K_M on disk; latency is hot-path
-cleanup of a ~2 s utterance on Apple Silicon (Metal).
+Five GGUF models were tried on conversational English dictation. The job is small — drop fillers, fix punctuation/casing, expand `gonna → going to` — so the question was the smallest model that does it *without* mangling meaning or domain casing. Sizes are Q4_K_M on disk; latency is hot-path cleanup of a ~2 s utterance on Apple Silicon (Metal).
 
 | Model | Size | Cleanup latency | Quality on dictation | Verdict |
 | --- | --- | --- | --- | --- |
@@ -183,43 +190,23 @@ cleanup of a ~2 s utterance on Apple Silicon (Metal).
 | Qwen 2.5 0.5B-IT | 398 MB | Fastest of the usable set | Quicker, but drops the occasional word and over-trims | Pick for raw speed on a slow machine |
 | SmolLM2 360M-IT | 271 MB | Fastest overall | Too aggressive — rewrites/omits content | Not recommended for cleanup |
 
-The takeaway: **4B isn't worth ~3× the latency for everyday dictation, and the
-sub-1B models start trading away accuracy.** Gemma 3 1B sits at the knee of the
-curve, so it ships as the default.
-
-You don't have to edit anything to switch — pick a different model from the
-**menu bar** (see below), or set `GEMMA_MODEL_PATH` for a scripted launch. The
-download script fetches only Parakeet + Gemma 3 1B; the other four are optional
-and can be downloaded into `models/llm/<name>/` to appear in the picker.
+The takeaway: **4B isn't worth ~3× the latency for everyday dictation, and the sub-1B models start trading away accuracy** — Gemma 3 1B sits at the knee of the curve. To switch, pick another model from the **menu bar** or set `GEMMA_MODEL_PATH`. The download script fetches only Parakeet + Gemma 3 1B; drop any of the others into `models/llm/<name>/` to make them appear in the picker.
 
 ## Features
 
-- **Push-to-talk.** Hold Right Option (configurable via `DICTATE_HOTKEY_KEYCODE`), speak, release.
-- **Hands-free mode.** Hold the push-to-talk key and **tap Space** to latch (a *pop* cue confirms), then release both keys and keep talking — recording continues with nothing held. **Tap the push-to-talk key once** to stop and inject. Normal hold-to-talk is unchanged; the latch only engages when you chord Space during a hold. (Space is swallowed while you hold the key, so it never leaks a character into your text.)
-- **Live waveform pill.** Floating dark pill at the bottom of your cursor's screen with 14 vertical bars driven by real-time mic RMS. Noise-gated so it stays still during ambient room sound; peak-hold + decay so loud syllables visibly linger before falling.
-- **Menu-bar icon + settings (SF Symbol).** Native macOS look that adopts your menu-bar tint: `mic` (idle) → `mic.fill` (recording) → `waveform` (processing). Click it for a full menu — no env vars or relaunch scripts needed:
-  - **Last dictation preview** + **Copy last dictation** (⌘C) — grab what you just dictated.
-  - **Dictation History…** (⌘H) — opens a small native window listing past dictations, newest first, grouped by day. The friendly counterpart to the log: just the text and when, nothing else.
-  - **Cleanup model ▸** — checkable submenu of every model under `models/llm/`; pick one and the daemon relaunches on it.
-  - **Push-to-talk key ▸** — Right Option / Command / Control / Shift.
-  - **Output format ▸** — pick an output-shape preset (email / bullets / code / …) defined in `prompts.json`, or *Default (no preset)*. Only shown once you've defined a `formats` block.
-  - **Cleanup enabled** — toggle LLM cleanup on/off (raw transcript when off).
-  - **Edit cleanup prompts…** — opens `prompts.json` in your text editor, seeded the first time with the currently-active cleanup + transform system prompts (with inline notes) so there's real text to edit. Save, then relaunch (e.g. toggle Cleanup enabled off/on) to apply. See [Editable prompts](#editable-prompts).
-  - **Open Log** (⌘L), **Export Log to Downloads…**, **Open corrections folder**.
-  - **Quit** (⌘Q).
-  Settings persist to `~/.config/local-dictation/settings.json`. Changing the model, hotkey, or cleanup toggle relaunches the daemon to apply (the model is loaded once at boot, so a relaunch is cleaner than a live swap). Any env var override (`GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE`) wins over the menu and greys out the matching items.
-- **Audio cues.** Tink on start, Bottle on stop, Pop on hands-free latch, Basso on error. Mute with `DICTATE_QUIET=1`.
-- **Mutes other audio while you talk.** The moment you start a capture, any audio already playing through your Mac's output (music, a video, a call) is muted, then restored the instant the utterance is fully handled — dictation injected, transform pasted, or the path bailed out. It's conservative: if your output was *already* muted, it's left muted on release rather than un-muted behind your back. Implemented with the same `osascript` output-mute the menu bar's volume control uses (no extra dependency). Disable with `DICTATE_NO_MUTE=1`.
-- **Smart spacing & capitalization.** Reads the focused element's caret context (or remembers the last-injected character when AX doesn't expose it) so consecutive dictations get the right spacing — no `wordswithoutspaces`, no `lowercase after a period`.
-- **Cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`wanna → want to`, `gonna → going to`, `kinda → kind of`), keeps standard contractions (`don't`, `it's`), and preserves domain casing (`macOS`, `Rust`, `ONNX`, `GitHub`).
-- **Transform selected text by voice.** Select text, hold **Shift + Right Option**, speak an instruction ("make this concise", "turn into bullet points", "translate to Spanish"), release — the selection is rewritten in place via the warm Gemma model. See [Transform selected text by voice](#transform-selected-text-by-voice).
-- **Editable prompts.** The transform and cleanup system prompts live in `~/.config/local-dictation/prompts.json` (copy [`prompts.example.json`](./prompts.example.json)); tune how the model behaves without touching code. See [Editable prompts](#editable-prompts).
-- **Clipboard fallback for Electron.** VS Code, Slack, Discord, browsers, etc. silently accept AX writes without rendering them — for those, we use save-clipboard → Cmd+V → restore.
-- **Personal corrections dictionary (now dictionary-aware).** Drop a JSON file at `~/.config/local-dictation/corrections.json` mapping words you commonly mis-transcribe to their right form (`{"lings": "Lingzi", "github": "GitHub"}`). Two things happen with it: (1) the target spellings are fed to the cleanup model up front as a *known-vocabulary* hint, so Gemma stops "correcting" your proper nouns and casing away in the first place; and (2) the map is still applied verbatim after cleanup as a backstop. Case-insensitive match at word boundaries; the hint is capped so a huge dictionary can't bloat the prompt. See `corrections.example.json`.
-- **Output-format presets.** Define named cleanup styles (`email`, `bullets`, `code`, …) under a `formats` object in `prompts.json`, then pick the active one from the menu bar's **Output format** submenu (or set `DICTATE_FORMAT`). When a preset is active it replaces the default cleanup prompt for normal dictation, so the same speech can land as an email body, a bullet list, or a terse code note. Unknown/blank presets fall back to the default cleanup; the menu only appears once you've defined at least one. See the `formats` block in [`prompts.example.json`](./prompts.example.json).
-- **Inline voice commands.** End a dictation with a recognised phrase and it's stripped from the text and turned into a keystroke after the body is injected: `press enter` / `press return` / `hit enter` / `new line` → **Return**; `new paragraph` → **two Returns**; `press tab` / `hit tab` → **Tab**. And if the *whole* utterance is `scratch that` / `never mind` / `cancel that` / `delete that`, nothing is injected. All matched on word boundaries, so "compress enter" or "let me scratch that itch" never fire.
-- **Dictation history.** Every injected dictation is saved to a tiny SQLite database at `~/.config/local-dictation/history.db`. Open **Dictation History…** from the menu bar for a plain native window listing them newest-first, grouped by day — readable at a glance, unlike the timing-heavy log.
-- **Structured logs.** Aligned per-utterance blocks at `/tmp/dictate-daemon.log` showing transcribe / cleanup / inject timings, the target app name, and the final injected text.
+A quick index — the headline features (push-to-talk, transform, editable prompts) each have their own section above.
+
+- **Push-to-talk + hands-free.** Hold Right Option to dictate; or hold it and tap Space to latch, then talk with nothing held and tap once to stop. Hotkey configurable via `DICTATE_HOTKEY_KEYCODE`. See [How you use it](#how-you-use-it).
+- **Transform selected text by voice.** Select, hold Shift + Right Option, speak an instruction, release — rewritten in place via the warm Gemma model. See [Transform selected text by voice](#transform-selected-text-by-voice).
+- **On-device LLM cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`gonna → going to`), keeps standard ones (`don't`), and preserves domain casing (`macOS`, `Rust`, `GitHub`). Toggle off for the raw transcript.
+- **Editable prompts + output-format presets.** Tune the cleanup/transform system prompts in plain JSON; define named styles (`email`, `bullets`, `code`) and switch the active one from the menu bar (or `DICTATE_FORMAT`). See [Editable prompts](#editable-prompts).
+- **Personal corrections dictionary.** Map words you mis-transcribe to their right form (`{"lings": "Lingzi"}`); the targets are fed to the cleaner as a vocabulary hint *and* applied verbatim afterwards as a backstop. See [`corrections.example.json`](./corrections.example.json).
+- **Inline voice commands.** End with `press enter` / `new paragraph` / `press tab` to emit the keystroke after injection; say `scratch that` / `never mind` to cancel the whole utterance. Matched on word boundaries so they never fire mid-sentence.
+- **Menu-bar app.** A tint-following SF Symbol mirrors state (`mic` → `mic.fill` → `waveform`) and opens a full menu: model / hotkey / output-format / cleanup pickers, copy-last-dictation, **Dictation History** (a native window backed by SQLite at `history.db`, grouped by day), edit-prompts, and log tools. Settings persist to `settings.json`; changing model/hotkey/cleanup relaunches the daemon, and any matching env var override greys out the menu item.
+- **Live waveform pill.** Floating dark pill at your cursor with 14 mic-driven bars — noise-gated against ambient sound, peak-hold + decay so loud syllables linger before falling.
+- **Mutes other audio while you talk**, restored the instant the utterance is handled (left muted if it already was). Disable with `DICTATE_NO_MUTE=1`. Audio cues on start / stop / latch / error; mute with `DICTATE_QUIET=1`.
+- **Smart spacing & capitalization** from the focused element's caret context — no `wordswithoutspaces`, no `lowercase after a period`. **Clipboard fallback** for Electron apps (VS Code, Slack, browsers) that swallow AX writes.
+- **Structured logs** at `/tmp/dictate-daemon.log` — per-utterance transcribe / cleanup / inject timings, the target app, and the injected text.
 
 ## What the log looks like
 
