@@ -802,7 +802,7 @@ fn handle_transform(
 /// Run a trailing voice command's keystroke(s). `None`/`Cancel` are no-ops
 /// (the caller handles `Cancel` earlier). Errors are logged, never fatal.
 fn execute_trailing_action(action: &TrailingAction) {
-    use crate::clipboard_paste::{synthesize_return, synthesize_tab};
+    use crate::clipboard_paste::{synthesize_escape, synthesize_return, synthesize_tab, synthesize_undo};
     let result = match action {
         TrailingAction::None | TrailingAction::Cancel => return,
         TrailingAction::PressEnter => synthesize_return(),
@@ -814,6 +814,8 @@ fn execute_trailing_action(action: &TrailingAction) {
             first.and(synthesize_return())
         }
         TrailingAction::PressTab => synthesize_tab(),
+        TrailingAction::PressEscape => synthesize_escape(),
+        TrailingAction::Undo => synthesize_undo(),
     };
     match (action, result) {
         (_, Ok(())) => eprintln!("  ↵    {action:?} sent"),

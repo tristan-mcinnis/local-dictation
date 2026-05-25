@@ -52,6 +52,8 @@ impl RefinedDictation {
                 TrailingAction::PressEnter
                     | TrailingAction::NewParagraph
                     | TrailingAction::PressTab
+                    | TrailingAction::PressEscape
+                    | TrailingAction::Undo
             )
     }
 

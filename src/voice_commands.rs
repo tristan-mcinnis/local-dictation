@@ -14,8 +14,13 @@
 //!
 //!   * **Whole-utterance cancel** — when the *entire* utterance is exactly a
 //!     cancel phrase ("scratch that", "never mind", "cancel that",
-//!     "delete that"), nothing is injected. Requiring an exact match keeps
-//!     "let me scratch that itch" from being swallowed.
+//!     "delete that", "forget that"), nothing is injected. Requiring an exact
+//!     match keeps "let me scratch that itch" from being swallowed.
+//!
+//!   * **Whole-utterance undo** — "undo that" / "undo" (exact) injects nothing
+//!     and synthesizes Cmd+Z, so you can voice-revert the previous dictation
+//!     without reaching for the keyboard. Exact match keeps "undo that commit"
+//!     from firing.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrailingAction {
@@ -26,12 +31,20 @@ pub enum TrailingAction {
     NewParagraph,
     /// Press Tab once ("press tab").
     PressTab,
+    /// Press Escape once ("press escape" / "hit escape").
+    PressEscape,
+    /// Synthesize Cmd+Z to undo the previous action ("undo that" / "undo").
+    Undo,
     /// Discard the whole utterance — inject nothing ("scratch that", …).
     Cancel,
 }
 
 /// Phrases that, when they form the *entire* utterance, cancel it.
-const CANCEL_PHRASES: &[&str] = &["scratch that", "cancel that", "never mind", "delete that"];
+const CANCEL_PHRASES: &[&str] =
+    &["scratch that", "cancel that", "never mind", "delete that", "forget that"];
+
+/// Phrases that, when they form the *entire* utterance, synthesize Cmd+Z.
+const UNDO_PHRASES: &[&str] = &["undo that", "undo", "undo last"];
 
 /// Trailing key-command phrases, longest first so "new paragraph" is tested
 /// before "new line" would ever shadow it. Each maps to the action to run
@@ -46,6 +59,9 @@ const TRAILING_PHRASES: &[(&str, TrailingAction)] = &[
     ("newline", TrailingAction::PressEnter),
     ("press tab", TrailingAction::PressTab),
     ("hit tab", TrailingAction::PressTab),
+    ("press escape", TrailingAction::PressEscape),
+    ("hit escape", TrailingAction::PressEscape),
+    ("press escape key", TrailingAction::PressEscape),
 ];
 
 /// Inspect cleaned text. If the whole thing is a cancel phrase, or it ends
@@ -64,6 +80,12 @@ pub fn parse_trailing_command(text: &str) -> (String, TrailingAction) {
     // Whole-utterance cancel: the entire utterance must BE a cancel phrase.
     if CANCEL_PHRASES.contains(&lower_trimmed.as_str()) {
         return (String::new(), TrailingAction::Cancel);
+    }
+
+    // Whole-utterance undo: the entire utterance must BE an undo phrase, so
+    // "undo that" reverts the previous dictation but "undo that commit" doesn't.
+    if UNDO_PHRASES.contains(&lower_trimmed.as_str()) {
+        return (String::new(), TrailingAction::Undo);
     }
 
     for (phrase, action) in TRAILING_PHRASES {
@@ -181,5 +203,42 @@ mod tests {
     fn never_mind_cancels() {
         let (_, act) = parse_trailing_command("never mind");
         assert_eq!(act, TrailingAction::Cancel);
+    }
+
+    #[test]
+    fn forget_that_cancels() {
+        let (_, act) = parse_trailing_command("Forget that.");
+        assert_eq!(act, TrailingAction::Cancel);
+    }
+
+    #[test]
+    fn press_escape_fires() {
+        let (body, act) = parse_trailing_command("close this press escape");
+        assert_eq!(body, "close this");
+        assert_eq!(act, TrailingAction::PressEscape);
+    }
+
+    #[test]
+    fn bare_press_escape() {
+        let (body, act) = parse_trailing_command("hit escape");
+        assert_eq!(body, "");
+        assert_eq!(act, TrailingAction::PressEscape);
+    }
+
+    #[test]
+    fn undo_whole_utterance() {
+        for phrase in ["undo that", "Undo.", "undo last"] {
+            let (body, act) = parse_trailing_command(phrase);
+            assert_eq!(act, TrailingAction::Undo, "phrase {phrase:?}");
+            assert_eq!(body, "");
+        }
+    }
+
+    #[test]
+    fn undo_does_not_fire_mid_sentence() {
+        // Undo must be the WHOLE utterance, so a real sentence passes through.
+        let (body, act) = parse_trailing_command("let's undo that commit");
+        assert_eq!(act, TrailingAction::None);
+        assert_eq!(body, "let's undo that commit");
     }
 }
