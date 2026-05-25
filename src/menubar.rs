@@ -487,10 +487,16 @@ fn build_model_submenu(
     });
 
     for choice in &models {
+        // Annotate with the speed/accuracy hint so the trade-off is one glance,
+        // e.g. "gemma-3-1b-it — fast · recommended".
+        let title = match &choice.hint {
+            Some(h) => format!("{} — {h}", choice.label),
+            None => choice.label.clone(),
+        };
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                &NSString::from_str(&choice.label),
+                &NSString::from_str(&title),
                 Some(sel!(selectModel:)),
                 &NSString::from_str(""),
             )

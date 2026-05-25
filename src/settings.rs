@@ -165,6 +165,54 @@ pub struct ModelChoice {
     pub label: String,
     /// Absolute path to the `.gguf` file.
     pub path: String,
+    /// Qualitative speed/accuracy hint for the menu, inferred from the model's
+    /// parameter count (e.g. "fast · recommended", "most accurate · ~2.5× slower").
+    /// `None` when the size can't be parsed from the name.
+    pub hint: Option<String>,
+}
+
+/// Parse a parameter count (in billions) from a model directory name by looking
+/// for a `<n>b` or `<n>m` token (e.g. `gemma-3-1b-it` → 1.0, `smollm2-360m-it`
+/// → 0.36, `qwen-2.5-0.5b-it` → 0.5). `None` if no size token is present.
+fn parse_param_billions(name: &str) -> Option<f32> {
+    let lower = name.to_lowercase();
+    for tok in lower.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.')) {
+        // A size token ends in 'b' or 'm' with a numeric body, e.g. "1b", "0.5b",
+        // "360m". Guard against the "3" in "gemma-3" (no unit suffix).
+        let (unit, body) = match tok.strip_suffix('b') {
+            Some(b) => ('b', b),
+            None => match tok.strip_suffix('m') {
+                Some(m) => ('m', m),
+                None => continue,
+            },
+        };
+        if body.is_empty() {
+            continue;
+        }
+        if let Ok(n) = body.parse::<f32>() {
+            return Some(if unit == 'm' { n / 1000.0 } else { n });
+        }
+    }
+    None
+}
+
+/// Map a parameter count to a one-line speed/accuracy hint for the picker.
+/// Thresholds are grounded in the measured ~2.5× cleanup-latency gap between
+/// Gemma 1B and 4B on this machine (see examples/latency_lab).
+fn model_hint(name: &str) -> Option<String> {
+    let b = parse_param_billions(name)?;
+    Some(
+        if b < 0.8 {
+            "fastest · roughest cleanup"
+        } else if b <= 1.5 {
+            "fast · recommended"
+        } else if b < 3.0 {
+            "balanced · slower"
+        } else {
+            "most accurate · ~2.5× slower"
+        }
+        .to_string(),
+    )
 }
 
 /// Enumerate cleanup models under `<models base>/llm/<name>/*.gguf`, where the
@@ -196,6 +244,7 @@ fn discover_llm_models_in(root: &Path) -> Vec<ModelChoice> {
                 if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
                     let abs = std::fs::canonicalize(&p).unwrap_or(p);
                     out.push(ModelChoice {
+                        hint: model_hint(&label),
                         label: label.clone(),
                         path: abs.to_string_lossy().into_owned(),
                     });
@@ -211,6 +260,25 @@ fn discover_llm_models_in(root: &Path) -> Vec<ModelChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn param_billions_parsing() {
+        assert_eq!(parse_param_billions("gemma-3-1b-it"), Some(1.0));
+        assert_eq!(parse_param_billions("gemma-3-4b-it"), Some(4.0));
+        assert_eq!(parse_param_billions("qwen-2.5-0.5b-it"), Some(0.5));
+        assert_eq!(parse_param_billions("smollm2-360m-it"), Some(0.36));
+        assert_eq!(parse_param_billions("llama-3.2-1b-it"), Some(1.0));
+        // No size token → None (the "3" in "gemma-3" must not be misread).
+        assert_eq!(parse_param_billions("some-model-it"), None);
+    }
+
+    #[test]
+    fn model_hints_bucket_by_size() {
+        assert_eq!(model_hint("smollm2-360m-it").as_deref(), Some("fastest · roughest cleanup"));
+        assert_eq!(model_hint("gemma-3-1b-it").as_deref(), Some("fast · recommended"));
+        assert_eq!(model_hint("gemma-3-4b-it").as_deref(), Some("most accurate · ~2.5× slower"));
+        assert_eq!(model_hint("mystery-model").as_deref(), None);
+    }
 
     #[test]
     fn parse_keycode_decimal_and_hex() {
