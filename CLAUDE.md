@@ -61,6 +61,30 @@ Support/Local Dictation/models` (dev symlink → repo) > `./models` (repo-relati
 Per-model env overrides (`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`) and `settings.json` still win.
 TODO (someday): let end users drop in / switch alternate cleanup models.
 
+## Iterating fast (which loop am I in?)
+
+The model + all config are read **once at daemon boot**, so changes take effect on relaunch — but
+there are two very different loops, and only one needs a rebuild:
+
+1. **Tuning prompts / formats / corrections (no code change).** Edit
+   `~/.config/local-dictation/prompts.json` (or `settings.json` / `corrections.json`), then
+   **`./scripts/reload-daemon.sh`** — it kills the running daemon and relaunches the *same*
+   installed bundle, so the signature is unchanged and macOS keeps the Mic + Accessibility grants.
+   Even faster: don't touch the live app at all — A/B candidate prompts with the offline harness
+   **`cargo run --release --features cleaner --example prompt_lab`** (loads Gemma once, scores a
+   corpus; see `prompts-lab/`). This is the right loop for prompt work.
+
+2. **Changing code or built-in defaults** (`src/**`, the `DEFAULT_*` consts in `prompts.rs`).
+   Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. Because the bundle is
+   *ad-hoc* signed, a rebuild changes the signature hash and **macOS may revoke + re-prompt for
+   Accessibility/Microphone** — the daemon will exit at boot (`daemon.rs` permission check) until
+   you re-grant it in System Settings → Privacy & Security. An agent cannot grant this; it requires
+   the user. (A real Developer ID signature would make the grant stick across rebuilds.)
+
+Gotcha: `build-app.sh --install` runs `open`, which only *activates* an already-running instance
+rather than replacing it — so after an `--install` you still need a real relaunch
+(`reload-daemon.sh`, or quit from the menu bar) to run the new binary.
+
 ## Feature flags are the architecture
 
 The crate is split by Cargo features so the lib and tests build without native/model deps. This
