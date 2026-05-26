@@ -79,6 +79,28 @@ fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
+/// True when cleanup output looks like a model runaway and the caller should
+/// fall back to the raw transcript: it emptied non-empty input, it ballooned far
+/// beyond the input (cleanup never legitimately expands much — even list/email
+/// presets restructure, they don't 4×), or it leaked a chat-template marker that
+/// `text_polish::polish` failed to strip. Pure + cheap so it's always safe to run.
+fn cleanup_ran_away(raw: &str, cleaned: &str) -> bool {
+    let raw_chars = raw.chars().count();
+    if raw_chars == 0 {
+        return false;
+    }
+    let out_chars = cleaned.chars().count();
+    if out_chars == 0 {
+        return true; // dropped all content
+    }
+    if out_chars > raw_chars * 4 + 32 {
+        return true; // ballooned — almost certainly hallucinated
+    }
+    // Belt-and-suspenders past `polish`: any leaked chat-template marker.
+    const MARKERS: &[&str] = &["<|", "<start_of_turn>", "<end_of_turn>", "</s>", "<s>"];
+    MARKERS.iter().any(|m| cleaned.contains(m))
+}
+
 pub struct TextCleanupEngine {
     model: Arc<LlamaModel>,
     chat_template: Arc<LlamaChatTemplate>,
@@ -276,7 +298,22 @@ impl TextCleanupEngine {
         let cleaned = self.run_chat(user_msg, budget, self.format_active, false).await?;
         // Deterministic mechanics the 1B does unreliably (leading "um", lone
         // lowercase "i") — cheap, exact, and always safe on speech.
-        Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
+        let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
+        // Runaway guard: a 1B can occasionally hallucinate — drop everything, or
+        // balloon a short utterance into paragraphs, or leak chat-template
+        // markers past `polish`. Cleanup never legitimately expands much, so on
+        // any of those, fall back to the raw transcript rather than inject
+        // garbage. Near-zero cost; protects the worst case. (The daemon still
+        // logs the milder shrink case separately.)
+        if cleanup_ran_away(raw, &cleaned) {
+            eprintln!(
+                "[warn] cleanup runaway (raw {} → {} chars); using raw transcript",
+                raw.chars().count(),
+                cleaned.chars().count()
+            );
+            return Ok(raw.to_string());
+        }
+        Ok(cleaned)
     }
 
     /// Rough token count for sizing generation budgets / the context window.
@@ -551,4 +588,26 @@ fn run_job(
     } else {
         crate::text_polish::polish(&out)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cleanup_ran_away;
+
+    #[test]
+    fn runaway_guard() {
+        // Normal cleanup (slightly shorter/longer) is fine.
+        assert!(!cleanup_ran_away("um so i think we should ship it", "I think we should ship it."));
+        assert!(!cleanup_ran_away("call it parakeet", "Call it Parakeet."));
+        // Empty input → never a runaway.
+        assert!(!cleanup_ran_away("", ""));
+        // Dropped all content from real input → runaway.
+        assert!(cleanup_ran_away("ship the build today", ""));
+        // Ballooned far beyond input → runaway.
+        let raw = "ship it";
+        let huge = "Here is a long elaboration ".repeat(20);
+        assert!(cleanup_ran_away(raw, &huge));
+        // Leaked chat-template marker → runaway even if length is reasonable.
+        assert!(cleanup_ran_away("ship it now please", "Ship it now please.<end_of_turn>"));
+    }
 }
