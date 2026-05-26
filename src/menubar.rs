@@ -888,22 +888,48 @@ fn dictionary_ui(mtm: MainThreadMarker) -> &'static DictionaryUi {
 }
 
 fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
-    let win_w = 460.0;
-    let win_h = 460.0;
-    let margin = 12.0;
-    let btn_w = 90.0;
-    let btn_h = 32.0;
+    let win_w = 440.0;
+    let win_h = 400.0;
+    let margin = 16.0;
+    let btn_w = 88.0;
+    let btn_h = 30.0;
+    let label_h = 16.0;
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(win_w, win_h));
 
-    // Container content view: editable text area on top, Save button bottom-right.
+    // Container content view: a hint label on top, the editable text area in the
+    // middle, a Save button bottom-right.
     let container: Retained<NSView> =
         unsafe { NSView::initWithFrame(NSView::alloc(mtm), frame) };
 
-    // Scrollable, editable text area — one term per line.
-    let scroll_y = margin + btn_h + margin;
+    // Instruction label (in-window, so it isn't truncated like a long subtitle).
+    let label_y = win_h - margin - label_h;
+    let label: Retained<NSTextField> = unsafe {
+        msg_send![
+            NSTextField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(margin, label_y),
+                NSSize::new(win_w - 2.0 * margin, label_h),
+            )
+        ]
+    };
+    unsafe {
+        label.setStringValue(&NSString::from_str(
+            "One word or phrase per line — names & terms to keep spelled exactly.",
+        ));
+        label.setBezeled(false);
+        label.setDrawsBackground(false);
+        label.setEditable(false);
+        label.setSelectable(false);
+        label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        let _: () = msg_send![&*label, setTextColor: &*NSColor::secondaryLabelColor()];
+        container.addSubview(&label);
+    }
+
+    // Bordered, padded, editable text area — one term per line.
+    let scroll_y = margin + btn_h + 14.0;
     let scroll_frame = NSRect::new(
         NSPoint::new(margin, scroll_y),
-        NSSize::new(win_w - 2.0 * margin, win_h - scroll_y - margin),
+        NSSize::new(win_w - 2.0 * margin, label_y - 8.0 - scroll_y),
     );
     let scroll: Retained<NSScrollView> =
         unsafe { msg_send![NSScrollView::alloc(mtm), initWithFrame: scroll_frame] };
@@ -918,11 +944,15 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setDrawsBackground(true);
-        scroll.setBackgroundColor(&NSColor::controlBackgroundColor());
+        scroll.setBackgroundColor(&NSColor::textBackgroundColor());
+        // Bezel border so the area reads as a defined editable field.
+        let _: () = msg_send![&*scroll, setBorderType: 2usize]; // NSBezelBorder
 
         tv.setEditable(true);
         tv.setRichText(false);
         tv.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        // Padding so the caret/text isn't jammed into the corner.
+        let _: () = msg_send![&*tv, setTextContainerInset: NSSize::new(8.0, 8.0)];
         tv.setMinSize(NSSize::new(0.0, content.height));
         tv.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
         tv.setVerticallyResizable(true);
@@ -958,8 +988,6 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
     };
     unsafe {
         window.setTitle(&NSString::from_str("Dictionary"));
-        let hint = NSString::from_str("One word or phrase per line · Save applies on relaunch");
-        let _: () = msg_send![&*window, setSubtitle: &*hint];
         window.setReleasedWhenClosed(false);
         window.setContentView(Some(&*container));
         window.center();
@@ -982,12 +1010,11 @@ fn show_dictionary_window(actions: &MenuActions) {
         ui.save_button.setAction(Some(sel!(saveDictionary:)));
     }
 
-    // Load current terms, one per line.
+    // Load current terms, one per line. The in-window label carries the hint,
+    // so the title bar stays clean ("Dictionary").
     let joined = crate::dictionary::load_default().join("\n");
     unsafe {
         ui.text_view.setString(&NSString::from_str(&joined));
-        let hint = NSString::from_str("One word or phrase per line · Save applies on relaunch");
-        let _: () = msg_send![&*ui.window, setSubtitle: &*hint];
         ui.window.makeKeyAndOrderFront(None);
     }
     // Accessory app: explicitly activate so the window comes to the front.
@@ -1012,8 +1039,7 @@ fn save_dictionary_from_view() {
     match crate::dictionary::save(&terms) {
         Ok(()) => {
             unsafe {
-                let msg =
-                    NSString::from_str(&format!("Saved {} term(s) — relaunching…", terms.len()));
+                let msg = NSString::from_str(&format!("Saved {} term(s)", terms.len()));
                 let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
             }
             // The cleaner reads the dictionary once at boot, so relaunch to
