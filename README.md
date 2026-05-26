@@ -311,3 +311,18 @@ cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey
 Dual-licensed under MIT OR Apache-2.0, at your option. See [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).
 
 Models are not redistributed by this repo. Parakeet TDT v3 is © NVIDIA under their license; Gemma 3 is under Google's Gemma terms. Check each model's repo before commercial use.
+
+## Acknowledgements
+
+This is a thin shell around some excellent on-device models and runtimes. Standing on:
+
+* [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — FastConformer TDT speech-recognition model (the ASR half)
+* [Gemma 3 1B-IT](https://huggingface.co/google/gemma-3-1b-it) by Google — the on-device LLM that cleans up each utterance
+* [parakeet-rs](https://github.com/cdpierse/parakeet-rs) — Rust inference for Parakeet, the bridge to the ONNX model
+* [ONNX Runtime](https://github.com/microsoft/onnxruntime) via [`ort`](https://github.com/pykeio/ort) — CoreML-accelerated ASR inference
+* [llama.cpp](https://github.com/ggml-org/llama.cpp) via [`llama-cpp-2`](https://github.com/utilityai/llama-cpp-rs) — Metal-accelerated Gemma inference
+* [cpal](https://github.com/RustAudio/cpal) — cross-platform audio capture (the mic input ring buffer)
+* [objc2](https://github.com/madsmtm/objc2) — Rust bindings to the macOS Accessibility, AppKit, and Core Graphics APIs (hotkey tap, text injection, menu bar, waveform pill)
+* [arboard](https://github.com/1Password/arboard) — clipboard access for the Electron-app injection fallback
+
+Inspired in part by [muesli](https://github.com/pHequals7/muesli) and the broader wave of local-first, on-device dictation tools.
