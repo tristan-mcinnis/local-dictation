@@ -324,5 +324,3 @@ This is a thin shell around some excellent on-device models and runtimes. Standi
 * [cpal](https://github.com/RustAudio/cpal) — cross-platform audio capture (the mic input ring buffer)
 * [objc2](https://github.com/madsmtm/objc2) — Rust bindings to the macOS Accessibility, AppKit, and Core Graphics APIs (hotkey tap, text injection, menu bar, waveform pill)
 * [arboard](https://github.com/1Password/arboard) — clipboard access for the Electron-app injection fallback
-
-Inspired in part by [muesli](https://github.com/pHequals7/muesli) and the broader wave of local-first, on-device dictation tools.
