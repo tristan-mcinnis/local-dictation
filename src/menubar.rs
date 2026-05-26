@@ -232,6 +232,7 @@ pub fn init_and_run() -> eyre::Result<()> {
 
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    install_main_menu(mtm, &app);
 
     let actions = MenuActions::new();
     let built = build_status_item(mtm, &actions)?;
@@ -254,6 +255,53 @@ pub fn init_and_run() -> eyre::Result<()> {
     install_poll_timer();
     app.run();
     Ok(())
+}
+
+/// Install a minimal application main menu carrying a standard **Edit** submenu
+/// (Undo/Redo/Cut/Copy/Paste/Select All).
+///
+/// Accessory (`LSUIElement`) apps get no main menu by default. Cocoa delivers
+/// the standard text-editing shortcuts — ⌘Z/⌘X/⌘C/⌘V/⌘A — via the Edit menu's
+/// *key equivalents*, so with no such menu Copy/Paste/Select-All simply do
+/// nothing inside the Dictionary editor's text view (the user's "copy button
+/// doesn't work"). Each item leaves its target nil, so the action travels up the
+/// responder chain to whatever text view is focused; the menu's default
+/// auto-enable then greys items out when they don't apply (e.g. Copy with no
+/// selection). The menu is never visible — it exists purely to route the keys.
+fn install_main_menu(mtm: MainThreadMarker, app: &NSApplication) {
+    let main_menu = NSMenu::new(mtm);
+
+    // Top-level item that owns the Edit submenu.
+    let edit_top = NSMenuItem::new(mtm);
+    let edit_menu = NSMenu::new(mtm);
+    unsafe { edit_menu.setTitle(&NSString::from_str("Edit")) };
+
+    // Standard first-responder editing actions + their conventional shortcuts.
+    // Target stays nil → routed up the responder chain to the focused view.
+    let edit_actions: &[(&str, objc2::runtime::Sel, &str)] = &[
+        ("Undo", sel!(undo:), "z"),
+        // Uppercase "Z" implies ⇧ in a key equivalent → ⇧⌘Z (Redo).
+        ("Redo", sel!(redo:), "Z"),
+        ("Cut", sel!(cut:), "x"),
+        ("Copy", sel!(copy:), "c"),
+        ("Paste", sel!(paste:), "v"),
+        ("Select All", sel!(selectAll:), "a"),
+    ];
+    for (title, selector, key) in edit_actions {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(*selector),
+                &NSString::from_str(key),
+            )
+        };
+        edit_menu.addItem(&item);
+    }
+
+    edit_top.setSubmenu(Some(&edit_menu));
+    main_menu.addItem(&edit_top);
+    app.setMainMenu(Some(&main_menu));
 }
 
 struct StatusItemBuild {
