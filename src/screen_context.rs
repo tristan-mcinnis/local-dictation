@@ -36,6 +36,26 @@ const STOPWORDS: &[&str] = &[
     "let's", "that's", "there's", "hello", "hi", "thanks", "thank",
 ];
 
+/// Take a window of `±radius` characters centred on `caret` from `text`. This
+/// is the relevance primitive for screen-context vocabulary: the text *around
+/// your cursor* in the focused field is what surrounds the words you're about to
+/// dictate — far higher signal than the whole field/window, and it keeps a tiny
+/// model from being cluttered with proper nouns from unrelated screen regions.
+/// Snaps to char boundaries; clamps to the text bounds.
+pub fn window_around(text: &str, caret: usize, radius: usize) -> &str {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let n = chars.len();
+    if n == 0 {
+        return "";
+    }
+    let caret = caret.min(n);
+    let start_ci = caret.saturating_sub(radius);
+    let end_ci = caret.saturating_add(radius).min(n);
+    let start_b = chars[start_ci].0;
+    let end_b = if end_ci >= n { text.len() } else { chars[end_ci].0 };
+    &text[start_b..end_b]
+}
+
 /// Extract up to `cap` proper-noun / domain-term candidates from a blob of
 /// on-screen text, preferring tokens the ASR is most likely to get wrong
 /// (mixed-case like `macOS`, identifiers, then plain proper nouns). The
@@ -192,5 +212,31 @@ mod tests {
     fn respects_cap_and_zero() {
         assert!(extract_terms("Alpha Bravo Charlie Delta Echo", 2).len() <= 2);
         assert!(extract_terms("Alpha Bravo", 0).is_empty());
+    }
+
+    #[test]
+    fn window_around_caret_clamps_and_centres() {
+        let text = "0123456789ABCDEFGHIJ"; // 20 chars
+        // Around index 10, radius 3 → chars [7,13).
+        assert_eq!(window_around(text, 10, 3), "789ABC");
+        // Caret at start clamps low edge.
+        assert_eq!(window_around(text, 0, 3), "012");
+        // Caret past end clamps to text end.
+        assert_eq!(window_around(text, 999, 3), "HIJ");
+        // Empty text is safe.
+        assert_eq!(window_around("", 5, 3), "");
+    }
+
+    #[test]
+    fn window_then_extract_keeps_only_nearby_names() {
+        // Names far from the caret must NOT be harvested — only the caret window.
+        let text = "FarawayProject discussion ... talking about Lingzi and Parakeet here";
+        let caret = text.find("Lingzi").unwrap_or(0);
+        // char index of the caret (find returns a byte index; ASCII here so equal)
+        let win = window_around(text, caret, 20);
+        let terms = extract_terms(win, 16);
+        assert!(terms.contains(&"Lingzi".to_string()));
+        assert!(terms.contains(&"Parakeet".to_string()));
+        assert!(!terms.contains(&"FarawayProject".to_string()), "got {terms:?}");
     }
 }

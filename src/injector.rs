@@ -197,9 +197,9 @@ mod imp {
     use super::*;
     use accessibility_sys::{
         kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute,
-        kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute, kAXTitleAttribute,
+        kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute,
         kAXTrustedCheckOptionPrompt, kAXValueAttribute, kAXValueTypeCFRange,
-        kAXWindowAttribute, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
+        AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
         AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
         AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
@@ -463,46 +463,60 @@ mod imp {
         }
     }
 
-    /// Read a string-valued attribute off an element, or `None` if absent.
-    unsafe fn read_string_attr(elem: AXUIElementRef, attr: &str) -> Option<String> {
-        let mut value_ref: CFTypeRef = ptr::null();
-        let cf_attr = CFString::new(attr);
-        let err =
-            AXUIElementCopyAttributeValue(elem, cf_attr.as_concrete_TypeRef(), &mut value_ref);
-        if err != kAXErrorSuccess || value_ref.is_null() {
-            return None;
-        }
-        Some(CFString::wrap_under_create_rule(value_ref as CFStringRef).to_string())
-    }
+    /// ±chars of focused-field text harvested around the caret. The text *near
+    /// your cursor* is what surrounds the words you're about to dictate — the
+    /// highest-signal, lowest-noise slice. Deliberately small so a focused
+    /// document can't flood the cleanup prompt with unrelated proper nouns.
+    const HARVEST_RADIUS: usize = 600;
 
-    /// Harvest visible text near the focus for vocabulary extraction: the
-    /// focused element's value (the document/field you're editing) plus the
-    /// containing window's title. Best-effort — returns `None` only when AX
-    /// discloses nothing. Runs in the parallel focus-capture thread, so its cost
-    /// is hidden behind the inference pipeline.
-    unsafe fn harvest_screen_text(focused: AXUIElementRef) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(v) = read_value(focused) {
-            parts.push(v);
-        }
-        // Window title: focused element → kAXWindow → kAXTitle.
-        let mut window_ref: CFTypeRef = ptr::null();
-        let window_attr = CFString::new(kAXWindowAttribute);
+    /// Read the caret position (char index) from `kAXSelectedTextRange`, or
+    /// `None` if the element doesn't expose it. The location is a UTF-16 index;
+    /// for ASCII (the dominant dictation case) it equals the char index, and
+    /// for non-BMP text it's a close-enough anchor for windowing.
+    unsafe fn read_caret_index(focused: AXUIElementRef) -> Option<usize> {
+        let mut range_ref: CFTypeRef = ptr::null();
+        let range_attr = CFString::new(kAXSelectedTextRangeAttribute);
         let err = AXUIElementCopyAttributeValue(
             focused,
-            window_attr.as_concrete_TypeRef(),
-            &mut window_ref,
+            range_attr.as_concrete_TypeRef(),
+            &mut range_ref,
         );
-        if err == kAXErrorSuccess && !window_ref.is_null() {
-            if let Some(title) = read_string_attr(window_ref as AXUIElementRef, kAXTitleAttribute) {
-                parts.push(title);
-            }
-            cf_release(window_ref);
+        if err != kAXErrorSuccess || range_ref.is_null() {
+            return None;
         }
-        if parts.is_empty() {
+        let mut cf_range = CFRange { location: 0, length: 0 };
+        let got = AXValueGetValue(
+            range_ref as AXValueRef,
+            kAXValueTypeCFRange,
+            &mut cf_range as *mut _ as *mut c_void,
+        );
+        cf_release(range_ref);
+        if got && cf_range.location >= 0 {
+            Some(cf_range.location as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Harvest the screen-context vocabulary source: a small window of the
+    /// FOCUSED element's text centred on the caret. NOT the window title, NOT
+    /// other panes/sidebars/terminals (those are separate AX elements we never
+    /// touch). Best-effort — `None` when AX exposes no field text (e.g. Electron
+    /// editors, empty fields), which correctly contributes nothing rather than
+    /// clutter. Runs in the parallel focus-capture thread, so it's off the
+    /// critical path.
+    unsafe fn harvest_screen_text(focused: AXUIElementRef) -> Option<String> {
+        let value = read_value(focused)?;
+        if value.trim().is_empty() {
+            return None;
+        }
+        // Anchor at the caret; default to end-of-field (dictation usually appends).
+        let caret = read_caret_index(focused).unwrap_or_else(|| value.chars().count());
+        let window = crate::screen_context::window_around(&value, caret, HARVEST_RADIUS);
+        if window.trim().is_empty() {
             None
         } else {
-            Some(parts.join("\n"))
+            Some(window.to_string())
         }
     }
 
