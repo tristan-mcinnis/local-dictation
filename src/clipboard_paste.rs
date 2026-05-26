@@ -33,7 +33,7 @@ const KEY_ESCAPE: CGKeyCode = 53;
 // pasteboard). Scale a base delay by text length, capped so we never stall the
 // hot path unreasonably.
 const PASTE_SETTLE_BASE_MS: u64 = 280;
-const PASTE_SETTLE_MAX_MS: u64 = 1500;
+const PASTE_SETTLE_MAX_MS: u64 = 1000;
 
 /// Settle time before restoring the clipboard, scaled by paste size.
 /// `+1 ms per ~3 chars` on top of the base, clamped to the max.
