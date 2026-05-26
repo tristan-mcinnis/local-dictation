@@ -594,6 +594,33 @@ fn worker_loop(
                     Err(_) => target_rx.recv().ok().and_then(|r| r.ok()),
                 };
                 let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
+
+                // ─── Spoken prefix command (e.g. "translate to Chinese …") ──
+                // A recognised lead-in at the START of the utterance turns the
+                // rest into a one-shot transform: translate the spoken body and
+                // inject the result at the cursor. Reuses the warm Gemma
+                // transform engine — no selection, no second gesture. Detection
+                // is deterministic (no model on the decision path); the model
+                // only runs once we know it's a command. Falls through to normal
+                // dictation when nothing matches, or when running --no-cleanup.
+                #[cfg(feature = "cleaner")]
+                if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript) {
+                    match cleaner {
+                        Some(ref c) => {
+                            handle_spoken_command(&rt, c, cmd, captured_target);
+                            eprintln!();
+                            ui_channel::set_state(UiState::Idle);
+                            continue;
+                        }
+                        None => {
+                            eprintln!(
+                                "  ✗    \"{}\" needs the cleanup engine (running with --no-cleanup) — dictating as-is",
+                                cmd.label
+                            );
+                        }
+                    }
+                }
+
                 // Terminals draw their own text grid and almost always receive
                 // shell commands, not prose — Gemma cleanup corrupts more than
                 // it helps there, so inject the raw transcript instead. Every
@@ -794,6 +821,55 @@ fn handle_transform(
         Ok(()) => eprintln!("  ✓    transformed in {} ms → \"{result}\"", ms(t.elapsed())),
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
+            cues::play_error();
+        }
+    }
+}
+
+/// Spoken prefix command (e.g. "translate to Chinese …"): run the resolved
+/// transform on the spoken body with the warm Gemma engine and inject the result
+/// at the cursor, like a normal dictation. Unlike `handle_transform` there's no
+/// selection and no clipboard round-trip — the body is fresh speech, so we
+/// inject straight into the focus target (with the usual AX/clipboard fallback).
+/// Cleanup and refinement are deliberately skipped: the output is already the
+/// final text (often a non-English translation), and the corrections dictionary
+/// + trailing-command parse are English-prose transforms that don't apply.
+#[cfg(feature = "cleaner")]
+fn handle_spoken_command(
+    rt: &tokio::runtime::Runtime,
+    cleaner: &TextCleanupEngine,
+    cmd: crate::spoken_command::SpokenCommand,
+    captured_target: Option<FocusTarget>,
+) {
+    eprintln!("  ⌘    {} · {} chars", cmd.label, cmd.body.chars().count());
+    let t = Instant::now();
+    let result = match rt.block_on(cleaner.transform(&cmd.instruction, &cmd.body)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  ✗    command failed: {e:?}");
+            cues::play_error();
+            return;
+        }
+    };
+    let result = result.trim();
+    if result.is_empty() {
+        eprintln!("  ✗    command produced no output");
+        cues::play_error();
+        return;
+    }
+
+    let inject_result = match captured_target {
+        Some(target) => AccessibilityInjector::inject_with_target(target, result),
+        None => AccessibilityInjector::inject_text(result),
+    };
+    match inject_result {
+        Ok(()) => {
+            eprintln!("  ✓    {} ms → \"{result}\"", ms(t.elapsed()));
+            ui_channel::set_last_dictation(result);
+            crate::history::record(result);
+        }
+        Err(e) => {
+            eprintln!("  ✗    inject failed: {e:?}");
             cues::play_error();
         }
     }
