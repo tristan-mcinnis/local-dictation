@@ -28,7 +28,8 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
     NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSLineBreakMode,
     NSMenu, NSMenuItem, NSScreen, NSScrollView, NSStatusBar, NSStatusItem, NSTextAlignment,
-    NSTextField, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
+    NSTextField, NSTextView, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
@@ -130,6 +131,16 @@ define_class!(
         #[unsafe(method(openCorrections:))]
         fn open_corrections(&self, _sender: *mut AnyObject) {
             open_corrections_folder();
+        }
+
+        #[unsafe(method(openDictionary:))]
+        fn open_dictionary(&self, _sender: *mut AnyObject) {
+            show_dictionary_window(self);
+        }
+
+        #[unsafe(method(saveDictionary:))]
+        fn save_dictionary(&self, _sender: *mut AnyObject) {
+            save_dictionary_from_view();
         }
 
         #[unsafe(method(editPrompts:))]
@@ -332,6 +343,12 @@ fn build_status_item(
     // verbose daemon log.
     let history_item = action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions);
     menu.addItem(&history_item);
+
+    // Simple editor for the personal dictionary (names/terms to keep spelled
+    // verbatim). Counterpart to Dictation History — one clean native window.
+    let dictionary_item =
+        action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
+    menu.addItem(&dictionary_item);
 
     menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
 
@@ -845,6 +862,172 @@ fn open_prompts_file() {
         .arg("-t")
         .arg(&path)
         .status();
+}
+
+// ─── Dictionary editor window ───────────────────────────────────────────
+//
+// A small native window mirroring Dictation History: one editable text view,
+// one term per line, plus a Save button. Save writes dictionary.json and
+// relaunches the daemon so the new vocabulary takes effect (the cleaner reads
+// the dictionary once at boot) — same apply-on-relaunch model as the settings.
+
+struct DictionaryUi {
+    window: Retained<NSWindow>,
+    text_view: Retained<NSTextView>,
+    save_button: Retained<NSButton>,
+}
+// Only ever touched on the main thread (menu actions), so parking the AppKit
+// pointers in a static is safe.
+unsafe impl Send for DictionaryUi {}
+unsafe impl Sync for DictionaryUi {}
+
+static DICTIONARY_UI: OnceLock<DictionaryUi> = OnceLock::new();
+
+fn dictionary_ui(mtm: MainThreadMarker) -> &'static DictionaryUi {
+    DICTIONARY_UI.get_or_init(|| build_dictionary_window(mtm))
+}
+
+fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
+    let win_w = 460.0;
+    let win_h = 460.0;
+    let margin = 12.0;
+    let btn_w = 90.0;
+    let btn_h = 32.0;
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(win_w, win_h));
+
+    // Container content view: editable text area on top, Save button bottom-right.
+    let container: Retained<NSView> =
+        unsafe { NSView::initWithFrame(NSView::alloc(mtm), frame) };
+
+    // Scrollable, editable text area — one term per line.
+    let scroll_y = margin + btn_h + margin;
+    let scroll_frame = NSRect::new(
+        NSPoint::new(margin, scroll_y),
+        NSSize::new(win_w - 2.0 * margin, win_h - scroll_y - margin),
+    );
+    let scroll: Retained<NSScrollView> =
+        unsafe { msg_send![NSScrollView::alloc(mtm), initWithFrame: scroll_frame] };
+    let content = unsafe { scroll.contentSize() };
+    let tv: Retained<NSTextView> = unsafe {
+        msg_send![
+            NSTextView::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), content)
+        ]
+    };
+    unsafe {
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(true);
+        scroll.setBackgroundColor(&NSColor::controlBackgroundColor());
+
+        tv.setEditable(true);
+        tv.setRichText(false);
+        tv.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        tv.setMinSize(NSSize::new(0.0, content.height));
+        tv.setMaxSize(NSSize::new(f64::MAX, f64::MAX));
+        tv.setVerticallyResizable(true);
+        tv.setHorizontallyResizable(false);
+        scroll.setDocumentView(Some(&*tv));
+        container.addSubview(&scroll);
+    }
+
+    // Save button, bottom-right.
+    let btn_frame = NSRect::new(
+        NSPoint::new(win_w - margin - btn_w, margin),
+        NSSize::new(btn_w, btn_h),
+    );
+    let save_button: Retained<NSButton> =
+        unsafe { msg_send![NSButton::alloc(mtm), initWithFrame: btn_frame] };
+    unsafe {
+        save_button.setTitle(&NSString::from_str("Save"));
+        let _: () = msg_send![&*save_button, setBezelStyle: 1usize]; // rounded
+        container.addSubview(&save_button);
+    }
+
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable;
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            frame,
+            style,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe {
+        window.setTitle(&NSString::from_str("Dictionary"));
+        let hint = NSString::from_str("One word or phrase per line · Save applies on relaunch");
+        let _: () = msg_send![&*window, setSubtitle: &*hint];
+        window.setReleasedWhenClosed(false);
+        window.setContentView(Some(&*container));
+        window.center();
+    }
+
+    DictionaryUi { window, text_view: tv, save_button }
+}
+
+/// Open the dictionary editor, pre-filled from dictionary.json, wired to save
+/// back to it. `actions` targets the Save button.
+fn show_dictionary_window(actions: &MenuActions) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let ui = dictionary_ui(mtm);
+
+    // Wire Save → saveDictionary: on the actions instance (idempotent).
+    unsafe {
+        ui.save_button.setTarget(Some(actions));
+        ui.save_button.setAction(Some(sel!(saveDictionary:)));
+    }
+
+    // Load current terms, one per line.
+    let joined = crate::dictionary::load_default().join("\n");
+    unsafe {
+        ui.text_view.setString(&NSString::from_str(&joined));
+        let hint = NSString::from_str("One word or phrase per line · Save applies on relaunch");
+        let _: () = msg_send![&*ui.window, setSubtitle: &*hint];
+        ui.window.makeKeyAndOrderFront(None);
+    }
+    // Accessory app: explicitly activate so the window comes to the front.
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    unsafe {
+        app.activateIgnoringOtherApps(true)
+    };
+}
+
+/// Read the editor, write dictionary.json, and relaunch so it takes effect.
+fn save_dictionary_from_view() {
+    let Some(ui) = DICTIONARY_UI.get() else {
+        return;
+    };
+    let text = unsafe { ui.text_view.string() }.to_string();
+    let terms: Vec<String> = text
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('_'))
+        .collect();
+    match crate::dictionary::save(&terms) {
+        Ok(()) => {
+            unsafe {
+                let msg =
+                    NSString::from_str(&format!("Saved {} term(s) — relaunching…", terms.len()));
+                let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
+            }
+            // The cleaner reads the dictionary once at boot, so relaunch to
+            // apply — same as the model / hotkey settings.
+            relaunch_daemon();
+        }
+        Err(e) => {
+            eprintln!("[menu] dictionary save failed: {e}");
+            unsafe {
+                let msg = NSString::from_str("Save failed — see log");
+                let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
+            }
+        }
+    }
 }
 
 // ─── Dictation history window ───────────────────────────────────────────
