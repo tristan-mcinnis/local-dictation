@@ -5,7 +5,9 @@
 //! Limitation: we only save/restore plain-text clipboard contents. RTF,
 //! images, file URLs etc. on the clipboard at injection time will be lost.
 //! Worth fixing later with NSPasteboard multi-type round-trip; sufficient
-//! for v1.
+//! for v1. We do, however, guard the restore with the pasteboard's
+//! `changeCount` so a user copying something during the paste-settle window
+//! isn't clobbered (see [`paste_via_clipboard`]).
 
 use arboard::Clipboard;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
@@ -54,6 +56,18 @@ fn clean_event_source() -> eyre::Result<CGEventSource> {
         .map_err(|_| eyre::eyre!("CGEventSource::new failed"))
 }
 
+/// The general pasteboard's `changeCount` — bumps whenever anything writes to
+/// the clipboard. We read it right after our own write, then again before
+/// restoring, to detect a user (or another app) copying something during the
+/// paste-settle window. `None` if the read fails (then we fall back to the old
+/// unconditional restore).
+fn pasteboard_change_count() -> Option<isize> {
+    use objc2_app_kit::NSPasteboard;
+    // NSPasteboard is thread-safe; changeCount is a plain read.
+    let pb = NSPasteboard::generalPasteboard();
+    Some(pb.changeCount())
+}
+
 pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
     let mut cb = Clipboard::new()
         .map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
@@ -65,12 +79,26 @@ pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
     cb.set_text(text)
         .map_err(|e| eyre::eyre!("Clipboard::set_text failed: {e}"))?;
 
+    // changeCount right after our write. Cmd+V only reads the pasteboard, so this
+    // stays put unless the user copies something during the settle wait below.
+    let our_count = pasteboard_change_count();
+
     synthesize_cmd_v()?;
 
     std::thread::sleep(Duration::from_millis(paste_settle_ms(text.chars().count())));
 
     if let Some(orig) = saved {
-        let _ = cb.set_text(orig);
+        // Don't clobber a fresh copy: if the changeCount advanced past our write,
+        // the user copied something during the settle window — leave it alone.
+        let user_copied = matches!(
+            (our_count, pasteboard_change_count()),
+            (Some(a), Some(b)) if b != a
+        );
+        if user_copied {
+            eprintln!("[clipboard] user copied during paste; leaving their clipboard intact");
+        } else {
+            let _ = cb.set_text(orig);
+        }
     } else {
         // If the clipboard was empty before, leave our injected text on it
         // (better than wiping it — gives the user a manual paste fallback).
