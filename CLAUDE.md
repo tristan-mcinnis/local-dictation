@@ -7,6 +7,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Work directly on `main` — no worktrees, no feature branches. After every change, commit it and
 push to `origin/main` in the same step (don't wait to be asked). Keep the working tree clean.
 
+## Design principle (read before adding features)
+
+**Primitives, first-principles, extremely low latency — and tested before they go in.** This is a
+real-time tool fronting two small on-device models (Parakeet ASR, Gemma 3 1B). Every feature must
+earn its place against that:
+
+- **Lowest-latency method wins.** Reason from first principles about where the cost lands (is it on
+  the critical path, or hidden behind work already happening?). Prefer the cheapest primitive that
+  works — a native AX read over a screenshot, a deterministic string pass over an LLM call.
+- **Guard the small model's signal-to-noise.** Gemma 1B has a narrow job (clean *this* utterance).
+  Do NOT feed it broad/irrelevant context — favour the tightest, most relevant slice (e.g. text
+  around the caret, not the whole window). Cluttering the prompt degrades quality, not just speed.
+- **Measure, then decide.** Validate latency *and* accuracy with the harnesses (`examples/latency_lab`,
+  `prompts-lab/`, `context-probe`) before committing. If it doesn't fit the stack or doesn't pull its
+  weight on the numbers, don't add it. "It works" is not "it's worth it."
+- **Don't add heavyweight machinery** (OCR, vision LLMs, whole-window scraping) when a primitive gets
+  most of the value at a fraction of the cost/permissions. Park it explicitly with the reason.
+
 ## What this is
 
 A local-first, push-to-talk dictation daemon for Apple Silicon macOS. Hold a hotkey, speak,
