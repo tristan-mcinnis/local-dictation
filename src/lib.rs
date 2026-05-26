@@ -11,6 +11,7 @@ pub mod refiner;
 pub mod screen_context;
 pub mod settings;
 pub mod smart_pad;
+pub mod spoken_command;
 pub mod text_polish;
 pub mod transcriber;
 pub mod ui_channel;
