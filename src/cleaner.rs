@@ -158,9 +158,14 @@ impl TextCleanupEngine {
         // target spellings in corrections.json) so the model stops "correcting"
         // proper nouns and domain casing away. Best-effort — a missing or
         // unreadable corrections file just means no suffix.
-        let static_vocab = crate::corrections::Corrections::load_default()
+        // Curated vocabulary fed to the cleanup prompt: the target spellings
+        // from corrections.json (from→to fixes) plus the flat dictionary.json
+        // list (known words to preserve as-is). Both are soft hints; dedup +
+        // cap happen in `vocabulary_suffix`.
+        let mut static_vocab = crate::corrections::Corrections::load_default()
             .map(|c| c.replacement_values())
             .unwrap_or_default();
+        static_vocab.extend(crate::dictionary::load_default());
         if !static_vocab.is_empty() {
             eprintln!(
                 "[boot] vocab       {} curated term(s) + per-utterance screen terms",

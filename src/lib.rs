@@ -3,6 +3,7 @@ pub mod audio;
 pub mod audio_duck;
 pub mod corrections;
 pub mod cues;
+pub mod dictionary;
 pub mod history;
 pub mod injector;
 pub mod prompts;

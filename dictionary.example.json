@@ -1,0 +1,12 @@
+[
+  "_ Copy to ~/.config/local-dictation/dictionary.json and edit. A flat list of",
+  "_ names / products / domain terms that are ALREADY spelled how you want — the",
+  "_ cleanup model is told to preserve them instead of substituting a similar",
+  "_ common word. This is a soft hint only (no text is rewritten). For hard",
+  "_ from→to fixes (e.g. lings → Lingzi), use corrections.json instead.",
+  "_ Strings starting with _ are comments and ignored.",
+  "Parakeet",
+  "CGEventTap",
+  "llama.cpp",
+  "Anthropic"
+]
