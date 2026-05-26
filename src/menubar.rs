@@ -867,9 +867,10 @@ fn open_prompts_file() {
 // ─── Dictionary editor window ───────────────────────────────────────────
 //
 // A small native window mirroring Dictation History: one editable text view,
-// one term per line, plus a Save button. Save writes dictionary.json and
-// relaunches the daemon so the new vocabulary takes effect (the cleaner reads
-// the dictionary once at boot) — same apply-on-relaunch model as the settings.
+// one entry per line, plus a Save button. It edits the user's single vocabulary
+// list (corrections.json): a bare word means "keep this spelling", and
+// "from → to" is a mishearing fix. Save writes corrections.json and relaunches
+// the daemon so it takes effect — same apply-on-relaunch model as the settings.
 
 struct DictionaryUi {
     window: Retained<NSWindow>,
@@ -914,7 +915,7 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
     };
     unsafe {
         label.setStringValue(&NSString::from_str(
-            "One word or phrase per line — names & terms to keep spelled exactly.",
+            "One per line — a word to keep spelled as-is, or  heard → Word  to fix a mishearing.",
         ));
         label.setBezeled(false);
         label.setDrawsBackground(false);
@@ -1010,9 +1011,13 @@ fn show_dictionary_window(actions: &MenuActions) {
         ui.save_button.setAction(Some(sel!(saveDictionary:)));
     }
 
-    // Load current terms, one per line. The in-window label carries the hint,
-    // so the title bar stays clean ("Dictionary").
-    let joined = crate::dictionary::load_default().join("\n");
+    // Load the user's vocabulary from corrections.json, rendered as editor lines
+    // (bare word = keep spelling; "from → to" = fix). The in-window label carries
+    // the hint, so the title bar stays clean ("Dictionary").
+    let joined = crate::corrections::Corrections::load_default()
+        .map(|c| c.to_editor_lines())
+        .unwrap_or_default()
+        .join("\n");
     unsafe {
         ui.text_view.setString(&NSString::from_str(&joined));
         ui.window.makeKeyAndOrderFront(None);
@@ -1031,18 +1036,15 @@ fn save_dictionary_from_view() {
         return;
     };
     let text = unsafe { ui.text_view.string() }.to_string();
-    let terms: Vec<String> = text
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty() && !l.starts_with('_'))
-        .collect();
-    match crate::dictionary::save(&terms) {
+    let corrections = crate::corrections::Corrections::from_editor_text(&text);
+    let count = corrections.len();
+    match corrections.save() {
         Ok(()) => {
             unsafe {
-                let msg = NSString::from_str(&format!("Saved {} term(s)", terms.len()));
+                let msg = NSString::from_str(&format!("Saved {count} term(s)"));
                 let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
             }
-            // The cleaner reads the dictionary once at boot, so relaunch to
+            // The refiner/cleaner read corrections once at boot, so relaunch to
             // apply — same as the model / hotkey settings.
             relaunch_daemon();
         }
