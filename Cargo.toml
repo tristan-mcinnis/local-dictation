@@ -93,3 +93,9 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSPasteboard",
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
+
+# Round-3b VAD experiment only (examples/silero_seg.rs, vad_stream_lab.rs).
+# Same ort version + features as parakeet-rs pulls, so the crate unifies and we
+# don't double-link onnxruntime. Dev-only: never compiled into the daemon.
+[dev-dependencies]
+ort = { version = "=2.0.0-rc.12", features = ["std", "ndarray", "api-24"] }
