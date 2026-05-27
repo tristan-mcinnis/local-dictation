@@ -67,7 +67,27 @@ pub struct Settings {
     /// Overridable via `DICTATE_STREAMING_CLEANUP=1`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streaming_cleanup: Option<bool>,
+    /// Always-on mic: keep the input stream warm and retain this many ms of
+    /// pre-roll, so the first words aren't clipped and there's no stream-open
+    /// latency on key-press. `None`/absent ⇒ off (open-on-press, current
+    /// behaviour). A sensible on value is `400`. Override: `DICTATE_PREROLL_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preroll_ms: Option<u32>,
+    /// EXPERIMENTAL wake-word listen mode: while idle, transcribe speech and, on
+    /// hearing the wake word, dictate the rest into the focused field (no key).
+    /// Requires always-on mic (`preroll_ms` > 0). `None`/false ⇒ off. Override:
+    /// `DICTATE_LISTEN_MODE=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_mode: Option<bool>,
+    /// The phrase that triggers listen-mode dictation. `None`/blank ⇒
+    /// [`DEFAULT_WAKE_WORD`]. Override: `DICTATE_WAKE_WORD`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_word: Option<String>,
 }
+
+/// Default wake word for listen mode. Two distinct syllables, uncommon as a
+/// sentence opener, so false triggers in normal speech are rare.
+pub const DEFAULT_WAKE_WORD: &str = "computer";
 
 impl Settings {
     /// `~/.config/local-dictation/settings.json` (None if `$HOME` is unset).
@@ -121,6 +141,46 @@ impl Settings {
             return matches!(v.as_str(), "1" | "true" | "on" | "yes");
         }
         self.streaming_cleanup.unwrap_or(false)
+    }
+
+    /// Resolve the pre-roll lookback in ms: `DICTATE_PREROLL_MS` env > settings
+    /// > 0 (off). 0 means open-on-press (current behaviour); any positive value
+    /// enables the always-on warm stream with that much lookback.
+    pub fn resolve_preroll_ms(&self) -> u32 {
+        if let Ok(v) = std::env::var("DICTATE_PREROLL_MS") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                return n;
+            }
+        }
+        self.preroll_ms.unwrap_or(0)
+    }
+
+    /// Resolve listen mode: `DICTATE_LISTEN_MODE` env > settings > false. Note
+    /// the daemon additionally requires `resolve_preroll_ms() > 0` to actually
+    /// engage it (listen mode needs the always-on stream).
+    pub fn resolve_listen_mode(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_LISTEN_MODE") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.listen_mode.unwrap_or(false)
+    }
+
+    /// Resolve the wake word: `DICTATE_WAKE_WORD` env > settings > default.
+    /// Blank/whitespace falls back to [`DEFAULT_WAKE_WORD`].
+    pub fn resolve_wake_word(&self) -> String {
+        if let Ok(v) = std::env::var("DICTATE_WAKE_WORD") {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+        self.wake_word
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| DEFAULT_WAKE_WORD.to_string())
     }
 
     /// Resolve the hotkey keycode: `DICTATE_HOTKEY_KEYCODE` env > settings >
@@ -358,6 +418,39 @@ mod tests {
             let mut s3 = Settings::default();
             s3.active_format = Some("   ".into()); // blank ⇒ unset
             assert_eq!(s3.resolve_format(), None);
+        }
+    }
+
+    #[test]
+    fn preroll_resolves_off_by_default_and_from_settings() {
+        if std::env::var_os("DICTATE_PREROLL_MS").is_none() {
+            assert_eq!(Settings::default().resolve_preroll_ms(), 0);
+            let mut s = Settings::default();
+            s.preroll_ms = Some(400);
+            assert_eq!(s.resolve_preroll_ms(), 400);
+        }
+    }
+
+    #[test]
+    fn listen_mode_off_by_default() {
+        if std::env::var_os("DICTATE_LISTEN_MODE").is_none() {
+            assert!(!Settings::default().resolve_listen_mode());
+            let mut s = Settings::default();
+            s.listen_mode = Some(true);
+            assert!(s.resolve_listen_mode());
+        }
+    }
+
+    #[test]
+    fn wake_word_falls_back_to_default_when_blank() {
+        if std::env::var_os("DICTATE_WAKE_WORD").is_none() {
+            assert_eq!(Settings::default().resolve_wake_word(), DEFAULT_WAKE_WORD);
+            let mut s = Settings::default();
+            s.wake_word = Some("  ".into());
+            assert_eq!(s.resolve_wake_word(), DEFAULT_WAKE_WORD);
+            let mut s2 = Settings::default();
+            s2.wake_word = Some("jarvis".into());
+            assert_eq!(s2.resolve_wake_word(), "jarvis");
         }
     }
 

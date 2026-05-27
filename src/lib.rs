@@ -18,6 +18,7 @@ pub mod transcriber;
 pub mod ui_channel;
 pub mod vad;
 pub mod voice_commands;
+pub mod wake_word;
 
 #[cfg(feature = "cleaner")]
 pub mod cleaner;

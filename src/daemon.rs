@@ -467,7 +467,34 @@ fn worker_loop(
     };
     let refiner = Refiner::new(corrections);
 
-    // Per-utterance state.
+    // Always-on capture (pre-roll). When the user enables it, the mic stream is
+    // kept warm for the daemon's life and the last few hundred ms before each
+    // key press are retained, so the first words are never clipped and there's
+    // no stream-open latency on press. `None` ⇒ the proven open-on-press path
+    // (default). Created on the worker thread because the cpal Stream is !Send.
+    let preroll_ms = crate::settings::Settings::load().resolve_preroll_ms();
+    let mut always: Option<(crate::audio::AlwaysOnCapture, crate::audio::HeapAudioConsumer)> =
+        if preroll_ms > 0 {
+            let preroll = crate::audio::preroll_samples(preroll_ms);
+            let (mut ao, cons) = crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
+            match ao.start() {
+                Ok(()) => {
+                    eprintln!("[boot] always-on  mic warm · pre-roll {preroll_ms} ms");
+                    Some((ao, cons))
+                }
+                Err(e) => {
+                    eprintln!("[warn] always-on capture failed ({e}); using press-to-open");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    // True between a pre-roll StartRecording and its StopRecording (the
+    // always-on analogue of `engine.is_some()` for the open-on-press path).
+    let mut session_active = false;
+
+    // Per-utterance state (open-on-press path).
     let mut engine: Option<AudioCaptureEngine> = None;
     let mut consumer: Option<crate::audio::HeapAudioConsumer> = None;
     let mut is_recording: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
@@ -479,8 +506,14 @@ fn worker_loop(
     // the cleaner is loaded). When on, sentences are transcribed + cleaned at VAD
     // pauses *during* the hold, so only the final segment is outstanding at
     // release. The flag-off path below is byte-identical to before.
+    // Streaming cleanup and always-on pre-roll are mutually exclusive for now
+    // (both are experimental and drain the capture ring differently). Pre-roll
+    // wins when both are set — keep the always-on path on the simple
+    // whole-buffer transcribe.
     #[cfg(feature = "cleaner")]
-    let streaming = cleaner.is_some() && crate::settings::Settings::load().resolve_streaming_cleanup();
+    let streaming = cleaner.is_some()
+        && always.is_none()
+        && crate::settings::Settings::load().resolve_streaming_cleanup();
     #[cfg(not(feature = "cleaner"))]
     let streaming = false;
     if streaming {
@@ -537,7 +570,22 @@ fn worker_loop(
                 eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
             }
             DaemonEvent::StartRecording { transform } => {
-                if engine.is_some() {
+                if engine.is_some() || session_active {
+                    continue;
+                }
+                // Always-on (pre-roll) path: the stream is already warm — just
+                // open a session. The next audio callback flushes the pre-roll
+                // lookback (audio from *before* this press) into the consumer,
+                // then live audio, so the first words can't be clipped.
+                if let Some((ao, _)) = always.as_ref() {
+                    transform_mode = transform;
+                    t_press = Some(Instant::now());
+                    ao.begin_session();
+                    cues::play_start();
+                    crate::audio_duck::mute();
+                    ui_channel::set_state(UiState::Recording);
+                    eprintln!("▶ recording · pre-roll");
+                    session_active = true;
                     continue;
                 }
                 transform_mode = transform;
@@ -572,7 +620,14 @@ fn worker_loop(
                 }
             }
             DaemonEvent::StopRecording => {
-                let Some(mut e) = engine.take() else { continue };
+                // Either capture path may be live: open-on-press (`engine`) or
+                // always-on pre-roll (`session_active`). Nothing live ⇒ ignore.
+                let mut on_demand_engine = engine.take();
+                let always_on_session = session_active;
+                session_active = false;
+                if on_demand_engine.is_none() && !always_on_session {
+                    continue;
+                }
                 // Un-mute other audio when this arm exits — by any path
                 // (transcribe error, empty/discarded utterance, transform,
                 // or successful inject). The guard's Drop runs on every
@@ -583,7 +638,17 @@ fn worker_loop(
                 #[allow(unused_variables)]
                 let transform = transform_mode;
                 transform_mode = false;
-                e.stop_capture();
+                // Stop capture for whichever path is live. Open-on-press drops
+                // its engine (releasing the mic); always-on just ends the
+                // session — the warm stream keeps running for the next press.
+                if let Some(e) = on_demand_engine.as_mut() {
+                    e.stop_capture();
+                }
+                if always_on_session {
+                    if let Some((ao, _)) = always.as_ref() {
+                        ao.end_session();
+                    }
+                }
                 cues::play_stop();
                 ui_channel::set_state(UiState::Processing);
                 let press_to_release = t_press.take().map(|t| t.elapsed());
@@ -600,10 +665,6 @@ fn worker_loop(
                     let _ = target_tx.send(FocusTarget::capture());
                 });
 
-                #[allow(unused_mut)]
-                let mut c = consumer.take().unwrap();
-                let r = is_recording.take().unwrap();
-
                 let t_pipeline = Instant::now();
                 // When cleanup already happened per-segment during the hold,
                 // carry the assembled cleaned text forward so the cleanup step
@@ -616,6 +677,32 @@ fn worker_loop(
                 // segment; everything else takes the proven whole-buffer path,
                 // byte-for-byte unchanged.
                 let transcript: String = 'got: {
+                    // Always-on pre-roll: drain the warm stream's queued audio
+                    // (the pre-roll lookback the callback flushed at press +
+                    // everything since) and transcribe the whole buffer.
+                    if always_on_session {
+                        if let Some((ao, cons)) = always.as_mut() {
+                            let recflag = ao.recording_flag();
+                            let buf = crate::audio::drain_session(cons, &recflag);
+                            match worker.transcribe_pcm(&buf) {
+                                Ok(t) => break 'got t,
+                                Err(err) => {
+                                    eprintln!("[err]  transcribe failed: {err:?}");
+                                    cues::play_error();
+                                    ui_channel::set_state(UiState::Idle);
+                                    eprintln!();
+                                    continue 'evloop;
+                                }
+                            }
+                        }
+                    }
+
+                    // Open-on-press path (and the streaming variant) own a
+                    // per-utterance consumer; take it only here.
+                    #[allow(unused_mut)]
+                    let mut c = consumer.take().unwrap();
+                    let r = is_recording.take().unwrap();
+
                     #[cfg(feature = "cleaner")]
                     if streaming && stream.is_some() {
                         // Clean the final outstanding segment(s) now (this is the
