@@ -83,6 +83,100 @@ pub fn segment_speech(audio: &[f32], sr: u32, cfg: &VadConfig) -> Vec<(usize, us
     segs
 }
 
+/// Incremental front-end to [`segment_speech`] for the streaming-cleanup path.
+/// Audio is pushed in as it's captured; [`Self::take_complete`] returns the
+/// sample ranges of sentence-segments that are *confirmed finished* (a pause of
+/// at least `min_pause_ms` follows them), so the daemon can transcribe + clean
+/// them mid-hold. A segment is never emitted while it might still be growing, so
+/// callers never clean a half-spoken sentence. At key release,
+/// [`Self::take_final`] flushes whatever remains regardless of trailing silence.
+///
+/// Ranges are absolute offsets into the full pushed stream ([`Self::buf`]), and
+/// each is emitted exactly once. No audio padding/overlap is added — segment ASR
+/// of a pause-bounded clip already matches whole-buffer ASR, and overlap was
+/// measured to *hurt* (see examples/vad_stream_lab.rs).
+pub struct SegmentStream {
+    sr: u32,
+    cfg: VadConfig,
+    buf: Vec<f32>,
+    committed: usize,
+}
+
+impl SegmentStream {
+    pub fn new(sr: u32, cfg: VadConfig) -> Self {
+        // No audio overlap in the streaming path (measured to hurt).
+        Self { sr, cfg: VadConfig { pad_ms: 0.0, ..cfg }, buf: Vec::new(), committed: 0 }
+    }
+
+    /// Append newly captured samples.
+    pub fn push(&mut self, samples: &[f32]) {
+        self.buf.extend_from_slice(samples);
+    }
+
+    /// The full audio captured so far (ranges from `take_*` index into this).
+    pub fn buf(&self) -> &[f32] {
+        &self.buf
+    }
+
+    fn min_pause_samples(&self) -> usize {
+        (self.cfg.min_pause_ms / 1000.0 * self.sr as f32) as usize
+    }
+
+    /// Sample ranges of segments that are confirmed finished (a long-enough pause
+    /// follows). Advances the internal cursor past them so each emits once.
+    pub fn take_complete(&mut self) -> Vec<(usize, usize)> {
+        if self.committed >= self.buf.len() {
+            return Vec::new();
+        }
+        // A silence-only remainder comes back as one whole-range "segment" with no
+        // trailing pause, which maybe_emit correctly declines to emit.
+        let rel = segment_speech(&self.buf[self.committed..], self.sr, &self.cfg);
+        self.maybe_emit(rel)
+    }
+
+    /// Decide which of `rel` (relative ranges) are confirmed-finished, emit them
+    /// as absolute ranges, and advance the cursor.
+    fn maybe_emit(&mut self, rel: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        let buf_rel_len = self.buf.len() - self.committed;
+        let min_pause = self.min_pause_samples();
+        let n = rel.len();
+        let mut out = Vec::new();
+        for (idx, &(s, e)) in rel.iter().enumerate() {
+            let is_last = idx == n - 1;
+            // earlier segments were closed by a real pause; the last is finished
+            // only if enough silence trails it within the buffer.
+            let finished = !is_last || buf_rel_len.saturating_sub(e) >= min_pause;
+            if finished {
+                out.push((self.committed + s, self.committed + e));
+            } else {
+                break;
+            }
+        }
+        // Advance to the start of the first not-yet-finished segment, or to the
+        // end of the buffer if everything was emitted.
+        if out.len() == n {
+            self.committed = self.buf.len();
+        } else {
+            self.committed += rel[out.len()].0;
+        }
+        out
+    }
+
+    /// Flush all remaining audio as final segments (called at key release).
+    pub fn take_final(&mut self) -> Vec<(usize, usize)> {
+        if self.committed >= self.buf.len() {
+            return Vec::new();
+        }
+        let rel = segment_speech(&self.buf[self.committed..], self.sr, &self.cfg);
+        let base = self.committed;
+        self.committed = self.buf.len();
+        rel.into_iter()
+            .map(|(s, e)| (base + s, base + e))
+            .filter(|(s, e)| e > s)
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +226,52 @@ mod tests {
         tone(&mut a, 0.8, 0.5);
         let segs = segment_speech(&a, SR, &VadConfig::default());
         assert_eq!(segs.len(), 1, "200ms gap should not split: {segs:?}");
+    }
+
+    #[test]
+    fn stream_emits_finished_sentences_and_holds_the_open_one() {
+        let cfg = VadConfig::default();
+        let mut st = SegmentStream::new(SR, cfg);
+
+        // push: speech (sentence 1) — no trailing pause yet → nothing finished
+        let mut a = Vec::new();
+        tone(&mut a, 1.0, 0.5);
+        st.push(&a);
+        assert!(st.take_complete().is_empty(), "open sentence must not emit");
+
+        // push a long pause, then start sentence 2 → sentence 1 now confirmed
+        let mut b = Vec::new();
+        silence(&mut b, 0.5);
+        tone(&mut b, 0.5, 0.5);
+        st.push(&b);
+        let done = st.take_complete();
+        assert_eq!(done.len(), 1, "sentence 1 should be confirmed: {done:?}");
+
+        // sentence 2 is still open → nothing more until its pause or release
+        assert!(st.take_complete().is_empty());
+
+        // release: flush the tail
+        let fin = st.take_final();
+        assert_eq!(fin.len(), 1, "tail sentence at release: {fin:?}");
+    }
+
+    #[test]
+    fn stream_each_segment_emitted_once_and_covers_speech() {
+        let cfg = VadConfig::default();
+        let mut st = SegmentStream::new(SR, cfg);
+        // three sentences separated by long pauses, pushed in one go
+        let mut a = Vec::new();
+        for _ in 0..3 {
+            tone(&mut a, 0.6, 0.5);
+            silence(&mut a, 0.5);
+        }
+        st.push(&a);
+        let mut all = st.take_complete();
+        all.extend(st.take_final());
+        assert_eq!(all.len(), 3, "all three sentences exactly once: {all:?}");
+        for w in all.windows(2) {
+            assert!(w[0].1 <= w[1].0, "ordered, non-overlapping: {all:?}");
+        }
     }
 
     #[test]
