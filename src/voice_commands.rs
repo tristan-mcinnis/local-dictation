@@ -64,6 +64,44 @@ const TRAILING_PHRASES: &[(&str, TrailingAction)] = &[
     ("press escape key", TrailingAction::PressEscape),
 ];
 
+/// Human-readable reference of every voice command, generated from the live
+/// tables above so the menu's "Voice Commands" help can never drift from actual
+/// behaviour.
+pub fn reference_text() -> String {
+    let action_label = |a: &TrailingAction| match a {
+        TrailingAction::PressEnter => "press Return (sends in chat apps / new line)",
+        TrailingAction::NewParagraph => "press Return twice (blank line)",
+        TrailingAction::PressTab => "press Tab",
+        TrailingAction::PressEscape => "press Escape",
+        TrailingAction::Undo => "undo (Cmd+Z)",
+        TrailingAction::Cancel => "discard the whole dictation",
+        TrailingAction::None => "",
+    };
+    let quoted = |ps: &[&str]| ps.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(" / ");
+
+    // Group trailing phrases by the action they trigger, preserving first-seen order.
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for (phrase, action) in TRAILING_PHRASES {
+        let label = action_label(action).to_string();
+        match groups.iter_mut().find(|(l, _)| *l == label) {
+            Some(g) => g.1.push(phrase),
+            None => groups.push((label, vec![phrase])),
+        }
+    }
+
+    let mut s = String::new();
+    s.push_str("TRAILING COMMANDS — say at the END of a dictation (after your text):\n");
+    for (label, phrases) in &groups {
+        s.push_str(&format!("  {}\n      → {label}\n", quoted(phrases)));
+    }
+    s.push_str("\nUNDO — say as the whole utterance:\n");
+    s.push_str(&format!("  {}\n      → undo (Cmd+Z)\n", quoted(UNDO_PHRASES)));
+    s.push_str("\nCANCEL — say as the whole utterance to throw it away:\n");
+    s.push_str(&format!("  {}\n", quoted(CANCEL_PHRASES)));
+    s.push_str("\nNote: trailing commands match on a word boundary, so \"compress enter\" or\n\"I want to press enter on the keyboard\" do NOT fire.\n");
+    s
+}
+
 /// Inspect cleaned text. If the whole thing is a cancel phrase, or it ends
 /// with a known trailing command, return the body to inject (possibly empty)
 /// plus the action for the daemon to execute.
@@ -113,6 +151,14 @@ pub fn parse_trailing_command(text: &str) -> (String, TrailingAction) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_text_lists_real_commands() {
+        let r = reference_text();
+        for needle in ["press enter", "new paragraph", "scratch that", "undo", "press Tab"] {
+            assert!(r.contains(needle), "reference missing {needle:?}");
+        }
+    }
 
     #[test]
     fn fires_on_simple_suffix() {
