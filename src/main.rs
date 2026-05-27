@@ -44,6 +44,7 @@ async fn main() -> eyre::Result<()> {
         "context-probe" => run_context_probe(),
         "inject-test" => run_inject_test(args.get(2).cloned()),
         "daemon" => run_daemon(args.iter().any(|a| a == "--no-cleanup")).await,
+        "listen" => run_listen(args.iter().any(|a| a == "--no-cleanup")).await,
         "synth-press" => run_synth_press(
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
@@ -52,7 +53,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, context-probe, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, context-probe, mock-loop"
         )),
     }
 }
@@ -445,6 +446,30 @@ fn redirect_stdio_to_log_if_bundled() {
         // Leak the handle so the fd stays valid for the process's lifetime.
         std::mem::forget(f);
     }
+}
+
+/// EXPERIMENTAL: run the hands-free wake-word listener instead of the
+/// push-to-talk daemon. Continuous mic + VAD + wake-word trigger → inject.
+#[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
+async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
+    use fast_dictate_backend::daemon::{run_listen, DaemonConfig};
+    #[cfg(feature = "cleaner")]
+    let no_cleanup = !fast_dictate_backend::settings::Settings::load()
+        .resolve_cleanup_enabled(no_cleanup);
+    let config = DaemonConfig::from_env(
+        parakeet_dir(),
+        #[cfg(feature = "cleaner")]
+        gemma_path(),
+        no_cleanup,
+    );
+    run_listen(config)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "parakeet", feature = "ax-inject")))]
+async fn run_listen(_no_cleanup: bool) -> eyre::Result<()> {
+    Err(eyre::eyre!(
+        "`listen` requires --features full (parakeet + cleaner + ax-inject) on macOS"
+    ))
 }
 
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
