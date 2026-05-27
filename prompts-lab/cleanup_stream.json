@@ -1,0 +1,297 @@
+{
+  "_README": "Round-2 cleanup corpus for examples/cleanup_stream_lab.rs. GOLD is real history.db dictation text (verbatim, split into sentence fragments) = the light-touch target the current pipeline already produces. RAW is a de-cleaned 'what Parakeet emits' version authored per fragment: lowercase, no terminal punctuation, disfluencies/false-starts, and dictionary names corrupted into plausible mis-hearings so corrections.json + screen-vocab are actually exercised. 'vocab' = the known-vocabulary block the daemon would inject (corrections targets + simulated screen terms). 'names' = target spellings that MUST appear in good output (the dictionary test). Segmentation here is ORACLE (gold sentence boundaries) = quality ceiling for incremental cleanup; real segmentation is round 3.",
+  "entries": [
+    {
+      "name": "speaker-id",
+      "tier": "long",
+      "vocab": [
+        "Tristan",
+        "Meeting Sentinel"
+      ],
+      "names": [
+        "Tristan"
+      ],
+      "fragments": [
+        {
+          "raw": "so i wanna work on a really simple small project which is about doing uh speaker identification",
+          "gold": "So I wanna work on a really simple small project, which is about doing uh speaker identification."
+        },
+        {
+          "raw": "so obviously within our meeting sentinel it's just focused on doing the transcript",
+          "gold": "So obviously within our meeting sentinel it's just focused on doing the transcript."
+        },
+        {
+          "raw": "that's it",
+          "gold": "That's it."
+        },
+        {
+          "raw": "i think i wanna understand what would be a really simple and lightweight way to do speaker identification",
+          "gold": "I think I wanna understand what would be a really simple and lightweight way to do speaker identification."
+        },
+        {
+          "raw": "so probably that means having a voice print where we have enough samples of different voices to then match",
+          "gold": "So probably that means having a voice print where we have enough samples of different voices to then match."
+        },
+        {
+          "raw": "i just don't know if that's something i can do locally or i need a api and how much latency and processing time that would take",
+          "gold": "I just don't know if that's something I can do locally or I need a API and how much latency and processing time that would take."
+        },
+        {
+          "raw": "i just don't really know and i want you to have a look and explore and just let me know what's realistic what's best in class what needs an api and what can be run locally",
+          "gold": "I just don't really know and I want you to have a look and explore and just let me know what's realistic, what's best in class, what needs an API and what can be run locally."
+        },
+        {
+          "raw": "like ideally if there's just a local solution that i can you know take different audio clips of various speakers and then see you know um like oh for example speaker one is ninety five percent likely as tristan",
+          "gold": "Like ideally if there's just a local solution that I can, you know, take different audio clips of various speakers and then see, you know um like oh, for example, speaker one is ninety-five percent likely as Tristan."
+        }
+      ]
+    },
+    {
+      "name": "slide-review",
+      "tier": "long",
+      "vocab": [
+        "Nike"
+      ],
+      "names": [],
+      "fragments": [
+        {
+          "raw": "i think my impression is that slide twenty nine the images are underneath the headline",
+          "gold": "I think my impression is that slide 29, the images are underneath the headline."
+        },
+        {
+          "raw": "so the headline is the question is set by the runner not by the brief that makes sense",
+          "gold": "So the headline is the question is set by the runner, not by the brief, that makes sense."
+        },
+        {
+          "raw": "and then we have four columns of images and the takeaways and they're kind of small hard to read",
+          "gold": "And then we have four columns of images and the takeaways and they're kind of small, hard to read."
+        },
+        {
+          "raw": "everything is left aligned which makes sense",
+          "gold": "Everything is left aligned, which makes sense."
+        },
+        {
+          "raw": "i like how you've faded the images i think it makes sense but my impression is that nike docs usually have full bleed images from top to bottom",
+          "gold": "I like how you've faded the images, I think it makes sense, but my impression is that Nike docs usually have full bleed images from top to bottom."
+        },
+        {
+          "raw": "so maybe you can extend the images so that there is a black fade from the top as well as the bottom",
+          "gold": "So maybe you can extend the images so that there is a black fade from the top as well as the bottom."
+        },
+        {
+          "raw": "and then that way we get a top and bottom fade and then the middle you can kind of more center the text in the middle of the image",
+          "gold": "And then that way we get a top and bottom fade, and then the middle you can kind of more center the text in the middle of the image."
+        },
+        {
+          "raw": "obviously the text itself can still be left aligned",
+          "gold": "Obviously the text itself can still be left aligned."
+        }
+      ]
+    },
+    {
+      "name": "realtime-transcript",
+      "tier": "long",
+      "vocab": [],
+      "names": [],
+      "fragments": [
+        {
+          "raw": "but yeah i was just thinking what to do",
+          "gold": "But yeah, I was just thinking what to do."
+        },
+        {
+          "raw": "i think obviously the real time transcript that is created for the meeting wouldn't be as accurate as when we have the full audio that comes afterwards",
+          "gold": "I think obviously the real time transcript that is created for the meeting wouldn't be as accurate as when we have the full audio that comes afterwards."
+        },
+        {
+          "raw": "you know what i mean",
+          "gold": "You know what I mean?"
+        },
+        {
+          "raw": "so i'm trying to think about how to harmonize these different things in a way that could be like kinda cool where i would still have the option just to do the very basic meeting start meeting stop",
+          "gold": "So I'm trying to think about how to harmonize these different things in a way that could be like kinda cool where I would still have the option just to do the very basic meeting start, meeting stop."
+        },
+        {
+          "raw": "but also with the click of a button i could surface the real time intelligence and that would also you know that would be quite useful",
+          "gold": "But also with the click of a button I could surface the real time intelligence and that would also you know that would be quite useful."
+        },
+        {
+          "raw": "and maybe that would also pull in like a pre meeting brief that i could review and stuff like that",
+          "gold": "And maybe that would also pull in like a pre-meeting brief that I could review and stuff like that."
+        }
+      ]
+    },
+    {
+      "name": "readme-agent",
+      "tier": "medium",
+      "vocab": [
+        "GitHub",
+        "Claude Code"
+      ],
+      "names": [
+        "GitHub"
+      ],
+      "fragments": [
+        {
+          "raw": "also before you do that i feel like you need to add a simple one liner for an agent like claude code codecs et cetera in the readme file on github",
+          "gold": "Also, before you do that, I feel like you need to add a simple one-liner for an agent like Claude Code, Codecs, et cetera, in the README file on GitHub."
+        },
+        {
+          "raw": "so that someone could just copy that and then it would their agent help set it up for them",
+          "gold": "So that someone could just copy that and then it would help their agent set it up for them."
+        },
+        {
+          "raw": "because right now there's nothing like that and i think it would lower the barrier a lot",
+          "gold": "Because right now there's nothing like that and I think it would lower the barrier a lot."
+        }
+      ]
+    },
+    {
+      "name": "hands-free",
+      "tier": "medium",
+      "vocab": [],
+      "names": [],
+      "fragments": [
+        {
+          "raw": "the hands free option is actually very simple",
+          "gold": "The hands-free option is actually very simple."
+        },
+        {
+          "raw": "basically you hold your push to talk button plus the spacebar and then you can let go of both uh and keep talking",
+          "gold": "Basically, you hold your push to talk button plus the spacebar, and then you can let go of both and keep talking."
+        },
+        {
+          "raw": "and then when you're done talking you just push your push to talk button one more time and then yeah that's my preference",
+          "gold": "And then when you're done talking, you just push your push to talk button one more time, and then, yeah, that's my preference."
+        }
+      ]
+    },
+    {
+      "name": "evidence-julien",
+      "tier": "medium",
+      "vocab": [
+        "Julien",
+        "Alex"
+      ],
+      "names": [
+        "Julien"
+      ],
+      "fragments": [
+        {
+          "raw": "and getting all of the details that we have available to us",
+          "gold": "And getting all of the details that we have available to us."
+        },
+        {
+          "raw": "and surfacing those in a clear logical way as evidence for julian and alex",
+          "gold": "And surfacing those in a clear, logical way as evidence for Julien and Alex."
+        }
+      ]
+    },
+    {
+      "name": "dictation-apps",
+      "tier": "medium",
+      "vocab": [
+        "Wispr Flow",
+        "MacWhisper",
+        "Aqua"
+      ],
+      "names": [],
+      "fragments": [
+        {
+          "raw": "not for a meeting you know transcript analysis apps or whatever",
+          "gold": "Not for a meeting, you know, transcript analysis apps or whatever."
+        },
+        {
+          "raw": "just more like dictation apps like wispr flow um mac whisper for dictation uh aqua",
+          "gold": "Just more like dictation apps like Wispr Flow, um, MacWhisper for dictation, uh Aqua."
+        }
+      ]
+    },
+    {
+      "name": "commit-github",
+      "tier": "short",
+      "vocab": [
+        "GitHub"
+      ],
+      "names": [
+        "GitHub"
+      ],
+      "fragments": [
+        {
+          "raw": "alright you can commit and push everything to github main then",
+          "gold": "Alright, you can commit and push everything to GitHub main then."
+        }
+      ]
+    },
+    {
+      "name": "lingzi-note",
+      "tier": "short",
+      "vocab": [
+        "Lingzi",
+        "Postgres"
+      ],
+      "names": [
+        "Lingzi",
+        "Postgres"
+      ],
+      "fragments": [
+        {
+          "raw": "i caught up with lings this morning about the postgres migration",
+          "gold": "I caught up with Lingzi this morning about the Postgres migration."
+        }
+      ]
+    },
+    {
+      "name": "anthropic-onnx",
+      "tier": "short",
+      "vocab": [
+        "ONNX",
+        "Anthropic",
+        "macOS",
+        "CoreML"
+      ],
+      "names": [
+        "ONNX",
+        "macOS",
+        "Anthropic"
+      ],
+      "fragments": [
+        {
+          "raw": "we're running the onnx runtime with core ml on macos and calling the anthropic api",
+          "gold": "We're running the ONNX runtime with CoreML on macOS and calling the Anthropic API."
+        }
+      ]
+    },
+    {
+      "name": "self-correction",
+      "tier": "short",
+      "vocab": [],
+      "names": [],
+      "fragments": [
+        {
+          "raw": "can you send the draft to bob no wait send it to alice instead and cc me on it",
+          "gold": "Can you send the draft to Alice and CC me on it?"
+        }
+      ]
+    },
+    {
+      "name": "logs-readme",
+      "tier": "short",
+      "vocab": [
+        "GitHub"
+      ],
+      "names": [
+        "GitHub"
+      ],
+      "fragments": [
+        {
+          "raw": "i think if you check the logs it seems to work pretty well",
+          "gold": "I think if you check the logs it seems to work pretty well."
+        },
+        {
+          "raw": "i just need you to also update the readme and then commit and push everything to github main please",
+          "gold": "I just need you to also update the readme and then commit and push everything to GitHub main, please."
+        }
+      ]
+    }
+  ]
+}
