@@ -227,6 +227,24 @@ impl Corrections {
     }
 }
 
+/// Build a single Dictionary-editor line from the quick-add fields, formatted
+/// exactly the way [`Corrections::to_editor_lines`] renders an entry so the two
+/// stay in lock-step: `None` when there's no target spelling; a bare word when
+/// `heard` is blank or matches `correct` case-insensitively (an identity/keep
+/// entry); else `heard → correct`. Inputs are trimmed.
+pub fn quick_add_line(heard: &str, correct: &str) -> Option<String> {
+    let heard = heard.trim();
+    let correct = correct.trim();
+    if correct.is_empty() {
+        return None;
+    }
+    if heard.is_empty() || heard.eq_ignore_ascii_case(correct) {
+        Some(correct.to_string())
+    } else {
+        Some(format!("{heard} → {correct}"))
+    }
+}
+
 /// Split a Dictionary-editor line on the first `→` or `->`, returning
 /// `(from, to)`. `None` for a bare word (no arrow).
 fn split_arrow(line: &str) -> Option<(&str, &str)> {
@@ -322,6 +340,28 @@ mod tests {
         assert_eq!(c.apply("macos"), "macOS"); // → arrow
         assert_eq!(c.apply("baz"), "Baz"); // bare word = identity, keeps casing
         assert_eq!(c.len(), 3); // comment + blank dropped
+    }
+
+    #[test]
+    fn quick_add_line_formats_like_editor_lines() {
+        // A real mishearing fix → arrow line, keyed on what was heard.
+        assert_eq!(quick_add_line("Julian", "Julien"), Some("Julian → Julien".to_string()));
+        // Blank "heard" → a bare keep-this-spelling word.
+        assert_eq!(quick_add_line("", "GitHub"), Some("GitHub".to_string()));
+        // Same word, different case → identity/keep, rendered bare (no arrow).
+        assert_eq!(quick_add_line("github", "GitHub"), Some("GitHub".to_string()));
+        // No target spelling → nothing to add.
+        assert_eq!(quick_add_line("Julian", "   "), None);
+        // Inputs are trimmed.
+        assert_eq!(quick_add_line("  lings ", " Lingzi "), Some("lings → Lingzi".to_string()));
+    }
+
+    #[test]
+    fn quick_add_line_round_trips_through_corrections() {
+        // The line the quick-add fields produce must parse back to the intended fix.
+        let line = quick_add_line("Julian", "Julien").unwrap();
+        let c = Corrections::from_editor_text(&line);
+        assert_eq!(c.apply("Julian"), "Julien");
     }
 
     #[test]
