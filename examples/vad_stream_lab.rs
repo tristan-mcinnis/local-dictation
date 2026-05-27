@@ -187,7 +187,7 @@ async fn main() -> eyre::Result<()> {
         agg.push((tr.tier.clone(), whole_ms, last_ms, wer_gold_stream, wer_stream_whole, asr_noov, asr_ov));
 
         if tr.tier == "long" {
-            println!("    gold  : {:?}", trunc2(&gold, 180));
+            println!("    gold  : {:?}", trunc2(&gold, 700));
             println!("    whole : {:?}", trunc2(&whole_clean, 180));
             println!("    stream: {:?}", trunc2(&stream_clean, 180));
             // segmentation accuracy: detected segments vs true sentence count
@@ -257,7 +257,11 @@ fn transcribe_overlap(
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
 fn energy_vad_segments(audio: &[f32], sr: u32) -> Vec<(usize, usize)> {
     let frame = (0.020 * sr as f32) as usize; // 20 ms
-    let min_pause_frames = (0.300 / 0.020) as usize; // 300 ms silence ends a segment
+    // 400ms silence ends a segment: long enough to ignore intra-sentence breaths
+    // (which over-split sentences at 300ms) while still catching real sentence
+    // gaps. Tuned on this corpus's pause structure; a real VAD (Silero) would
+    // set boundaries from learned speech probability rather than a fixed gap.
+    let min_pause_frames = (0.400 / 0.020) as usize;
     let pad = frame * 3; // include a little context around each segment edge
     if frame == 0 || audio.is_empty() {
         return vec![(0, audio.len())];
@@ -308,11 +312,14 @@ fn ctx_prompt(vocab: &[String], ctx: &str) -> String {
         p.push_str(&suffix);
     }
     if !ctx.trim().is_empty() {
+        // Tail of the already-cleaned text for casing/flow consistency. NOTE: no
+        // quote/delimiter framing — Gemma 1B echoes `"""` into its output (seen as
+        // stray `""` in the cleaned text). A plain sentence reference is safer.
         let chars: Vec<char> = ctx.chars().collect();
         let start = chars.len().saturating_sub(240);
         let tail: String = chars[start..].iter().collect();
         p.push_str(&format!(
-            "\n\nThe transcript so far has already been cleaned as:\n\"\"\"\n…{tail}\n\"\"\"\nClean ONLY the new fragment below and output just the cleaned new fragment — do not repeat the text above."
+            "\n\nFor context, the preceding text (already cleaned, do not repeat it) ended with: {tail}\nClean only the new fragment below and output just the cleaned new fragment."
         ));
     }
     p
