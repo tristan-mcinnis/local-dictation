@@ -65,7 +65,8 @@ fn is_ax_blind(pid: i32) -> bool {
 /// clipboard paste, which goes through the system-level Cmd+V handler and
 /// always works:
 ///   1. Electron / Chromium web views (VS Code, Cursor, Slack, Discord,
-///      Claude, Notion, Chrome, Brave, Arc, Obsidian, Zed, Figma …).
+///      Claude, Notion, Chrome, Brave, Arc, Obsidian, Zed, Figma, new
+///      Microsoft Outlook …).
 ///   2. GPU/native terminal emulators (Ghostty, Terminal.app, iTerm2,
 ///      WezTerm, kitty, Alacritty) — they draw their own text grid and
 ///      ignore AX writes, confirmed via INJECT_PROFILE: Ghostty returns
@@ -104,7 +105,11 @@ fn classify_pid(pid: i32) -> (bool, bool) {
         || comm.contains("/arc")
         || comm.contains("/obsidian")
         || comm.contains("/zed")
-        || comm.contains("/figma");
+        || comm.contains("/figma")
+        // New Outlook for Mac is a WebView2/Chromium app: it reports an editable
+        // AX role and accepts kAXSelectedText writes with kAXErrorSuccess, but
+        // the compose web view never renders them. Route it to clipboard paste.
+        || comm.contains("/microsoft outlook");
     // Native terminal emulators: own-drawn text grids that accept but ignore
     // AX writes. The `/term` anchor catches Terminal.app and iTerm2's exec
     // (`.../macos/iterm2`); the rest match their app/exec name.

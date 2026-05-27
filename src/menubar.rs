@@ -27,7 +27,8 @@ use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
     NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSLineBreakMode,
-    NSMenu, NSMenuItem, NSScreen, NSScrollView, NSStatusBar, NSStatusItem, NSTextAlignment,
+    NSMenu, NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSStatusBar, NSStatusItem,
+    NSTextAlignment,
     NSTextField, NSTextView, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
     NSWindowStyleMask,
 };
@@ -126,6 +127,16 @@ define_class!(
         fn copy_history_entry(&self, sender: *mut AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
             copy_history_entry_at(tag);
+        }
+
+        // The history search field changed. Re-filter the cached entries by
+        // case-insensitive substring and rebuild the list. Fires per keystroke
+        // (the field is configured to send its string immediately).
+        #[unsafe(method(searchHistory:))]
+        fn search_history(&self, sender: *mut AnyObject) {
+            let field: &NSSearchField = unsafe { &*(sender as *const NSSearchField) };
+            let query = field.stringValue().to_string();
+            apply_history_filter(&query);
         }
 
         #[unsafe(method(openCorrections:))]
@@ -230,6 +241,11 @@ static GLOBALS: OnceLock<UiGlobals> = OnceLock::new();
 /// row carries its index here as its `tag`, so the click handler can copy the
 /// full (untruncated) text even though the row only displays one line.
 static HISTORY_ENTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// All entries loaded on the last window open (newest first), unfiltered. The
+/// search field filters this master list down to what's shown; kept separate
+/// so clearing the query restores the full list without re-querying the DB.
+static HISTORY_ALL: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 
 pub fn init_and_run() -> eyre::Result<()> {
     let mtm = MainThreadMarker::new()
@@ -1286,6 +1302,8 @@ fn add_dictionary_entry_from_fields() {
 
 struct HistoryUi {
     window: Retained<NSWindow>,
+    /// Search field pinned to the top of the window; filters the list live.
+    search: Retained<NSSearchField>,
     scroll: Retained<NSScrollView>,
     /// Flipped document view that holds the day-header labels and per-entry
     /// buttons. Rebuilt from scratch on every open.
@@ -1303,15 +1321,62 @@ fn history_ui(mtm: MainThreadMarker) -> &'static HistoryUi {
 }
 
 fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
-    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 580.0));
+    const WIN_W: f64 = 460.0;
+    const WIN_H: f64 = 580.0;
+    const PAD: f64 = 10.0;
+    const SEARCH_H: f64 = 24.0;
+    // Raw NSView autoresizing masks (NSUInteger bit flags), used directly to
+    // avoid depending on the typed constant names: WidthSizable=2,
+    // MinYMargin=8 (flexible bottom → stick to top), HeightSizable=16.
+    const M_WIDTH_STICK_TOP: usize = 2 | 8;
+    const M_WIDTH_HEIGHT: usize = 2 | 16;
 
-    let scroll: Retained<NSScrollView> =
-        unsafe { msg_send![NSScrollView::alloc(mtm), initWithFrame: frame] };
+    let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W, WIN_H));
+
+    // Container holds the search field (top) and the scroll view (below).
+    let container: Retained<NSView> =
+        unsafe { msg_send![NSView::alloc(mtm), initWithFrame: frame] };
+
+    // ── Search field, pinned to the top ────────────────────────────────────
+    let search_frame = NSRect::new(
+        NSPoint::new(PAD, WIN_H - PAD - SEARCH_H),
+        NSSize::new(WIN_W - 2.0 * PAD, SEARCH_H),
+    );
+    let search: Retained<NSSearchField> =
+        unsafe { msg_send![NSSearchField::alloc(mtm), initWithFrame: search_frame] };
+    unsafe {
+        // Send the action on every keystroke, not just on Return, so the list
+        // filters as you type.
+        let _: () = msg_send![&*search, setSendsWholeSearchString: false];
+        let _: () = msg_send![&*search, setSendsSearchStringImmediately: true];
+        let ph = NSString::from_str("Search dictations");
+        let _: () = msg_send![&*search, setPlaceholderString: &*ph];
+        let _: () = msg_send![&*search, setAutoresizingMask: M_WIDTH_STICK_TOP];
+        // Wire the search action to the shared menu-action target (set during
+        // init_and_run, well before the window is first built).
+        if let Some(actions) = GLOBALS.get().map(|g| &g._actions) {
+            let _: () = msg_send![&*search, setTarget: &**actions];
+            let _: () = msg_send![&*search, setAction: sel!(searchHistory:)];
+        }
+    }
+    container.addSubview(&search);
+
+    // ── Scroll view, filling the area below the search field ───────────────
+    let scroll_h = WIN_H - 2.0 * PAD - SEARCH_H;
+    let scroll: Retained<NSScrollView> = unsafe {
+        msg_send![
+            NSScrollView::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W, scroll_h))
+        ]
+    };
     {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setDrawsBackground(true);
         scroll.setBackgroundColor(&NSColor::controlBackgroundColor());
+        unsafe {
+            let _: () = msg_send![&*scroll, setAutoresizingMask: M_WIDTH_HEIGHT];
+        }
     }
 
     // Document view starts the size of the clip area; rebuild_history_list
@@ -1324,6 +1389,7 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         ]
     };
     scroll.setDocumentView(Some(&*doc));
+    container.addSubview(&scroll);
 
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
@@ -1345,11 +1411,11 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         let _: () = msg_send![&*window, setSubtitle: &*hint];
         // Reused across opens — closing must hide, not deallocate it.
         window.setReleasedWhenClosed(false);
-        window.setContentView(Some(&*scroll));
+        window.setContentView(Some(&*container));
         window.center();
     }
 
-    HistoryUi { window, scroll, doc }
+    HistoryUi { window, search, scroll, doc }
 }
 
 /// Re-query the history DB, rebuild the list, and bring the window forward.
@@ -1360,6 +1426,11 @@ fn show_history_window() {
     let ui = history_ui(mtm);
     let entries = crate::history::recent(1000);
 
+    // Cache the full (unfiltered) entry list so the search field can filter it
+    // without re-querying the DB, then show everything.
+    if let Ok(mut all) = HISTORY_ALL.lock() {
+        *all = entries.clone();
+    }
     // Stash the full texts, newest first, so a clicked row (carrying its index
     // as its tag) can copy the untruncated text.
     if let Ok(mut store) = HISTORY_ENTRIES.lock() {
@@ -1367,10 +1438,11 @@ fn show_history_window() {
     }
     rebuild_history_list(mtm, ui, &entries);
 
-    // Reset the subtitle hint for the fresh open.
+    // Reset the subtitle hint and clear any prior search query for the fresh open.
     unsafe {
         let hint = NSString::from_str("Click any entry to copy it");
         let _: () = msg_send![&*ui.window, setSubtitle: &*hint];
+        ui.search.setStringValue(&NSString::from_str(""));
         ui.window.makeKeyAndOrderFront(None);
     }
     // We're an Accessory app (no Dock icon); without an explicit activate the
@@ -1380,6 +1452,33 @@ fn show_history_window() {
     {
         app.activateIgnoringOtherApps(true)
     };
+}
+
+/// Filter the cached history by a case-insensitive substring query and rebuild
+/// the list. An empty/whitespace query restores the full list. Keeps
+/// HISTORY_ENTRIES in lock-step with the rows shown so click-to-copy tags stay
+/// valid against the *filtered* view.
+fn apply_history_filter(query: &str) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(ui) = HISTORY_UI.get() else {
+        return;
+    };
+    let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+    let needle = query.trim().to_lowercase();
+    let filtered: Vec<Entry> = if needle.is_empty() {
+        all
+    } else {
+        all.into_iter()
+            .filter(|e| e.text.to_lowercase().contains(&needle))
+            .collect()
+    };
+
+    if let Ok(mut store) = HISTORY_ENTRIES.lock() {
+        *store = filtered.iter().map(|e| e.text.clone()).collect();
+    }
+    rebuild_history_list(mtm, ui, &filtered);
 }
 
 /// Copy the stored history text at `tag` (its index in HISTORY_ENTRIES) to the
@@ -1471,10 +1570,14 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
     doc.setSubviews(&empty);
 
     if entries.is_empty() {
-        let label = NSTextField::labelWithString(
-            &NSString::from_str("No dictations yet — hold your hotkey and speak."),
-            mtm,
-        );
+        // Distinguish "history is empty" from "search matched nothing".
+        let has_history = HISTORY_ALL.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        let msg = if has_history {
+            "No dictations match your search."
+        } else {
+            "No dictations yet — hold your hotkey and speak."
+        };
+        let label = NSTextField::labelWithString(&NSString::from_str(msg), mtm);
         label.setFrame(NSRect::new(
             NSPoint::new(MX, TOP + 6.0),
             NSSize::new(row_w, 20.0),
