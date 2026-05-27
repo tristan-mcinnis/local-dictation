@@ -718,7 +718,12 @@ fn worker_loop(
                         // dictations; short utterances / transforms fall back to the
                         // proven whole-buffer path so commands & transform still work.
                         let result = if !transform && stream_clean.len() >= 2 {
-                            precleaned_override = Some(stream_clean.join(" "));
+                            // Strip a trailing "yeah/yep/…" on the ASSEMBLED text: in
+                            // streaming, a standalone trailing "Yeah." is its own
+                            // segment and the per-segment pass keeps it (looks like a
+                            // whole-utterance ack); only the join reveals it's trailing.
+                            let joined = crate::text_polish::strip_trailing_filler(&stream_clean.join(" "));
+                            precleaned_override = Some(joined);
                             eprintln!("  ⟫ streamed {} sentence segment(s) during hold", stream_clean.len());
                             stream_raw.join(" ")
                         } else {
@@ -938,6 +943,16 @@ fn worker_loop(
                     eprintln!("  app  {} (pid {})", app_name(pid), pid);
                 } else if used_fresh_capture {
                     eprintln!("  app  <fresh capture · target unknown>");
+                }
+                // Which cleanup model produced this — always visible, so the log
+                // is self-describing when comparing models.
+                #[cfg(feature = "cleaner")]
+                if cleaner.is_some() {
+                    let m = std::path::Path::new(&config.gemma_path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?");
+                    eprintln!("  llm  {m}");
                 }
                 // Truncation watchdog: if the cleaned text is dramatically
                 // shorter than the raw transcript (>40% dropped), the cleanup

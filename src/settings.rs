@@ -89,6 +89,11 @@ pub struct Settings {
 /// sentence opener, so false triggers in normal speech are rare.
 pub const DEFAULT_WAKE_WORD: &str = "computer";
 
+/// Wake-word presets offered in the menu picker. Custom words: set `wake_word`
+/// in settings.json (or `DICTATE_WAKE_WORD`). Two-syllable, uncommon-as-a-
+/// sentence-opener words trigger most reliably.
+pub const WAKE_WORD_CHOICES: &[&str] = &["computer", "jarvis", "assistant", "hey computer"];
+
 impl Settings {
     /// `~/.config/local-dictation/settings.json` (None if `$HOME` is unset).
     pub fn config_path() -> Option<PathBuf> {

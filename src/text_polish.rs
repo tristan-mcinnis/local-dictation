@@ -269,7 +269,7 @@ pub fn flatten_to_line(s: &str) -> String {
 /// real dictations but consistently a verbatim verbal tic.)
 const TRAILING_FILLERS: &[&str] = &["yeah", "yep", "yup", "you know"];
 
-fn strip_trailing_filler(s: &str) -> String {
+pub fn strip_trailing_filler(s: &str) -> String {
     let trimmed = s.trim_end();
     // Bare text with trailing terminal punctuation / spaces removed, for matching.
     let core = trimmed.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ' '));
