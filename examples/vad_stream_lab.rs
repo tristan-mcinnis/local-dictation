@@ -108,10 +108,11 @@ async fn main() -> eyre::Result<()> {
         let _ = engine.process_transcript("warm up").await?;
     }
 
-    println!("{:<20} {:>5} {:>4} {:>5} {:>9} {:>9} {:>10} {:>9} {:>9} {:>7}",
-        "clip", "dur", "sent", "segs", "whole_ms", "strm_tot", "strm_resid", "WERvGold", "WERvWhl", "names");
+    println!("{:<20} {:>5} {:>4} {:>5} {:>9} {:>10} {:>8} {:>8} {:>9} {:>7}",
+        "clip", "dur", "sent", "segs", "whole_ms", "strm_resid", "asrNoOv", "asrOv", "WERvWhl", "names");
 
-    let mut agg: Vec<(String, f64, f64, f64, f64)> = Vec::new(); // tier,whole,resid,wer_gold_stream,wer_whole
+    // tier, whole_ms, resid, wer_gold_stream, wer_stream_whole, asr_noov, asr_ov
+    let mut agg: Vec<(String, f64, f64, f64, f64, f64, f64)> = Vec::new();
 
     for tr in &truths {
         let audio = load_wav_mono16k(&tr.wav)?;
@@ -125,23 +126,43 @@ async fn main() -> eyre::Result<()> {
 
         // ---- VAD segmentation ----
         let segs = energy_vad_segments(&audio, SR);
+        // ~0.5s of prior audio prepended to each segment so Parakeet keeps the
+        // acoustic context it would have in the whole buffer (fixes isolated-
+        // segment mis-hears like brief→brave); the pre-roll words are dropped.
+        let pad = (0.5 * SR as f32) as usize;
 
-        // ---- VAD-STREAM: per segment transcribe + incremental clean ----
+        // ---- ASR-only A/B: segment ASR with vs without overlap, vs whole ----
+        let mut raw_noov: Vec<String> = Vec::new();
+        let mut raw_ov: Vec<String> = Vec::new();
+        for (s, e) in &segs {
+            let n = transcribe(&mut asr, &audio[*s..*e])?;
+            if !n.trim().is_empty() {
+                raw_noov.push(n);
+            }
+            let o = transcribe_overlap(&mut asr, &audio, *s, *e, pad, SR)?;
+            if !o.trim().is_empty() {
+                raw_ov.push(o);
+            }
+        }
+        let asr_noov = wer(&normalize(&whole_raw), &normalize(&raw_noov.join(" "))) * 100.0;
+        let asr_ov = wer(&normalize(&whole_raw), &normalize(&raw_ov.join(" "))) * 100.0;
+
+        // ---- VAD-STREAM: per segment transcribe (w/ overlap) + incremental clean ----
         let mut cleaned_so_far = String::new();
         let mut pieces: Vec<String> = Vec::new();
-        let mut total_ms = 0.0;
         let mut last_ms = 0.0;
+        // Stream uses NO overlap: the A/B below shows pre-roll overlap only adds
+        // boundary word-drop errors on pause-bounded segments (asrOv > asrNoOv),
+        // while no-overlap segment ASR already matches the whole buffer (~0.6%).
         for (s, e) in &segs {
-            let seg = &audio[*s..*e];
             let t = Instant::now();
-            let raw = transcribe(&mut asr, seg)?;
+            let raw = transcribe(&mut asr, &audio[*s..*e])?;
             if raw.trim().is_empty() {
                 continue;
             }
             let prompt = ctx_prompt(&tr.vocab, &cleaned_so_far);
             let piece = engine.eval_cleanup(&prompt, &raw, false).await?;
             last_ms = t.elapsed().as_secs_f64() * 1000.0;
-            total_ms += last_ms;
             if !cleaned_so_far.is_empty() {
                 cleaned_so_far.push(' ');
             }
@@ -158,12 +179,12 @@ async fn main() -> eyre::Result<()> {
         let (nf_s, nt) = name_recall(&stream_clean, &tr.names);
         let (nf_w, _) = name_recall(&whole_clean, &tr.names);
 
-        println!("{:<20} {:>4.0}s {:>4} {:>5} {:>9.1} {:>9.1} {:>10.1} {:>8.1}% {:>8.1}% {}/{} v{}/{}",
+        println!("{:<20} {:>4.0}s {:>4} {:>5} {:>9.1} {:>10.1} {:>7.1}% {:>7.1}% {:>8.1}% {}/{} v{}/{}",
             trunc(&tr.wav), tr.dur_s, tr.sentences.len(), segs.len(),
-            whole_ms, total_ms, last_ms, wer_gold_stream, wer_stream_whole,
+            whole_ms, last_ms, asr_noov, asr_ov, wer_stream_whole,
             nf_s, nt, nf_w, nt);
 
-        agg.push((tr.tier.clone(), whole_ms, last_ms, wer_gold_stream, wer_stream_whole));
+        agg.push((tr.tier.clone(), whole_ms, last_ms, wer_gold_stream, wer_stream_whole, asr_noov, asr_ov));
 
         if tr.tier == "long" {
             println!("    gold  : {:?}", trunc2(&gold, 180));
@@ -178,21 +199,56 @@ async fn main() -> eyre::Result<()> {
 
     // summary
     println!("\n══════════ SUMMARY by tier ══════════");
-    println!("{:<8} {:>9} {:>11} {:>10} {:>10} {:>9}", "tier", "whole_ms", "strm_resid", "felt_cut", "WERvGold", "WERvWhole");
+    println!("{:<8} {:>9} {:>11} {:>9} {:>9} {:>9} {:>9}",
+        "tier", "whole_ms", "strm_resid", "felt_cut", "asrNoOv", "asrOv", "WERvWhol");
     for tier in ["long", "medium", "short"] {
-        let rows: Vec<&(String, f64, f64, f64, f64)> = agg.iter().filter(|a| a.0 == tier).collect();
+        let rows: Vec<&(String, f64, f64, f64, f64, f64, f64)> = agg.iter().filter(|a| a.0 == tier).collect();
         if rows.is_empty() { continue; }
         let n = rows.len() as f64;
-        let whole = rows.iter().map(|a| a.1).sum::<f64>() / n;
-        let resid = rows.iter().map(|a| a.2).sum::<f64>() / n;
-        let wg = rows.iter().map(|a| a.3).sum::<f64>() / n;
-        let ww = rows.iter().map(|a| a.4).sum::<f64>() / n;
-        println!("{:<8} {:>9.1} {:>11.1} {:>9.0}% {:>9.1}% {:>8.1}%",
-            tier, whole, resid, (1.0 - resid / whole) * 100.0, wg, ww);
+        let m = |f: &dyn Fn(&(String, f64, f64, f64, f64, f64, f64)) -> f64| rows.iter().map(|a| f(a)).sum::<f64>() / n;
+        let whole = m(&|a| a.1);
+        let resid = m(&|a| a.2);
+        println!("{:<8} {:>9.1} {:>11.1} {:>8.0}% {:>8.1}% {:>8.1}% {:>8.1}%",
+            tier, whole, resid, (1.0 - resid / whole) * 100.0, m(&|a| a.5), m(&|a| a.6), m(&|a| a.4));
     }
-    println!("\nfelt_cut = how much of today's end-to-end (ASR+cleanup) post-release wait\n  disappears: strm_resid is just the LAST segment, the rest runs during the hold.\n  WERvWhole = drift from today's output. names a/b = stream vs whole dictionary hits.");
+    println!("\nfelt_cut = today's post-release wait that disappears (resid = last segment only).\n  asrNoOv/asrOv = segment-ASR WER vs whole-buffer ASR, WITHOUT vs WITH 0.5s\n  pre-roll overlap (lower = overlap recovers acoustic context). WERvWhol = final\n  cleaned-output drift from today.");
 
     Ok(())
+}
+
+/// Transcribe segment [s,e) with `pad` samples of pre-roll context prepended,
+/// then drop the words that fall in the pre-roll (their start < pad seconds) so
+/// the result is just the segment — but decoded with the prior acoustic context.
+#[cfg(all(feature = "parakeet", feature = "cleaner"))]
+fn transcribe_overlap(
+    asr: &mut parakeet_rs::ParakeetTDT,
+    audio: &[f32],
+    s: usize,
+    e: usize,
+    pad: usize,
+    sr: u32,
+) -> eyre::Result<String> {
+    use parakeet_rs::{TimestampMode, Transcriber};
+    let start = s.saturating_sub(pad);
+    let pre_s = (s - start) as f32 / sr as f32; // seconds of pre-roll actually present
+    let clip = &audio[start..e];
+    if clip.is_empty() {
+        return Ok(String::new());
+    }
+    let r = asr
+        .transcribe_samples(clip.to_vec(), sr, 1, Some(TimestampMode::Words))
+        .map_err(|err| eyre::eyre!("transcribe: {err:?}"))?;
+    if pre_s <= 0.0 {
+        return Ok(r.text);
+    }
+    // keep words whose midpoint is after the pre-roll
+    let kept: Vec<&str> = r
+        .tokens
+        .iter()
+        .filter(|t| (t.start + t.end) / 2.0 >= pre_s)
+        .map(|t| t.text.as_str())
+        .collect();
+    Ok(kept.join(" "))
 }
 
 /// Energy-based pause segmenter. 20ms frames; speech where RMS exceeds a floor
