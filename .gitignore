@@ -24,3 +24,5 @@ testdata/streaming/*.wav
 testdata/streaming/*.aiff
 testdata/vad/*.wav
 testdata/vad/*.aiff
+testdata/streaming/
+testdata/vad/
