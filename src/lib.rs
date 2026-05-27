@@ -15,6 +15,7 @@ pub mod spoken_command;
 pub mod text_polish;
 pub mod transcriber;
 pub mod ui_channel;
+pub mod vad;
 pub mod voice_commands;
 
 #[cfg(feature = "cleaner")]
