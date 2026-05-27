@@ -162,6 +162,18 @@ impl SegmentStream {
         out
     }
 
+    /// Drop the already-emitted (committed) prefix so a long-lived stream (e.g.
+    /// the always-on wake-word listener) doesn't grow without bound. Only the
+    /// not-yet-finished tail is retained; ranges from earlier `take_*` calls are
+    /// no longer valid after this. Safe to call after draining `take_complete`.
+    pub fn compact(&mut self) {
+        if self.committed == 0 {
+            return;
+        }
+        self.buf.drain(0..self.committed);
+        self.committed = 0;
+    }
+
     /// Flush all remaining audio as final segments (called at key release).
     pub fn take_final(&mut self) -> Vec<(usize, usize)> {
         if self.committed >= self.buf.len() {
@@ -272,6 +284,28 @@ mod tests {
         for w in all.windows(2) {
             assert!(w[0].1 <= w[1].0, "ordered, non-overlapping: {all:?}");
         }
+    }
+
+    #[test]
+    fn compact_drops_emitted_prefix_but_keeps_open_tail() {
+        let cfg = VadConfig::default();
+        let mut st = SegmentStream::new(SR, cfg);
+        // sentence 1 + long pause + start of sentence 2
+        let mut a = Vec::new();
+        tone(&mut a, 0.6, 0.5);
+        silence(&mut a, 0.5);
+        tone(&mut a, 0.4, 0.5);
+        st.push(&a);
+        let done = st.take_complete();
+        assert_eq!(done.len(), 1, "sentence 1 confirmed: {done:?}");
+        let before = st.buf().len();
+        st.compact();
+        // The open tail (sentence 2, still growing) must survive.
+        assert!(st.buf().len() < before, "prefix dropped");
+        assert!(!st.buf().is_empty(), "open tail retained");
+        // After compaction the tail still flushes exactly once at the end.
+        let fin = st.take_final();
+        assert_eq!(fin.len(), 1, "tail flushes after compact: {fin:?}");
     }
 
     #[test]
