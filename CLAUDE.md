@@ -40,8 +40,8 @@ apps). Everything runs on-device; nothing hits the network at runtime. The crate
 cargo build --features full --release        # the real build — see feature flags below
 ./target/release/fast-dictate-backend daemon # run the push-to-talk daemon
 
-cargo test                                   # 64 unit + 2 integration, NO models or features needed
-cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (75 total)
+cargo test                                   # 116 unit + 2 integration, NO models or features needed
+cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (130 total)
 cargo test --features full <name>            # single test by name substring
 ```
 
