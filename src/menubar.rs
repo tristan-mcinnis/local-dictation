@@ -189,6 +189,16 @@ define_class!(
             write_settings_and_relaunch(move |set| set.cleanup_enabled = Some(!current));
         }
 
+        #[unsafe(method(togglePreroll:))]
+        fn toggle_preroll(&self, _sender: *mut AnyObject) {
+            // On ⇒ keep the mic warm with DEFAULT_PREROLL_MS of lookback so the
+            // first words aren't clipped; off ⇒ open-on-press (0 ms).
+            let on = Settings::load().preroll_ms.unwrap_or(0) > 0;
+            write_settings_and_relaunch(move |set| {
+                set.preroll_ms = Some(if on { 0 } else { crate::audio::DEFAULT_PREROLL_MS });
+            });
+        }
+
         #[unsafe(method(selectFormat:))]
         fn select_format(&self, sender: *mut AnyObject) {
             // representedObject holds the preset name; the empty string means
@@ -466,6 +476,26 @@ fn build_status_item(
         });
     }
     menu.addItem(&cleanup_item);
+
+    // ── Always-on mic (pre-roll) toggle ─────────────────────────────────
+    // Keeps the mic stream warm and retains a short lookback so the first
+    // words aren't clipped and there's no stream-open latency on key-press.
+    // Note: the mic indicator stays on while enabled. (Wake-word listen mode
+    // is the separate `listen` subcommand — see docs/wake-word-and-preroll.md.)
+    let preroll_item = action_item(
+        mtm,
+        "Always-on mic (pre-roll)",
+        sel!(togglePreroll:),
+        "",
+        actions,
+    );
+    let preroll_on = settings.preroll_ms.unwrap_or(0) > 0;
+    preroll_item.setState(if preroll_on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    menu.addItem(&preroll_item);
 
     // ── Edit the cleanup / transform system prompts ─────────────────────
     // Opens prompts.json in a text editor (seeded with the live prompts the
