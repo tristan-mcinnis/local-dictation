@@ -229,6 +229,38 @@ pub fn fix_speech_mechanics(s: &str) -> String {
     crate::numbers::spoken_to_numerals(&i_capped)
 }
 
+/// Does this text look like a list the model intentionally formatted — i.e. ≥2
+/// non-empty lines, a majority of which open with a list marker (`1.` / `1)` /
+/// `- ` / `* ` / `• `)? Used by the cleanup path to decide whether to PRESERVE
+/// the model's line breaks (auto numbered/bulleted lists) instead of flattening
+/// normal dictation to a single line.
+pub fn looks_like_list(s: &str) -> bool {
+    let lines: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.len() < 2 {
+        return false;
+    }
+    let listish = lines.iter().filter(|l| starts_like_list_item(l)).count();
+    listish >= 2 && listish * 2 >= lines.len()
+}
+
+fn starts_like_list_item(line: &str) -> bool {
+    if line.starts_with("- ") || line.starts_with("* ") || line.starts_with("• ") {
+        return true;
+    }
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    i > 0 && i < b.len() && (b[i] == b'.' || b[i] == b')')
+}
+
+/// Collapse all whitespace (including newlines) to single spaces — the
+/// single-line form normal dictation injects.
+pub fn flatten_to_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Trailing acknowledgement fillers a speaker tacks on while thinking — kept as
 /// its own clause, e.g. "…we can use. Yeah." Only stripped when it's a STANDALONE
 /// trailing clause (after a sentence/comma boundary), so "I told him yeah" and a
@@ -549,6 +581,20 @@ mod tests {
         assert_eq!(strip_trailing_filler("yeah"), "yeah");
         // whole-word only: must not chop the end of a real word
         assert_eq!(strip_trailing_filler("the deal is conveyed"), "the deal is conveyed");
+    }
+
+    #[test]
+    fn detects_lists_vs_prose() {
+        assert!(looks_like_list("1. Buy milk.\n2. Buy eggs.\n3. Buy flour."));
+        assert!(looks_like_list("- one\n- two\n- three"));
+        assert!(!looks_like_list("I went to the store and bought milk, eggs, and flour."));
+        assert!(!looks_like_list("First we set up the repo. Second we ship it.")); // one line
+        assert!(!looks_like_list("3.11 is the version we shipped today.")); // single line, not a list
+    }
+
+    #[test]
+    fn flatten_collapses_newlines() {
+        assert_eq!(flatten_to_line("a\nb   c\n\n d"), "a b c d");
     }
 
     #[test]

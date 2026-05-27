@@ -293,12 +293,19 @@ impl TextCleanupEngine {
         // with headroom instead of a fixed 256-token cap, which used to chop any
         // dictation past ~190 words mid-sentence.
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        // Plain dictation flattens to one line; an active format preset
-        // (numbered / bullets / email) keeps its line structure.
-        let cleaned = self.run_chat(user_msg, budget, self.format_active, false).await?;
+        // Generate keeping the model's line breaks, then decide whether to keep
+        // them: an active format preset, or an AUTO-DETECTED list (the model
+        // formatted an enumeration as 1./2./3. or bullets), preserves structure;
+        // ordinary prose flattens to a single line as dictation always has.
+        let cleaned = self.run_chat(user_msg, budget, true, false).await?;
         // Deterministic mechanics the 1B does unreliably (leading "um", lone
         // lowercase "i") — cheap, exact, and always safe on speech.
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
+        let cleaned = if self.format_active || crate::text_polish::looks_like_list(&cleaned) {
+            cleaned
+        } else {
+            crate::text_polish::flatten_to_line(&cleaned)
+        };
         // Runaway guard: a 1B can occasionally hallucinate — drop everything, or
         // balloon a short utterance into paragraphs, or leak chat-template
         // markers past `polish`. Cleanup never legitimately expands much, so on
@@ -363,9 +370,16 @@ impl TextCleanupEngine {
         }
         let user_msg = format!("{prompt_body}\n\nRaw transcript:\n{raw}");
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        // Segments are sentence-sized; preserve_newlines=false flattens to a line.
-        let cleaned = self.run_chat(user_msg, budget, false, false).await?;
+        // Keep line breaks only if this segment is itself a list (a list spoken
+        // in one breath lands in one segment); otherwise flatten. Multi-segment
+        // lists (items separated by long pauses) won't unify — known limitation.
+        let cleaned = self.run_chat(user_msg, budget, true, false).await?;
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
+        let cleaned = if crate::text_polish::looks_like_list(&cleaned) {
+            cleaned
+        } else {
+            crate::text_polish::flatten_to_line(&cleaned)
+        };
         if cleanup_ran_away(raw, &cleaned) {
             eprintln!(
                 "[warn] segment cleanup runaway (raw {} → {} chars); using raw",
