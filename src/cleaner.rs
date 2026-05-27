@@ -316,6 +316,67 @@ impl TextCleanupEngine {
         Ok(cleaned)
     }
 
+    /// Clean ONE sentence-segment of a longer dictation, given the text already
+    /// cleaned so far as left-context. This is the streaming-cleanup primitive:
+    /// the daemon can clean each sentence the moment a VAD pause closes it (during
+    /// the hold), so on key release only the final segment is outstanding — the
+    /// post-release cleanup wait stops scaling with utterance length. Validated in
+    /// `examples/vad_stream_lab.rs`: per-segment + left-context tracks whole-buffer
+    /// cleanup quality, while naive context-free chunking does not.
+    ///
+    /// Identical framing/budget to [`Self::process_transcript_with_vocab`] (same
+    /// cached instruction prefix + vocab block), plus a short plain-text reference
+    /// to the tail of the prior cleaned text. The reference is deliberately NOT
+    /// quote-delimited: Gemma 1B echoes `"""`/`"` fences into its output (observed
+    /// as stray `""` in the lab). `prior_cleaned` empty ⇒ behaves like the first
+    /// segment (no context clause).
+    #[cfg(feature = "cleaner")]
+    pub async fn process_segment_with_context(
+        &self,
+        raw_text: &str,
+        screen_vocab: &[String],
+        prior_cleaned: &str,
+    ) -> eyre::Result<String> {
+        let raw = raw_text.trim();
+        if raw.is_empty() {
+            return Ok(String::new());
+        }
+        let mut prompt_body = self.cleanup_prompt.clone();
+        if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
+            let mut combined =
+                Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
+            combined.extend_from_slice(&self.static_vocab);
+            combined.extend_from_slice(screen_vocab);
+            if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
+                prompt_body.push_str(&suffix);
+            }
+        }
+        // Tail (~240 chars) of the cleaned-so-far text for casing/flow continuity.
+        let prior = prior_cleaned.trim();
+        if !prior.is_empty() {
+            let chars: Vec<char> = prior.chars().collect();
+            let start = chars.len().saturating_sub(240);
+            let tail: String = chars[start..].iter().collect();
+            prompt_body.push_str(&format!(
+                "\n\nFor context, the preceding text (already cleaned, do not repeat it) ended with: {tail}\nClean only the new fragment below and output just the cleaned new fragment."
+            ));
+        }
+        let user_msg = format!("{prompt_body}\n\nRaw transcript:\n{raw}");
+        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
+        // Segments are sentence-sized; preserve_newlines=false flattens to a line.
+        let cleaned = self.run_chat(user_msg, budget, false, false).await?;
+        let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
+        if cleanup_ran_away(raw, &cleaned) {
+            eprintln!(
+                "[warn] segment cleanup runaway (raw {} → {} chars); using raw",
+                raw.chars().count(),
+                cleaned.chars().count()
+            );
+            return Ok(raw.to_string());
+        }
+        Ok(cleaned)
+    }
+
     /// Rough token count for sizing generation budgets / the context window.
     /// Uses the model's own tokenizer; falls back to a chars/3 estimate if
     /// tokenization fails (never on the hot path, but keeps this infallible).
