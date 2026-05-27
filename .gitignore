@@ -22,3 +22,5 @@ dist/
 # Synthetic streaming-lab corpus (regenerate with scripts/gen-streaming-corpus.sh)
 testdata/streaming/*.wav
 testdata/streaming/*.aiff
+testdata/vad/*.wav
+testdata/vad/*.aiff
