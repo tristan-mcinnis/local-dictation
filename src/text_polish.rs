@@ -221,7 +221,11 @@ const FILLER_INTERJECTIONS: &[&str] =
 /// Pure & unit-tested.
 pub fn fix_speech_mechanics(s: &str) -> String {
     let despoken = drop_filler_interjections(s);
-    capitalize_standalone_i(&despoken)
+    let i_capped = capitalize_standalone_i(&despoken);
+    // Numerals-heavy number formatting: the deterministic half (decimals,
+    // versions, well-formed cardinals). The cleanup prompt handles contextual
+    // singles; ambiguous runs (years, "three four") are left for it / the user.
+    crate::numbers::spoken_to_numerals(&i_capped)
 }
 
 /// Remove whole-word filler interjections anywhere in the text, then repair
