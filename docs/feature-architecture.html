@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cargo Feature Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --c-bg: #f8fafc;
+      --c-canvas: #ffffff;
+      --c-border: #cbd5e1;
+      --c-border-strong: #94a3b8;
+      --c-text-main: #0f172a;
+      --c-text-sub: #64748b;
+      --c-accent: #dc2626;
+      --font-ui: 'Inter', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: var(--font-ui); background: var(--c-bg); padding: 40px; min-height: 100vh; }
+    .diagram-container { max-width: 1180px; margin: 0 auto; }
+    .diagram-canvas { background: var(--c-canvas); border: 1px solid var(--c-border); padding: 32px; }
+    .diagram-header { border-bottom: 1px solid var(--c-border); padding-bottom: 16px; margin-bottom: 28px; }
+    .diagram-title { font-size: 20px; font-weight: 600; color: var(--c-text-main); margin-bottom: 4px; }
+    .diagram-subtitle { font-size: 11px; font-weight: 500; color: var(--c-text-sub); text-transform: uppercase; letter-spacing: 0.06em; }
+
+    /* Section scaffolding */
+    .section { margin-bottom: 28px; }
+    .section-label {
+      font-family: var(--font-mono); font-size: 11px; color: var(--c-text-sub);
+      text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;
+      display: flex; align-items: baseline; gap: 10px;
+    }
+    .section-label .meta { color: var(--c-text-main); font-weight: 500; text-transform: none; letter-spacing: 0; }
+
+    /* Base layer */
+    .base {
+      border: 2px solid var(--c-text-main); padding: 18px 18px 16px;
+    }
+    .base .row-title {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+    }
+    .mods { display: flex; flex-wrap: wrap; gap: 6px; }
+    .mod {
+      font-family: var(--font-mono); font-size: 11px; color: var(--c-text-main);
+      border: 1px solid var(--c-border); padding: 3px 7px; background: var(--c-canvas);
+    }
+    .mod.dim { color: var(--c-text-sub); }
+
+    /* Feature columns */
+    .features { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 18px; }
+    .feature { border: 1px solid var(--c-border-strong); display: flex; flex-direction: column; }
+    .feature-head {
+      border-bottom: 1px solid var(--c-border-strong); padding: 12px 14px;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .feature-name { font-family: var(--font-mono); font-size: 14px; font-weight: 500; color: var(--c-text-main); }
+    .feature-body { padding: 14px; display: flex; flex-direction: column; gap: 14px; flex: 1; }
+    .blk-label { font-family: var(--font-mono); font-size: 10px; color: var(--c-text-sub); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
+    .deps { font-family: var(--font-mono); font-size: 11px; color: var(--c-text-sub); line-height: 1.7; }
+
+    /* Badges */
+    .badge {
+      display: inline-block; font-family: var(--font-mono); font-size: 10px;
+      padding: 2px 6px; border: 1px solid var(--c-border); color: var(--c-text-sub);
+    }
+    .badge-solid { background: var(--c-text-main); color: var(--c-canvas); border-color: var(--c-text-main); }
+    .badge-os { border-color: var(--c-border-strong); color: var(--c-text-main); }
+
+    /* Composite footer row */
+    .composite { display: grid; grid-template-columns: 1.4fr 1fr; gap: 18px; }
+    .composite .cell { border: 1px solid var(--c-border); padding: 16px; }
+    .composite .cell.full { border: 2px solid var(--c-text-main); }
+    .formula { font-family: var(--font-mono); font-size: 13px; color: var(--c-text-main); line-height: 1.8; }
+    .formula .op { color: var(--c-text-sub); }
+    .note { font-size: 12px; color: var(--c-text-sub); line-height: 1.6; margin-top: 8px; }
+
+    /* connector hint */
+    .stack-hint {
+      text-align: center; font-family: var(--font-mono); font-size: 18px;
+      color: var(--c-border-strong); margin: 6px 0 16px;
+    }
+    .legend { margin-top: 24px; border-top: 1px solid var(--c-border); padding-top: 14px; display: flex; gap: 24px; flex-wrap: wrap; }
+    .legend-item { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--c-text-sub); }
+    .swatch { width: 26px; height: 12px; box-sizing: border-box; }
+    .swatch.base { border: 2px solid var(--c-text-main); }
+    .swatch.feat { border: 1px solid var(--c-border-strong); }
+  </style>
+</head>
+<body>
+  <div class="diagram-container">
+    <div class="diagram-canvas">
+      <div class="diagram-header">
+        <div class="diagram-title">Cargo Feature Architecture</div>
+        <div class="diagram-subtitle">fast-dictate-backend &nbsp;·&nbsp; lib + bin &nbsp;·&nbsp; feature-gated modules</div>
+      </div>
+
+      <!-- BASE LAYER -->
+      <div class="section">
+        <div class="section-label">
+          Base layer <span class="meta">default = []</span>
+          <span class="badge">cargo build &nbsp;·&nbsp; cargo test &nbsp;·&nbsp; 64 unit + 2 integration &nbsp;·&nbsp; no native / model deps</span>
+        </div>
+        <div class="base">
+          <div class="row-title">
+            <span class="badge badge-solid">ALWAYS COMPILED</span>
+            <span style="font-size:12px;color:var(--c-text-sub);">pure-Rust modules — the lib + tests build with no features</span>
+          </div>
+          <div class="mods">
+            <span class="mod">app_paths</span>
+            <span class="mod">audio</span>
+            <span class="mod">audio_duck</span>
+            <span class="mod">corrections</span>
+            <span class="mod">cues</span>
+            <span class="mod">dictionary</span>
+            <span class="mod">history</span>
+            <span class="mod">prompts</span>
+            <span class="mod">refiner</span>
+            <span class="mod">screen_context</span>
+            <span class="mod">settings</span>
+            <span class="mod">smart_pad</span>
+            <span class="mod">spoken_command</span>
+            <span class="mod">text_polish</span>
+            <span class="mod">transcriber<span style="color:var(--c-text-sub)"> (stub)</span></span>
+            <span class="mod">ui_channel</span>
+            <span class="mod">voice_commands</span>
+            <span class="mod dim">injector*</span>
+          </div>
+          <div class="note">* <span style="font-family:var(--font-mono)">injector</span> module is always declared; its real macOS Accessibility path is gated internally behind <span style="font-family:var(--font-mono)">ax-inject</span>.</div>
+        </div>
+      </div>
+
+      <div class="stack-hint">▲ &nbsp; features add native deps + real implementations on top &nbsp; ▲</div>
+
+      <!-- FEATURE COLUMNS -->
+      <div class="section">
+        <div class="section-label">Opt-in features <span class="meta">each pulls its own native dependency stack</span></div>
+        <div class="features">
+
+          <!-- parakeet -->
+          <div class="feature">
+            <div class="feature-head">
+              <span class="feature-name">parakeet</span>
+              <span class="badge badge-os">ASR</span>
+            </div>
+            <div class="feature-body">
+              <div>
+                <div class="blk-label">Adds modules</div>
+                <div class="mods"><span class="mod">transcriber</span></div>
+              </div>
+              <div>
+                <div class="blk-label">Native deps</div>
+                <div class="deps">parakeet-rs<br>ort → onnxruntime <span style="color:var(--c-text-main)">(downloaded at build)</span><br>hound<br><span class="badge badge-os" style="margin-top:6px">CoreML EP</span></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- cleaner -->
+          <div class="feature">
+            <div class="feature-head">
+              <span class="feature-name">cleaner</span>
+              <span class="badge badge-os">LLM</span>
+            </div>
+            <div class="feature-body">
+              <div>
+                <div class="blk-label">Adds modules</div>
+                <div class="mods"><span class="mod">cleaner</span></div>
+              </div>
+              <div>
+                <div class="blk-label">Native deps</div>
+                <div class="deps">llama-cpp-2 <span style="color:var(--c-text-main)">(not llama_cpp 0.3.x)</span><br>encoding_rs<br><span class="badge badge-os" style="margin-top:6px">Metal</span></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ax-inject -->
+          <div class="feature">
+            <div class="feature-head">
+              <span class="feature-name">ax-inject</span>
+              <span class="badge badge-os">macOS</span>
+            </div>
+            <div class="feature-body">
+              <div>
+                <div class="blk-label">Adds modules</div>
+                <div class="mods"><span class="mod">clipboard_paste</span><span class="mod">menubar</span></div>
+              </div>
+              <div>
+                <div class="blk-label">Native deps</div>
+                <div class="deps">accessibility-sys<br>core-foundation · core-graphics<br>arboard<br>objc2 · -foundation · -app-kit</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- COMPOSITE -->
+      <div class="section" style="margin-bottom:0">
+        <div class="section-label">Composition</div>
+        <div class="composite">
+          <div class="cell full">
+            <div class="row-title" style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+              <span class="badge badge-solid">full</span>
+              <span style="font-size:12px;color:var(--c-text-sub);">the real build — every feature on</span>
+            </div>
+            <div class="formula">
+              full <span class="op">=</span> parakeet <span class="op">+</span> cleaner <span class="op">+</span> ax-inject
+            </div>
+            <div class="note">Used for any real binary and for the feature-gated test suites (75 total). <span style="font-family:var(--font-mono)">cargo build --features full --release</span></div>
+          </div>
+          <div class="cell">
+            <div class="blk-label" style="margin-bottom:8px">Gated binary entrypoint</div>
+            <div class="formula" style="font-size:12px">
+              <span class="mod" style="display:inline-block">daemon</span><br>
+              <span class="op">cfg(macos &amp;&amp; parakeet &amp;&amp; ax-inject)</span>
+            </div>
+            <div class="note">The push-to-talk daemon needs ASR + injection to exist; <span style="font-family:var(--font-mono)">cleaner</span> is optional at runtime (<span style="font-family:var(--font-mono)">--no-cleanup</span>).</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="legend">
+        <div class="legend-item"><span class="swatch base"></span> Always compiled (default build)</div>
+        <div class="legend-item"><span class="swatch feat"></span> Opt-in feature module</div>
+        <div class="legend-item"><span class="badge badge-os" style="padding:1px 5px">macOS</span> Platform / backend tag</div>
+        <div class="legend-item"><span class="op" style="font-family:var(--font-mono)">cfg(...)</span> Conditional-compilation gate</div>
+      </div>
+
+    </div>
+  </div>
+</body>
+</html>
