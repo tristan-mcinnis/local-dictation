@@ -279,7 +279,7 @@ fn install_main_menu(mtm: MainThreadMarker, app: &NSApplication) {
     // Top-level item that owns the Edit submenu.
     let edit_top = NSMenuItem::new(mtm);
     let edit_menu = NSMenu::new(mtm);
-    unsafe { edit_menu.setTitle(&NSString::from_str("Edit")) };
+    edit_menu.setTitle(&NSString::from_str("Edit"));
 
     // Standard first-responder editing actions + their conventional shortcuts.
     // Target stays nil → routed up the responder chain to the focused view.
@@ -346,8 +346,8 @@ fn build_status_item(
     mtm: MainThreadMarker,
     actions: &Retained<MenuActions>,
 ) -> eyre::Result<StatusItemBuild> {
-    let bar = unsafe { NSStatusBar::systemStatusBar() };
-    let item = unsafe { bar.statusItemWithLength(-1.0) };
+    let bar = NSStatusBar::systemStatusBar();
+    let item = bar.statusItemWithLength(-1.0);
     let button = item
         .button(mtm)
         .ok_or_else(|| eyre::eyre!("status item has no button"))?;
@@ -359,16 +359,16 @@ fn build_status_item(
     let icon_recording = sf_symbol("mic.fill");
     let icon_processing = sf_symbol("waveform");
     if let Some(img) = &icon_idle {
-        unsafe { button.setImage(Some(img)) };
-        unsafe { button.setTitle(&NSString::from_str("")) };
+        button.setImage(Some(img));
+        button.setTitle(&NSString::from_str(""));
     } else {
-        unsafe { button.setTitle(&NSString::from_str("◯")) };
+        button.setTitle(&NSString::from_str("◯"));
     }
 
     let menu = NSMenu::new(mtm);
     // We manage enabled-state ourselves (lets us grey the preview label and
     // any env-locked items).
-    unsafe { menu.setAutoenablesItems(false) };
+    menu.setAutoenablesItems(false);
 
     let settings = Settings::load();
     // Output-format presets: the built-in set (numbered / bullets / email /
@@ -386,7 +386,7 @@ fn build_status_item(
             &NSString::from_str(""),
         )
     };
-    unsafe { last_item.setEnabled(false) };
+    last_item.setEnabled(false);
     menu.addItem(&last_item);
 
     let copy_last = action_item(mtm, "Copy last dictation", sel!(copyLast:), "c", actions);
@@ -403,7 +403,7 @@ fn build_status_item(
         action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
     menu.addItem(&dictionary_item);
 
-    menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+    menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
     // ── Cleanup model submenu ───────────────────────────────────────────
     let model_parent = unsafe {
@@ -414,9 +414,9 @@ fn build_status_item(
             &NSString::from_str(""),
         )
     };
-    unsafe { model_parent.setEnabled(true) };
+    model_parent.setEnabled(true);
     let model_submenu = build_model_submenu(mtm, actions, &settings);
-    unsafe { model_parent.setSubmenu(Some(&model_submenu)) };
+    model_parent.setSubmenu(Some(&model_submenu));
     menu.addItem(&model_parent);
 
     // ── Hotkey submenu ──────────────────────────────────────────────────
@@ -428,9 +428,9 @@ fn build_status_item(
             &NSString::from_str(""),
         )
     };
-    unsafe { hotkey_parent.setEnabled(true) };
+    hotkey_parent.setEnabled(true);
     let hotkey_submenu = build_hotkey_submenu(mtm, actions, &settings);
-    unsafe { hotkey_parent.setSubmenu(Some(&hotkey_submenu)) };
+    hotkey_parent.setSubmenu(Some(&hotkey_submenu));
     menu.addItem(&hotkey_parent);
 
     // ── Cleanup on/off toggle ───────────────────────────────────────────
@@ -442,7 +442,7 @@ fn build_status_item(
         actions,
     );
     let cleanup_on = settings.cleanup_enabled.unwrap_or(true);
-    unsafe {
+    {
         cleanup_item.setState(if cleanup_on {
             NSControlStateValueOn
         } else {
@@ -476,13 +476,13 @@ fn build_status_item(
                 &NSString::from_str(""),
             )
         };
-        unsafe { format_parent.setEnabled(true) };
+        format_parent.setEnabled(true);
         let format_submenu = build_format_submenu(mtm, actions, &settings, &format_names);
-        unsafe { format_parent.setSubmenu(Some(&format_submenu)) };
+        format_parent.setSubmenu(Some(&format_submenu));
         menu.addItem(&format_parent);
     }
 
-    menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+    menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
     // ── Logs + corrections ──────────────────────────────────────────────
     menu.addItem(&action_item(mtm, "Open Log", sel!(openLog:), "l", actions));
@@ -495,7 +495,7 @@ fn build_status_item(
         actions,
     ));
 
-    menu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+    menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
     // ── Quit (standard NSApp terminate: — works with nil target) ─────────
     let quit_item = unsafe {
@@ -506,7 +506,7 @@ fn build_status_item(
             &NSString::from_str("q"),
         )
     };
-    unsafe { quit_item.setEnabled(true) };
+    quit_item.setEnabled(true);
     menu.addItem(&quit_item);
 
     item.setMenu(Some(&menu));
@@ -529,7 +529,7 @@ fn build_model_submenu(
     settings: &Settings,
 ) -> Retained<NSMenu> {
     let submenu = NSMenu::new(mtm);
-    unsafe { submenu.setAutoenablesItems(false) };
+    submenu.setAutoenablesItems(false);
 
     let env_locked = std::env::var_os("GEMMA_MODEL_PATH").is_some();
     let models = settings::discover_llm_models();
@@ -543,7 +543,7 @@ fn build_model_submenu(
                 &NSString::from_str(""),
             )
         };
-        unsafe { none.setEnabled(false) };
+        none.setEnabled(false);
         submenu.addItem(&none);
         return submenu;
     }
@@ -588,7 +588,7 @@ fn build_model_submenu(
     }
 
     if env_locked {
-        submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
         let note = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -597,7 +597,7 @@ fn build_model_submenu(
                 &NSString::from_str(""),
             )
         };
-        unsafe { note.setEnabled(false) };
+        note.setEnabled(false);
         submenu.addItem(&note);
     }
 
@@ -615,7 +615,7 @@ fn build_format_submenu(
     names: &[String],
 ) -> Retained<NSMenu> {
     let submenu = NSMenu::new(mtm);
-    unsafe { submenu.setAutoenablesItems(false) };
+    submenu.setAutoenablesItems(false);
 
     let env_locked = std::env::var_os("DICTATE_FORMAT").is_some();
     let active = settings.active_format.clone().unwrap_or_default();
@@ -642,7 +642,7 @@ fn build_format_submenu(
         });
     }
     submenu.addItem(&default_item);
-    submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
 
     for name in names {
         let item = unsafe {
@@ -669,7 +669,7 @@ fn build_format_submenu(
     }
 
     if env_locked {
-        submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
         let note = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -678,7 +678,7 @@ fn build_format_submenu(
                 &NSString::from_str(""),
             )
         };
-        unsafe { note.setEnabled(false) };
+        note.setEnabled(false);
         submenu.addItem(&note);
     }
 
@@ -692,7 +692,7 @@ fn build_hotkey_submenu(
     settings: &Settings,
 ) -> Retained<NSMenu> {
     let submenu = NSMenu::new(mtm);
-    unsafe { submenu.setAutoenablesItems(false) };
+    submenu.setAutoenablesItems(false);
 
     let env_locked = std::env::var_os("DICTATE_HOTKEY_KEYCODE").is_some();
     let active = settings.hotkey_keycode.unwrap_or(0x3D); // default Right Option
@@ -720,7 +720,7 @@ fn build_hotkey_submenu(
     }
 
     if env_locked {
-        submenu.addItem(&*unsafe { NSMenuItem::separatorItem(mtm) });
+        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
         let note = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -729,7 +729,7 @@ fn build_hotkey_submenu(
                 &NSString::from_str(""),
             )
         };
-        unsafe { note.setEnabled(false) };
+        note.setEnabled(false);
         submenu.addItem(&note);
     }
 
@@ -963,7 +963,7 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
     // Container content view: a hint label on top, the editable text area in the
     // middle, a Save button bottom-right.
     let container: Retained<NSView> =
-        unsafe { NSView::initWithFrame(NSView::alloc(mtm), frame) };
+        NSView::initWithFrame(NSView::alloc(mtm), frame);
 
     // Instruction label (in-window, so it isn't truncated like a long subtitle).
     let label_y = win_h - margin - label_h;
@@ -1004,7 +1004,7 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
     );
     let scroll: Retained<NSScrollView> =
         unsafe { msg_send![NSScrollView::alloc(mtm), initWithFrame: scroll_frame] };
-    let content = unsafe { scroll.contentSize() };
+    let content = scroll.contentSize();
     let tv: Retained<NSTextView> = unsafe {
         msg_send![
             NSTextView::alloc(mtm),
@@ -1193,14 +1193,14 @@ fn show_dictionary_window(actions: &MenuActions) {
         .map(|c| c.to_editor_lines())
         .unwrap_or_default()
         .join("\n");
-    unsafe {
+    {
         ui.text_view.setString(&NSString::from_str(&joined));
         ui.window.makeKeyAndOrderFront(None);
     }
     // Accessory app: explicitly activate so the window comes to the front.
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    unsafe {
+    {
         app.activateIgnoringOtherApps(true)
     };
 }
@@ -1210,7 +1210,7 @@ fn save_dictionary_from_view() {
     let Some(ui) = DICTIONARY_UI.get() else {
         return;
     };
-    let text = unsafe { ui.text_view.string() }.to_string();
+    let text = ui.text_view.string().to_string();
     let corrections = crate::corrections::Corrections::from_editor_text(&text);
     let count = corrections.len();
     match corrections.save() {
@@ -1242,8 +1242,8 @@ fn add_dictionary_entry_from_fields() {
     let Some(ui) = DICTIONARY_UI.get() else {
         return;
     };
-    let heard = unsafe { ui.heard_field.stringValue() }.to_string();
-    let correct = unsafe { ui.correct_field.stringValue() }.to_string();
+    let heard = ui.heard_field.stringValue().to_string();
+    let correct = ui.correct_field.stringValue().to_string();
 
     // The target spelling is required; "Heard" is optional (blank = keep).
     let Some(line) = crate::corrections::quick_add_line(&heard, &correct) else {
@@ -1307,7 +1307,7 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
 
     let scroll: Retained<NSScrollView> =
         unsafe { msg_send![NSScrollView::alloc(mtm), initWithFrame: frame] };
-    unsafe {
+    {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setDrawsBackground(true);
@@ -1316,14 +1316,14 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
 
     // Document view starts the size of the clip area; rebuild_history_list
     // resizes its height to fit the rows.
-    let content = unsafe { scroll.contentSize() };
+    let content = scroll.contentSize();
     let doc: Retained<FlippedView> = unsafe {
         msg_send![
             FlippedView::alloc(mtm),
             initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), content)
         ]
     };
-    unsafe { scroll.setDocumentView(Some(&*doc)) };
+    scroll.setDocumentView(Some(&*doc));
 
     let style = NSWindowStyleMask::Titled
         | NSWindowStyleMask::Closable
@@ -1377,7 +1377,7 @@ fn show_history_window() {
     // new window opens behind the frontmost app.
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    unsafe {
+    {
         app.activateIgnoringOtherApps(true)
     };
 }
@@ -1435,7 +1435,7 @@ fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
     let mut rows = Vec::new();
     let mut last_day: Option<String> = None;
     for (i, e) in entries.iter().enumerate() {
-        let date = unsafe { NSDate::dateWithTimeIntervalSince1970(e.created_at as f64) };
+        let date = NSDate::dateWithTimeIntervalSince1970(e.created_at as f64);
         let day = day_fmt.stringFromDate(&date).to_string().to_uppercase();
         let time = time_fmt.stringFromDate(&date).to_string();
         if last_day.as_deref() != Some(day.as_str()) {
@@ -1462,13 +1462,13 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
     const DAY_GAP: f64 = 8.0; // extra space above each day after the first
 
     let doc = &ui.doc;
-    let content = unsafe { ui.scroll.contentSize() };
+    let content = ui.scroll.contentSize();
     let width = content.width.max(200.0);
     let row_w = width - 2.0 * MX;
 
     // Clear previous rows.
     let empty: Retained<NSArray<NSView>> = NSArray::new();
-    unsafe { doc.setSubviews(&empty) };
+    doc.setSubviews(&empty);
 
     if entries.is_empty() {
         let label = NSTextField::labelWithString(
@@ -1479,8 +1479,8 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
             NSPoint::new(MX, TOP + 6.0),
             NSSize::new(row_w, 20.0),
         ));
-        unsafe { label.setTextColor(Some(&NSColor::secondaryLabelColor())) };
-        unsafe { doc.addSubview(&label) };
+        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        doc.addSubview(&label);
         doc.setFrame(NSRect::new(
             NSPoint::new(0.0, 0.0),
             NSSize::new(width, content.height.max(60.0)),
@@ -1501,8 +1501,8 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
                 let label = NSTextField::labelWithString(&NSString::from_str(&day), mtm);
                 label.setFrame(NSRect::new(NSPoint::new(MX, y), NSSize::new(row_w, 18.0)));
                 label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
-                unsafe { label.setTextColor(Some(&NSColor::secondaryLabelColor())) };
-                unsafe { doc.addSubview(&label) };
+                label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                doc.addSubview(&label);
                 y += HEADER_H;
             }
             HistoryRow::Item { time, text, index } => {
@@ -1548,20 +1548,20 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
         NSSize::new(width, total.max(content.height)),
     ));
     // Flipped view: (0,0) is the top, so this shows the newest entries.
-    unsafe { doc.scrollPoint(NSPoint::new(0.0, 0.0)) };
+    doc.scrollPoint(NSPoint::new(0.0, 0.0));
 }
 
 /// Build an NSImage from an SF Symbol name. Returns None if the symbol
 /// doesn't exist or we're on an older macOS without SF Symbols.
 fn sf_symbol(name: &str) -> Option<Retained<NSImage>> {
     let ns_name = NSString::from_str(name);
-    let img = unsafe {
+    let img = {
         NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None)
     };
     if let Some(ref img) = img {
         // Template mode: the image adopts the menu-bar tint color
         // (dark or light depending on the user's theme).
-        unsafe { img.setTemplate(true) };
+        img.setTemplate(true);
     }
     img
 }
@@ -1582,7 +1582,7 @@ fn build_pill_window(
             false,
         )
     };
-    unsafe {
+    {
         window.setLevel(NSWindowLevel::from(3_isize)); // floating panel
         window.setOpaque(false);
         let clear = NSColor::clearColor();
@@ -1597,7 +1597,7 @@ fn build_pill_window(
     }
 
     // Content view: dark rounded pill with a subtle gray border.
-    let content_view = unsafe { NSView::initWithFrame(NSView::alloc(mtm), frame) };
+    let content_view = NSView::initWithFrame(NSView::alloc(mtm), frame);
     unsafe {
         content_view.setWantsLayer(true);
         let layer: *mut objc2::runtime::AnyObject = msg_send![&*content_view, layer];
@@ -1623,7 +1623,7 @@ fn build_pill_window(
         let x = bar_block_x + i as f64 * (BAR_W + BAR_GAP);
         let y = (PILL_H - BAR_MIN_H) / 2.0;
         let bar_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, BAR_MIN_H));
-        let bar = unsafe { NSView::initWithFrame(NSView::alloc(mtm), bar_frame) };
+        let bar = NSView::initWithFrame(NSView::alloc(mtm), bar_frame);
         unsafe {
             bar.setWantsLayer(true);
             let layer: *mut objc2::runtime::AnyObject = msg_send![&*bar, layer];
@@ -1632,7 +1632,7 @@ fn build_pill_window(
             let white_cg: *mut objc2::runtime::AnyObject = msg_send![&*white, CGColor];
             let _: () = msg_send![layer, setBackgroundColor: white_cg];
         }
-        unsafe { content_view.addSubview(&bar) };
+        content_view.addSubview(&bar);
         bars.push(bar);
     }
 
@@ -1703,7 +1703,7 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
     };
     if let Some(button) = globals.status_item.button(mtm) {
         if let Some(img) = icon {
-            unsafe { button.setImage(Some(img)) };
+            button.setImage(Some(img));
         } else {
             // Fallback if SF Symbols weren't available.
             let fallback = match state {
@@ -1711,7 +1711,7 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 UiState::Recording => "●",
                 UiState::Processing => "◌",
             };
-            unsafe { button.setTitle(&NSString::from_str(fallback)) };
+            button.setTitle(&NSString::from_str(fallback));
         }
     }
 
@@ -1719,18 +1719,18 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         UiState::Idle => {
             // A dictation just completed (or we were cancelled) — refresh the
             // "Last: …" preview so the menu shows the newest text.
-            unsafe {
+            {
                 globals
                     .last_item
                     .setTitle(&NSString::from_str(&last_dictation_label()));
             }
             ui_channel::reset_levels();
             collapse_bars(globals);
-            unsafe { globals.pill_window.orderOut(None) };
+            globals.pill_window.orderOut(None);
         }
         UiState::Recording | UiState::Processing => {
             position_pill_at_cursor_screen(&globals.pill_window);
-            unsafe { globals.pill_window.orderFrontRegardless() };
+            globals.pill_window.orderFrontRegardless();
         }
     }
 }
@@ -1819,7 +1819,7 @@ fn set_bar_height(bar: &NSView, i: usize, h: f64) {
     let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
     let y = (PILL_H - h) / 2.0;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, h));
-    unsafe { bar.setFrame(frame) };
+    bar.setFrame(frame);
 }
 
 fn collapse_bars(globals: &UiGlobals) {
@@ -1835,7 +1835,7 @@ fn collapse_bars(globals: &UiGlobals) {
 
 fn position_pill_at_cursor_screen(window: &NSWindow) {
     let Some(mtm) = MainThreadMarker::new() else { return };
-    unsafe {
+    {
         let mouse_loc = NSEvent::mouseLocation();
         let screens = NSScreen::screens(mtm);
         let mut chosen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
