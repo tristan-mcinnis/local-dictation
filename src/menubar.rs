@@ -143,6 +143,11 @@ define_class!(
             save_dictionary_from_view();
         }
 
+        #[unsafe(method(addDictionaryEntry:))]
+        fn add_dictionary_entry(&self, _sender: *mut AnyObject) {
+            add_dictionary_entry_from_fields();
+        }
+
         #[unsafe(method(editPrompts:))]
         fn edit_prompts(&self, _sender: *mut AnyObject) {
             open_prompts_file();
@@ -924,6 +929,11 @@ struct DictionaryUi {
     window: Retained<NSWindow>,
     text_view: Retained<NSTextView>,
     save_button: Retained<NSButton>,
+    /// "Heard" field of the quick-add row (the mis-heard spelling; blank = keep).
+    heard_field: Retained<NSTextField>,
+    /// "Correct to" field of the quick-add row (the spelling you want).
+    correct_field: Retained<NSTextField>,
+    add_button: Retained<NSButton>,
 }
 // Only ever touched on the main thread (menu actions), so parking the AppKit
 // pointers in a static is safe.
@@ -938,11 +948,16 @@ fn dictionary_ui(mtm: MainThreadMarker) -> &'static DictionaryUi {
 
 fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
     let win_w = 440.0;
-    let win_h = 400.0;
+    let win_h = 440.0;
     let margin = 16.0;
     let btn_w = 88.0;
     let btn_h = 30.0;
     let label_h = 16.0;
+    // Quick-add row geometry (two fields + Add button, sitting between the list
+    // and the Save button so adding a term never requires typing the arrow).
+    let field_h = 24.0;
+    let add_btn_w = 64.0;
+    let add_hint_h = 14.0;
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(win_w, win_h));
 
     // Container content view: a hint label on top, the editable text area in the
@@ -974,8 +989,15 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         container.addSubview(&label);
     }
 
-    // Bordered, padded, editable text area — one term per line.
-    let scroll_y = margin + btn_h + 14.0;
+    // Bordered, padded, editable text area — one term per line. It sits above
+    // the quick-add row, which sits above the Save button:
+    //   Save row:     y = margin                         (h = btn_h)
+    //   add hint:     y = margin + btn_h + 12            (h = add_hint_h)
+    //   add fields:   y = margin + btn_h + 12 + hint + 8 (h = field_h)
+    //   list scroll:  starts above the add fields
+    let add_hint_y = margin + btn_h + 12.0;
+    let add_row_y = add_hint_y + add_hint_h + 8.0;
+    let scroll_y = add_row_y + field_h + 16.0;
     let scroll_frame = NSRect::new(
         NSPoint::new(margin, scroll_y),
         NSSize::new(win_w - 2.0 * margin, label_y - 8.0 - scroll_y),
@@ -1010,6 +1032,101 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         container.addSubview(&scroll);
     }
 
+    // ── Quick-add row: [Heard…]  →  [Correct to…]  [Add] ──────────────────
+    // Type the two parts and click Add; we append a correctly-formatted line to
+    // the list above (bare word if Heard is blank, "heard → Word" otherwise), so
+    // the user never has to know the arrow syntax. Geometry, left→right:
+    //   heard field | arrow label | correct field | Add button (right-aligned)
+    let gap = 8.0;
+    let arrow_w = 16.0;
+    let add_btn_x = win_w - margin - add_btn_w;
+    let fields_left = margin;
+    let fields_right = add_btn_x - gap;
+    let field_w = (fields_right - fields_left - arrow_w - 2.0 * gap) / 2.0;
+
+    let heard_field: Retained<NSTextField> = unsafe {
+        msg_send![
+            NSTextField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(fields_left, add_row_y),
+                NSSize::new(field_w, field_h),
+            )
+        ]
+    };
+    let arrow_label: Retained<NSTextField> = unsafe {
+        msg_send![
+            NSTextField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(fields_left + field_w + gap, add_row_y),
+                NSSize::new(arrow_w, field_h),
+            )
+        ]
+    };
+    let correct_field: Retained<NSTextField> = unsafe {
+        msg_send![
+            NSTextField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(fields_left + field_w + gap + arrow_w + gap, add_row_y),
+                NSSize::new(field_w, field_h),
+            )
+        ]
+    };
+    let add_button: Retained<NSButton> = unsafe {
+        msg_send![
+            NSButton::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(add_btn_x, add_row_y - 2.0),
+                NSSize::new(add_btn_w, btn_h),
+            )
+        ]
+    };
+    unsafe {
+        heard_field.setPlaceholderString(Some(&NSString::from_str("Heard")));
+        heard_field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        correct_field.setPlaceholderString(Some(&NSString::from_str("Correct to")));
+        correct_field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+
+        arrow_label.setStringValue(&NSString::from_str("→"));
+        arrow_label.setBezeled(false);
+        arrow_label.setDrawsBackground(false);
+        arrow_label.setEditable(false);
+        arrow_label.setSelectable(false);
+        arrow_label.setAlignment(NSTextAlignment::Center);
+        arrow_label.setFont(Some(&NSFont::systemFontOfSize(13.0)));
+        let _: () = msg_send![&*arrow_label, setTextColor: &*NSColor::secondaryLabelColor()];
+
+        add_button.setTitle(&NSString::from_str("Add"));
+        let _: () = msg_send![&*add_button, setBezelStyle: 1usize]; // rounded
+
+        container.addSubview(&heard_field);
+        container.addSubview(&arrow_label);
+        container.addSubview(&correct_field);
+        container.addSubview(&add_button);
+    }
+
+    // Hint under the quick-add row.
+    let add_hint: Retained<NSTextField> = unsafe {
+        msg_send![
+            NSTextField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(margin, add_hint_y),
+                NSSize::new(win_w - 2.0 * margin, add_hint_h),
+            )
+        ]
+    };
+    unsafe {
+        add_hint.setStringValue(&NSString::from_str(
+            "Leave “Heard” blank to just keep a word spelled the way you type it.",
+        ));
+        add_hint.setBezeled(false);
+        add_hint.setDrawsBackground(false);
+        add_hint.setEditable(false);
+        add_hint.setSelectable(false);
+        add_hint.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+        let _: () = msg_send![&*add_hint, setTextColor: &*NSColor::secondaryLabelColor()];
+        container.addSubview(&add_hint);
+    }
+
     // Save button, bottom-right.
     let btn_frame = NSRect::new(
         NSPoint::new(win_w - margin - btn_w, margin),
@@ -1042,7 +1159,14 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         window.center();
     }
 
-    DictionaryUi { window, text_view: tv, save_button }
+    DictionaryUi {
+        window,
+        text_view: tv,
+        save_button,
+        heard_field,
+        correct_field,
+        add_button,
+    }
 }
 
 /// Open the dictionary editor, pre-filled from dictionary.json, wired to save
@@ -1053,10 +1177,13 @@ fn show_dictionary_window(actions: &MenuActions) {
     };
     let ui = dictionary_ui(mtm);
 
-    // Wire Save → saveDictionary: on the actions instance (idempotent).
+    // Wire Save → saveDictionary: and Add → addDictionaryEntry: on the actions
+    // instance (idempotent).
     unsafe {
         ui.save_button.setTarget(Some(actions));
         ui.save_button.setAction(Some(sel!(saveDictionary:)));
+        ui.add_button.setTarget(Some(actions));
+        ui.add_button.setAction(Some(sel!(addDictionaryEntry:)));
     }
 
     // Load the user's vocabulary from corrections.json, rendered as editor lines
@@ -1103,6 +1230,48 @@ fn save_dictionary_from_view() {
                 let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
             }
         }
+    }
+}
+
+/// Append a row from the quick-add fields to the list, formatted exactly the way
+/// the list round-trips: a bare word when "Heard" is blank (or matches the target
+/// case-insensitively — an identity/keep entry), else `heard → Word`. This keeps
+/// the fields and the free-text list in lock-step with `Corrections::from_editor_text`.
+/// Nothing is saved here — the user still clicks Save to write + relaunch.
+fn add_dictionary_entry_from_fields() {
+    let Some(ui) = DICTIONARY_UI.get() else {
+        return;
+    };
+    let heard = unsafe { ui.heard_field.stringValue() }.to_string();
+    let correct = unsafe { ui.correct_field.stringValue() }.to_string();
+
+    // The target spelling is required; "Heard" is optional (blank = keep).
+    let Some(line) = crate::corrections::quick_add_line(&heard, &correct) else {
+        unsafe {
+            let msg = NSString::from_str("Type the spelling you want in “Correct to”.");
+            let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
+            ui.window.makeFirstResponder(Some(&*ui.correct_field));
+        }
+        return;
+    };
+
+    unsafe {
+        let current = ui.text_view.string().to_string();
+        let base = current.trim_end_matches('\n');
+        let joined = if base.is_empty() {
+            line
+        } else {
+            format!("{base}\n{line}")
+        };
+        ui.text_view.setString(&NSString::from_str(&joined));
+        let _: () = msg_send![&*ui.text_view, scrollToEndOfDocument: std::ptr::null_mut::<AnyObject>()];
+
+        // Clear the fields and return focus to "Heard" for the next entry.
+        ui.heard_field.setStringValue(&NSString::from_str(""));
+        ui.correct_field.setStringValue(&NSString::from_str(""));
+        let msg = NSString::from_str("Added — click Save to apply.");
+        let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
+        ui.window.makeFirstResponder(Some(&*ui.heard_field));
     }
 }
 
