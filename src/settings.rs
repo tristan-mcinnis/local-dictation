@@ -61,6 +61,12 @@ pub struct Settings {
     /// `formats` map). `None`/blank ⇒ the default cleanup prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_format: Option<String>,
+    /// EXPERIMENTAL: stream cleanup per sentence during the hold (VAD-segmented)
+    /// so the post-release wait stops scaling with utterance length. `None`/false
+    /// ⇒ the proven whole-buffer path. Off by default; flip to test on real mic.
+    /// Overridable via `DICTATE_STREAMING_CLEANUP=1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming_cleanup: Option<bool>,
 }
 
 impl Settings {
@@ -105,6 +111,16 @@ impl Settings {
             return v;
         }
         self.gemma_model.clone().unwrap_or_else(|| default.to_string())
+    }
+
+    /// Resolve streaming-cleanup mode: `DICTATE_STREAMING_CLEANUP` env > settings
+    /// > false. Env accepts `1`/`true`/`on` (case-insensitive) to enable.
+    pub fn resolve_streaming_cleanup(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_STREAMING_CLEANUP") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.streaming_cleanup.unwrap_or(false)
     }
 
     /// Resolve the hotkey keycode: `DICTATE_HOTKEY_KEYCODE` env > settings >

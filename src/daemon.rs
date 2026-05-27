@@ -475,7 +475,60 @@ fn worker_loop(
     // Whether the in-flight utterance is a transform instruction (Shift held).
     let mut transform_mode = false;
 
-    while let Ok(event) = rx.recv() {
+    // EXPERIMENTAL streaming cleanup (off unless the setting/env enables it AND
+    // the cleaner is loaded). When on, sentences are transcribed + cleaned at VAD
+    // pauses *during* the hold, so only the final segment is outstanding at
+    // release. The flag-off path below is byte-identical to before.
+    #[cfg(feature = "cleaner")]
+    let streaming = cleaner.is_some() && crate::settings::Settings::load().resolve_streaming_cleanup();
+    #[cfg(not(feature = "cleaner"))]
+    let streaming = false;
+    if streaming {
+        eprintln!("[boot] streaming   cleanup ENABLED (experimental · VAD-segmented during hold)");
+    }
+    // Per-utterance streaming accumulators (only used when `streaming`).
+    #[cfg(feature = "cleaner")]
+    let mut stream: Option<crate::vad::SegmentStream> = None;
+    #[cfg(feature = "cleaner")]
+    let mut stream_raw: Vec<String> = Vec::new();
+    #[cfg(feature = "cleaner")]
+    let mut stream_clean: Vec<String> = Vec::new();
+
+    'evloop: loop {
+        // While recording in streaming mode, wake periodically to process any
+        // sentence that a VAD pause has just closed; otherwise block for the next
+        // event. recv_timeout keeps everything on this one thread, which already
+        // owns the Parakeet worker, the cleaner, and the runtime — no shared state.
+        let event = {
+            #[cfg(feature = "cleaner")]
+            if streaming && engine.is_some() {
+                match rx.recv_timeout(std::time::Duration::from_millis(120)) {
+                    Ok(ev) => ev,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if let (Some(st), Some(c), Some(cl)) =
+                            (stream.as_mut(), consumer.as_mut(), cleaner.as_ref())
+                        {
+                            stream_process(
+                                &mut worker, cl, &rt, st, c,
+                                &mut stream_raw, &mut stream_clean, false,
+                            );
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(ev) => ev,
+                    Err(_) => break,
+                }
+            }
+            #[cfg(not(feature = "cleaner"))]
+            match rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => break,
+            }
+        };
         match event {
             DaemonEvent::LatchArmed => {
                 // Hands-free engaged mid-hold: the mic keeps running once the
@@ -508,6 +561,15 @@ fn worker_loop(
                 engine = Some(e);
                 consumer = Some(c);
                 is_recording = Some(r);
+                #[cfg(feature = "cleaner")]
+                if streaming {
+                    stream = Some(crate::vad::SegmentStream::new(
+                        crate::audio::SAMPLE_RATE,
+                        crate::vad::VadConfig::default(),
+                    ));
+                    stream_raw.clear();
+                    stream_clean.clear();
+                }
             }
             DaemonEvent::StopRecording => {
                 let Some(mut e) = engine.take() else { continue };
@@ -538,18 +600,65 @@ fn worker_loop(
                     let _ = target_tx.send(FocusTarget::capture());
                 });
 
-                let c = consumer.take().unwrap();
+                #[allow(unused_mut)]
+                let mut c = consumer.take().unwrap();
                 let r = is_recording.take().unwrap();
 
                 let t_pipeline = Instant::now();
-                let transcript = match rt.block_on(worker.run_inference_pipeline(c, r)) {
-                    Ok(t) => t,
-                    Err(err) => {
-                        eprintln!("[err]  transcribe failed: {err:?}");
-                        cues::play_error();
-                        ui_channel::set_state(UiState::Idle);
-                        eprintln!();
-                        continue;
+                // When cleanup already happened per-segment during the hold,
+                // carry the assembled cleaned text forward so the cleanup step
+                // below reuses it instead of re-running Gemma on the whole thing.
+                #[cfg(feature = "cleaner")]
+                let mut precleaned_override: Option<String> = None;
+
+                // Acquire the transcript. Streaming mode (experimental) assembles
+                // it from the sentences cleaned during the hold + a final tail
+                // segment; everything else takes the proven whole-buffer path,
+                // byte-for-byte unchanged.
+                let transcript: String = 'got: {
+                    #[cfg(feature = "cleaner")]
+                    if streaming && stream.is_some() {
+                        // Clean the final outstanding segment(s) now (this is the
+                        // only cleanup left post-release — the win).
+                        if let (Some(st), Some(cl)) = (stream.as_mut(), cleaner.as_ref()) {
+                            stream_process(
+                                &mut worker, cl, &rt, st, &mut c,
+                                &mut stream_raw, &mut stream_clean, true,
+                            );
+                        }
+                        let whole = stream.as_ref().map(|s| s.buf().to_vec()).unwrap_or_default();
+                        // Use the streamed result only for genuinely multi-sentence
+                        // dictations; short utterances / transforms fall back to the
+                        // proven whole-buffer path so commands & transform still work.
+                        let result = if !transform && stream_clean.len() >= 2 {
+                            precleaned_override = Some(stream_clean.join(" "));
+                            eprintln!("  ⟫ streamed {} sentence segment(s) during hold", stream_clean.len());
+                            stream_raw.join(" ")
+                        } else {
+                            match worker.transcribe_pcm(&whole) {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("[err]  transcribe failed: {err:?}");
+                                    cues::play_error();
+                                    ui_channel::set_state(UiState::Idle);
+                                    eprintln!();
+                                    stream = None;
+                                    continue 'evloop;
+                                }
+                            }
+                        };
+                        stream = None;
+                        break 'got result;
+                    }
+                    match rt.block_on(worker.run_inference_pipeline(c, r)) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            eprintln!("[err]  transcribe failed: {err:?}");
+                            cues::play_error();
+                            ui_channel::set_state(UiState::Idle);
+                            eprintln!();
+                            continue 'evloop;
+                        }
                     }
                 };
                 let t_transcribe = t_pipeline.elapsed();
@@ -652,6 +761,14 @@ fn worker_loop(
                     #[cfg(feature = "cleaner")]
                     {
                         match cleaner {
+                            // Already cleaned per-sentence during the hold — reuse
+                            // it (the whole point of streaming). Skips a redundant
+                            // whole-buffer Gemma pass. Terminals still take raw.
+                            Some(_) if !is_terminal && precleaned_override.is_some() => {
+                                let pre = precleaned_override.take().unwrap();
+                                eprintln!("  ⟫    streamed cleanup ({} chars)", pre.chars().count());
+                                pre
+                            }
                             Some(ref c) if !is_terminal => {
                                 if !screen_vocab.is_empty() {
                                     eprintln!("  ⌕    screen vocab: {}", screen_vocab.join(", "));
@@ -827,6 +944,72 @@ fn handle_transform(
 }
 
 /// Spoken prefix command (e.g. "translate to Chinese …"): run the resolved
+/// Pop everything currently sitting in the capture ring buffer (non-blocking).
+/// Used by the streaming path to pull newly captured audio on each tick + at
+/// release without waiting on the recording flag.
+#[cfg(feature = "cleaner")]
+fn drain_available(consumer: &mut crate::audio::HeapAudioConsumer) -> Vec<f32> {
+    use ringbuf::traits::{Consumer, Observer};
+    let n = consumer.occupied_len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0.0_f32; n];
+    let got = consumer.pop_slice(&mut buf);
+    buf.truncate(got);
+    buf
+}
+
+/// One streaming step: pull available audio into the segment stream, then
+/// transcribe + clean each segment the VAD reports (finished-only on a tick,
+/// everything remaining when `final_flush`). Cleaned pieces carry the prior
+/// cleaned text as left-context. Results append to `raw_acc` / `clean_acc`.
+#[cfg(feature = "cleaner")]
+#[allow(clippy::too_many_arguments)]
+fn stream_process(
+    worker: &mut LocalInferenceWorker,
+    cleaner: &TextCleanupEngine,
+    rt: &tokio::runtime::Runtime,
+    st: &mut crate::vad::SegmentStream,
+    consumer: &mut crate::audio::HeapAudioConsumer,
+    raw_acc: &mut Vec<String>,
+    clean_acc: &mut Vec<String>,
+    final_flush: bool,
+) {
+    let avail = drain_available(consumer);
+    if !avail.is_empty() {
+        st.push(&avail);
+    }
+    let segs = if final_flush { st.take_final() } else { st.take_complete() };
+    for (s, e) in segs {
+        let seg = st.buf()[s..e].to_vec();
+        let raw = match worker.transcribe_pcm(&seg) {
+            Ok(t) => t.trim().to_string(),
+            Err(err) => {
+                eprintln!("[warn] stream seg transcribe: {err:?}");
+                continue;
+            }
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        // Screen-context vocab isn't known until release (focus capture), so
+        // streamed segments use the static corrections vocab only; the final
+        // refiner corrections pass still applies to the assembled text.
+        let prior = clean_acc.join(" ");
+        let cleaned = match rt.block_on(cleaner.process_segment_with_context(&raw, &[], &prior)) {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("[warn] stream seg cleanup: {err:?}; using raw");
+                raw.clone()
+            }
+        };
+        eprintln!("  ⟫ seg · {raw:?} → {cleaned:?}");
+        raw_acc.push(raw);
+        clean_acc.push(cleaned);
+    }
+}
+
 /// transform on the spoken body with the warm Gemma engine and inject the result
 /// at the cursor, like a normal dictation. Unlike `handle_transform` there's no
 /// selection and no clipboard round-trip — the body is fresh speech, so we
