@@ -221,11 +221,53 @@ const FILLER_INTERJECTIONS: &[&str] =
 /// Pure & unit-tested.
 pub fn fix_speech_mechanics(s: &str) -> String {
     let despoken = drop_filler_interjections(s);
-    let i_capped = capitalize_standalone_i(&despoken);
+    let detrailed = strip_trailing_filler(&despoken);
+    let i_capped = capitalize_standalone_i(&detrailed);
     // Numerals-heavy number formatting: the deterministic half (decimals,
     // versions, well-formed cardinals). The cleanup prompt handles contextual
     // singles; ambiguous runs (years, "three four") are left for it / the user.
     crate::numbers::spoken_to_numerals(&i_capped)
+}
+
+/// Trailing acknowledgement fillers a speaker tacks on while thinking — kept as
+/// its own clause, e.g. "…we can use. Yeah." Only stripped when it's a STANDALONE
+/// trailing clause (after a sentence/comma boundary), so "I told him yeah" and a
+/// whole-utterance "Yeah." are left intact. (Leading versions are handled by the
+/// cleanup prompt; this is the deterministic trailing case — measured at ~1% of
+/// real dictations but consistently a verbatim verbal tic.)
+const TRAILING_FILLERS: &[&str] = &["yeah", "yep", "yup", "you know"];
+
+fn strip_trailing_filler(s: &str) -> String {
+    let trimmed = s.trim_end();
+    // Bare text with trailing terminal punctuation / spaces removed, for matching.
+    let core = trimmed.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ' '));
+    for f in TRAILING_FILLERS {
+        if core.len() < f.len() || !core[core.len() - f.len()..].eq_ignore_ascii_case(f) {
+            continue;
+        }
+        let before = &core[..core.len() - f.len()];
+        // Whole-word: the char before the filler must be a boundary, not a letter
+        // ("conveyed" must not match trailing "yed", "okay" not match "ay", etc.).
+        if before.chars().last().is_some_and(|c| c.is_alphanumeric()) {
+            continue;
+        }
+        let before_trim = before.trim_end();
+        if before_trim.is_empty() {
+            // The whole utterance is just the filler — the speaker meant it. Keep.
+            return trimmed.to_string();
+        }
+        // Only strip when a clause boundary precedes the filler (so "I said yeah"
+        // — no boundary — is preserved as meaningful).
+        if before_trim.ends_with(['.', '!', '?', ',']) {
+            let kept = before_trim.trim_end_matches([',', ' ']);
+            return if kept.ends_with(['.', '!', '?']) {
+                kept.to_string()
+            } else {
+                format!("{kept}.")
+            };
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Remove whole-word filler interjections anywhere in the text, then repair
@@ -487,6 +529,34 @@ mod tests {
         assert_eq!(
             polish_multiline("Sure! line one\nline two<end_of_turn>"),
             "line one\nline two"
+        );
+    }
+
+    #[test]
+    fn strips_standalone_trailing_filler() {
+        assert_eq!(strip_trailing_filler("the models we can use. Yeah."), "the models we can use.");
+        assert_eq!(strip_trailing_filler("do it. yeah"), "do it.");
+        assert_eq!(strip_trailing_filler("that's cool, yeah"), "that's cool.");
+        assert_eq!(strip_trailing_filler("ship it tomorrow. You know."), "ship it tomorrow.");
+    }
+
+    #[test]
+    fn keeps_meaningful_and_whole_utterance_yeah() {
+        // no clause boundary before "yeah" → it's part of the sentence
+        assert_eq!(strip_trailing_filler("I told him yeah"), "I told him yeah");
+        // the entire utterance is the acknowledgement → the speaker meant it
+        assert_eq!(strip_trailing_filler("Yeah."), "Yeah.");
+        assert_eq!(strip_trailing_filler("yeah"), "yeah");
+        // whole-word only: must not chop the end of a real word
+        assert_eq!(strip_trailing_filler("the deal is conveyed"), "the deal is conveyed");
+    }
+
+    #[test]
+    fn fix_speech_mechanics_drops_trailing_yeah_end_to_end() {
+        // (leading "so" removal is the cleanup model's job, not this pass)
+        assert_eq!(
+            fix_speech_mechanics("i think we should ship it. yeah"),
+            "I think we should ship it."
         );
     }
 }
