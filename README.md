@@ -1,11 +1,24 @@
 # local-dictation
 
-**Hold a hotkey, speak, release — cleaned text appears at your cursor.** A local-first dictation app for Apple Silicon, optimized for the lowest latency and highest accuracy I could get end-to-end. Everything runs on-device; nothing touches the network at runtime.
+**The fastest, lowest-latency, fully on-device dictation app for Apple Silicon.** Hold a hotkey, speak, release — cleaned text appears at your cursor in **~300–400 ms end-to-end** (key release → injected text, 2 s clip). Speech is transcribed, LLM-cleaned, and injected entirely on-device; **nothing touches the network at runtime.** No cloud, no streaming, no round-trip — just local compute on the Apple Neural Engine + Metal.
 
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 ![On-device](https://img.shields.io/badge/network%20at%20runtime-none-success)
+![Latency: ~300–400 ms end-to-end](https://img.shields.io/badge/latency-~300--400ms%20end--to--end-brightgreen)
+
+### ⚡ Latency at a glance
+
+Measured on Apple Silicon, hot path after warm-up, **end-to-end from key release to text on screen** — transcription **and** LLM cleanup included:
+
+| Speech length | Total latency | What's happening |
+| --- | --- | --- |
+| **2 s utterance** | **~300–400 ms** | transcribe ~90 ms · clean ~150 ms · inject ~5 ms |
+| 5 s utterance | ~500–700 ms | scales with audio length, not network |
+| 10 s utterance | ~800 ms–1.1 s | still fully local, still no round-trip |
+
+Two small on-device models do the work: **Parakeet TDT v3** (ASR, CoreML on the Neural Engine) → **Gemma 3 1B** (cleanup, llama.cpp + Metal). The ~400-token cleanup prompt is decoded once at boot and its KV-cache prefix reused every utterance, so cleanup stays near ~150 ms instead of re-prefilling each time. Full breakdown and methodology in [Verified performance](#verified-performance) below.
 
 <p align="center">
   <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release — cleaned text lands at the cursor" width="420">
