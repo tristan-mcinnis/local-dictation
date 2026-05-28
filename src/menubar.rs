@@ -217,33 +217,6 @@ define_class!(
             });
         }
 
-        #[unsafe(method(selectWakeWord:))]
-        fn select_wake_word(&self, sender: *mut AnyObject) {
-            let word = unsafe {
-                let obj: *mut AnyObject = msg_send![sender, representedObject];
-                if obj.is_null() {
-                    String::new()
-                } else {
-                    let s: &NSString = &*(obj as *const NSString);
-                    s.to_string()
-                }
-            };
-            write_settings_and_relaunch(move |set| set.wake_word = Some(word.clone()));
-        }
-
-        #[unsafe(method(toggleListen:))]
-        fn toggle_listen(&self, _sender: *mut AnyObject) {
-            // Listen mode needs the always-on mic; turning it on also turns
-            // pre-roll on so the wake word is actually heard.
-            let on = Settings::load().listen_mode.unwrap_or(false);
-            write_settings_and_relaunch(move |set| {
-                set.listen_mode = Some(!on);
-                if !on && set.preroll_ms.unwrap_or(0) == 0 {
-                    set.preroll_ms = Some(crate::audio::DEFAULT_PREROLL_MS);
-                }
-            });
-        }
-
         #[unsafe(method(openCommandsRef:))]
         fn open_commands_ref(&self, _sender: *mut AnyObject) {
             write_and_open_commands_reference();
@@ -378,92 +351,18 @@ struct StatusItemBuild {
 /// Build a plain menu item with a title, selector, and key-equivalent,
 /// targeting `actions`. Always enabled (we disable auto-enabling on the
 /// menu so we control state explicitly).
-/// Wake-word picker (presets). Custom words go in settings.json. Mirrors the
-/// hotkey/format submenus; the chosen word rides on `representedObject`.
-fn build_wake_submenu(
-    mtm: MainThreadMarker,
-    actions: &Retained<MenuActions>,
-    settings: &Settings,
-) -> Retained<NSMenu> {
-    let submenu = NSMenu::new(mtm);
-    submenu.setAutoenablesItems(false);
-    let env_locked = std::env::var_os("DICTATE_WAKE_WORD").is_some();
-    let active = settings
-        .wake_word
-        .clone()
-        .unwrap_or_else(|| settings::DEFAULT_WAKE_WORD.to_string());
-
-    for word in settings::WAKE_WORD_CHOICES {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(&format!("“{word}”")),
-                Some(sel!(selectWakeWord:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe {
-            item.setTarget(Some(actions));
-            item.setEnabled(!env_locked);
-            let ns = NSString::from_str(word);
-            let rep: &AnyObject = &ns;
-            item.setRepresentedObject(Some(rep));
-            if !env_locked && active.eq_ignore_ascii_case(word) {
-                item.setState(NSControlStateValueOn);
-            } else {
-                item.setState(NSControlStateValueOff);
-            }
-        }
-        submenu.addItem(&item);
-    }
-
-    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
-    let note_text = if env_locked {
-        "(locked by DICTATE_WAKE_WORD env var)".to_string()
-    } else {
-        format!("now: “{active}” · custom: edit wake_word in settings.json")
-    };
-    let note = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(&note_text),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    note.setEnabled(false);
-    submenu.addItem(&note);
-    submenu
-}
-
 /// Generate the live voice-commands + settings reference and open it in the
 /// default text editor. Generated from the actual command tables + settings so
 /// it never drifts. Backs the menu's "Voice Commands & Shortcuts…" item.
 fn write_and_open_commands_reference() {
     let s = Settings::load();
-    let wake = s
-        .wake_word
-        .clone()
-        .unwrap_or_else(|| settings::DEFAULT_WAKE_WORD.to_string());
     let hotkey = settings::hotkey_name(s.hotkey_keycode.unwrap_or(0x3D));
-    let listen = s.listen_mode.unwrap_or(false);
-    let preroll = s.preroll_ms.unwrap_or(0) > 0;
 
     let mut body = String::new();
     body.push_str("Local Dictation — Voice Commands & Settings\n");
     body.push_str("===========================================\n\n");
     body.push_str(&crate::voice_commands::reference_text());
-    body.push_str("\n\nWAKE WORD (hands-free listen mode):\n");
-    body.push_str(&format!("  Current wake word: “{wake}”\n"));
-    body.push_str(&format!(
-        "  Listen mode: {} · Always-on mic (pre-roll): {}\n",
-        if listen { "ON" } else { "OFF" },
-        if preroll { "ON" } else { "OFF" },
-    ));
-    body.push_str("  To use it: enable BOTH (menu → Listen mode, and Always-on mic), then say e.g.\n");
-    body.push_str(&format!("  “{wake}, reply that sounds good”. Lead-ins hey/ok/okay/hi/hello/yo are allowed.\n"));
-    body.push_str("  Change it from the menu (Wake word ▸), or set \"wake_word\" in settings.json.\n");
-    body.push_str(&format!("\nPUSH-TO-TALK KEY: {hotkey}\n"));
+    body.push_str(&format!("\n\nPUSH-TO-TALK KEY: {hotkey} (hold, speak, release)\n"));
     body.push_str("OUTPUT FORMATS (menu → Output format): default · numbered · bullets · email · code\n");
 
     let Some(path) = crate::app_paths::config_file("voice-commands.txt") else {
@@ -627,29 +526,6 @@ fn build_status_item(
         NSControlStateValueOff
     });
     menu.addItem(&preroll_item);
-
-    // ── Wake-word listen mode (hands-free) ──────────────────────────────
-    // Toggle continuous listening + pick the trigger word. Listen mode also
-    // forces pre-roll on (it needs the always-on stream).
-    let listen_item = action_item(mtm, "Listen mode (wake word)", sel!(toggleListen:), "", actions);
-    listen_item.setState(if settings.listen_mode.unwrap_or(false) {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    menu.addItem(&listen_item);
-
-    let wake_parent = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Wake word"),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    wake_parent.setEnabled(true);
-    wake_parent.setSubmenu(Some(&build_wake_submenu(mtm, actions, &settings)));
-    menu.addItem(&wake_parent);
 
     // ── Edit the cleanup / transform system prompts ─────────────────────
     // Opens prompts.json in a text editor (seeded with the live prompts the
