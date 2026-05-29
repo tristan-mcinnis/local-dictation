@@ -49,6 +49,16 @@ Takes effect on daemon relaunch (`./scripts/reload-daemon.sh`).
   and **no ASR runs while idle** — idle callbacks only update the rolling ring,
   they don't push to the consumer, so Parakeet/Gemma stay asleep until a press.
 - Mutually exclusive with the experimental `streaming_cleanup` (pre-roll wins).
+- **Bluetooth headsets: not recommended.** Holding an input stream open on
+  AirPods / a BT headset pins macOS into the low-quality HFP "call" codec for the
+  stream's whole life, which also degrades that device's *output* (music/video
+  sound bad) even when you're not dictating. `AlwaysOnCapture::start` logs a
+  warning when the input device looks Bluetooth; prefer `preroll_ms = 0` there.
+- **Default-input changes are handled.** The warm stream binds to whatever input
+  was default at boot; if the user later switches inputs (AirPods connect, a call
+  app grabs the mic), the daemon detects the change on the next key-press
+  (`AlwaysOnCapture::device_changed`) and rebuilds the stream on the current
+  device, so it never silently keeps recording the old one.
 
 ### Validation
 - Unit tests: `PrerollRing` rolling/eviction semantics, `preroll_samples`,
