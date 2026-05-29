@@ -10,13 +10,13 @@ push to `origin/main` in the same step (don't wait to be asked). Keep the workin
 ## Design principle (read before adding features)
 
 **Primitives, first-principles, extremely low latency — and tested before they go in.** This is a
-real-time tool fronting two small on-device models (Parakeet ASR, Gemma 3 1B). Every feature must
-earn its place against that:
+real-time tool fronting two small on-device models (Parakeet ASR, Qwen 2.5 1.5B cleanup). Every
+feature must earn its place against that:
 
 - **Lowest-latency method wins.** Reason from first principles about where the cost lands (is it on
   the critical path, or hidden behind work already happening?). Prefer the cheapest primitive that
   works — a native AX read over a screenshot, a deterministic string pass over an LLM call.
-- **Guard the small model's signal-to-noise.** Gemma 1B has a narrow job (clean *this* utterance).
+- **Guard the small model's signal-to-noise.** The 1.5B cleanup model has a narrow job (clean *this* utterance).
   Do NOT feed it broad/irrelevant context — favour the tightest, most relevant slice (e.g. text
   around the caret, not the whole window). Cluttering the prompt degrades quality, not just speed.
 - **Measure, then decide.** Validate latency *and* accuracy with the harnesses (`examples/latency_lab`,
@@ -28,20 +28,20 @@ earn its place against that:
 ## What this is
 
 A local-first, push-to-talk dictation daemon for Apple Silicon macOS. Hold a hotkey, speak,
-release — audio is transcribed (Parakeet TDT v3, CoreML), cleaned up (Gemma 3 1B, llama.cpp +
-Metal), and injected at the cursor (macOS Accessibility, with a clipboard fallback for Electron
+release — audio is transcribed (Parakeet TDT v3, CoreML), cleaned up (Qwen 2.5 1.5B by default,
+llama.cpp + Metal), and injected at the cursor (macOS Accessibility, with a clipboard fallback for Electron
 apps). Everything runs on-device; nothing hits the network at runtime. The crate is
 `fast-dictate-backend` (lib `fast_dictate_backend` + bin `fast-dictate-backend`).
 
 ## Build, run, test
 
 ```bash
-./scripts/download-models.sh                 # one-time: fetches Parakeet + Gemma 3 1B into ./models/
+./scripts/download-models.sh                 # one-time: fetches Parakeet + Qwen 2.5 1.5B into ./models/
 cargo build --features full --release        # the real build — see feature flags below
 ./target/release/fast-dictate-backend daemon # run the push-to-talk daemon
 
-cargo test                                   # 116 unit + 2 integration, NO models or features needed
-cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (130 total)
+cargo test                                   # 157 unit + 2 integration, NO models or features needed
+cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (171 total)
 cargo test --features full <name>            # single test by name substring
 ```
 
@@ -93,8 +93,8 @@ there are two very different loops, and only one needs a rebuild:
    **`./scripts/reload-daemon.sh`** — it kills the running daemon and relaunches the *same*
    installed bundle, so the signature is unchanged and macOS keeps the Mic + Accessibility grants.
    Even faster: don't touch the live app at all — A/B candidate prompts with the offline harness
-   **`cargo run --release --features cleaner --example prompt_lab`** (loads Gemma once, scores a
-   corpus; see `prompts-lab/`). This is the right loop for prompt work.
+   **`cargo run --release --features cleaner --example prompt_lab`** (loads the cleanup model once,
+   scores a corpus; see `prompts-lab/`). This is the right loop for prompt work.
 
 2. **Changing code or built-in defaults** (`src/**`, the `DEFAULT_*` consts in `prompts.rs`).
    Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. Because the bundle is
@@ -114,8 +114,8 @@ is the single most important thing to understand before editing — most modules
 `#[cfg(feature = ...)]` and a default `cargo build` compiles almost none of the real app.
 
 - **`parakeet`** — ASR via `parakeet-rs` + `ort` (downloads onnxruntime at build time) + CoreML.
-- **`cleaner`** — Gemma cleanup via `llama-cpp-2` (NOT `llama_cpp` 0.3.x, which vendors an old
-  llama.cpp that can't load Gemma 3) + Metal.
+- **`cleaner`** — LLM cleanup (Qwen 2.5 1.5B by default; Gemma/Llama also supported) via
+  `llama-cpp-2` (NOT `llama_cpp` 0.3.x, which vendors an old llama.cpp that can't load Gemma 3) + Metal.
 - **`ax-inject`** — real macOS Accessibility text injection, clipboard fallback, menu-bar status
   item, floating waveform pill (objc2 / core-graphics / arboard stack).
 - **`full`** = all three. Use this for any real build or when running the feature-gated tests.
@@ -131,7 +131,7 @@ drains audio and runs the pipeline:
 ```
 audio.rs (cpal + SPSC ring buffer)
   → transcriber.rs (Parakeet → raw text)
-  → cleaner.rs (Gemma cleanup; skipped if --no-cleanup / cleanup disabled)
+  → cleaner.rs (LLM cleanup; skipped if --no-cleanup / cleanup disabled)
   → text_polish.rs (strip LLM preamble/quotes/artefacts)
   → refiner.rs (corrections dict + voice-command parse) — shared by daemon & CLI
   → smart_pad.rs (spacing/capitalization from caret context)
@@ -143,7 +143,7 @@ audio.rs (cpal + SPSC ring buffer)
 dictation to SQLite at `~/.config/local-dictation/history.db`. The model is loaded once at boot,
 so config changes (model/hotkey/cleanup) **relaunch** the daemon rather than hot-swapping.
 
-`cleaner.rs` runs Gemma on a **dedicated worker thread that owns one persistent
+`cleaner.rs` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
 `LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in
 a struct). The worker tracks the resident token sequence and **reuses the shared KV-cache
 prefix** with each new prompt (`clear_kv_cache_seq` wipes only the divergent tail), so the
@@ -159,9 +159,9 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 (`settings.rs`, `prompts.rs`, `corrections.rs`, `history.rs`, the menu bar) shares
 the same location rather than re-joining the path:
 - `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`. Plus `streaming_cleanup` (EXPERIMENTAL, default false / `DICTATE_STREAMING_CLEANUP=1`): clean each sentence at VAD pauses *during* the hold (`vad::SegmentStream` + `cleaner::process_segment_with_context`) so only the final segment is outstanding at release — only engages for multi-sentence dictations (≥2 segments); short utterances, transforms, and spoken commands fall back to the proven whole-buffer path. Validated in `examples/{cleanup_stream_lab,vad_stream_lab}.rs`; unverified on real mic. Plus `preroll_ms` (always-on mic, menu toggle "Always-on mic (pre-roll)" / `DICTATE_PREROLL_MS`, default 0 = off): when >0 the daemon keeps the cpal input stream warm (`audio::AlwaysOnCapture` + `PrerollRing`) and flushes that many ms of lookback into the transcript on key-press, so the first words aren't clipped and there's no stream-open latency (idle callbacks only roll the ring — no ASR runs until a press). Mutually exclusive with `streaming_cleanup` (pre-roll wins). And `listen_mode` (`DICTATE_LISTEN_MODE=1`) + `wake_word` (`DICTATE_WAKE_WORD`, default `computer`): config for the `listen` subcommand's hands-free wake-word dictation. Both validated in `examples/{preroll_lab,wake_word_lab}.rs` + unit tests; **unverified on real mic.** Verdict + cost analysis in `docs/wake-word-and-preroll.md` (pre-roll: recommended; wake word: opt-in experiment — continuous ASR has a real power cost).
-- `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts, plus a `formats` map of named output-shape presets. Four presets ship built-in (`numbered`/`bullets`/`email`/`code`, in `DEFAULT_FORMATS`); a user's `prompts.json` `formats` map overlays them (same key overrides, new key adds). The active preset (`active_format`/`DICTATE_FORMAT`) replaces the cleanup prompt for normal dictation, and list presets keep their line breaks (the cleanup path preserves newlines when a preset is active); unknown/blank falls back to default. The default cleanup/transform prompts are tuned against Gemma 3 1B in `prompts-lab/` (a data-driven eval harness, `examples/prompt_lab.rs`); a deterministic `text_polish::fix_speech_mechanics` pass handles leftover filler + lone "i" so the prompt doesn't have to.
+- `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts, plus a `formats` map of named output-shape presets. Four presets ship built-in (`numbered`/`bullets`/`email`/`code`, in `DEFAULT_FORMATS`); a user's `prompts.json` `formats` map overlays them (same key overrides, new key adds). The active preset (`active_format`/`DICTATE_FORMAT`) replaces the cleanup prompt for normal dictation, and list presets keep their line breaks (the cleanup path preserves newlines when a preset is active); unknown/blank falls back to default. The default cleanup/transform prompts are tuned in `prompts-lab/` (a data-driven eval harness, `examples/prompt_lab.rs`) — originally against Gemma 3 1B; the default cleanup model is now Qwen 2.5 1.5B (see `examples/model_bakeoff.rs`), and the same prompts carry over (validate model swaps with the bakeoff). A deterministic `text_polish::fix_speech_mechanics` pass handles leftover filler + lone "i" so the prompt doesn't have to.
 - `corrections.json` (`corrections.rs`) — the user's single personal vocabulary, a word→replacement map. Applied verbatim after cleanup **and** fed (target spellings only) into the cleanup prompt as a known-vocabulary hint via `prompts::vocabulary_suffix`. **Edited via the menu bar's "Dictionary…" window** (`menubar.rs` `build_dictionary_window`), which renders the map as one entry per line: a casing-only/identity entry shows as a clean bare word ("GitHub", "macOS"), a genuine phonetic fix shows as `from → to` ("lings → Lingzi"). `Corrections::{to_editor_lines, from_editor_text, save}` do the conversion; a bare word saved becomes an identity entry (key = lowercased word). Save rewrites `corrections.json` and relaunches the daemon to apply (corrections are read once at boot — same apply-on-relaunch model as the model/hotkey settings).
-- `dictionary.json` (`dictionary.rs`) — an *optional, advanced* flat JSON array of extra known words still read by the cleaner and merged into the same vocabulary block (`DICTATE_DICTIONARY_PATH` overrides the path; `dictionary.example.json` shows the format). The menu-bar editor manages `corrections.json`, not this file; it remains for power users who want a separate plain-list input. The cleanup *instructions* are the cached/warmed prefix; the vocabulary block is appended **per-utterance** (so the prefix cache reuses the instructions every time, and the vocab too when unchanged). Alongside the curated corrections terms, `screen_context.rs` harvests proper nouns from the focused window (field value + title, read in the parallel focus capture so it's off the critical path) — `extract_terms` ranks mixed-case/identifier/proper-noun tokens, caps at `SCREEN_VOCAB_CAP=16`, and the daemon passes them to `cleaner::process_transcript_with_vocab`. This stops Gemma from substituting similar-sounding names (measured: "Saoirse"→"Seamus" without it, correct with it). Verify coverage live with `context-probe`.
+- `dictionary.json` (`dictionary.rs`) — an *optional, advanced* flat JSON array of extra known words still read by the cleaner and merged into the same vocabulary block (`DICTATE_DICTIONARY_PATH` overrides the path; `dictionary.example.json` shows the format). The menu-bar editor manages `corrections.json`, not this file; it remains for power users who want a separate plain-list input. The cleanup *instructions* are the cached/warmed prefix; the vocabulary block is appended **per-utterance** (so the prefix cache reuses the instructions every time, and the vocab too when unchanged). Alongside the curated corrections terms, `screen_context.rs` harvests proper nouns from the focused window (field value + title, read in the parallel focus capture so it's off the critical path) — `extract_terms` ranks mixed-case/identifier/proper-noun tokens, caps at `SCREEN_VOCAB_CAP=16`, and the daemon passes them to `cleaner::process_transcript_with_vocab`. This stops the cleanup model from substituting similar-sounding names (measured: "Saoirse"→"Seamus" without it, correct with it). Verify coverage live with `context-probe`.
 
 Precedence is always **env var > JSON file > built-in default**. Key env knobs:
 `PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE` (default `0x3D` Right Option),
@@ -169,7 +169,7 @@ Precedence is always **env var > JSON file > built-in default**. Key env knobs:
 `DICTATE_TRANSFORM_PROMPT`, `DICTATE_CLEANUP_PROMPT`, `DICTATE_PREROLL_MS` (always-on pre-roll ms;
 0 = off), `DICTATE_LISTEN_MODE` + `DICTATE_WAKE_WORD` (the `listen` subcommand),
 `DICTATE_CORRECTIONS_PATH`, `FOCUS_APP`/`INJECT_DIAG` (scripted-test helpers). Models default to
-`models/dictation/parakeet-tdt-v3-int8` and `models/llm/gemma-3-1b-it/...` inside the repo tree.
+`models/dictation/parakeet-tdt-v3-int8` and `models/llm/qwen-2.5-1.5b-it/...` inside the repo tree.
 
 ## Debugging
 

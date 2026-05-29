@@ -92,10 +92,10 @@ ok "cmake $(cmake --version | head -1 | awk '{print $3}')"
 
 # ── 2. models ────────────────────────────────────────────────────────────────
 echo
-bold "2/4  Models (Parakeet speech-to-text + Gemma cleanup, ~1.4 GB)"
+bold "2/4  Models (Parakeet speech-to-text + Qwen 2.5 1.5B cleanup, ~1.7 GB)"
 PARAKEET="models/dictation/parakeet-tdt-v3-int8/encoder-model.int8.onnx"
-GEMMA="models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf"
-if [ -s "$PARAKEET" ] && [ -s "$GEMMA" ]; then
+CLEANUP_MODEL="models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf"
+if [ -s "$PARAKEET" ] && [ -s "$CLEANUP_MODEL" ]; then
   ok "models already downloaded"
 else
   info "downloading (one time)…"

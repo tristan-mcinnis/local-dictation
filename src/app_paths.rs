@@ -87,11 +87,14 @@ pub fn parakeet_default_dir() -> String {
         .into_owned()
 }
 
-/// Default Gemma cleanup model path
-/// (`<base>/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf`).
+/// Default cleanup model path
+/// (`<base>/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf`).
+/// Named `gemma_*` for historical reasons (Gemma was the original default);
+/// the recommended cleanup model is now Qwen 2.5 1.5B — see the bake-off in
+/// `examples/model_bakeoff.rs` and the README "Models" section.
 pub fn gemma_default_path() -> String {
     models_base_dir()
-        .join("llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf")
+        .join("llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf")
         .to_string_lossy()
         .into_owned()
 }
