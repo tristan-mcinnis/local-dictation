@@ -577,15 +577,40 @@ fn worker_loop(
                 // open a session. The next audio callback flushes the pre-roll
                 // lookback (audio from *before* this press) into the consumer,
                 // then live audio, so the first words can't be clipped.
-                if let Some((ao, _)) = always.as_ref() {
-                    transform_mode = transform;
-                    t_press = Some(Instant::now());
-                    ao.begin_session();
-                    cues::play_start();
-                    crate::audio_duck::mute();
-                    ui_channel::set_state(UiState::Recording);
-                    eprintln!("▶ recording · pre-roll");
-                    session_active = true;
+                if always.is_some() {
+                    // The warm stream is bound to whatever input was default at
+                    // boot. If the user has since switched inputs (AirPods
+                    // connected, a call app grabbed the mic), rebuild it now so
+                    // we capture from the *current* device instead of silently
+                    // recording the old one. Cheap host query; only the rare
+                    // device-change case pays the rebuild.
+                    if always.as_ref().map(|(ao, _)| ao.device_changed()).unwrap_or(false) {
+                        let preroll = crate::audio::preroll_samples(preroll_ms);
+                        let (mut ao2, cons2) =
+                            crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
+                        match ao2.start() {
+                            Ok(()) => {
+                                eprintln!(
+                                    "[audio] default input changed → rebuilt always-on stream on `{}`",
+                                    ao2.device_name()
+                                );
+                                always = Some((ao2, cons2));
+                            }
+                            Err(e) => eprintln!(
+                                "[warn] always-on rebuild failed ({e}); keeping previous stream"
+                            ),
+                        }
+                    }
+                    if let Some((ao, _)) = always.as_ref() {
+                        transform_mode = transform;
+                        t_press = Some(Instant::now());
+                        ao.begin_session();
+                        cues::play_start();
+                        crate::audio_duck::mute();
+                        ui_channel::set_state(UiState::Recording);
+                        eprintln!("▶ recording · pre-roll");
+                        session_active = true;
+                    }
                     continue;
                 }
                 transform_mode = transform;

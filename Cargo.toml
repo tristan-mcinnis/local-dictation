@@ -91,6 +91,10 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     # Read the general pasteboard's changeCount so the clipboard-paste fallback
     # doesn't clobber something the user copied during the paste-settle window.
     "NSPasteboard",
+    # Detect the frontmost app (bundle id) so audio-ducking can skip muting
+    # system output while a call app is in front — see audio_duck.rs.
+    "NSWorkspace",
+    "NSRunningApplication",
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
 

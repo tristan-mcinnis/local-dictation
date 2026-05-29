@@ -259,6 +259,17 @@ mod tests {
     }
 
     #[test]
+    fn bluetooth_device_detection() {
+        assert!(is_bluetooth_device("Tristan's AirPods Pro"));
+        assert!(is_bluetooth_device("Beats Studio Buds"));
+        assert!(is_bluetooth_device("Sony Bluetooth Headphones"));
+        // Built-in / wired inputs must NOT trip the warning.
+        assert!(!is_bluetooth_device("MacBook Pro Microphone"));
+        assert!(!is_bluetooth_device("External Microphone"));
+        assert!(!is_bluetooth_device("USB Audio Device"));
+    }
+
+    #[test]
     fn resample_passthrough_at_matching_rate() {
         // stride 1.0 (16k→16k), mono: output mirrors input (first sample uses
         // the `last` carry of 0.0).
@@ -351,6 +362,12 @@ pub struct AlwaysOnCapture {
     preroll_samples: usize,
     pub native_sample_rate: u32,
     pub native_channels: u16,
+    // Name of the input device this stream was opened on. The warm stream stays
+    // bound to it for life, so if the system default input later changes
+    // (AirPods connect, a call app switches the device) we'd silently keep
+    // capturing the old device — `device_changed` detects that so the daemon can
+    // rebuild. Empty until `start`.
+    device_name: String,
 }
 
 unsafe impl Sync for AlwaysOnCapture {}
@@ -370,6 +387,7 @@ impl AlwaysOnCapture {
                 preroll_samples,
                 native_sample_rate: 0,
                 native_channels: 0,
+                device_name: String::new(),
             },
             consumer,
         )
@@ -414,12 +432,25 @@ impl AlwaysOnCapture {
 
         self.native_sample_rate = native_rate;
         self.native_channels = native_channels;
+        self.device_name = device_name.clone();
         eprintln!(
             "[audio] always-on on `{device_name}` @ {native_rate} Hz × {native_channels} ch ({:?}); \
              pre-roll {} ms",
             sample_format,
             self.preroll_samples * 1000 / SAMPLE_RATE as usize
         );
+        // Holding an input stream open on a Bluetooth headset forces macOS into
+        // the low-quality HFP "call" profile for as long as the stream lives —
+        // and with always-on that's the daemon's whole lifetime, so the device's
+        // *output* (music, video) is degraded even when you're not dictating.
+        // Warn so the user can turn pre-roll off for Bluetooth headsets.
+        if is_bluetooth_device(&device_name) {
+            eprintln!(
+                "[warn] always-on mic is on a Bluetooth device (`{device_name}`) — macOS keeps it \
+                 in low-quality call mode while the stream is open, degrading its audio output. \
+                 Consider disabling pre-roll (preroll_ms = 0) for Bluetooth headsets."
+            );
+        }
 
         let stride = native_rate as f64 / SAMPLE_RATE as f64;
         let channels = native_channels as usize;
@@ -484,6 +515,46 @@ impl AlwaysOnCapture {
         self.stream = Some(stream);
         Ok(())
     }
+
+    /// Name of the input device this stream is bound to (empty before `start`).
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// True if the system default input device has changed since this stream was
+    /// opened. The warm stream stays bound to the *original* device for life, so
+    /// after the user switches inputs (connects AirPods, joins a call that grabs
+    /// the mic) it would otherwise keep capturing the wrong device. The daemon
+    /// calls this on key-press and rebuilds the stream when it returns true.
+    /// Conservative: if the current default can't be read, returns false (don't
+    /// churn the stream on a transient query failure).
+    pub fn device_changed(&self) -> bool {
+        match default_input_name() {
+            Some(name) => name != self.device_name,
+            None => false,
+        }
+    }
+}
+
+/// Name of the current system default input device, or `None` if there isn't
+/// one (or its name can't be read). Cheap host query; used to detect a
+/// default-input change against a warm always-on stream.
+pub fn default_input_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|d| d.name().ok())
+}
+
+/// Heuristic: does this input-device name look like a Bluetooth headset? Used
+/// only to warn that always-on capture pins it into low-quality call mode.
+/// Pure + name-based so it's unit-testable without an audio device.
+fn is_bluetooth_device(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("airpods")
+        || n.contains("bluetooth")
+        || n.contains("beats")
+        || n.contains("buds")
+        || n.contains("headphones")
 }
 
 /// Like [`push_resampled`] but returns the resampled mono 16 kHz chunk instead
