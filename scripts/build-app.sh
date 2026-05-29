@@ -7,7 +7,7 @@
 #   ./scripts/build-app.sh                  # dev build: tiny app, models shared
 #                                           #   from the repo via a symlink
 #   ./scripts/build-app.sh --bundle-models  # ship build: copy the recommended
-#                                           #   model stack into the app (~1.4 GB)
+#                                           #   model stack into the app (~1.7 GB)
 #   ./scripts/build-app.sh --install        # also copy to /Applications, add a
 #                                           #   Login Item, and launch it
 #   ./scripts/build-app.sh --dmg            # wrap the app in a distributable
@@ -21,7 +21,7 @@
 #   DICTATE_MODELS_DIR env > <app>/Contents/Resources/models
 #     > ~/Library/Application Support/Local Dictation/models > ./models
 #
-# Dev builds leave the models OUT of the app (instant rebuilds, no 1.4 GB copy)
+# Dev builds leave the models OUT of the app (instant rebuilds, no 1.7 GB copy)
 # and instead symlink the App Support models dir back to the repo, so the app
 # resolves the exact same files you develop against.
 
@@ -49,7 +49,7 @@ VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 
 # Recommended (shipped) model stack — only these get bundled with --bundle-models.
 PARAKEET_REL="dictation/parakeet-tdt-v3-int8"
-GEMMA_REL="llm/gemma-3-1b-it"
+LLM_REL="llm/qwen-2.5-1.5b-it"
 
 BUNDLE_MODELS=0
 INSTALL=0
@@ -126,7 +126,7 @@ if [ "$BUNDLE_MODELS" -eq 1 ]; then
   echo "• bundling model stack into the app (recommended stack only)…"
   mkdir -p "$RES_DIR/models/dictation" "$RES_DIR/models/llm"
   cp -R "$REPO_ROOT/models/$PARAKEET_REL" "$RES_DIR/models/$PARAKEET_REL"
-  cp -R "$REPO_ROOT/models/$GEMMA_REL"    "$RES_DIR/models/$GEMMA_REL"
+  cp -R "$REPO_ROOT/models/$LLM_REL"      "$RES_DIR/models/$LLM_REL"
   echo "  bundled: $(du -sh "$RES_DIR/models" | cut -f1)"
 else
   echo "• dev build: linking shared models via Application Support…"

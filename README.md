@@ -1,6 +1,8 @@
-# local-dictation
+# local-dictation — free, private, on-device dictation for macOS
 
 **The fastest, lowest-latency, fully on-device dictation app for Apple Silicon.** Hold a hotkey, speak, release — cleaned text appears at your cursor in **~300–400 ms end-to-end** (key release → injected text, 2 s clip). Speech is transcribed, LLM-cleaned, and injected entirely on-device; **nothing touches the network at runtime.** No cloud, no streaming, no round-trip — just local compute on the Apple Neural Engine + Metal.
+
+*A free, open-source, **offline speech-to-text / voice-to-text** tool for macOS — a private, local **alternative to cloud dictation and Whisper-based apps**. Push-to-talk dictation with on-device LLM cleanup (filler removal, punctuation, domain casing) and voice editing of selected text. Runs 100% locally on Apple Silicon (M1/M2/M3/M4) — your audio never leaves your Mac.*
 
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black)
@@ -18,7 +20,7 @@ Measured on Apple Silicon, hot path after warm-up, **end-to-end from key release
 | 5 s utterance | ~500–700 ms | scales with audio length, not network |
 | 10 s utterance | ~800 ms–1.1 s | still fully local, still no round-trip |
 
-Two small on-device models do the work: **Parakeet TDT v3** (ASR, CoreML on the Neural Engine) → **Gemma 3 1B** (cleanup, llama.cpp + Metal). The ~400-token cleanup prompt is decoded once at boot and its KV-cache prefix reused every utterance, so cleanup stays near ~150 ms instead of re-prefilling each time. Full breakdown and methodology in [Verified performance](#verified-performance) below.
+Two small on-device models do the work: **Parakeet TDT v3** (ASR, CoreML on the Neural Engine) → **Qwen 2.5 1.5B** (cleanup, llama.cpp + Metal). The ~400-token cleanup prompt is decoded once at boot and its KV-cache prefix reused every utterance, so cleanup stays near ~140 ms instead of re-prefilling each time. Full breakdown and methodology in [Verified performance](#verified-performance) below.
 
 <p align="center">
   <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release — cleaned text lands at the cursor" width="420">
@@ -34,7 +36,7 @@ There are good dictation tools already. This one exists because I wanted a speci
 | --- | --- | --- | --- | --- |
 | Runs fully on-device | ✅ | ✅ | ❌ (audio leaves your Mac) | ✅ |
 | End-to-end latency | ~300–400 ms (2 s clip) | variable | network-bound | varies |
-| LLM cleanup of fillers/punctuation | ✅ (Gemma, on-device) | ❌ | ✅ | some |
+| LLM cleanup of fillers/punctuation | ✅ (Qwen 2.5 1.5B, on-device) | ❌ | ✅ | some |
 | Edit *selected* text by voice | ✅ | ❌ | partial | rare |
 | Editable system prompts | ✅ (plain JSON) | ❌ | ❌ | ❌ |
 | Open source, free | ✅ MIT/Apache | n/a | ❌ | mostly ❌ |
@@ -44,7 +46,7 @@ There are good dictation tools already. This one exists because I wanted a speci
 
 ## Get started
 
-**Easiest — download the app.** Grab **Local Dictation.dmg** from the [latest release](https://github.com/tristan-mcinnis/local-dictation/releases/latest), open it, and drag **Local Dictation.app** into `/Applications`. It's a self-contained ~1.2 GB bundle (Parakeet + Gemma included), so there's no toolchain to install. Because it's ad-hoc signed, Gatekeeper blocks it on first open — clear the quarantine flag once:
+**Easiest — download the app.** Grab **Local Dictation.dmg** from the [latest release](https://github.com/tristan-mcinnis/local-dictation/releases/latest), open it, and drag **Local Dictation.app** into `/Applications`. It's a self-contained ~1.7 GB bundle (Parakeet + Qwen 2.5 1.5B included), so there's no toolchain to install. Because it's ad-hoc signed, Gatekeeper blocks it on first open — clear the quarantine flag once:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Local Dictation.app"
@@ -90,7 +92,7 @@ cargo build --features full --release
 ./scripts/build-app.sh --bundle-models  # self-contained ~1.4 GB app (for sharing/moving)
 ```
 
-Running the daemon directly from a terminal prompts for Microphone + Accessibility tied to *that terminal*; the `.app` is the cleaner path because the permissions attach to the app itself. By default the app shares the models in `./models` (instant rebuilds during development); `--bundle-models` copies the recommended Parakeet + Gemma stack inside the app so it works anywhere.
+Running the daemon directly from a terminal prompts for Microphone + Accessibility tied to *that terminal*; the `.app` is the cleaner path because the permissions attach to the app itself. By default the app shares the models in `./models` (instant rebuilds during development); `--bundle-models` copies the recommended Parakeet + Qwen 2.5 1.5B stack inside the app so it works anywhere.
 
 </details>
 
@@ -132,15 +134,15 @@ A small **menu-bar icon** mirrors the state — a monochrome SF Symbol that foll
 
 ## Transform selected text by voice
 
-Beyond dictating new text, you can **edit text you've already got** by voice. Select a passage, then hold **Shift + Right Option** (Shift first, then the push-to-talk key), speak an instruction, and release. The selection is read, rewritten by the same warm Gemma model, and pasted back in place — works even in Electron/terminal apps, because the read + write both go through the clipboard.
+Beyond dictating new text, you can **edit text you've already got** by voice. Select a passage, then hold **Shift + Right Option** (Shift first, then the push-to-talk key), speak an instruction, and release. The selection is read, rewritten by the same warm cleanup model, and pasted back in place — works even in Electron/terminal apps, because the read + write both go through the clipboard.
 
 ```
 select text → hold Shift+Right Option → say "make this more concise" → release
 ```
 
-Things that work well with the default (1B) model: rephrasing, tightening or expanding, changing tone, fixing grammar, reformatting ("turn this into bullet points"), and translation ("translate to Spanish").
+Things that work well with the default (1.5B) model: rephrasing, tightening or expanding, changing tone, fixing grammar, reformatting ("turn this into bullet points"), and translation ("translate to Spanish").
 
-**It comes down to the prompt.** The built-in transform prompt is deliberately permissive — it follows your instruction even when that means *adding* content, so "turn these two bullets into four" expands rather than playing it safe. If a transform under- or over-does it, that prompt is the dial to turn (see [Editable prompts](#editable-prompts)). It's a 1B model, so it's occasionally literal — short selections give it little to build on.
+**It comes down to the prompt.** The built-in transform prompt is deliberately permissive — it follows your instruction even when that means *adding* content, so "turn these two bullets into four" expands rather than playing it safe. If a transform under- or over-does it, that prompt is the dial to turn (see [Editable prompts](#editable-prompts)). It's a 1.5B model, so it's occasionally literal — short selections give it little to build on.
 
 ### Editable prompts
 
@@ -170,10 +172,10 @@ Breakdown of a typical 2 s utterance:
 
 ```
 transcribe (Parakeet TDT v3 INT8, CoreML)    ~90 ms
-cleanup    (Gemma 3 1B Q4_K_M, Metal)       ~150 ms
+cleanup    (Qwen 2.5 1.5B Q4_K_M, Metal)    ~140 ms
 inject     (AX direct, native apps)           ~5 ms
                                             ────────
-                                             ~245 ms
+                                             ~235 ms
 ```
 
 Inject is ~185 ms for Electron-class apps (VS Code, Slack, Discord, browsers, Notion, Obsidian, Zed, Figma — anything with a renderer process that swallows AX writes). For those we route through clipboard paste, which always works.
@@ -189,28 +191,31 @@ Both fully local. A helper script downloads the two defaults:
 | Model | Size | Role |
 | --- | --- | --- |
 | Parakeet TDT v3 INT8 (ONNX) | 640 MB | ASR — speech → text |
-| Gemma 3 1B-IT Q4_K_M (GGUF) | 770 MB | Cleanup — strip fillers, fix punctuation, preserve domain casing |
+| Qwen 2.5 1.5B-IT Q4_K_M (GGUF) | 1.0 GB | Cleanup — strip fillers, fix punctuation, preserve domain casing |
 
-### Why Gemma 3 1B is the default cleanup model
+### Why Qwen 2.5 1.5B is the default cleanup model
 
-Five GGUF models were tried on conversational English dictation. The job is small — drop fillers, fix punctuation/casing, expand `gonna → going to` — so the question was the smallest model that does it *without* mangling meaning or domain casing. Sizes are Q4_K_M on disk; latency is hot-path cleanup of a ~2 s utterance on Apple Silicon (Metal).
+Eight GGUF models were run through the bake-off harness ([`examples/model_bakeoff.rs`](./examples/model_bakeoff.rs)) on a curated set of 11 hard dictation cases × 5 reps each (55 runs/model): reported-speech quoting, domain casing (`macOS`/`GitHub`/`iOS`/`TypeScript`), filler removal, self-correction, fragment-completion, and spoken decimals. The job is small, so the question was the smallest model that does it *without* mangling meaning or casing. Sizes are Q4_K_M on disk; latency is hot-path cleanup on Apple Silicon (Metal), mean / p90 across all runs.
 
-| Model | Size | Cleanup latency | Quality on dictation | Verdict |
+| Model | Size | Pass rate | Cleanup latency (mean / p90) | Verdict |
 | --- | --- | --- | --- | --- |
-| **Gemma 3 1B-IT** | 770 MB | **~150 ms** | Matches 4B on everyday speech; keeps `macOS`/`Rust`/`GitHub` casing | **Default** — best quality-per-ms |
-| Gemma 3 4B-IT | 2.5 GB | ~3× slower (~450 ms) | Marginally better on long/complex sentences | Use for max polish if you don't mind the latency |
-| Llama 3.2 1B-IT | 808 MB | ~1B-class | Solid, but slightly looser on punctuation than Gemma 1B | Fine alternative; no clear win over the default |
-| Qwen 2.5 0.5B-IT | 398 MB | Fastest of the usable set | Quicker, but drops the occasional word and over-trims | Pick for raw speed on a slow machine |
-| SmolLM2 360M-IT | 271 MB | Fastest overall | Too aggressive — rewrites/omits content | Not recommended for cleanup |
+| **Qwen 2.5 1.5B-IT** | 1.0 GB | **50/55 (91%)** | **137 / 190 ms** | **Default** — highest accuracy in the lineup, near the latency floor |
+| Gemma 3 4B-IT | 2.3 GB | 45/55 (82%) | 329 / 479 ms | Max polish on long sentences, but ~2.4× slower |
+| Qwen 2.5 0.5B-IT | 379 MB | 40/55 (73%) | 63 / 88 ms | **Fastest usable** — pick for raw speed on a slow machine |
+| Qwen 2.5 3B-IT | 1.9 GB | 40/55 (73%) | 218 / 340 ms | No accuracy win over the 1.5B, and slower |
+| Llama 3.2 3B-IT | 1.9 GB | 40/55 (73%) | 238 / 348 ms | Solid, but no win over the 1.5B default |
+| Gemma 3 1B-IT | 769 MB | 25/55 (45%) | 117 / 157 ms | *Old default* — fast, but misses domain casing |
+| Llama 3.2 1B-IT | 808 MB | 24/55 (44%) | 362 / 690 ms | Rambles (weak EOS discipline) — slow *and* loose |
+| SmolLM2 360M-IT | 271 MB | 15/55 (27%) | 82 / 99 ms | Too aggressive — rewrites/omits content |
 
-The takeaway: **4B isn't worth ~3× the latency for everyday dictation, and the sub-1B models start trading away accuracy** — Gemma 3 1B sits at the knee of the curve. To switch, pick another model from the **menu bar** or set `GEMMA_MODEL_PATH`. The download script fetches only Parakeet + Gemma 3 1B; drop any of the others into `models/llm/<name>/` to make them appear in the picker.
+The takeaway: **Qwen 2.5 1.5B is the single best model in the lineup — beating Gemma 3 4B at one-third the size — for only ~20 ms more than the smallest 1B-class models.** Bigger isn't better here (the 3B/4B models are slower *and* score no higher), and the sub-1B models trade away accuracy. Qwen 1.5B sits squarely at the knee of the curve. To switch, pick another model from the **menu bar** or set `GEMMA_MODEL_PATH`. The download script fetches only Parakeet + Qwen 2.5 1.5B; drop any of the others into `models/llm/<name>/` to make them appear in the picker.
 
 ## Features
 
 A quick index — the headline features (push-to-talk, transform, editable prompts) each have their own section above.
 
 - **Push-to-talk + hands-free.** Hold Right Option to dictate; or hold it and tap Space to latch, then talk with nothing held and tap once to stop. Hotkey configurable via `DICTATE_HOTKEY_KEYCODE`. See [How you use it](#how-you-use-it).
-- **Transform selected text by voice.** Select, hold Shift + Right Option, speak an instruction, release — rewritten in place via the warm Gemma model. See [Transform selected text by voice](#transform-selected-text-by-voice).
+- **Transform selected text by voice.** Select, hold Shift + Right Option, speak an instruction, release — rewritten in place via the warm cleanup model. See [Transform selected text by voice](#transform-selected-text-by-voice).
 - **On-device LLM cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`gonna → going to`), keeps standard ones (`don't`), and preserves domain casing (`macOS`, `Rust`, `GitHub`). Toggle off for the raw transcript.
 - **Editable prompts + output-format presets.** Tune the cleanup/transform system prompts in plain JSON. **Four presets ship built-in** — `numbered`, `bullets`, `email`, `code` — and the active one reshapes normal dictation accordingly; switch it from the menu bar's "Output format" picker (or `DICTATE_FORMAT`), and add your own or override a built-in in `prompts.json`'s `formats` map. (Transform mode itself is open-ended — there's no fixed list; you speak any instruction.) See [Editable prompts](#editable-prompts).
 - **Personal corrections dictionary.** One vocabulary list, editable from the menu bar's **"Dictionary…"** window: a bare word means "keep this spelling," and `heard → Word` fixes a recurring mishearing. Targets are fed to the cleaner as a vocabulary hint *and* applied verbatim afterwards as a backstop. Backed by `corrections.json` (see [`corrections.example.json`](./corrections.example.json)); an optional flat `dictionary.json` adds extra known words.
@@ -228,8 +233,8 @@ A quick index — the headline features (push-to-talk, transform, editable promp
 
 ```
 [boot] parakeet    loaded in  757 ms
-[boot] cleaner     loaded in  360 ms · gemma-3-1b-it-Q4_K_M.gguf
-[boot] warm-up     done   in  374 ms
+[boot] cleaner     loaded in  611 ms · qwen2.5-1.5b-instruct-q4_k_m.gguf
+[boot] warm-up     done   in  237 ms
 [boot] ready · hold Right Option (0x3d) to dictate · Right Option+Space then release = hands-free (tap Right Option to stop) · ⌘Q quits
 
 ▶ recording
@@ -243,7 +248,7 @@ A quick index — the headline features (push-to-talk, transform, editable promp
   skip · empty transcript
 ```
 
-`xcr` = transcribe (Parakeet), `cln` = cleanup (Gemma), `inj` = inject (AX or clipboard). `app` is the resolved name of whatever process owned the focused UI element. Tail it live with `tail -f /tmp/dictate-daemon.log`.
+`xcr` = transcribe (Parakeet), `cln` = cleanup (the LLM), `inj` = inject (AX or clipboard). `app` is the resolved name of whatever process owned the focused UI element. Tail it live with `tail -f /tmp/dictate-daemon.log`.
 
 ## Subcommands
 
@@ -270,7 +275,7 @@ Two ways to configure the daemon, in order of precedence:
 | Var | Effect |
 | --- | --- |
 | `PARAKEET_MODEL_DIR` | Default: `models/dictation/parakeet-tdt-v3-int8` |
-| `GEMMA_MODEL_PATH` | Cleanup model. Default: `models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf`. Overrides the menu's model picker. |
+| `GEMMA_MODEL_PATH` | Cleanup model (env var name is historical). Default: `models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf`. Overrides the menu's model picker. |
 | `DICTATE_HOTKEY_KEYCODE` | Default: `0x3D` (Right Option). Also handled: `0x36` Right ⌘, `0x3E` Right Control, `0x3C` Right Shift. The daemon watches the matching modifier flag, so any of these register a hold correctly. Overrides the menu's key picker. |
 | `DICTATE_QUIET` | Set to anything to mute audio cues |
 | `DICTATE_NO_MUTE` | Set to anything to stop muting other system audio during capture (the default is to mute it while you dictate and restore on release) |
@@ -297,7 +302,7 @@ Two ways to configure the daemon, in order of precedence:
 src/
 ├── audio.rs            cpal input + SPSC ring buffer + drain_until_stopped
 ├── audio_duck.rs       mute other system output during capture, restore after
-├── cleaner.rs          Gemma cleanup (llama-cpp-2 + Metal)
+├── cleaner.rs          LLM cleanup — Qwen/Gemma/Llama (llama-cpp-2 + Metal)
 ├── clipboard_paste.rs  save → set → Cmd+V → restore (+ Return key synth)
 ├── cues.rs             afplay system sounds
 ├── daemon.rs           push-to-talk loop, CGEventTap, worker thread
@@ -318,25 +323,25 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 80 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 93 total
+cargo test                # 157 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 171 total
 ```
 
 ## License
 
 Dual-licensed under MIT OR Apache-2.0, at your option. See [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).
 
-Models are not redistributed by this repo. Parakeet TDT v3 is © NVIDIA under their license; Gemma 3 is under Google's Gemma terms. Check each model's repo before commercial use.
+Models are not redistributed by this repo. Parakeet TDT v3 is © NVIDIA under their license; Qwen 2.5 is under the Apache-2.0 license; Gemma 3 (an optional alternative) is under Google's Gemma terms. Check each model's repo before commercial use.
 
 ## Acknowledgements
 
 This is a thin shell around some excellent on-device models and runtimes. Standing on:
 
 * [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — FastConformer TDT speech-recognition model (the ASR half)
-* [Gemma 3 1B-IT](https://huggingface.co/google/gemma-3-1b-it) by Google — the on-device LLM that cleans up each utterance
+* [Qwen 2.5 1.5B-IT](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) by Alibaba (Apache-2.0) — the default on-device LLM that cleans up each utterance; [Gemma 3](https://huggingface.co/google/gemma-3-1b-it) by Google is a supported alternative
 * [parakeet-rs](https://github.com/cdpierse/parakeet-rs) — Rust inference for Parakeet, the bridge to the ONNX model
 * [ONNX Runtime](https://github.com/microsoft/onnxruntime) via [`ort`](https://github.com/pykeio/ort) — CoreML-accelerated ASR inference
-* [llama.cpp](https://github.com/ggml-org/llama.cpp) via [`llama-cpp-2`](https://github.com/utilityai/llama-cpp-rs) — Metal-accelerated Gemma inference
+* [llama.cpp](https://github.com/ggml-org/llama.cpp) via [`llama-cpp-2`](https://github.com/utilityai/llama-cpp-rs) — Metal-accelerated LLM cleanup inference
 * [cpal](https://github.com/RustAudio/cpal) — cross-platform audio capture (the mic input ring buffer)
 * [objc2](https://github.com/madsmtm/objc2) — Rust bindings to the macOS Accessibility, AppKit, and Core Graphics APIs (hotkey tap, text injection, menu bar, waveform pill)
 * [arboard](https://github.com/1Password/arboard) — clipboard access for the Electron-app injection fallback

@@ -14,10 +14,13 @@
 //!
 //! ```json
 //! {
-//!     "gemma_model": "/abs/path/to/models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf",
+//!     "gemma_model": "/abs/path/to/models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf",
 //!     "hotkey_keycode": 61,
 //!     "cleanup_enabled": true
 //! }
+//!
+//! (The `gemma_model` key name is historical — it holds the path to whatever
+//! cleanup model is selected; the recommended default is now Qwen 2.5 1.5B.)
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -25,7 +28,10 @@ use std::path::{Path, PathBuf};
 
 /// Built-in default cleanup model, relative to the project tree. Shared by
 /// the CLI resolver and the menu so "default" means the same thing in both.
-pub const DEFAULT_GEMMA_REL: &str = "models/llm/gemma-3-1b-it/gemma-3-1b-it-Q4_K_M.gguf";
+/// Qwen 2.5 1.5B is the recommended cleanup model (best quality-per-ms in the
+/// `examples/model_bakeoff.rs` lineup); the `GEMMA_*` names are historical.
+pub const DEFAULT_GEMMA_REL: &str =
+    "models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf";
 
 /// Push-to-talk hotkey options offered in the menu, as (label, keycode).
 /// Each must be a modifier key handled by `keycode_to_modifier_flag` in the
