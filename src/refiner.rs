@@ -107,6 +107,16 @@ impl Refiner {
         Self { corrections }
     }
 
+    /// Apply only the corrections dictionary, without voice-command parsing.
+    /// Used to fix known proper nouns in the *raw* transcript before LLM
+    /// cleanup, so the small model sees the intended spelling (e.g. "to twist"
+    /// → "Todoist") instead of mangling a garbled one. The post-cleanup
+    /// [`Self::refine`] pass runs corrections again — idempotent for these
+    /// proper-noun fixes (the target spelling isn't itself a correction key).
+    pub fn apply_corrections(&self, text: &str) -> String {
+        self.corrections.apply(text)
+    }
+
     /// Refine already-cleaned text into a body + trailing action.
     ///
     /// Corrections are applied first so they cannot alter the voice-command

@@ -28,8 +28,11 @@
 //!   3. otherwise: no corrections (returns an empty dictionary)
 //!
 //! Matching is word-boundary aware — `lings` won't match inside
-//! `lingsworth`. Punctuation, whitespace, and other non-alphanumeric
-//! characters delimit words.
+//! `lingsworth` — and supports multi-word keys: `to twist → Todoist` matches
+//! the words "to twist" (or "to-twist") as a unit. Punctuation, whitespace, and
+//! other non-alphanumeric characters delimit words; a phrase's words may be
+//! joined only by spaces or hyphens, so a key never matches across a comma or
+//! period. When several keys could match at a word, the longest phrase wins.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -37,8 +40,16 @@ use std::path::{Path, PathBuf};
 
 #[derive(Default, Debug, Clone)]
 pub struct Corrections {
-    /// All keys lowercased; values stored verbatim.
+    /// All keys lowercased; values stored verbatim. The source of truth for the
+    /// editor, `save`, and the vocabulary hint.
     map: HashMap<String, String>,
+    /// Derived phrase index: each key reduced to its lowercased word tokens,
+    /// joined by a single space (so `"to-doist"` and `"to doist"` both become
+    /// `"to doist"`), mapped to the replacement. Built once per construction so
+    /// `apply` can match multi-word keys without re-tokenizing every call.
+    phrases: HashMap<String, String>,
+    /// Longest key, in tokens — the max phrase length `apply` needs to probe.
+    max_phrase_tokens: usize,
 }
 
 #[derive(Deserialize)]
@@ -55,7 +66,7 @@ impl Corrections {
     /// than the JSON file.
     pub fn from_map(map: HashMap<String, String>) -> Self {
         let map = map.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
-        Self { map }
+        Self::build(map)
     }
 
     pub fn len(&self) -> usize {
@@ -148,7 +159,7 @@ impl Corrections {
             }
             map.insert(from.to_lowercase(), to);
         }
-        Self { map }
+        Self::build(map)
     }
 
     /// Write the map to `path` as a pretty, key-sorted JSON object.
@@ -188,43 +199,152 @@ impl Corrections {
             .filter(|(k, _)| !k.starts_with('_'))
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect();
-        Ok(Self { map })
+        Ok(Self::build(map))
     }
 
-    /// Apply corrections to `text` with word-boundary matching.
-    /// Lookup is case-insensitive; replacement uses the dictionary
-    /// value verbatim (so `lings → Lingzi` works regardless of how
-    /// "lings" was capitalized in the input).
+    /// Build a `Corrections` (with its derived phrase index) from an
+    /// already-lowercased key map. The single funnel every constructor passes
+    /// through, so the phrase index can't drift from `map`.
+    fn build(map: HashMap<String, String>) -> Self {
+        let mut phrases = HashMap::with_capacity(map.len());
+        let mut max_phrase_tokens = 0;
+        for (k, v) in &map {
+            let tokens = key_tokens(k);
+            if tokens.is_empty() {
+                continue;
+            }
+            max_phrase_tokens = max_phrase_tokens.max(tokens.len());
+            phrases.insert(tokens.join(" "), v.clone());
+        }
+        Self {
+            map,
+            phrases,
+            max_phrase_tokens,
+        }
+    }
+
+    /// Apply corrections to `text`, matching both single words and multi-word
+    /// phrases (`to twist → Todoist`). Lookup is case-insensitive and
+    /// word-boundary aware — `lings` won't match inside `lingsworth`, and a
+    /// phrase only matches a run of whole words joined by spaces or hyphens
+    /// (never across sentence punctuation). The longest phrase anchored at a
+    /// word wins; replacements use the dictionary value verbatim.
     pub fn apply(&self, text: &str) -> String {
-        if self.map.is_empty() {
+        if self.phrases.is_empty() {
             return text.to_string();
         }
+        let segs = segment(text);
         let mut out = String::with_capacity(text.len());
-        let mut word = String::new();
-        for c in text.chars() {
-            if c.is_alphanumeric() || c == '\'' {
-                word.push(c);
-            } else {
-                self.flush_word(&mut word, &mut out);
-                out.push(c);
+        let mut i = 0;
+        while i < segs.len() {
+            match &segs[i] {
+                Seg::Sep(s) => {
+                    out.push_str(s);
+                    i += 1;
+                }
+                Seg::Word { orig, .. } => match self.match_phrase(&segs, i) {
+                    Some((rep, consumed)) => {
+                        out.push_str(rep);
+                        i += consumed;
+                    }
+                    None => {
+                        out.push_str(orig);
+                        i += 1;
+                    }
+                },
             }
         }
-        self.flush_word(&mut word, &mut out);
         out
     }
 
-    fn flush_word(&self, word: &mut String, out: &mut String) {
-        if word.is_empty() {
-            return;
+    /// Longest-first phrase match anchored at the word segment `start`. Returns
+    /// the replacement plus how many segments it consumes (the matched words
+    /// and the separators joining them). Words may be joined only by spaces or
+    /// hyphens, so a phrase never spans a comma or period.
+    fn match_phrase(&self, segs: &[Seg], start: usize) -> Option<(&str, usize)> {
+        let mut tokens: Vec<&str> = Vec::new();
+        let mut consumed: Vec<usize> = Vec::new(); // segs spanned when the phrase ends at this word
+        let mut j = start;
+        loop {
+            let Some(Seg::Word { lower, .. }) = segs.get(j) else {
+                break;
+            };
+            tokens.push(lower.as_str());
+            consumed.push(j + 1 - start);
+            if tokens.len() >= self.max_phrase_tokens {
+                break;
+            }
+            // Extend only across a joinable separator immediately followed by
+            // another word; anything else ends the phrase.
+            match (segs.get(j + 1), segs.get(j + 2)) {
+                (Some(Seg::Sep(s)), Some(Seg::Word { .. })) if is_joinable_sep(s) => j += 2,
+                _ => break,
+            }
         }
-        let lower = word.to_lowercase();
-        if let Some(rep) = self.map.get(&lower) {
-            out.push_str(rep);
-        } else {
-            out.push_str(word);
+        for len in (1..=tokens.len()).rev() {
+            if let Some(rep) = self.phrases.get(&tokens[..len].join(" ")) {
+                return Some((rep.as_str(), consumed[len - 1]));
+            }
         }
-        word.clear();
+        None
     }
+}
+
+/// A word (alphanumeric + apostrophe run) or a separator run. `apply` walks the
+/// input as these segments so it can match phrases across words while emitting
+/// the original casing and spacing verbatim for everything it doesn't replace.
+enum Seg {
+    Word { orig: String, lower: String },
+    Sep(String),
+}
+
+/// Split text into alternating word/separator segments, preserving everything.
+fn segment(text: &str) -> Vec<Seg> {
+    let mut segs = Vec::new();
+    let mut word = String::new();
+    let mut sep = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() || c == '\'' {
+            if !sep.is_empty() {
+                segs.push(Seg::Sep(std::mem::take(&mut sep)));
+            }
+            word.push(c);
+        } else {
+            if !word.is_empty() {
+                let lower = word.to_lowercase();
+                segs.push(Seg::Word {
+                    orig: std::mem::take(&mut word),
+                    lower,
+                });
+            }
+            sep.push(c);
+        }
+    }
+    if !word.is_empty() {
+        let lower = word.to_lowercase();
+        segs.push(Seg::Word { orig: word, lower });
+    }
+    if !sep.is_empty() {
+        segs.push(Seg::Sep(sep));
+    }
+    segs
+}
+
+/// Tokens of a correction *key*: lowercased alphanumeric/apostrophe runs. Both
+/// `"to-doist"` and `"to doist"` reduce to `["to", "doist"]`, so either spoken
+/// spacing matches the same entry.
+fn key_tokens(key: &str) -> Vec<String> {
+    key.split(|c: char| !(c.is_alphanumeric() || c == '\''))
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// A separator is "joinable" (can sit inside a phrase) only if it's entirely
+/// spaces, tabs, or hyphens — so `to twist` and `t-twist` match, but `to. twist`
+/// and `to, twist` do not.
+fn is_joinable_sep(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c == ' ' || c == '\t' || c == '-')
 }
 
 /// Build a single Dictionary-editor line from the quick-add fields, formatted
@@ -266,7 +386,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_lowercase(), v.to_string()))
             .collect();
-        Corrections { map }
+        Corrections::build(map)
     }
 
     #[test]
@@ -318,6 +438,45 @@ mod tests {
     fn punctuation_only_passes_through() {
         let c = dict(&[("a", "b")]);
         assert_eq!(c.apply("... !!! ???"), "... !!! ???");
+    }
+
+    #[test]
+    fn matches_multi_word_phrase() {
+        // The whole point of the rewrite: multi-word keys actually fire now.
+        let c = dict(&[("to twist", "Todoist")]);
+        assert_eq!(c.apply("send articles to twist now"), "send articles Todoist now");
+        // Case-insensitive across the whole phrase; surrounding spacing kept.
+        assert_eq!(c.apply("To Twist"), "Todoist");
+    }
+
+    #[test]
+    fn hyphen_and_space_spelling_match_same_phrase_key() {
+        // A key written with a hyphen matches both hyphen and space input.
+        let c = dict(&[("t-twist", "Todoist")]);
+        assert_eq!(c.apply("my T-Twist"), "my Todoist");
+        assert_eq!(c.apply("my t twist"), "my Todoist");
+    }
+
+    #[test]
+    fn phrase_does_not_span_sentence_punctuation() {
+        // "to" ends a sentence and "Twist" starts the next — not the phrase.
+        let c = dict(&[("to twist", "Todoist")]);
+        assert_eq!(c.apply("get to. Twist it"), "get to. Twist it");
+    }
+
+    #[test]
+    fn longest_phrase_anchored_at_a_word_wins() {
+        let c = dict(&[("new york", "NYC"), ("new york city", "NYC metro")]);
+        assert_eq!(c.apply("from new york city today"), "from NYC metro today");
+        assert_eq!(c.apply("from new york today"), "from NYC today");
+    }
+
+    #[test]
+    fn single_word_behavior_unchanged_alongside_phrases() {
+        let c = dict(&[("macos", "macOS"), ("to twist", "Todoist")]);
+        assert_eq!(c.apply("ship macos to twist"), "ship macOS Todoist");
+        // A phrase key does not enable partial-word matches.
+        assert_eq!(c.apply("macostuff"), "macostuff");
     }
 
     #[test]
