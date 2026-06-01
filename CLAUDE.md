@@ -71,7 +71,7 @@ prerequisites (Rust/CLT/cmake), downloads models if missing, then calls
 
 ```bash
 ./scripts/build-app.sh                  # dev: tiny app; models shared from ./models via a symlink
-./scripts/build-app.sh --bundle-models  # ship: copies ONLY the recommended stack (~1.4 GB) into the app
+./scripts/build-app.sh --bundle-models  # ship: copies ONLY the recommended stack (~1.7 GB) into the app
 ./scripts/build-app.sh --install        # also copy to /Applications, add Login Item, launch it
 ```
 
