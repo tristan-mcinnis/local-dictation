@@ -45,6 +45,12 @@ async fn main() -> eyre::Result<()> {
         "inject-test" => run_inject_test(args.get(2).cloned()),
         "daemon" => run_daemon(args.iter().any(|a| a == "--no-cleanup")).await,
         "listen" => run_listen(args.iter().any(|a| a == "--no-cleanup")).await,
+        // Control a *running* daemon over its local socket — for Shortcuts,
+        // Raycast, a Stream Deck button, a foot pedal, etc.
+        "toggle" => run_control(fast_dictate_backend::ipc::Command::Toggle),
+        "start" => run_control(fast_dictate_backend::ipc::Command::Start),
+        "stop" => run_control(fast_dictate_backend::ipc::Command::Stop),
+        "cancel" => run_control(fast_dictate_backend::ipc::Command::Cancel),
         "synth-press" => run_synth_press(
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
@@ -53,7 +59,24 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, context-probe, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, context-probe, mock-loop"
+        )),
+    }
+}
+
+/// Drive a *running* daemon over its local control socket (`toggle`/`start`/
+/// `stop`/`cancel`). This is how external automation — macOS Shortcuts, Raycast,
+/// a Stream Deck button, an Alfred workflow, a hardware foot pedal — triggers
+/// dictation without the hotkey and without loading a second copy of the models.
+fn run_control(cmd: fast_dictate_backend::ipc::Command) -> eyre::Result<()> {
+    match fast_dictate_backend::ipc::send(cmd) {
+        Ok(reply) => {
+            println!("[ctl] {} → {reply}", cmd.as_str());
+            Ok(())
+        }
+        Err(e) => Err(eyre::eyre!(
+            "couldn't reach the daemon control socket ({e}). Is the daemon running? \
+             Start it with `daemon` (or launch Local Dictation.app)."
         )),
     }
 }
