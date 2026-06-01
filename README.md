@@ -215,10 +215,11 @@ The takeaway: **Qwen 2.5 1.5B is the single best model in the lineup — beating
 A quick index — the headline features (push-to-talk, transform, editable prompts) each have their own section above.
 
 - **Push-to-talk + hands-free.** Hold Right Option to dictate; or hold it and tap Space to latch, then talk with nothing held and tap once to stop. Hotkey configurable via `DICTATE_HOTKEY_KEYCODE`. See [How you use it](#how-you-use-it).
+- **Drive it from anything (control socket).** Beyond the hotkey, a tiny local Unix-socket control surface lets **macOS Shortcuts, Raycast, a Stream Deck button, or a hardware foot pedal** start/stop/cancel the same flow — `fast-dictate-backend toggle` (also `start` / `stop` / `cancel`) talks to the running daemon with no second model load. Socket path overridable via `DICTATE_CONTROL_SOCK`.
 - **Transform selected text by voice.** Select, hold Shift + Right Option, speak an instruction, release — rewritten in place via the warm cleanup model. See [Transform selected text by voice](#transform-selected-text-by-voice).
 - **On-device LLM cleanup that respects your voice.** Removes `uh / um / like / you know`, expands colloquial contractions (`gonna → going to`), keeps standard ones (`don't`), and preserves domain casing (`macOS`, `Rust`, `GitHub`). Toggle off for the raw transcript.
 - **Editable prompts + output-format presets.** Tune the cleanup/transform system prompts in plain JSON. **Four presets ship built-in** — `numbered`, `bullets`, `email`, `code` — and the active one reshapes normal dictation accordingly; switch it from the menu bar's "Output format" picker (or `DICTATE_FORMAT`), and add your own or override a built-in in `prompts.json`'s `formats` map. (Transform mode itself is open-ended — there's no fixed list; you speak any instruction.) See [Editable prompts](#editable-prompts).
-- **Personal corrections dictionary.** One vocabulary list, editable from the menu bar's **"Dictionary…"** window: a bare word means "keep this spelling," and `heard → Word` fixes a recurring mishearing. Targets are fed to the cleaner as a vocabulary hint *and* applied verbatim afterwards as a backstop. Backed by `corrections.json` (see [`corrections.example.json`](./corrections.example.json)); an optional flat `dictionary.json` adds extra known words.
+- **Personal corrections dictionary.** One vocabulary list, editable from the menu bar's **"Dictionary…"** window: a bare word means "keep this spelling," and `heard → Word` fixes a recurring mishearing — the left side can be a multi-word phrase too (`to twist → Todoist`), matched as a unit. Targets are fed to the cleaner as a vocabulary hint, applied to the **raw transcript before cleanup** so the small model sees the right spelling instead of mangling a garbled one, *and* applied verbatim again afterwards as a backstop. Backed by `corrections.json` (see [`corrections.example.json`](./corrections.example.json)); an optional flat `dictionary.json` adds extra known words.
 - **Inline voice commands.** End an utterance with `press enter` / `new line` / `new paragraph` / `press tab` / `press escape` to emit the keystroke after injection; say `scratch that` / `never mind` / `forget that` to cancel the whole utterance, or `undo that` to revert the previous dictation (⌘Z). Matched on word boundaries (and, for cancel/undo, the whole utterance) so they never fire mid-sentence.
 - **Screen-context vocabulary.** Proper nouns from a small window of text around your cursor (read via Accessibility during the parallel focus capture, so zero added latency) are fed to the cleanup model — so it spells the names already on screen correctly instead of substituting similar-sounding words. Native apps only (AX-blind Electron editors contribute nothing rather than clutter). Check coverage with `context-probe`.
 - **Menu-bar app.** A tint-following SF Symbol mirrors state (`mic` → `mic.fill` → `waveform`) and opens a full menu: model / hotkey / output-format / cleanup pickers, copy-last-dictation, **Dictation History** (a native window backed by SQLite at `history.db`, grouped by day), edit-prompts, and log tools. Settings persist to `settings.json`; changing model/hotkey/cleanup relaunches the daemon, and any matching env var override greys out the menu item.
@@ -255,6 +256,7 @@ A quick index — the headline features (push-to-talk, transform, editable promp
 | Command | What it does |
 | --- | --- |
 | `daemon` | Push-to-talk daemon — the way to use this for real |
+| `toggle` · `start` · `stop` · `cancel` | Drive a **running** daemon over its local control socket — for macOS Shortcuts, Raycast, a Stream Deck button, a foot pedal. `toggle` start-or-stops; `cancel` aborts an in-flight utterance (no transcribe, no inject). No second model load — they just connect to the socket. |
 | `logs` | Open `/tmp/dictate-daemon.log` in your default editor |
 | `bench [wav]` | Transcribe + clean a WAV, report timings |
 | `dictate <ms>` | Fixed-duration capture (no hotkey) |
@@ -282,6 +284,7 @@ Two ways to configure the daemon, in order of precedence:
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
 | `DICTATE_FORMAT` | Active output-format preset name (matches a key in `prompts.json`'s `formats`). Overrides the menu's Output-format picker. Unknown/blank ⇒ default cleanup. |
+| `DICTATE_CONTROL_SOCK` | Override the control-socket path (default: `<tempdir>/dictate-control.sock`). Set it to the **same** path on the daemon and on any client (Shortcut/Raycast/etc.) so they meet — the default temp dir can differ between a login-launched app and a separately-spawned client. |
 | `DICTATE_CORRECTIONS_PATH` | Override the corrections JSON path (default: `~/.config/local-dictation/corrections.json`) |
 | `DICTATE_PROMPTS_PATH` | Override the prompts JSON path (default: `~/.config/local-dictation/prompts.json`) |
 | `DICTATE_TRANSFORM_PROMPT` | Inline override for the transform system prompt (wins over `prompts.json`) |
@@ -308,6 +311,7 @@ src/
 ├── daemon.rs           push-to-talk loop, CGEventTap, worker thread
 ├── history.rs          SQLite dictation history (record / recent)
 ├── injector.rs         AX direct + smart-spacing + Electron clipboard route
+├── ipc.rs              local control socket — toggle/start/stop/cancel from outside
 ├── menubar.rs          NSStatusItem menu (model/hotkey/cleanup/history) + pill + history window
 ├── prompts.rs          editable transform + cleanup system prompts (prompts.json)
 ├── refiner.rs          corrections + voice-command parse (shared by daemon & CLI)
@@ -323,8 +327,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 157 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 171 total
+cargo test                # 166 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 178 total
 ```
 
 ## License
