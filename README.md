@@ -284,7 +284,7 @@ Two ways to configure the daemon, in order of precedence:
 | `FOCUS_APP` | Activate a specific app and inject by PID (for scripted tests) |
 | `INJECT_DIAG` | Log focused element role + PID before every inject |
 | `DICTATE_FORMAT` | Active output-format preset name (matches a key in `prompts.json`'s `formats`). Overrides the menu's Output-format picker. Unknown/blank ⇒ default cleanup. |
-| `DICTATE_CONTROL_SOCK` | Override the control-socket path (default: `<tempdir>/dictate-control.sock`). Set it to the **same** path on the daemon and on any client (Shortcut/Raycast/etc.) so they meet — the default temp dir can differ between a login-launched app and a separately-spawned client. |
+| `DICTATE_CONTROL_SOCK` | Override the control-socket path. Default: `~/.config/local-dictation/control.sock` — a stable, login-session-independent path the daemon and any client (Shortcut/Raycast/etc.) both resolve to. |
 | `DICTATE_CORRECTIONS_PATH` | Override the corrections JSON path (default: `~/.config/local-dictation/corrections.json`) |
 | `DICTATE_PROMPTS_PATH` | Override the prompts JSON path (default: `~/.config/local-dictation/prompts.json`) |
 | `DICTATE_TRANSFORM_PROMPT` | Inline override for the transform system prompt (wins over `prompts.json`) |
@@ -327,8 +327,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 166 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 178 total
+cargo test                # 167 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 179 total
 ```
 
 ## License

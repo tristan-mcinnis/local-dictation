@@ -61,13 +61,26 @@ impl Command {
 }
 
 /// Path to the control socket. `DICTATE_CONTROL_SOCK` overrides it; otherwise it
-/// lives in the temp dir next to the daemon log (`/tmp/dictate-daemon.log`), so
-/// it's always writable and cleared on reboot.
+/// lives next to the other user config (`~/.config/local-dictation/control.sock`).
+/// A *stable, login-session-independent* location is the point: `temp_dir()`
+/// resolves differently for a GUI-launched daemon (its own per-session `$TMPDIR`
+/// under `/var/folders/…`) than for a separately-spawned client (Shortcut,
+/// Raycast, a terminal), so the two would never meet at the same path. The
+/// config dir is identical for both.
 pub fn socket_path() -> PathBuf {
-    if let Ok(p) = std::env::var("DICTATE_CONTROL_SOCK") {
+    socket_path_from(std::env::var("DICTATE_CONTROL_SOCK").ok())
+}
+
+/// Resolve the socket path from an optional explicit override. Factored out from
+/// [`socket_path`] so it's unit-testable without mutating process-global env. A
+/// non-empty override is used verbatim; otherwise the path sits in the shared
+/// config dir, falling back to the temp dir only if `$HOME` is unset.
+fn socket_path_from(env_override: Option<String>) -> PathBuf {
+    if let Some(p) = env_override.filter(|s| !s.trim().is_empty()) {
         return PathBuf::from(p);
     }
-    std::env::temp_dir().join("dictate-control.sock")
+    crate::app_paths::config_file("control.sock")
+        .unwrap_or_else(|| std::env::temp_dir().join("dictate-control.sock"))
 }
 
 /// Resolve `Toggle` to a concrete `Start`/`Stop` from the live recording state.
@@ -95,6 +108,12 @@ where
     F: Fn(Command) + Send + 'static,
 {
     let path = socket_path();
+    // The config dir is the default home now, so make sure it exists before we
+    // bind (it normally does — settings.json etc. live there — but a fresh
+    // install might not have written anything yet).
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     // A leftover socket file from a crashed run blocks bind(); clear it first.
     // The daemon relaunch flow always kills the previous instance before the
     // new one boots (reload-daemon.sh), so we never race two live owners — a
@@ -181,6 +200,28 @@ mod tests {
             Command::Cancel,
         ] {
             assert_eq!(Command::parse(c.as_str()), Some(c));
+        }
+    }
+
+    #[test]
+    fn socket_path_uses_override_then_config_dir() {
+        // An explicit override is used verbatim…
+        assert_eq!(
+            socket_path_from(Some("/tmp/custom.sock".to_string())),
+            PathBuf::from("/tmp/custom.sock")
+        );
+        // …a blank/whitespace override is ignored (falls through to the default)…
+        assert!(socket_path_from(Some("   ".to_string()))
+            .to_string_lossy()
+            .ends_with("control.sock"));
+        // …and the default sits next to the other config, not in temp_dir.
+        let def = socket_path_from(None);
+        assert!(def.ends_with("control.sock"), "{def:?}");
+        if std::env::var_os("HOME").is_some() {
+            assert!(
+                def.to_string_lossy().contains("local-dictation"),
+                "default should live in the config dir: {def:?}"
+            );
         }
     }
 
