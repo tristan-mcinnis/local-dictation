@@ -564,7 +564,7 @@ fn worker_loop(
                             (stream.as_mut(), consumer.as_mut(), cleaner.as_ref())
                         {
                             stream_process(
-                                &mut worker, cl, &rt, st, c,
+                                &mut worker, cl, &refiner, &rt, st, c,
                                 &mut stream_raw, &mut stream_clean, false,
                             );
                         }
@@ -802,7 +802,7 @@ fn worker_loop(
                         // only cleanup left post-release — the win).
                         if let (Some(st), Some(cl)) = (stream.as_mut(), cleaner.as_ref()) {
                             stream_process(
-                                &mut worker, cl, &rt, st, &mut c,
+                                &mut worker, cl, &refiner, &rt, st, &mut c,
                                 &mut stream_raw, &mut stream_clean, true,
                             );
                         }
@@ -1176,6 +1176,7 @@ fn drain_available(consumer: &mut crate::audio::HeapAudioConsumer) -> Vec<f32> {
 fn stream_process(
     worker: &mut LocalInferenceWorker,
     cleaner: &TextCleanupEngine,
+    refiner: &Refiner,
     rt: &tokio::runtime::Runtime,
     st: &mut crate::vad::SegmentStream,
     consumer: &mut crate::audio::HeapAudioConsumer,
@@ -1200,15 +1201,19 @@ fn stream_process(
         if raw.is_empty() {
             continue;
         }
+        // Fix known proper nouns in this segment *before* cleanup — same as the
+        // whole-buffer path — so the small model sees the intended spelling
+        // (e.g. "to do list" → "Todoist") instead of mangling a garbled one.
+        // The final assembled text is still refined again at release.
         // Screen-context vocab isn't known until release (focus capture), so
-        // streamed segments use the static corrections vocab only; the final
-        // refiner corrections pass still applies to the assembled text.
+        // streamed segments use the static corrections vocab only.
+        let corrected = refiner.apply_corrections(&raw);
         let prior = clean_acc.join(" ");
-        let cleaned = match rt.block_on(cleaner.process_segment_with_context(&raw, &[], &prior)) {
+        let cleaned = match rt.block_on(cleaner.process_segment_with_context(&corrected, &[], &prior)) {
             Ok(c) => c,
             Err(err) => {
                 eprintln!("[warn] stream seg cleanup: {err:?}; using raw");
-                raw.clone()
+                corrected.clone()
             }
         };
         eprintln!("  ⟫ seg · {raw:?} → {cleaned:?}");
