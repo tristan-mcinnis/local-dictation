@@ -890,8 +890,20 @@ fn worker_loop(
                                 if !screen_vocab.is_empty() {
                                     eprintln!("  ⌕    screen vocab: {}", screen_vocab.join(", "));
                                 }
+                                // Fix known proper nouns in the *raw* transcript
+                                // before cleanup, so the small model sees the
+                                // intended spelling (e.g. "to twist" → "Todoist")
+                                // instead of mangling a garbled one out of reach
+                                // of the post-cleanup pass. refine() corrects
+                                // again afterwards (idempotent for these fixes).
+                                let pre_corrected = refiner.apply_corrections(&transcript);
+                                if pre_corrected != transcript {
+                                    eprintln!("  ✎    pre-cleanup corrections applied");
+                                }
                                 let t_clean = Instant::now();
-                                match rt.block_on(c.process_transcript_with_vocab(&transcript, &screen_vocab)) {
+                                match rt.block_on(
+                                    c.process_transcript_with_vocab(&pre_corrected, &screen_vocab),
+                                ) {
                                     Ok(cleaned) => {
                                         t_cleanup_ms = ms(t_clean.elapsed());
                                         cleaned
