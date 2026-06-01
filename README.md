@@ -89,7 +89,7 @@ cargo build --features full --release
 # … or build the .app bundle yourself:
 ./scripts/build-app.sh                  # build into ./dist (no install)
 ./scripts/build-app.sh --install        # + copy to /Applications, login item, launch
-./scripts/build-app.sh --bundle-models  # self-contained ~1.4 GB app (for sharing/moving)
+./scripts/build-app.sh --bundle-models  # self-contained ~1.7 GB app (for sharing/moving)
 ```
 
 Running the daemon directly from a terminal prompts for Microphone + Accessibility tied to *that terminal*; the `.app` is the cleaner path because the permissions attach to the app itself. By default the app shares the models in `./models` (instant rebuilds during development); `--bundle-models` copies the recommended Parakeet + Qwen 2.5 1.5B stack inside the app so it works anywhere.
