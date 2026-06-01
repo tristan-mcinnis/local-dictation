@@ -205,6 +205,10 @@ enum DaemonEvent {
     /// is an instruction to rewrite the current selection, not text to insert.
     StartRecording { transform: bool },
     StopRecording,
+    /// Cancel an in-flight utterance: stop capture and discard it (no
+    /// transcribe, no inject). Reached only via the control socket — there's no
+    /// hotkey gesture for it. A no-op when nothing is recording.
+    CancelRecording,
     /// PTT + Space chord recognised mid-hold: the session became hands-free, so
     /// releasing the keys won't stop recording. Worker just plays the cue.
     LatchArmed,
@@ -375,6 +379,24 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     );
     eprintln!();
     ui_channel::set_state(UiState::Idle);
+
+    // Local control socket: let macOS Shortcuts / Raycast / a Stream Deck button
+    // / a foot pedal drive the same start/stop/cancel flow as the hotkey, with
+    // no second model load. The server resolves `toggle` against the live
+    // recording state, then forwards a concrete command onto the SAME channel
+    // the event tap uses, so it funnels through the worker's existing guards.
+    let tx_for_ctl = tx.clone();
+    crate::ipc::serve(move |cmd| {
+        use crate::ipc::Command;
+        let _ = match cmd {
+            Command::Start => tx_for_ctl.send(DaemonEvent::StartRecording { transform: false }),
+            Command::Stop => tx_for_ctl.send(DaemonEvent::StopRecording),
+            Command::Cancel => tx_for_ctl.send(DaemonEvent::CancelRecording),
+            // The server resolves Toggle → Start/Stop before dispatch, so a
+            // Toggle reaching here would be a bug; treat it as a no-op.
+            Command::Toggle => Ok(()),
+        };
+    });
 
     // Hand the main thread to NSApplication. AppKit pumps the same
     // CFRunLoop that our event tap is attached to, so the tap + menu bar +
@@ -569,6 +591,49 @@ fn worker_loop(
                 cues::play_latch();
                 eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
             }
+            DaemonEvent::CancelRecording => {
+                // External "cancel" (control socket only): stop capture and throw
+                // the utterance away — no transcribe, no inject. Mirrors the
+                // StopRecording teardown minus the pipeline. Safe to fire when
+                // idle (nothing live ⇒ no-op).
+                crate::ipc::DAEMON_RECORDING.store(false, Ordering::SeqCst);
+                let mut on_demand_engine = engine.take();
+                let always_on_session = session_active;
+                session_active = false;
+                if on_demand_engine.is_none() && !always_on_session {
+                    continue;
+                }
+                // Un-mute other audio on every exit, exactly like StopRecording.
+                let _unmute = crate::audio_duck::RestoreOnDrop;
+                transform_mode = false;
+                t_press.take();
+                if let Some(e) = on_demand_engine.as_mut() {
+                    e.stop_capture();
+                }
+                if always_on_session {
+                    // End the session and drain+discard the buffered audio so the
+                    // next press starts from a clean ring.
+                    if let Some((ao, cons)) = always.as_mut() {
+                        ao.end_session();
+                        let recflag = ao.recording_flag();
+                        let _ = crate::audio::drain_session(cons, &recflag);
+                    }
+                } else {
+                    // Drop the per-utterance consumer + recording flag unread.
+                    consumer.take();
+                    is_recording.take();
+                }
+                #[cfg(feature = "cleaner")]
+                {
+                    stream = None;
+                    stream_raw.clear();
+                    stream_clean.clear();
+                }
+                cues::play_cancel();
+                ui_channel::set_state(UiState::Idle);
+                eprintln!("⌫ cancelled · discarded");
+                eprintln!();
+            }
             DaemonEvent::StartRecording { transform } => {
                 if engine.is_some() || session_active {
                     continue;
@@ -610,6 +675,7 @@ fn worker_loop(
                         ui_channel::set_state(UiState::Recording);
                         eprintln!("▶ recording · pre-roll");
                         session_active = true;
+                        crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
                     }
                     continue;
                 }
@@ -631,6 +697,7 @@ fn worker_loop(
                 crate::audio_duck::mute();
                 ui_channel::set_state(UiState::Recording);
                 eprintln!("▶ recording");
+                crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
                 engine = Some(e);
                 consumer = Some(c);
                 is_recording = Some(r);
@@ -647,6 +714,7 @@ fn worker_loop(
             DaemonEvent::StopRecording => {
                 // Either capture path may be live: open-on-press (`engine`) or
                 // always-on pre-roll (`session_active`). Nothing live ⇒ ignore.
+                crate::ipc::DAEMON_RECORDING.store(false, Ordering::SeqCst);
                 let mut on_demand_engine = engine.take();
                 let always_on_session = session_active;
                 session_active = false;

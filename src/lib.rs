@@ -6,6 +6,7 @@ pub mod cues;
 pub mod dictionary;
 pub mod history;
 pub mod injector;
+pub mod ipc;
 pub mod numbers;
 pub mod prompts;
 pub mod refiner;

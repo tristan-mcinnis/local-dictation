@@ -40,17 +40,24 @@ apps). Everything runs on-device; nothing hits the network at runtime. The crate
 cargo build --features full --release        # the real build — see feature flags below
 ./target/release/fast-dictate-backend daemon # run the push-to-talk daemon
 
-cargo test                                   # 157 unit + 2 integration, NO models or features needed
-cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (171 total)
+cargo test                                   # 161 unit + 2 integration, NO models or features needed
+cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (175 total)
 cargo test --features full <name>            # single test by name substring
 ```
 
-Subcommands of the binary: `daemon [--no-cleanup]`, `listen [--no-cleanup]`, `logs`, `bench [wav]`,
-`dictate <ms>`, `inject-test [text]`, `transform "<instruction>" "<text>"`, `ax-check`,
-`context-probe`, `mock-loop`. (`listen` is the EXPERIMENTAL hands-free wake-word mode —
-continuous mic + VAD + `wake_word::detect` → inject; see `docs/wake-word-and-preroll.md`.
-`context-probe` waits 4 s then prints the proper-noun terms harvested from the
-focused window — the live check for screen-context vocabulary.) Dispatch is a
+Subcommands of the binary: `daemon [--no-cleanup]`, `listen [--no-cleanup]`, `toggle`, `start`,
+`stop`, `cancel`, `logs`, `bench [wav]`, `dictate <ms>`, `inject-test [text]`,
+`transform "<instruction>" "<text>"`, `ax-check`, `context-probe`, `mock-loop`. (`listen` is the
+EXPERIMENTAL hands-free wake-word mode — continuous mic + VAD + `wake_word::detect` → inject; see
+`docs/wake-word-and-preroll.md`. `context-probe` waits 4 s then prints the proper-noun terms
+harvested from the focused window — the live check for screen-context vocabulary.
+`toggle`/`start`/`stop`/`cancel` drive a **running** daemon over its local control socket — see
+`src/ipc.rs` — so external automation (macOS Shortcuts, Raycast, a Stream Deck button, a foot
+pedal) can trigger dictation without the hotkey and without loading a second copy of the models;
+they just connect to the Unix socket and write one word, which the daemon forwards onto the same
+mpsc channel the event tap uses, funnelling through the worker's existing guards. `toggle` reads
+the live recording state to fire start-or-stop; `cancel` is socket-only — it stops capture and
+discards the utterance with no transcribe/inject (there's no hotkey gesture for it).) Dispatch is a
 plain `match` in `src/main.rs`. The default subcommand is `mock-loop` from the CLI, but **`daemon`
 when the binary is running inside a `.app` bundle** (a double-clicked app gets no args) — see
 `app_paths::running_in_bundle`.
@@ -168,7 +175,9 @@ Precedence is always **env var > JSON file > built-in default**. Key env knobs:
 `DICTATE_FORMAT` (active output-format preset), `DICTATE_QUIET`, `DICTATE_PROMPTS_PATH`,
 `DICTATE_TRANSFORM_PROMPT`, `DICTATE_CLEANUP_PROMPT`, `DICTATE_PREROLL_MS` (always-on pre-roll ms;
 0 = off), `DICTATE_LISTEN_MODE` + `DICTATE_WAKE_WORD` (the `listen` subcommand),
-`DICTATE_CORRECTIONS_PATH`, `FOCUS_APP`/`INJECT_DIAG` (scripted-test helpers). Models default to
+`DICTATE_CONTROL_SOCK` (override the daemon control-socket path; default
+`<tempdir>/dictate-control.sock`), `DICTATE_CORRECTIONS_PATH`,
+`FOCUS_APP`/`INJECT_DIAG` (scripted-test helpers). Models default to
 `models/dictation/parakeet-tdt-v3-int8` and `models/llm/qwen-2.5-1.5b-it/...` inside the repo tree.
 
 ## Debugging
