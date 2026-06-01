@@ -327,8 +327,8 @@ tests/verification.rs   ring buffer + drain integration tests
 ## Tests
 
 ```bash
-cargo test                # 167 unit + 2 integration, no models needed
-cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 179 total
+cargo test                # 168 unit + 2 integration, no models needed
+cargo test --features full  # adds the menubar/history/injector/cleaner + hotkey suites — 180 total
 ```
 
 ## License

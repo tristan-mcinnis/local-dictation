@@ -480,6 +480,17 @@ mod tests {
     }
 
     #[test]
+    fn real_world_brand_phrasings_resolve_through_phrase_match() {
+        // Parakeet mishears "Todoist" as the literal phrase "to do list" / "do
+        // list"; the cleanup model then emits "to-do list" / "do list". The
+        // post-cleanup correction pass must resolve both spellings (hyphen and
+        // space) to the brand — a 3-token and a 2-token phrase, mid-sentence.
+        let c = dict(&[("to do list", "Todoist"), ("do list", "Todoist")]);
+        assert_eq!(c.apply("Double check the to-do list."), "Double check the Todoist.");
+        assert_eq!(c.apply("Double check the do list."), "Double check the Todoist.");
+    }
+
+    #[test]
     fn editor_lines_render_fixes_and_bare_words() {
         let c = dict(&[("lings", "Lingzi"), ("github", "GitHub"), ("parakeet", "Parakeet")]);
         let lines = c.to_editor_lines();
