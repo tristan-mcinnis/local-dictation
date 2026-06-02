@@ -1,6 +1,6 @@
 [package]
 name = "fast-dictate-backend"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Low-latency local dictation pipeline for Apple Silicon: Parakeet TDT v3 + Qwen 2.5 + macOS AX inject."
