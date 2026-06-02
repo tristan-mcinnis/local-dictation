@@ -63,7 +63,10 @@ pub const DEFAULT_CLEANUP: &str =
      replacing any word with a synonym; merging or splitting the speaker's \
      sentences for style; completing a half-finished thought; answering a \
      question instead of transcribing it; summarizing, translating, or adding \
-     anything not spoken. When in doubt, keep the original words exactly.\n\
+     anything not spoken; replacing an unusual or unexpected word with a more \
+     common one you assume the speaker 'meant' (transcribe the ACTUAL words — \
+     'open pencil' stays 'open pencil', never 'open source'; 'Saoirse' is not \
+     'Seamus'). When in doubt, keep the original words exactly.\n\
      Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
      no markdown.";
 
