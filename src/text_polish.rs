@@ -221,7 +221,8 @@ const FILLER_INTERJECTIONS: &[&str] =
 /// Pure & unit-tested.
 pub fn fix_speech_mechanics(s: &str) -> String {
     let despoken = drop_filler_interjections(s);
-    let detrailed = strip_trailing_filler(&despoken);
+    let deled = strip_leading_filler(&despoken);
+    let detrailed = strip_trailing_filler(&deled);
     let i_capped = capitalize_standalone_i(&detrailed);
     // Numerals-heavy number formatting: the deterministic half (decimals,
     // versions, well-formed cardinals). The cleanup prompt handles contextual
@@ -268,6 +269,50 @@ pub fn flatten_to_line(s: &str) -> String {
 /// cleanup prompt; this is the deterministic trailing case — measured at ~1% of
 /// real dictations but consistently a verbatim verbal tic.)
 const TRAILING_FILLERS: &[&str] = &["yeah", "yep", "yup", "you know"];
+
+/// Leading throat-clearing the speaker tacks on before the real sentence —
+/// "Yeah, let's ship it." → "Let's ship it." Removing leading filler used to be
+/// the cleanup LLM's job, but clear dictation now skips the model (see
+/// `needs_llm_cleanup`), so this deterministic pass handles it instead.
+///
+/// Conservative: only strips a leading filler word **immediately followed by a
+/// comma** ("Yeah, …", "So, …", "Okay, …"), which is reliably throat-clearing.
+/// A bare leading "So I think…" (no comma) is left alone — "so" there is a real
+/// connective. Strips at most ONE (so "Yeah, okay, sure." → "Okay, sure.", not
+/// "Sure."), and a whole-utterance "Yeah." has no comma so it's kept.
+const LEADING_FILLERS: &[&str] = &[
+    "yeah", "yep", "yup", "so", "okay", "ok", "well", "right", "um", "uh", "er",
+    "anyway", "look", "like", "basically", "honestly",
+];
+
+fn strip_leading_filler(s: &str) -> String {
+    let trimmed = s.trim_start();
+    for f in LEADING_FILLERS {
+        if trimmed.len() <= f.len() {
+            continue;
+        }
+        // Byte compare (filler words are ASCII) so a leading multi-byte char
+        // can't panic a str slice; a match guarantees f.len() is a char boundary.
+        if !trimmed.as_bytes()[..f.len()].eq_ignore_ascii_case(f.as_bytes()) {
+            continue;
+        }
+        // The char right after the word must be a comma (optionally preceded by
+        // nothing) — that's the throat-clearing signal. Word boundary too.
+        let rest = &trimmed[f.len()..];
+        if !rest.starts_with(',') {
+            continue;
+        }
+        let after = rest[1..].trim_start();
+        if after.is_empty() {
+            continue; // "Yeah," with nothing after — leave it
+        }
+        // Capitalize the first letter of what remains.
+        let mut chars = after.chars();
+        let first = chars.next().unwrap();
+        return format!("{}{}", first.to_uppercase(), chars.as_str());
+    }
+    s.to_string()
+}
 
 pub fn strip_trailing_filler(s: &str) -> String {
     let trimmed = s.trim_end();
@@ -563,9 +608,11 @@ mod tests {
             fix_speech_mechanics("so um I think we should ship it you know"),
             "so I think we should ship it you know"
         );
+        // "Um" dropped as an interjection; leading "yeah," stripped as
+        // throat-clearing; "so" (no comma) is a real connective, kept.
         assert_eq!(
             fix_speech_mechanics("Um, yeah, so the cache keeps growing."),
-            "yeah, so the cache keeps growing."
+            "So the cache keeps growing."
         );
         assert_eq!(fix_speech_mechanics("uh we never evict anything"), "we never evict anything");
     }
@@ -742,6 +789,39 @@ mod tests {
         assert!(!needs_llm_cleanup("I don't use open pencil, you can remove that."));
         assert!(!needs_llm_cleanup("So that we could then update the basketball room slide sketch."));
         assert!(!needs_llm_cleanup("Give me the key structure that would appear inside a brief."));
+    }
+
+    #[test]
+    fn strips_leading_throat_clearing_yeah() {
+        assert_eq!(
+            fix_speech_mechanics("Yeah, let's get the redesign live right now."),
+            "Let's get the redesign live right now."
+        );
+        assert_eq!(
+            fix_speech_mechanics("So, actually that might add latency."),
+            "Actually that might add latency."
+        );
+        // Strips at most one leading filler.
+        assert_eq!(
+            fix_speech_mechanics("Yeah, okay, makes sense."),
+            "Okay, makes sense."
+        );
+    }
+
+    #[test]
+    fn keeps_meaningful_leading_words() {
+        // No comma ⇒ "so" is a real connective, leave it.
+        assert_eq!(
+            fix_speech_mechanics("So we need to ship the build."),
+            "So we need to ship the build."
+        );
+        // A whole-utterance "Yeah." (no comma) is the speaker's actual answer.
+        assert_eq!(fix_speech_mechanics("Yeah."), "Yeah.");
+        // "right" mid-word / as content must not be touched.
+        assert_eq!(
+            fix_speech_mechanics("Right now is a good time."),
+            "Right now is a good time."
+        );
     }
 
     #[test]
