@@ -87,21 +87,6 @@ const DEFAULT_HOTKEY_KEYCODE: i64 = 0x3D;
 /// corrections vocabulary, this stays well under that regression threshold.
 const SCREEN_VOCAB_CAP: usize = 16;
 
-/// Utterances at or below this many words skip the generative cleanup LLM and
-/// take a deterministic-only pass instead (filler/punctuation/casing/numbers +
-/// corrections). Parakeet already punctuates and capitalizes, so for a short
-/// message the LLM adds latency and rewrite risk (dropped clauses) for little
-/// gain. Override with `DICTATE_LLM_MIN_WORDS`. Only applies to default cleanup
-/// — an active output-format preset (numbered/bullets/email) always uses the LLM.
-const SHORT_UTTERANCE_MAX_WORDS: usize = 8;
-
-#[cfg(feature = "cleaner")]
-fn short_utterance_max_words() -> usize {
-    std::env::var("DICTATE_LLM_MIN_WORDS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(SHORT_UTTERANCE_MAX_WORDS)
-}
 
 // Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
 const SPACE_KEYCODE: i64 = 0x31;
@@ -998,12 +983,18 @@ fn worker_loop(
                                     crate::text_polish::fix_speech_mechanics(&pre_corrected);
                                 let word_count = pre_corrected.split_whitespace().count();
 
-                                if !format_active && word_count <= short_utterance_max_words() {
-                                    // (1) Skip the LLM entirely for short messages:
-                                    // Parakeet already punctuates them, so the
-                                    // model only adds latency and rewrite risk.
+                                if !format_active
+                                    && !crate::text_polish::needs_llm_cleanup(&pre_corrected)
+                                {
+                                    // (1) Clean dictation skips the generative LLM
+                                    // entirely. Measured: ~87% of utterances pass
+                                    // through it unchanged, and some pick up unwanted
+                                    // substitutions ("open pencil" → "open source").
+                                    // The deterministic pass can't drop or swap a word,
+                                    // and it's faster. The LLM runs only on real mess
+                                    // (contractions, stutters, dense filler, run-ons).
                                     eprintln!(
-                                        "  ⚡    short ({word_count} words) · deterministic cleanup, LLM skipped"
+                                        "  ⚡    clean ({word_count} words) · deterministic cleanup, LLM skipped"
                                     );
                                     deterministic
                                 } else {

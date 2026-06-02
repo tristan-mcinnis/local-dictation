@@ -449,6 +449,63 @@ pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
     dropped >= 3
 }
 
+/// Decide whether a transcript is messy enough to be worth the generative
+/// cleanup LLM, or clean enough to take the deterministic pass alone.
+///
+/// Measured motivation: ~87% of real dictations from a clear speaker pass
+/// through the LLM unchanged (it re-emits the same text for ~150 ms–1 s), and a
+/// chunk of the rest are *unwanted* rewrites — e.g. "open pencil" → "open source"
+/// (the model swapping an unusual word for a common phrase it assumes you meant).
+/// So we only invoke the model when the text has mess the deterministic pass
+/// (filler interjections, casing, numbers) can't already handle:
+///   - colloquial contractions that need expanding (wanna/gonna/…),
+///   - a false start / stutter (adjacent duplicate word),
+///   - ≥2 "soft" fillers the deterministic pass leaves in (like / you know /
+///     i mean / sort of / kind of),
+///   - a long run-on (≥40 words) with almost no sentence punctuation.
+/// Otherwise the deterministic pass is enough — faster, and it can't substitute
+/// or drop a word. `< 3` words is always "clean" (nothing for the model to do).
+pub fn needs_llm_cleanup(raw: &str) -> bool {
+    let lower = raw.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.len() < 3 {
+        return false;
+    }
+    const CONTRACTIONS: &[&str] = &[
+        "wanna", "gonna", "gotta", "kinda", "sorta", "gimme", "lemme", "dunno",
+        "outta", "lotta", "shoulda", "coulda", "woulda",
+    ];
+    if words.iter().any(|w| CONTRACTIONS.contains(w)) {
+        return true;
+    }
+    // False start / stutter: the same word twice in a row ("the the", "I I").
+    if words.windows(2).any(|w| w[0] == w[1] && w[0].len() > 1) {
+        return true;
+    }
+    // Soft fillers the deterministic pass won't safely strip (context-dependent).
+    const SOFT: &[&str] = &["like", "basically", "literally", "seriously", "honestly"];
+    let mut score = words.iter().filter(|w| SOFT.contains(w)).count();
+    for w in words.windows(2) {
+        if (w[0] == "you" && w[1] == "know")
+            || (w[0] == "i" && w[1] == "mean")
+            || (w[0] == "sort" && w[1] == "of")
+            || (w[0] == "kind" && w[1] == "of")
+        {
+            score += 1;
+        }
+    }
+    if score >= 2 {
+        return true;
+    }
+    // Long run-on with almost no sentence breaks — the model may need to
+    // re-segment it into sentences.
+    let terminators = raw.matches(['.', '!', '?']).count();
+    words.len() >= 40 && terminators <= 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +733,26 @@ mod tests {
     fn dropped_content_skips_short_utterances() {
         // Too short to judge — never fire (avoids nuking genuinely terse edits).
         assert!(!cleanup_dropped_content("yeah sounds good to me", "Sounds good."));
+    }
+
+    #[test]
+    fn messiness_gate_skips_clean_speech() {
+        // The exact failure case: clean, no mess → skip the LLM, so it can't
+        // turn "open pencil" into "open source".
+        assert!(!needs_llm_cleanup("I don't use open pencil, you can remove that."));
+        assert!(!needs_llm_cleanup("So that we could then update the basketball room slide sketch."));
+        assert!(!needs_llm_cleanup("Give me the key structure that would appear inside a brief."));
+    }
+
+    #[test]
+    fn messiness_gate_routes_messy_speech_to_llm() {
+        assert!(needs_llm_cleanup("we're gonna wanna refactor this kinda soon")); // contractions
+        assert!(needs_llm_cleanup("I think the the build is slow")); // stutter / false start
+        assert!(needs_llm_cleanup("it was like really slow and like you know kind of broken")); // dense soft filler
+        // A 40+ word run-on with no sentence breaks needs re-segmenting.
+        let runon = "so then we did the thing and then the other thing and then \
+            after that we went over to the place and grabbed the stuff and then \
+            came back and started again with the first part of the whole process once more";
+        assert!(needs_llm_cleanup(runon));
     }
 }
