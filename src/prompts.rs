@@ -55,12 +55,15 @@ pub const DEFAULT_CLEANUP: &str =
        tokens like git, npm, cd, ls, main, master, dev, prod, api stay \
        lowercase exactly as written. Only capitalize a word that is \
        unambiguously a proper noun.\n\
-     FORBIDDEN (these change intent and are never allowed): changing verb \
-     tense, mood, or word order to 'read better'; replacing any word with a \
-     synonym; merging or splitting the speaker's sentences for style; \
-     completing a half-finished thought; answering a question instead of \
-     transcribing it; summarizing, translating, or adding anything not \
-     spoken. When in doubt, keep the original word exactly.\n\
+     FORBIDDEN (these change intent and are never allowed): dropping or \
+     omitting any clause, sentence, or phrase the speaker said — keep EVERY \
+     one, even a greeting, an aside, or a line that seems like unimportant \
+     small talk (e.g. 'just blocking your time to talk about X' must survive \
+     in full); changing verb tense, mood, or word order to 'read better'; \
+     replacing any word with a synonym; merging or splitting the speaker's \
+     sentences for style; completing a half-finished thought; answering a \
+     question instead of transcribing it; summarizing, translating, or adding \
+     anything not spoken. When in doubt, keep the original words exactly.\n\
      Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
      no markdown.";
 

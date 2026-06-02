@@ -409,6 +409,46 @@ fn collapse_whitespace(s: &str) -> String {
     out
 }
 
+/// Lowercased alphanumeric word tokens of `s`.
+fn word_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+}
+
+/// Heuristic guard: did the generative cleanup **drop real content** (rewrite
+/// instead of edit) rather than just remove filler? Because the cleanup model
+/// regenerates the whole utterance, it can silently delete a whole clause — e.g.
+/// "Hey Chris, just blocking your time to talk about basketball. Let me know if
+/// this works." → "Hey Chris, let me know if this works." This catches that so
+/// the daemon can fall back to the (faithful) raw transcript instead of
+/// injecting a gutted message.
+///
+/// Fires only when BOTH signals agree, to stay clear of legitimate filler
+/// removal / contraction expansion / number formatting:
+///   1. the output lost more than ~45% of its characters, AND
+///   2. at least 3 *substantial* words (≥4 chars — skips fillers and function
+///      words like um/uh/so/the/you) present in the raw are absent from the
+///      cleaned text.
+/// Short utterances (< 24 raw chars) are never judged — too little to tell.
+pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
+    let raw_chars = raw.chars().count();
+    if raw_chars < 24 {
+        return false;
+    }
+    let clean_chars = cleaned.chars().count();
+    // Lost > 45% of characters (clean < 55% of raw).
+    if clean_chars * 100 >= raw_chars * 55 {
+        return false;
+    }
+    let clean_words: std::collections::HashSet<String> = word_tokens(cleaned).collect();
+    let dropped = word_tokens(raw)
+        .filter(|w| w.chars().count() >= 4)
+        .filter(|w| !clean_words.contains(w))
+        .count();
+    dropped >= 3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +644,37 @@ mod tests {
             fix_speech_mechanics("i think we should ship it. yeah"),
             "I think we should ship it."
         );
+    }
+
+    #[test]
+    fn dropped_content_catches_a_deleted_clause() {
+        // The real failure: a whole clause silently deleted (rewrite, not edit).
+        let raw = "Hey Chris, just blocking your time to talk about basketball. Let me know if this works.";
+        let gutted = "Hey Chris, let me know if this works.";
+        assert!(cleanup_dropped_content(raw, gutted));
+    }
+
+    #[test]
+    fn dropped_content_ignores_legit_cleanup() {
+        // Filler removal + light edits must NOT trip the guard.
+        let raw = "um so like I think we should uh ship the the build tomorrow you know";
+        let clean = "I think we should ship the build tomorrow.";
+        assert!(!cleanup_dropped_content(raw, clean));
+
+        // Contraction expansion / number formatting shouldn't fire either.
+        let raw2 = "we're gonna wanna refactor this in version two point one soon";
+        let clean2 = "We are going to want to refactor this in version 2.1 soon.";
+        assert!(!cleanup_dropped_content(raw2, clean2));
+
+        // A faithful, same-length clean is obviously fine.
+        let raw3 = "the latency lab shows the model warms up once at boot";
+        let clean3 = "The latency lab shows the model warms up once at boot.";
+        assert!(!cleanup_dropped_content(raw3, clean3));
+    }
+
+    #[test]
+    fn dropped_content_skips_short_utterances() {
+        // Too short to judge — never fire (avoids nuking genuinely terse edits).
+        assert!(!cleanup_dropped_content("yeah sounds good to me", "Sounds good."));
     }
 }
