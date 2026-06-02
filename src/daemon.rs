@@ -1059,6 +1059,17 @@ fn worker_loop(
                         .unwrap_or("?");
                     eprintln!("  llm  {m}");
                 }
+                // Raw→cleaned visibility. The whole-buffer path otherwise logs
+                // only the final text, so a SAME-LENGTH intent rewrite (raw
+                // "did you do this" → "did you actually fix everything") is
+                // invisible — the shrink watchdog below never fires on it. Log
+                // the raw transcript whenever cleanup changed it (paired with the
+                // `✓` final line) so ASR-vs-cleanup is always attributable after
+                // the fact. One line to the /tmp log, well off the hot path.
+                #[cfg(feature = "cleaner")]
+                if cleaner.is_some() && raw_transcript.trim() != final_text.trim() {
+                    eprintln!("  ⟫ raw · \"{raw_transcript}\"");
+                }
                 // Truncation watchdog: if the cleaned text is dramatically
                 // shorter than the raw transcript (>40% dropped), the cleanup
                 // model likely gave up early or summarized — log the raw text so
