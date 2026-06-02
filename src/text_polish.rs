@@ -227,7 +227,53 @@ pub fn fix_speech_mechanics(s: &str) -> String {
     // Numerals-heavy number formatting: the deterministic half (decimals,
     // versions, well-formed cardinals). The cleanup prompt handles contextual
     // singles; ambiguous runs (years, "three four") are left for it / the user.
-    crate::numbers::spoken_to_numerals(&i_capped)
+    let numbered = crate::numbers::spoken_to_numerals(&i_capped);
+    // Sentence-start casing: when the model strips a leading filler itself
+    // ("Okay, the issue…" → "the issue…") it leaves a lowercase start nothing
+    // else repairs. Last so it sees the final word boundaries.
+    capitalize_sentence_starts(&numbered)
+}
+
+/// Capitalize the first letter of the utterance and of each sentence that
+/// follows terminal punctuation (`.`/`!`/`?`). The cleanup model, when it strips
+/// a leading filler on its own, leaves a lowercase sentence start that no other
+/// pass fixes. Conservative: only acts on a word that begins with a lowercase
+/// ASCII letter AND carries no *interior* uppercase, so intercaps brand /
+/// identifier tokens ("iOS", "eBay", "macOS", "iPhone") at a sentence start are
+/// preserved verbatim. Decimals/versions are untouched (the char after the
+/// period isn't a letter). Idempotent.
+fn capitalize_sentence_starts(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut at_sentence_start = true;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if at_sentence_start && c.is_ascii_lowercase() {
+            // Consume the whole word; skip capitalizing if it's intercaps.
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_alphanumeric() {
+                j += 1;
+            }
+            if chars[i + 1..j].iter().any(|c| c.is_uppercase()) {
+                out.extend(&chars[i..j]);
+            } else {
+                out.push(c.to_ascii_uppercase());
+                out.extend(&chars[i + 1..j]);
+            }
+            i = j;
+            at_sentence_start = false;
+            continue;
+        }
+        out.push(c);
+        if c.is_alphanumeric() {
+            at_sentence_start = false;
+        } else if matches!(c, '.' | '!' | '?') {
+            at_sentence_start = true;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Does this text look like a list the model intentionally formatted — i.e. ≥2
@@ -461,6 +507,17 @@ fn word_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
         .map(|w| w.to_lowercase())
 }
 
+/// Discourse / hedge / contraction words (≥4 chars) that legitimate cleanup
+/// routinely drops or rewrites ("like", "you know", "gonna" → "going to"). They
+/// must NOT count as dropped *content* when judging whether the model gutted a
+/// clause, or heavy-but-correct filler removal would trip the guard.
+const DROPPABLE_DISCOURSE: &[&str] = &[
+    "like", "just", "yeah", "yep", "yup", "okay", "well", "right", "anyway",
+    "actually", "basically", "literally", "seriously", "honestly", "really",
+    "mean", "know", "sort", "kind", "guess", "maybe", "stuff", "very", "even",
+    "gonna", "wanna", "gotta", "kinda", "sorta", "dunno", "lemme", "gimme",
+];
+
 /// Heuristic guard: did the generative cleanup **drop real content** (rewrite
 /// instead of edit) rather than just remove filler? Because the cleanup model
 /// regenerates the whole utterance, it can silently delete a whole clause — e.g.
@@ -469,12 +526,14 @@ fn word_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
 /// the daemon can fall back to the (faithful) raw transcript instead of
 /// injecting a gutted message.
 ///
-/// Fires only when BOTH signals agree, to stay clear of legitimate filler
-/// removal / contraction expansion / number formatting:
-///   1. the output lost more than ~45% of its characters, AND
-///   2. at least 3 *substantial* words (≥4 chars — skips fillers and function
-///      words like um/uh/so/the/you) present in the raw are absent from the
-///      cleaned text.
+/// The signal is **content words dropped**: substantial words (≥4 chars,
+/// excluding the discourse/hedge/contraction set the model legitimately rewrites)
+/// that are in the raw but absent from the cleaned text. Two ways it fires:
+///   (A) Wholesale gutting — output collapsed to < 55% of the raw's characters
+///       AND ≥3 content words gone (a heavy rewrite, not an edit).
+///   (B) Dropped clause in a longer utterance — the overall length barely moves
+///       (one sentence deleted from several), so the char ratio misses it, but a
+///       run of ≥5 content words (≈ a short clause) has vanished.
 /// Short utterances (< 24 raw chars) are never judged — too little to tell.
 pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
     let raw_chars = raw.chars().count();
@@ -482,16 +541,18 @@ pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
         return false;
     }
     let clean_chars = cleaned.chars().count();
-    // Lost > 45% of characters (clean < 55% of raw).
-    if clean_chars * 100 >= raw_chars * 55 {
-        return false;
-    }
     let clean_words: std::collections::HashSet<String> = word_tokens(cleaned).collect();
-    let dropped = word_tokens(raw)
+    let dropped_content = word_tokens(raw)
         .filter(|w| w.chars().count() >= 4)
+        .filter(|w| !DROPPABLE_DISCOURSE.contains(&w.as_str()))
         .filter(|w| !clean_words.contains(w))
         .count();
-    dropped >= 3
+    // (A) Wholesale gutting: big char loss + a few content words gone.
+    if clean_chars * 100 < raw_chars * 55 && dropped_content >= 3 {
+        return true;
+    }
+    // (B) Dropped clause that the char ratio alone can't see.
+    dropped_content >= 5
 }
 
 /// Decide whether a transcript is messy enough to be worth the generative
@@ -606,7 +667,7 @@ mod tests {
     fn mechanics_drops_leading_and_inline_interjections() {
         assert_eq!(
             fix_speech_mechanics("so um I think we should ship it you know"),
-            "so I think we should ship it you know"
+            "So I think we should ship it you know"
         );
         // "Um" dropped as an interjection; leading "yeah," stripped as
         // throat-clearing; "so" (no comma) is a real connective, kept.
@@ -614,7 +675,7 @@ mod tests {
             fix_speech_mechanics("Um, yeah, so the cache keeps growing."),
             "So the cache keeps growing."
         );
-        assert_eq!(fix_speech_mechanics("uh we never evict anything"), "we never evict anything");
+        assert_eq!(fix_speech_mechanics("uh we never evict anything"), "We never evict anything");
     }
 
     #[test]
@@ -628,13 +689,15 @@ mod tests {
 
     #[test]
     fn mechanics_leaves_words_containing_filler_or_i_alone() {
-        // "i" inside a word and filler substrings inside real words survive.
+        // "i" inside a word and filler substrings inside real words survive
+        // (only the sentence-initial letter is capitalized; "api"/"main" stay).
         assert_eq!(
             fix_speech_mechanics("the api summary is in the main file"),
-            "the api summary is in the main file"
+            "The api summary is in the main file"
         );
         // "summary" contains "um"; "main" contains "i"; none are standalone.
-        assert!(fix_speech_mechanics("summary").contains("summary"));
+        // (Sentence-initial capitalization makes it "Summary".)
+        assert!(fix_speech_mechanics("summary").contains("Summary"));
     }
 
     #[test]
@@ -777,6 +840,19 @@ mod tests {
     }
 
     #[test]
+    fn dropped_content_catches_a_clause_dropped_from_a_longer_utterance() {
+        // The log smoking gun: a content sentence deleted mid-utterance. Overall
+        // length barely moves (64% retained), so the old char-ratio gate missed
+        // it, but a run of content words ("amazing nice looking designs") is gone.
+        let raw = "So I forked this repo and now this is me I'm working on it. So actually \
+            what I would like is there are a lot of amazing nice looking designs in here. \
+            I would like to make an HTML template design for the inner chapter slide master that we have";
+        let gutted = "So I forked this repo and now I'm working on it. Actually, I would like \
+            to create an HTML template design for the Inner Chapter slide master that we have.";
+        assert!(cleanup_dropped_content(raw, gutted));
+    }
+
+    #[test]
     fn dropped_content_skips_short_utterances() {
         // Too short to judge — never fire (avoids nuking genuinely terse edits).
         assert!(!cleanup_dropped_content("yeah sounds good to me", "Sounds good."));
@@ -805,6 +881,39 @@ mod tests {
         assert_eq!(
             fix_speech_mechanics("Yeah, okay, makes sense."),
             "Okay, makes sense."
+        );
+    }
+
+    #[test]
+    fn capitalizes_sentence_start_after_model_strips_filler() {
+        // The LLM stripped "Okay," itself and left "the" lowercase — repair it.
+        assert_eq!(
+            fix_speech_mechanics("the issue is when you look at some of the logs."),
+            "The issue is when you look at some of the logs."
+        );
+        // Mid-utterance sentence start after a period.
+        assert_eq!(
+            fix_speech_mechanics("Cool, that makes sense. the other thing is the gutters."),
+            "Cool, that makes sense. The other thing is the gutters."
+        );
+    }
+
+    #[test]
+    fn capitalization_preserves_intercaps_and_decimals() {
+        // Intercaps brand/identifier tokens at a sentence start stay verbatim.
+        assert_eq!(
+            capitalize_sentence_starts("iOS is fine. macOS too."),
+            "iOS is fine. macOS too."
+        );
+        // A decimal after a period must not trigger a spurious capitalization.
+        assert_eq!(
+            capitalize_sentence_starts("Ship version 2.1 today."),
+            "Ship version 2.1 today."
+        );
+        // Already-correct text is unchanged (idempotent).
+        assert_eq!(
+            capitalize_sentence_starts("Hello there. How are you?"),
+            "Hello there. How are you?"
         );
     }
 
