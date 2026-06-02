@@ -87,6 +87,22 @@ const DEFAULT_HOTKEY_KEYCODE: i64 = 0x3D;
 /// corrections vocabulary, this stays well under that regression threshold.
 const SCREEN_VOCAB_CAP: usize = 16;
 
+/// Utterances at or below this many words skip the generative cleanup LLM and
+/// take a deterministic-only pass instead (filler/punctuation/casing/numbers +
+/// corrections). Parakeet already punctuates and capitalizes, so for a short
+/// message the LLM adds latency and rewrite risk (dropped clauses) for little
+/// gain. Override with `DICTATE_LLM_MIN_WORDS`. Only applies to default cleanup
+/// — an active output-format preset (numbered/bullets/email) always uses the LLM.
+const SHORT_UTTERANCE_MAX_WORDS: usize = 8;
+
+#[cfg(feature = "cleaner")]
+fn short_utterance_max_words() -> usize {
+    std::env::var("DICTATE_LLM_MIN_WORDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SHORT_UTTERANCE_MAX_WORDS)
+}
+
 // Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
 const SPACE_KEYCODE: i64 = 0x31;
 
@@ -541,6 +557,11 @@ fn worker_loop(
     if streaming {
         eprintln!("[boot] streaming   cleanup ENABLED (experimental · VAD-segmented during hold)");
     }
+    // When an output-format preset (numbered/bullets/email/…) is active, every
+    // dictation must go through the LLM to be reshaped — so the short-utterance
+    // deterministic shortcut is disabled. Default cleanup has no such need.
+    #[cfg(feature = "cleaner")]
+    let format_active = crate::settings::Settings::load().resolve_format().is_some();
     // Per-utterance streaming accumulators (only used when `streaming`).
     #[cfg(feature = "cleaner")]
     let mut stream: Option<crate::vad::SegmentStream> = None;
@@ -968,17 +989,50 @@ fn worker_loop(
                                 if pre_corrected != transcript {
                                     eprintln!("  ✎    pre-cleanup corrections applied");
                                 }
-                                let t_clean = Instant::now();
-                                match rt.block_on(
-                                    c.process_transcript_with_vocab(&pre_corrected, &screen_vocab),
-                                ) {
-                                    Ok(cleaned) => {
-                                        t_cleanup_ms = ms(t_clean.elapsed());
-                                        cleaned
-                                    }
-                                    Err(err) => {
-                                        eprintln!("[warn] cleanup failed, using raw: {err:?}");
-                                        transcript
+                                // Deterministic cleanup (filler/casing/numbers on
+                                // top of already-corrected, already-punctuated
+                                // Parakeet text). Used both as the short-utterance
+                                // shortcut and as the safe fallback when the LLM
+                                // over-deletes — it can never drop a clause.
+                                let deterministic =
+                                    crate::text_polish::fix_speech_mechanics(&pre_corrected);
+                                let word_count = pre_corrected.split_whitespace().count();
+
+                                if !format_active && word_count <= short_utterance_max_words() {
+                                    // (1) Skip the LLM entirely for short messages:
+                                    // Parakeet already punctuates them, so the
+                                    // model only adds latency and rewrite risk.
+                                    eprintln!(
+                                        "  ⚡    short ({word_count} words) · deterministic cleanup, LLM skipped"
+                                    );
+                                    deterministic
+                                } else {
+                                    let t_clean = Instant::now();
+                                    match rt.block_on(
+                                        c.process_transcript_with_vocab(&pre_corrected, &screen_vocab),
+                                    ) {
+                                        Ok(cleaned) => {
+                                            t_cleanup_ms = ms(t_clean.elapsed());
+                                            // (2) Diff-guard: if the generative
+                                            // cleanup rewrote away real content
+                                            // (dropped a whole clause), keep the
+                                            // faithful deterministic result instead.
+                                            if crate::text_polish::cleanup_dropped_content(
+                                                &pre_corrected,
+                                                &cleaned,
+                                            ) {
+                                                eprintln!(
+                                                    "  ⚠    cleanup dropped content — using faithful deterministic text instead"
+                                                );
+                                                deterministic
+                                            } else {
+                                                cleaned
+                                            }
+                                        }
+                                        Err(err) => {
+                                            eprintln!("[warn] cleanup failed, using raw: {err:?}");
+                                            deterministic
+                                        }
                                     }
                                 }
                             }
