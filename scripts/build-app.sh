@@ -8,14 +8,18 @@
 #                                           #   from the repo via a symlink
 #   ./scripts/build-app.sh --bundle-models  # ship build: copy the recommended
 #                                           #   model stack into the app (~1.7 GB)
+#   ./scripts/build-app.sh --slim           # ship build: NO models bundled; the
+#                                           #   app downloads the defaults on
+#                                           #   first run (few-MB app / DMG)
 #   ./scripts/build-app.sh --install        # also copy to /Applications, add a
 #                                           #   Login Item, and launch it
 #   ./scripts/build-app.sh --dmg            # wrap the app in a distributable
-#                                           #   dist/Local-Dictation-<ver>.dmg
-#                                           #   (implies --bundle-models so the
-#                                           #   DMG is self-contained/portable)
+#                                           #   dist/Local-Dictation-<ver>.dmg.
+#                                           #   Defaults to --bundle-models (self-
+#                                           #   contained); pair with --slim for a
+#                                           #   fetch-on-first-run DMG instead.
 #
-# Flags combine, e.g.  ./scripts/build-app.sh --bundle-models --install
+# Flags combine, e.g.  ./scripts/build-app.sh --slim --dmg
 #
 # Model resolution at runtime (see src/app_paths.rs):
 #   DICTATE_MODELS_DIR env > <app>/Contents/Resources/models
@@ -52,21 +56,28 @@ PARAKEET_REL="dictation/parakeet-tdt-v3-int8"
 LLM_REL="llm/qwen-2.5-1.5b-it"
 
 BUNDLE_MODELS=0
+SLIM=0
 INSTALL=0
 MAKE_DMG=0
 for arg in "$@"; do
   case "$arg" in
     --bundle-models) BUNDLE_MODELS=1 ;;
+    --slim)          SLIM=1 ;;
     --install)       INSTALL=1 ;;
     --dmg)           MAKE_DMG=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
 
-# A DMG is meant to be moved/shared, so it must carry its own models — a dev
-# symlink into the repo would dangle the moment the .app leaves this machine.
-if [ "$MAKE_DMG" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 0 ]; then
-  echo "• --dmg implies --bundle-models (a portable DMG must be self-contained)"
+if [ "$SLIM" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 1 ]; then
+  echo "--slim and --bundle-models are mutually exclusive" >&2; exit 2
+fi
+
+# A DMG is meant to be moved/shared, so a dev symlink into the repo would dangle
+# the moment the .app leaves this machine. Either carry the models (default) or
+# go --slim (the app fetches them on first run) — but never ship the symlink.
+if [ "$MAKE_DMG" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 0 ] && [ "$SLIM" -eq 0 ]; then
+  echo "• --dmg defaults to --bundle-models (a portable DMG must be self-contained; use --slim to fetch on first run)"
   BUNDLE_MODELS=1
 fi
 
@@ -128,6 +139,11 @@ if [ "$BUNDLE_MODELS" -eq 1 ]; then
   cp -R "$REPO_ROOT/models/$PARAKEET_REL" "$RES_DIR/models/$PARAKEET_REL"
   cp -R "$REPO_ROOT/models/$LLM_REL"      "$RES_DIR/models/$LLM_REL"
   echo "  bundled: $(du -sh "$RES_DIR/models" | cut -f1)"
+elif [ "$SLIM" -eq 1 ]; then
+  # Ship NO models and NO dev symlink: on a clean machine the app resolves no
+  # model base, so the daemon fetches the defaults into Application Support on
+  # first launch (src/model_fetch.rs). Keeps the app/DMG to a few MB.
+  echo "• slim ship build: no models bundled — the app downloads them on first run."
 else
   echo "• dev build: linking shared models via Application Support…"
   mkdir -p "$APP_SUPPORT"

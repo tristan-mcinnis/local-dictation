@@ -48,13 +48,19 @@ There are good dictation tools already. This one exists because I wanted a speci
 
 ## Get started
 
-**Easiest — download the app.** Grab **Local Dictation.dmg** from the [latest release](https://github.com/tristan-mcinnis/local-dictation/releases/latest), open it, and drag **Local Dictation.app** into `/Applications`. It's a self-contained ~1.7 GB bundle (Parakeet + Qwen 2.5 1.5B included), so there's no toolchain to install. Because it's ad-hoc signed, Gatekeeper blocks it on first open — clear the quarantine flag once:
+**Easiest — download the app.** Grab the **`.dmg` from the [latest release](https://github.com/tristan-mcinnis/local-dictation/releases/latest)** (~12 MB), open it, and drag **Local Dictation.app** into `/Applications`. The app is tiny because it **downloads the two models — Parakeet + Qwen 2.5 1.5B, ~1.7 GB — on first launch** into Application Support, so there's no toolchain to install but the *first* run needs an internet connection. Because it's ad-hoc signed, Gatekeeper blocks it on first open — clear the quarantine flag once:
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/Local Dictation.app"
 ```
 
-Then launch it, grant **Microphone** + **Accessibility** in System Settings → Privacy & Security, and look for the 🎤 in your menu bar.
+Then launch it. On first run you'll see a **"Downloading models…"** notification — give it a few minutes — after which it asks for **Microphone** + **Accessibility** in System Settings → Privacy & Security. Look for the 🎤 in your menu bar.
+
+> **🌐 If huggingface.co is blocked or slow where you are (e.g. mainland China):** the models are fetched from Hugging Face. Either turn on a **VPN** for the first launch, or pre-download via the **[hf-mirror.com](https://hf-mirror.com)** mirror from a terminal — no VPN needed:
+> ```bash
+> HF_ENDPOINT=https://hf-mirror.com "/Applications/Local Dictation.app/Contents/MacOS/local-dictation" fetch-models
+> ```
+> That pulls the models through the mirror; the app then finds them and starts normally. (`HF_ENDPOINT` also works with `./scripts/download-models.sh` and `./install.sh`.)
 
 **Build from source — one script.** Clone the repo and run the installer:
 
@@ -92,6 +98,7 @@ cargo build --features full --release
 ./scripts/build-app.sh                  # build into ./dist (no install)
 ./scripts/build-app.sh --install        # + copy to /Applications, login item, launch
 ./scripts/build-app.sh --bundle-models  # self-contained ~1.7 GB app (for sharing/moving)
+./scripts/build-app.sh --slim --dmg     # tiny ~12 MB DMG; models fetched on first run (the shipped release)
 ```
 
 Running the daemon directly from a terminal prompts for Microphone + Accessibility tied to *that terminal*; the `.app` is the cleaner path because the permissions attach to the app itself. By default the app shares the models in `./models` (instant rebuilds during development); `--bundle-models` copies the recommended Parakeet + Qwen 2.5 1.5B stack inside the app so it works anywhere.
@@ -116,6 +123,9 @@ System Settings → Privacy & Security myself (you can't grant them for me).
 Finally, remind me of the hotkeys: hold Right Option to dictate; for hands-free,
 hold Right Option and tap Space, let go of both, keep talking, then tap Right
 Option once to stop.
+If huggingface.co is blocked here (e.g. mainland China), run the model download
+with HF_ENDPOINT=https://hf-mirror.com so it pulls from a mirror instead of
+needing a VPN.
 ```
 
 </details>
