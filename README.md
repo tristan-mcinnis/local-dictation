@@ -2,7 +2,7 @@
 
 **The fastest, lowest-latency, fully on-device dictation app for Apple Silicon.** Hold a hotkey, speak, release — cleaned text appears at your cursor in **~300–400 ms end-to-end** (key release → injected text, 2 s clip). Speech is transcribed, LLM-cleaned, and injected entirely on-device; **nothing touches the network at runtime.** No cloud, no streaming, no round-trip — just local compute on the Apple Neural Engine + Metal.
 
-*A free, open-source, **offline speech-to-text / voice-to-text** tool for macOS — a private, local **alternative to cloud dictation and Whisper-based apps**. Push-to-talk dictation with on-device LLM cleanup (filler removal, punctuation, domain casing) and voice editing of selected text. Runs 100% locally on Apple Silicon (M1/M2/M3/M4) — your audio never leaves your Mac.*
+*A free, open-source, **offline speech-to-text / voice-to-text** tool for macOS — a private, local **alternative to Superwhisper, Wispr Flow, MacWhisper, and built-in Apple Dictation**. Push-to-talk dictation with on-device LLM cleanup (filler removal, punctuation, domain casing) and voice editing of selected text. No subscription, no account, no cloud. Runs 100% locally on Apple Silicon (M1/M2/M3/M4) — your audio never leaves your Mac.*
 
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black)
@@ -40,6 +40,8 @@ There are good dictation tools already. This one exists because I wanted a speci
 | Edit *selected* text by voice | ✅ | ❌ | partial | rare |
 | Editable system prompts | ✅ (plain JSON) | ❌ | ❌ | ❌ |
 | Open source, free | ✅ MIT/Apache | n/a | ❌ | mostly ❌ |
+| Price | **$0**, no subscription | free (built-in) | paid subscription | paid / freemium |
+| Account / signup | none | none | usually required | varies |
 | Polished, one-click install | ❌ (build from source) | ✅ | ✅ | ✅ |
 
 *(Competitor capabilities as I understood them at the time of writing — check their current versions.)* The short version: if you want zero setup and a maintained app, the others win. If you want every millisecond and the ability to rewrite the model's behaviour by editing a text file, that's this.
