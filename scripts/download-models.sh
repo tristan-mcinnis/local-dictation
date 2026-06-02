@@ -10,8 +10,13 @@ PARAKEET_DIR="models/dictation/parakeet-tdt-v3-int8"
 LLM_DIR="models/llm/qwen-2.5-1.5b-it"
 mkdir -p "$PARAKEET_DIR" "$LLM_DIR"
 
-PARAKEET_BASE="https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
-LLM_BASE="https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main"
+# Honour HF_ENDPOINT (same var huggingface_hub uses) so users where
+# huggingface.co is blocked/slow — notably mainland China — can mirror, e.g.
+#   HF_ENDPOINT=https://hf-mirror.com ./scripts/download-models.sh
+HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
+HF_ENDPOINT="${HF_ENDPOINT%/}"
+PARAKEET_BASE="$HF_ENDPOINT/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main"
+LLM_BASE="$HF_ENDPOINT/Qwen/Qwen2.5-1.5B-Instruct-GGUF/resolve/main"
 
 fetch() {
   local url="$1" out="$2"

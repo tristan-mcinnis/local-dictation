@@ -40,6 +40,7 @@ async fn main() -> eyre::Result<()> {
                 .unwrap_or(5_000);
             run_dictate(duration_ms).await
         }
+        "fetch-models" => run_fetch_models(args.get(2).cloned()),
         "ax-check" => run_ax_check(),
         "context-probe" => run_context_probe(),
         "inject-test" => run_inject_test(args.get(2).cloned()),
@@ -59,7 +60,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", ax-check, context-probe, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, mock-loop"
         )),
     }
 }
@@ -156,6 +157,31 @@ fn refine_for_cli(cleaned: &str) -> String {
         println!("[refine] parsed trailing command {:?} (not executed in CLI mode)", refined.action);
     }
     refined.text
+}
+
+/// Download the default models (Parakeet TDT v3 + Qwen 2.5 1.5B) into a target
+/// dir — the same fetch the slim shipped app runs on first launch. With no
+/// argument it uses the writable Application Support models dir (where the app
+/// resolves them); pass an explicit dir to fetch elsewhere. Idempotent.
+fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
+    use fast_dictate_backend::{app_paths, model_fetch};
+    let base = match target {
+        Some(t) => std::path::PathBuf::from(t),
+        None => app_paths::app_support_dir()
+            .map(|d| d.join("models"))
+            .ok_or_else(|| eyre::eyre!("$HOME unset — pass an explicit target dir"))?,
+    };
+    println!("[fetch-models] target: {}", base.display());
+    let fetched = model_fetch::ensure_default_models(&base)?;
+    println!(
+        "[fetch-models] {}",
+        if fetched {
+            "done — all default models present."
+        } else {
+            "already present — nothing to download."
+        }
+    );
+    Ok(())
 }
 
 /// Open the daemon log in the user's default text editor / Console.app.
@@ -476,6 +502,7 @@ fn redirect_stdio_to_log_if_bundled() {
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
 async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run_listen, DaemonConfig};
+    fast_dictate_backend::model_fetch::ensure_models_on_first_run();
     #[cfg(feature = "cleaner")]
     let no_cleanup = !fast_dictate_backend::settings::Settings::load()
         .resolve_cleanup_enabled(no_cleanup);
@@ -499,6 +526,9 @@ async fn run_listen(_no_cleanup: bool) -> eyre::Result<()> {
 async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run, DaemonConfig};
     redirect_stdio_to_log_if_bundled();
+    // Slim shipped app: fetch the default models on first run before anything
+    // tries to load them. No-op for dev/CLI runs and for --bundle-models apps.
+    fast_dictate_backend::model_fetch::ensure_models_on_first_run();
     // IMPORTANT: must call daemon::run on the OS main thread (NSApp.run()
     // refuses to start otherwise). We're already on the main thread thanks
     // to #[tokio::main(flavor = "current_thread")] — DO NOT wrap in
