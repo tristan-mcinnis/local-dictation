@@ -89,6 +89,20 @@ pub struct Settings {
     /// [`DEFAULT_WAKE_WORD`]. Override: `DICTATE_WAKE_WORD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_word: Option<String>,
+    /// Which ASR engine transcribes audio: `"parakeet"` (default, lowest
+    /// latency) or `"cohere"` (Cohere Transcribe 2B, higher accuracy + 14
+    /// languages). `None`/unknown ⇒ Parakeet. Override: `DICTATE_ASR_BACKEND`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asr_backend: Option<String>,
+    /// Cohere weight quantization: `"int4"` (default) or `"int8"`. Only used
+    /// when `asr_backend` is `"cohere"`. Override: `DICTATE_COHERE_QUANT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohere_quant: Option<String>,
+    /// Language hint for the Cohere decoder (it has no auto-detect), e.g.
+    /// `"en"`, `"de"`, `"zh"`, `"ja"`. `None`/blank ⇒ `"en"`. Override:
+    /// `DICTATE_COHERE_LANG`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cohere_language: Option<String>,
 }
 
 /// Default wake word for listen mode. Two distinct syllables, uncommon as a
@@ -137,6 +151,54 @@ impl Settings {
             return v;
         }
         self.gemma_model.clone().unwrap_or_else(|| default.to_string())
+    }
+
+    /// Resolve the full ASR selection (backend + each model's directory) with
+    /// the usual **env > settings > default** precedence. This is the single
+    /// place backend choice is decided; the daemon and the CLI both go through
+    /// it so they always agree.
+    ///
+    /// Env knobs: `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`),
+    /// `DICTATE_COHERE_QUANT` (`int4`|`int8`), `DICTATE_COHERE_LANG`,
+    /// `PARAKEET_MODEL_DIR`, `DICTATE_COHERE_MODEL_DIR`.
+    pub fn resolve_asr(&self) -> crate::transcriber::AsrConfig {
+        use crate::transcriber::{AsrBackend, AsrConfig, CohereQuant};
+
+        let backend = std::env::var("DICTATE_ASR_BACKEND")
+            .ok()
+            .and_then(|v| AsrBackend::parse(&v))
+            .or_else(|| self.asr_backend.as_deref().and_then(AsrBackend::parse))
+            .unwrap_or_default();
+
+        let cohere_quant = std::env::var("DICTATE_COHERE_QUANT")
+            .ok()
+            .and_then(|v| CohereQuant::parse(&v))
+            .or_else(|| self.cohere_quant.as_deref().and_then(CohereQuant::parse))
+            .unwrap_or_default();
+
+        let cohere_language = std::env::var("DICTATE_COHERE_LANG")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                self.cohere_language
+                    .clone()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .unwrap_or_else(|| "en".to_string());
+
+        let parakeet_dir = std::env::var("PARAKEET_MODEL_DIR")
+            .unwrap_or_else(|_| crate::app_paths::parakeet_default_dir());
+
+        let cohere_dir = std::env::var("DICTATE_COHERE_MODEL_DIR")
+            .unwrap_or_else(|_| crate::app_paths::cohere_default_dir(cohere_quant.as_str()));
+
+        AsrConfig {
+            backend,
+            parakeet_dir,
+            cohere_dir,
+            cohere_quant,
+            cohere_language,
+        }
     }
 
     /// Resolve streaming-cleanup mode: `DICTATE_STREAMING_CLEANUP` env > settings

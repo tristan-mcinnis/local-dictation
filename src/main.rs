@@ -273,8 +273,8 @@ async fn run_dictate(_ms: u64) -> eyre::Result<()> {
 async fn run_bench(wav_path: &str) -> eyre::Result<()> {
     use fast_dictate_backend::transcriber::load_wav_mono16k;
 
-    let parakeet_dir = parakeet_dir();
-    println!("[bench] parakeet model dir: {parakeet_dir}");
+    let asr = asr_config();
+    println!("[bench] asr backend:        {}", asr.describe());
     println!("[bench] input wav:          {wav_path}");
 
     let t_load_audio = Instant::now();
@@ -288,9 +288,9 @@ async fn run_bench(wav_path: &str) -> eyre::Result<()> {
     );
 
     let t_load_model = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&parakeet_dir)?;
+    let mut worker = LocalInferenceWorker::initialize(&asr)?;
     println!(
-        "[bench] parakeet model loaded in {:?} (one-time cost)",
+        "[bench] asr model loaded in {:?} (one-time cost)",
         t_load_model.elapsed()
     );
 
@@ -352,17 +352,17 @@ async fn run_bench(wav_path: &str) -> eyre::Result<()> {
 
 #[cfg(feature = "parakeet")]
 async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
-    let parakeet_dir = parakeet_dir();
-    println!("[dictate] parakeet model dir: {parakeet_dir}");
+    let asr = asr_config();
+    println!("[dictate] asr backend: {}", asr.describe());
     println!(
         "[dictate] recording for {} ms — speak now...",
         duration_ms
     );
 
     let t_load_model = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&parakeet_dir)?;
+    let mut worker = LocalInferenceWorker::initialize(&asr)?;
     println!(
-        "[dictate] parakeet loaded in {:?}",
+        "[dictate] asr loaded in {:?}",
         t_load_model.elapsed()
     );
 
@@ -426,11 +426,13 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Resolve the active ASR selection (backend + model dirs) from
+/// settings/env/defaults. Single source of truth shared by bench, dictate,
+/// the daemon, and listen mode — see `settings::Settings::resolve_asr`. All of
+/// those entry points require the `parakeet` feature, so gate it there.
 #[cfg(feature = "parakeet")]
-fn parakeet_dir() -> String {
-    // Precedence: PARAKEET_MODEL_DIR env > bundle/App-Support/repo default.
-    std::env::var("PARAKEET_MODEL_DIR")
-        .unwrap_or_else(|_| fast_dictate_backend::app_paths::parakeet_default_dir())
+fn asr_config() -> fast_dictate_backend::transcriber::AsrConfig {
+    fast_dictate_backend::settings::Settings::load().resolve_asr()
 }
 
 #[cfg(all(feature = "parakeet", feature = "cleaner"))]
@@ -507,7 +509,7 @@ async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
     let no_cleanup = !fast_dictate_backend::settings::Settings::load()
         .resolve_cleanup_enabled(no_cleanup);
     let config = DaemonConfig::from_env(
-        parakeet_dir(),
+        asr_config(),
         #[cfg(feature = "cleaner")]
         gemma_path(),
         no_cleanup,
@@ -540,7 +542,7 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     let no_cleanup = !fast_dictate_backend::settings::Settings::load()
         .resolve_cleanup_enabled(no_cleanup);
     let config = DaemonConfig::from_env(
-        parakeet_dir(),
+        asr_config(),
         #[cfg(feature = "cleaner")]
         gemma_path(),
         no_cleanup,

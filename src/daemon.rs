@@ -172,7 +172,9 @@ extern "C" {
 
 /// Configuration for the daemon. Built from CLI args / env vars in main.rs.
 pub struct DaemonConfig {
-    pub parakeet_dir: String,
+    /// Resolved ASR selection (which backend + each model dir). Replaces the
+    /// old single `parakeet_dir`, so the daemon can run Parakeet or Cohere.
+    pub asr: crate::transcriber::AsrConfig,
     #[cfg(feature = "cleaner")]
     pub gemma_path: String,
     /// If true, inject the raw ASR transcript without Gemma cleanup.
@@ -184,14 +186,14 @@ pub struct DaemonConfig {
 
 impl DaemonConfig {
     pub fn from_env(
-        parakeet_dir: String,
+        asr: crate::transcriber::AsrConfig,
         #[cfg(feature = "cleaner")] gemma_path: String,
         no_cleanup: bool,
     ) -> Self {
         let hotkey_keycode =
             crate::settings::Settings::load().resolve_hotkey(DEFAULT_HOTKEY_KEYCODE);
         Self {
-            parakeet_dir,
+            asr,
             #[cfg(feature = "cleaner")]
             gemma_path,
             no_cleanup,
@@ -434,8 +436,12 @@ fn worker_loop(
     config: DaemonConfig,
 ) -> eyre::Result<()> {
     let t_load = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&config.parakeet_dir)?;
-    eprintln!("[boot] parakeet    loaded in {:>4} ms", ms(t_load.elapsed()));
+    let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
+    eprintln!(
+        "[boot] asr         loaded in {:>4} ms · {}",
+        ms(t_load.elapsed()),
+        config.asr.describe()
+    );
 
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
@@ -1356,8 +1362,12 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
     let wake_word = settings.resolve_wake_word();
 
     let t_load = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&config.parakeet_dir)?;
-    eprintln!("[boot] parakeet    loaded in {:>4} ms", ms(t_load.elapsed()));
+    let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
+    eprintln!(
+        "[boot] asr         loaded in {:>4} ms · {}",
+        ms(t_load.elapsed()),
+        config.asr.describe()
+    );
 
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {

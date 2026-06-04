@@ -21,6 +21,14 @@ path = "src/main.rs"
 default = []
 # Pulls parakeet-rs + ort (downloads onnxruntime binary at build time) + CoreML EP.
 parakeet = ["dep:parakeet-rs", "dep:hound"]
+# Alternative ASR backend: Cohere Transcribe (2B Conformer encoder/decoder,
+# 14 languages) via transcribe-rs. It pins the SAME `ort =2.0.0-rc.12` as
+# parakeet-rs, so cargo unifies them — no second onnxruntime gets linked.
+# `transcribe-rs/ort-coreml` routes inference through the CoreML EP (Neural
+# Engine / GPU) on Apple Silicon, matching the Parakeet path. Opt-in; Parakeet
+# stays the default backend (lowest-latency CTC/TDT). Pulls hound for the WAV
+# loader shared with the parakeet path.
+cohere = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs/ort-coreml"]
 # Adds llama.cpp (via llama-cpp-2) with Metal for the cleanup engine.
 # llama-cpp-2 (despite its 0.1.x version) is the actively-maintained binding;
 # `llama_cpp` 0.3.x vendors a llama.cpp from April 2024 and cannot load Gemma 3.
@@ -37,8 +45,10 @@ ax-inject = [
     "dep:objc2-app-kit",
     "dep:objc2-core-foundation",
 ]
-# Convenience: everything on.
-full = ["parakeet", "cleaner", "ax-inject"]
+# Convenience: everything on (both ASR backends + cleanup + injection). This is
+# what the shipped app and the feature-gated test suite build with, so the
+# bundle can offer Parakeet and Cohere as selectable backends.
+full = ["parakeet", "cohere", "cleaner", "ax-inject"]
 
 [dependencies]
 ringbuf = "0.4"
@@ -51,6 +61,9 @@ serde_json = "1"
 # from source so we don't depend on the system libsqlite3 version.
 rusqlite = { version = "0.39", features = ["bundled"] }
 parakeet-rs = { version = "0.3", optional = true, features = ["coreml"] }
+# Multi-engine ASR library; we use only its Cohere ONNX engine (behind the
+# `cohere` feature). Shares ort =2.0.0-rc.12 with parakeet-rs (unified).
+transcribe-rs = { version = "0.3", optional = true, default-features = false }
 hound = { version = "3.5", optional = true }
 llama-cpp-2 = { version = "0.1", optional = true, default-features = false, features = ["metal"] }
 encoding_rs = { version = "0.8", optional = true }

@@ -87,6 +87,18 @@ pub fn parakeet_default_dir() -> String {
         .into_owned()
 }
 
+/// Default Cohere ASR model directory for a given quantization
+/// (`<base>/dictation/cohere-<quant>`, e.g. `…/cohere-int4`). Populated by
+/// `./scripts/download-models.sh --cohere <quant>`; overridable with
+/// `DICTATE_COHERE_MODEL_DIR`. Cohere is opt-in, so this dir may not exist
+/// unless the user has selected the backend and fetched the weights.
+pub fn cohere_default_dir(quant: &str) -> String {
+    models_base_dir()
+        .join(format!("dictation/cohere-{quant}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Default cleanup model path
 /// (`<base>/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf`).
 /// Named `gemma_*` for historical reasons (Gemma was the original default);

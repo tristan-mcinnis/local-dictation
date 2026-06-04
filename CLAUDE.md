@@ -41,7 +41,7 @@ cargo build --features full --release        # the real build — see feature fl
 ./target/release/fast-dictate-backend daemon # run the push-to-talk daemon
 
 cargo test                                   # 168 unit + 2 integration, NO models or features needed
-cargo test --features full                   # adds menubar/history/injector/cleaner/hotkey suites (180 total)
+cargo test --features full                   # adds menubar/history/injector/cleaner/cohere/hotkey suites (195 total)
 cargo test --features full <name>            # single test by name substring
 ```
 
@@ -87,7 +87,10 @@ Developer ID would make grants stick. When bundled, the daemon redirects stdout/
 **Model resolution** (`src/app_paths.rs`), in order: `DICTATE_MODELS_DIR` env >
 `<app>/Contents/Resources/models` (shipped, self-contained) > `~/Library/Application
 Support/Local Dictation/models` (dev symlink → repo) > `./models` (repo-relative, for `cargo run`).
-Per-model env overrides (`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`) and `settings.json` still win.
+Per-model env overrides (`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_COHERE_MODEL_DIR`) and
+`settings.json` still win. The Cohere model (when used) resolves to `<base>/dictation/cohere-<quant>`
+(`app_paths::cohere_default_dir`); fetch it with `./scripts/download-models.sh --cohere [int4|int8]`
+(opt-in — NOT part of the default download or the slim bundle, since it's ~1–2.5 GB).
 TODO (someday): let end users drop in / switch alternate cleanup models.
 
 ## Iterating fast (which loop am I in?)
@@ -120,12 +123,19 @@ The crate is split by Cargo features so the lib and tests build without native/m
 is the single most important thing to understand before editing — most modules are behind
 `#[cfg(feature = ...)]` and a default `cargo build` compiles almost none of the real app.
 
-- **`parakeet`** — ASR via `parakeet-rs` + `ort` (downloads onnxruntime at build time) + CoreML.
+- **`parakeet`** — default ASR via `parakeet-rs` + `ort` (downloads onnxruntime at build time) + CoreML.
+- **`cohere`** — alternative ASR: Cohere Transcribe 03-2026 (2B Conformer encoder/decoder, 14
+  languages) via `transcribe-rs`, also `ort` + CoreML. **It pins the SAME `ort =2.0.0-rc.12` as
+  `parakeet-rs`, so cargo unifies them — one onnxruntime, no double-link.** Opt-in; Parakeet stays
+  the default (a single CTC/TDT forward pass vs Cohere's slower autoregressive decode). The backend
+  is selected at runtime (`settings.json` `asr_backend` / `DICTATE_ASR_BACKEND`), abstracted behind
+  the `Backend` enum in `transcriber.rs` — Parakeet untouched on its proven path.
 - **`cleaner`** — LLM cleanup (Qwen 2.5 1.5B by default; Gemma/Llama also supported) via
   `llama-cpp-2` (NOT `llama_cpp` 0.3.x, which vendors an old llama.cpp that can't load Gemma 3) + Metal.
 - **`ax-inject`** — real macOS Accessibility text injection, clipboard fallback, menu-bar status
   item, floating waveform pill (objc2 / core-graphics / arboard stack).
-- **`full`** = all three. Use this for any real build or when running the feature-gated tests.
+- **`full`** = all four (both ASR backends + cleaner + ax-inject). Use this for any real build or
+  when running the feature-gated tests; it's what the shipped app builds with.
 
 When adding code, gate it behind the right feature and keep the default (featureless) build green
 so `cargo test` stays fast and dependency-free.
@@ -137,7 +147,7 @@ drains audio and runs the pipeline:
 
 ```
 audio.rs (cpal + SPSC ring buffer)
-  → transcriber.rs (Parakeet → raw text)
+  → transcriber.rs (Parakeet by default, or Cohere — selected by `asr_backend` → raw text)
   → cleaner.rs (LLM cleanup; skipped if --no-cleanup / cleanup disabled)
   → text_polish.rs (strip LLM preamble/quotes/artefacts)
   → refiner.rs (corrections dict + voice-command parse) — shared by daemon & CLI
@@ -165,13 +175,18 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 **one** place (`app_paths::config_dir` / `config_file`), so every consumer
 (`settings.rs`, `prompts.rs`, `corrections.rs`, `history.rs`, the menu bar) shares
 the same location rather than re-joining the path:
-- `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`. Plus `streaming_cleanup` (EXPERIMENTAL, default false / `DICTATE_STREAMING_CLEANUP=1`): clean each sentence at VAD pauses *during* the hold (`vad::SegmentStream` + `cleaner::process_segment_with_context`) so only the final segment is outstanding at release — only engages for multi-sentence dictations (≥2 segments); short utterances, transforms, and spoken commands fall back to the proven whole-buffer path. Validated in `examples/{cleanup_stream_lab,vad_stream_lab}.rs`; unverified on real mic. Plus `preroll_ms` (always-on mic, menu toggle "Always-on mic (pre-roll)" / `DICTATE_PREROLL_MS`, default 0 = off): when >0 the daemon keeps the cpal input stream warm (`audio::AlwaysOnCapture` + `PrerollRing`) and flushes that many ms of lookback into the transcript on key-press, so the first words aren't clipped and there's no stream-open latency (idle callbacks only roll the ring — no ASR runs until a press). Mutually exclusive with `streaming_cleanup` (pre-roll wins). And `listen_mode` (`DICTATE_LISTEN_MODE=1`) + `wake_word` (`DICTATE_WAKE_WORD`, default `computer`): config for the `listen` subcommand's hands-free wake-word dictation. Both validated in `examples/{preroll_lab,wake_word_lab}.rs` + unit tests; **unverified on real mic.** Verdict + cost analysis in `docs/wake-word-and-preroll.md` (pre-roll: recommended; wake word: opt-in experiment — continuous ASR has a real power cost).
+- `settings.json` (`settings.rs`) — written by the menu bar: `gemma_model`, `hotkey_keycode`, `cleanup_enabled`, `active_format`. Plus the ASR backend selector: `asr_backend` (`"parakeet"` default / `"cohere"`; `DICTATE_ASR_BACKEND`), `cohere_quant` (`"int4"` default / `"int8"`; `DICTATE_COHERE_QUANT`), and `cohere_language` (decoder language hint — Cohere has no auto-detect — `"en"` default; `DICTATE_COHERE_LANG`). These three are resolved together by `Settings::resolve_asr` → a `transcriber::AsrConfig` (the single source of truth shared by daemon + bench/dictate CLI), then loaded once at boot like every other model setting (changing the backend **relaunches** the daemon). Plus `streaming_cleanup` (EXPERIMENTAL, default false / `DICTATE_STREAMING_CLEANUP=1`): clean each sentence at VAD pauses *during* the hold (`vad::SegmentStream` + `cleaner::process_segment_with_context`) so only the final segment is outstanding at release — only engages for multi-sentence dictations (≥2 segments); short utterances, transforms, and spoken commands fall back to the proven whole-buffer path. Validated in `examples/{cleanup_stream_lab,vad_stream_lab}.rs`; unverified on real mic. Plus `preroll_ms` (always-on mic, menu toggle "Always-on mic (pre-roll)" / `DICTATE_PREROLL_MS`, default 0 = off): when >0 the daemon keeps the cpal input stream warm (`audio::AlwaysOnCapture` + `PrerollRing`) and flushes that many ms of lookback into the transcript on key-press, so the first words aren't clipped and there's no stream-open latency (idle callbacks only roll the ring — no ASR runs until a press). Mutually exclusive with `streaming_cleanup` (pre-roll wins). And `listen_mode` (`DICTATE_LISTEN_MODE=1`) + `wake_word` (`DICTATE_WAKE_WORD`, default `computer`): config for the `listen` subcommand's hands-free wake-word dictation. Both validated in `examples/{preroll_lab,wake_word_lab}.rs` + unit tests; **unverified on real mic.** Verdict + cost analysis in `docs/wake-word-and-preroll.md` (pre-roll: recommended; wake word: opt-in experiment — continuous ASR has a real power cost).
 - `prompts.json` (`prompts.rs`) — hand-edited transform + cleanup system prompts, plus a `formats` map of named output-shape presets. Four presets ship built-in (`numbered`/`bullets`/`email`/`code`, in `DEFAULT_FORMATS`); a user's `prompts.json` `formats` map overlays them (same key overrides, new key adds). The active preset (`active_format`/`DICTATE_FORMAT`) replaces the cleanup prompt for normal dictation, and list presets keep their line breaks (the cleanup path preserves newlines when a preset is active); unknown/blank falls back to default. The default cleanup/transform prompts are tuned in `prompts-lab/` (a data-driven eval harness, `examples/prompt_lab.rs`) — originally against Gemma 3 1B; the default cleanup model is now Qwen 2.5 1.5B (see `examples/model_bakeoff.rs`), and the same prompts carry over (validate model swaps with the bakeoff). A deterministic `text_polish::fix_speech_mechanics` pass handles leftover filler + lone "i" so the prompt doesn't have to.
 - `corrections.json` (`corrections.rs`) — the user's single personal vocabulary, a word→replacement map. Keys may be **multi-word phrases** (`to twist → Todoist`), reduced to lowercased word tokens and matched as a unit (longest phrase wins; words join only across spaces/hyphens, never a comma/period) — see `Corrections::apply`. Applied to the **raw transcript before cleanup** (`refiner.apply_corrections` on the daemon path, so the small model sees the intended spelling instead of mangling a garbled one), verbatim **again after** cleanup as a backstop, **and** fed (target spellings only) into the cleanup prompt as a known-vocabulary hint via `prompts::vocabulary_suffix`. **Edited via the menu bar's "Dictionary…" window** (`menubar.rs` `build_dictionary_window`), which renders the map as one entry per line: a casing-only/identity entry shows as a clean bare word ("GitHub", "macOS"), a genuine phonetic fix shows as `from → to` ("lings → Lumen"). `Corrections::{to_editor_lines, from_editor_text, save}` do the conversion; a bare word saved becomes an identity entry (key = lowercased word). Save rewrites `corrections.json` and relaunches the daemon to apply (corrections are read once at boot — same apply-on-relaunch model as the model/hotkey settings).
 - `dictionary.json` (`dictionary.rs`) — an *optional, advanced* flat JSON array of extra known words still read by the cleaner and merged into the same vocabulary block (`DICTATE_DICTIONARY_PATH` overrides the path; `dictionary.example.json` shows the format). The menu-bar editor manages `corrections.json`, not this file; it remains for power users who want a separate plain-list input. The cleanup *instructions* are the cached/warmed prefix; the vocabulary block is appended **per-utterance** (so the prefix cache reuses the instructions every time, and the vocab too when unchanged). Alongside the curated corrections terms, `screen_context.rs` harvests proper nouns from the focused window (field value + title, read in the parallel focus capture so it's off the critical path) — `extract_terms` ranks mixed-case/identifier/proper-noun tokens, caps at `SCREEN_VOCAB_CAP=16`, and the daemon passes them to `cleaner::process_transcript_with_vocab`. This stops the cleanup model from substituting similar-sounding names (measured: "Saoirse"→"Seamus" without it, correct with it). Verify coverage live with `context-probe`.
 
 Precedence is always **env var > JSON file > built-in default**. Key env knobs:
-`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_HOTKEY_KEYCODE` (default `0x3D` Right Option),
+`PARAKEET_MODEL_DIR`, `GEMMA_MODEL_PATH`, `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`),
+`DICTATE_COHERE_QUANT` (`int4`|`int8`), `DICTATE_COHERE_LANG`, `DICTATE_COHERE_MODEL_DIR`,
+`DICTATE_COHERE_ACCEL` (`coreml`|`cpu`|`auto`; default tries CoreML then auto-falls back to CPU —
+onnxruntime's CoreML EP can't load the Cohere external-data sidecar today, so Cohere effectively
+runs on CPU at ~5× realtime),
+`DICTATE_HOTKEY_KEYCODE` (default `0x3D` Right Option),
 `DICTATE_FORMAT` (active output-format preset), `DICTATE_QUIET`, `DICTATE_PROMPTS_PATH`,
 `DICTATE_TRANSFORM_PROMPT`, `DICTATE_CLEANUP_PROMPT`, `DICTATE_PREROLL_MS` (always-on pre-roll ms;
 0 = off), `DICTATE_LISTEN_MODE` + `DICTATE_WAKE_WORD` (the `listen` subcommand),
