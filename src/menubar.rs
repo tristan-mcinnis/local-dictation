@@ -217,6 +217,20 @@ define_class!(
             });
         }
 
+        #[unsafe(method(selectAsrBackend:))]
+        fn select_asr_backend(&self, sender: *mut AnyObject) {
+            // representedObject holds the backend name ("parakeet" / "cohere").
+            let name = unsafe {
+                let obj: *mut AnyObject = msg_send![sender, representedObject];
+                if obj.is_null() {
+                    return;
+                }
+                let s: &NSString = &*(obj as *const NSString);
+                s.to_string()
+            };
+            write_settings_and_relaunch(move |set| set.asr_backend = Some(name.clone()));
+        }
+
         #[unsafe(method(openCommandsRef:))]
         fn open_commands_ref(&self, _sender: *mut AnyObject) {
             write_and_open_commands_reference();
@@ -461,6 +475,22 @@ fn build_status_item(
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
+    // ── ASR engine submenu (which model transcribes the audio) ──────────
+    // Parakeet (default, lowest latency) vs Cohere (more accurate, 14
+    // languages, but heavier). Picking one writes `asr_backend` + relaunches.
+    let asr_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Speech engine"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    asr_parent.setEnabled(true);
+    let asr_submenu = build_asr_submenu(mtm, actions, &settings);
+    asr_parent.setSubmenu(Some(&asr_submenu));
+    menu.addItem(&asr_parent);
+
     // ── Cleanup model submenu ───────────────────────────────────────────
     let model_parent = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -602,6 +632,91 @@ fn build_status_item(
         icon_processing,
         last_item,
     })
+}
+
+/// Build the speech-engine (ASR backend) picker: Parakeet vs Cohere. The
+/// active backend is checked; selecting one writes `asr_backend` + relaunches.
+/// `DICTATE_ASR_BACKEND` locks the choice (disabled items + note). When Cohere
+/// is chosen but its model isn't downloaded, a disabled hint says how to get it.
+fn build_asr_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+) -> Retained<NSMenu> {
+    use crate::transcriber::AsrBackend;
+
+    let submenu = NSMenu::new(mtm);
+    submenu.setAutoenablesItems(false);
+
+    let env_locked = std::env::var_os("DICTATE_ASR_BACKEND").is_some();
+    // The checkmark reflects the *file* setting (env lock is shown separately).
+    let active = settings
+        .asr_backend
+        .as_deref()
+        .and_then(AsrBackend::parse)
+        .unwrap_or_default();
+
+    // Is the Cohere model actually present? (resolve_asr applies env + default.)
+    let cohere_dir = settings.resolve_asr().cohere_dir;
+    let cohere_present = std::path::Path::new(&cohere_dir).is_dir();
+
+    for (backend, label) in [
+        (AsrBackend::Parakeet, "Parakeet — fast (default)"),
+        (AsrBackend::Cohere, "Cohere — accurate, 14 languages"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(label),
+                Some(sel!(selectAsrBackend:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(actions));
+            item.setEnabled(!env_locked);
+            let rep_ns = NSString::from_str(backend.as_str());
+            let rep: &AnyObject = &rep_ns;
+            item.setRepresentedObject(Some(rep));
+            item.setState(if !env_locked && active == backend {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+        }
+        submenu.addItem(&item);
+    }
+
+    // Hint when Cohere is selected/selectable but the weights aren't on disk.
+    if !cohere_present {
+        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+        let note = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Cohere: run  download-models.sh --cohere"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        note.setEnabled(false);
+        submenu.addItem(&note);
+    }
+
+    if env_locked {
+        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+        let note = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("(locked by DICTATE_ASR_BACKEND env var)"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        note.setEnabled(false);
+        submenu.addItem(&note);
+    }
+
+    submenu
 }
 
 /// Build the model-picker submenu. Each discovered model gets a checkable
