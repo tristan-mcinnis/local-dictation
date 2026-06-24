@@ -270,6 +270,42 @@ mod tests {
     }
 
     #[test]
+    fn normalize_boosts_quiet_speech_toward_target() {
+        // A "whisper": low-amplitude tone well under the target RMS.
+        let mut buf: Vec<f32> = (0..16_000)
+            .map(|n| if n % 2 == 0 { 0.01 } else { -0.01 })
+            .collect();
+        let gain = normalize_for_asr(&mut buf);
+        assert!(gain > 5.0, "quiet input should be boosted hard, got {gain}");
+        let rms = (buf.iter().map(|x| x * x).sum::<f32>() / buf.len() as f32).sqrt();
+        // Boosted close to the target (capped by ASR_MAX_GAIN here: 0.01*16 = 0.16).
+        assert!(rms > 0.10, "boosted RMS too low: {rms}");
+        assert!(buf.iter().all(|x| x.abs() <= ASR_PEAK_CEILING), "must not clip");
+    }
+
+    #[test]
+    fn normalize_never_clips_loud_speech() {
+        // A loud, near-full-scale signal must come DOWN, not blow past ceiling.
+        let mut buf: Vec<f32> = (0..16_000)
+            .map(|n| if n % 2 == 0 { 0.8 } else { -0.8 })
+            .collect();
+        let gain = normalize_for_asr(&mut buf);
+        assert!(gain < 1.0, "loud input should be attenuated, got {gain}");
+        assert!(buf.iter().all(|x| x.abs() <= ASR_PEAK_CEILING), "must not clip");
+    }
+
+    #[test]
+    fn normalize_leaves_silence_untouched() {
+        let mut buf = vec![0.0f32; 16_000];
+        assert_eq!(normalize_for_asr(&mut buf), 1.0);
+        assert!(buf.iter().all(|&x| x == 0.0), "silence must stay silent");
+        // A tiny click below the silence floor is also left alone.
+        let mut nearly = vec![0.0f32; 16_000];
+        nearly[0] = 1e-5;
+        assert_eq!(normalize_for_asr(&mut nearly), 1.0);
+    }
+
+    #[test]
     fn resample_passthrough_at_matching_rate() {
         // stride 1.0 (16k→16k), mono: output mirrors input (first sample uses
         // the `last` carry of 0.0).
@@ -279,6 +315,62 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(*out.last().unwrap(), 0.5);
     }
+}
+
+/// Target RMS the ASR front-end normalizes each utterance toward (~ -18 dBFS).
+/// Quiet / whispered speech is boosted up to this level and a raised voice is
+/// gently brought down, so Parakeet/Cohere see a consistent loudness no matter
+/// how close or loud you speak — this is what lets you dictate at a whisper
+/// instead of having to project (cloud tools like Wispr Flow do the same).
+pub const ASR_TARGET_RMS: f32 = 0.12;
+/// Hard ceiling on any sample after gain — keeps a boost from ever clipping.
+pub const ASR_PEAK_CEILING: f32 = 0.97;
+/// Cap on the boost factor, so near-silence / room tone can't be amplified into
+/// a roar when there's no real speech to normalize.
+pub const ASR_MAX_GAIN: f32 = 16.0;
+/// Peak below which the buffer is treated as silence and left untouched (warm-up
+/// passes, empty captures) — avoids dividing by ~0 and amplifying nothing.
+const ASR_SILENCE_PEAK: f32 = 1.0e-4;
+
+/// Automatic input gain for the ASR front-end, applied in place. Normalizes the
+/// utterance to a consistent loudness ([`ASR_TARGET_RMS`]) so a whisper
+/// transcribes as well as a raised voice, while clamping the gain so it can
+/// never clip ([`ASR_PEAK_CEILING`]) or blow up room tone ([`ASR_MAX_GAIN`]).
+/// One O(n) pass, run at release (off the critical path). Returns the gain
+/// applied (1.0 when the buffer was silent or already at level), for logging.
+pub fn normalize_for_asr(audio: &mut [f32]) -> f32 {
+    if audio.is_empty() {
+        return 1.0;
+    }
+    let mut peak = 0.0f32;
+    let mut sum_sq = 0.0f64;
+    for &x in audio.iter() {
+        let a = x.abs();
+        if a > peak {
+            peak = a;
+        }
+        sum_sq += (x as f64) * (x as f64);
+    }
+    // Silence / warm-up: nothing to normalize.
+    if peak < ASR_SILENCE_PEAK {
+        return 1.0;
+    }
+    let rms = (sum_sq / audio.len() as f64).sqrt() as f32;
+    if rms <= 0.0 {
+        return 1.0;
+    }
+    // Move toward the target RMS, but never clip and never exceed the cap.
+    let gain = (ASR_TARGET_RMS / rms)
+        .min(ASR_PEAK_CEILING / peak)
+        .min(ASR_MAX_GAIN);
+    // Skip a no-op pass when the buffer is already essentially at level.
+    if (gain - 1.0).abs() < 0.01 {
+        return 1.0;
+    }
+    for x in audio.iter_mut() {
+        *x *= gain;
+    }
+    gain
 }
 
 /// Default pre-roll lookback (ms) when always-on capture is enabled. ~400 ms is

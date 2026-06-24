@@ -131,6 +131,14 @@ pub struct LocalInferenceWorker {
     backend: Backend,
 }
 
+/// Whether the pre-ASR loudness normalization is disabled (`DICTATE_NO_NORMALIZE`).
+/// Read once and cached so the per-utterance hot path doesn't touch the env.
+fn normalize_disabled() -> bool {
+    use std::sync::OnceLock;
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("DICTATE_NO_NORMALIZE").is_some())
+}
+
 impl LocalInferenceWorker {
     /// Load the ASR model selected by `cfg`. Available whenever at least one
     /// real backend feature is compiled in. Errors clearly if the selected
@@ -266,30 +274,34 @@ impl LocalInferenceWorker {
         if audio.is_empty() {
             return Ok(String::new());
         }
+        // Automatic input gain before ASR: normalize the utterance to a
+        // consistent loudness so quiet / whispered speech transcribes as well as
+        // a raised voice (you no longer have to project at the mic). A single
+        // O(n) pass at release, off the critical path, clamped so it can never
+        // clip. Set DICTATE_NO_NORMALIZE=1 to A/B against the raw signal.
+        let mut buf = audio.to_vec();
+        if !normalize_disabled() {
+            crate::audio::normalize_for_asr(&mut buf);
+        }
         match &mut self.backend {
             #[cfg(feature = "parakeet")]
             Backend::Parakeet(model) => {
                 let result = model
-                    .transcribe_samples(
-                        audio.to_vec(),
-                        SAMPLE_RATE,
-                        1,
-                        Some(TimestampMode::Sentences),
-                    )
+                    .transcribe_samples(buf, SAMPLE_RATE, 1, Some(TimestampMode::Sentences))
                     .map_err(|e| eyre::eyre!("transcribe_samples failed: {e:?}"))?;
                 Ok(result.text)
             }
             #[cfg(feature = "cohere")]
             Backend::Cohere { model, params } => {
                 let result = model
-                    .transcribe_with(audio, params)
+                    .transcribe_with(&buf, params)
                     .map_err(|e| eyre::eyre!("cohere transcribe_with failed: {e:?}"))?;
                 Ok(result.text)
             }
             #[cfg(not(any(feature = "parakeet", feature = "cohere")))]
             Backend::Mock => Ok(format!(
                 "<mock transcript of {} samples @ {} Hz>",
-                audio.len(),
+                buf.len(),
                 SAMPLE_RATE
             )),
         }

@@ -25,7 +25,8 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSColor,
+    NSAppearance, NSAppearanceCustomization, NSApplication, NSApplicationActivationPolicy,
+    NSBackingStoreType, NSButton, NSColor,
     NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSLineBreakMode,
     NSMenu, NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSStatusBar, NSStatusItem,
     NSTextAlignment,
@@ -59,6 +60,51 @@ const BAR_W: f64 = 3.0;
 const BAR_GAP: f64 = 2.0;
 const BAR_MAX_H: f64 = 26.0;
 const BAR_MIN_H: f64 = 2.0;
+
+/// Shared monochrome palette — the same design language as the other personal
+/// menu-bar apps (sync-pill, rti). Strict greyscale; the only colour anywhere is
+/// a single muted status accent, used sparingly (sync-pill's "the only colour is
+/// the status dot" rule). Defined once here instead of scattering RGBA literals
+/// through the window builders.
+#[allow(dead_code)] // the full palette is documented once; not every tier is consumed yet
+mod theme {
+    use objc2_app_kit::NSColor;
+    use objc2::rc::Retained;
+
+    fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
+        NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, b, a)
+    }
+
+    // Light surfaces (history / dictionary windows).
+    pub fn panel() -> Retained<NSColor> { rgba(0.969, 0.969, 0.973, 1.0) } // #F7F7F8
+    pub fn card() -> Retained<NSColor> { rgba(1.0, 1.0, 1.0, 1.0) }
+    pub fn border() -> Retained<NSColor> { rgba(0.851, 0.851, 0.871, 1.0) }
+    pub fn text_primary() -> Retained<NSColor> { rgba(0.067, 0.067, 0.078, 1.0) }
+    pub fn text_secondary() -> Retained<NSColor> { rgba(0.345, 0.345, 0.380, 1.0) }
+    pub fn text_tertiary() -> Retained<NSColor> { rgba(0.480, 0.480, 0.510, 1.0) }
+
+    // The floating recording pill stays a dark HUD (legible over any app), but in
+    // the family's refined charcoal rather than the old near-black + grey ring.
+    pub fn pill_bg() -> Retained<NSColor> { rgba(0.071, 0.071, 0.078, 0.95) } // ~#121214
+    pub fn pill_border() -> Retained<NSColor> { rgba(1.0, 1.0, 1.0, 0.10) }   // hairline
+    /// Live-recording waveform: clean off-white.
+    pub fn bar_active() -> Retained<NSColor> { rgba(0.95, 0.95, 0.97, 1.0) }
+    /// Processing ("thinking") waveform: the family's muted busy-grey, so the two
+    /// states finally read differently without introducing a new colour.
+    pub fn bar_busy() -> Retained<NSColor> { rgba(0.55, 0.58, 0.62, 1.0) }
+}
+
+/// Pin a window to the light "Aqua" appearance and the family panel background,
+/// so the history / dictionary windows read as the same light monochrome surface
+/// as sync-pill regardless of the system's light/dark setting (the system
+/// semantic text colours then resolve to their dark-on-light variants).
+fn apply_light_chrome(window: &NSWindow) {
+    let name = NSString::from_str("NSAppearanceNameAqua");
+    if let Some(aqua) = NSAppearance::appearanceNamed(&name) {
+        window.setAppearance(Some(&aqua));
+    }
+    window.setBackgroundColor(Some(&theme::panel()));
+}
 
 // The worker→UI state (current `UiState`, last dictation, audio levels) lives
 // in `crate::ui_channel`. The menu bar is purely the reader side here.
@@ -1185,7 +1231,7 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         label.setEditable(false);
         label.setSelectable(false);
         label.setFont(Some(&NSFont::systemFontOfSize(11.0)));
-        let _: () = msg_send![&*label, setTextColor: &*NSColor::secondaryLabelColor()];
+        let _: () = msg_send![&*label, setTextColor: &*theme::text_secondary()];
         container.addSubview(&label);
     }
 
@@ -1356,6 +1402,7 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         window.setTitle(&NSString::from_str("Dictionary"));
         window.setReleasedWhenClosed(false);
         window.setContentView(Some(&*container));
+        apply_light_chrome(&window);
         window.center();
     }
 
@@ -1405,7 +1452,7 @@ fn show_dictionary_window(actions: &MenuActions) {
     };
 }
 
-/// Read the editor, write dictionary.json, and relaunch so it takes effect.
+/// Read the editor, write corrections.json, and relaunch so it takes effect.
 fn save_dictionary_from_view() {
     let Some(ui) = DICTIONARY_UI.get() else {
         return;
@@ -1557,7 +1604,7 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         scroll.setHasVerticalScroller(true);
         scroll.setAutohidesScrollers(true);
         scroll.setDrawsBackground(true);
-        scroll.setBackgroundColor(&NSColor::controlBackgroundColor());
+        scroll.setBackgroundColor(&theme::panel());
         unsafe {
             let _: () = msg_send![&*scroll, setAutoresizingMask: M_WIDTH_HEIGHT];
         }
@@ -1596,6 +1643,7 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         // Reused across opens — closing must hide, not deallocate it.
         window.setReleasedWhenClosed(false);
         window.setContentView(Some(&*container));
+        apply_light_chrome(&window);
         window.center();
     }
 
@@ -1788,7 +1836,7 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
                 let label = NSTextField::labelWithString(&NSString::from_str(&day), mtm);
                 label.setFrame(NSRect::new(NSPoint::new(MX, y), NSSize::new(row_w, 18.0)));
                 label.setFont(Some(&NSFont::boldSystemFontOfSize(11.0)));
-                label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                label.setTextColor(Some(&theme::text_secondary()));
                 doc.addSubview(&label);
                 y += HEADER_H;
             }
@@ -1890,12 +1938,12 @@ fn build_pill_window(
         let layer: *mut objc2::runtime::AnyObject = msg_send![&*content_view, layer];
         let _: () = msg_send![layer, setCornerRadius: PILL_H / 2.0];
         let _: () = msg_send![layer, setMasksToBounds: true];
-        // Background: near-black, slightly translucent
-        let bg = NSColor::colorWithCalibratedRed_green_blue_alpha(0.05, 0.05, 0.07, 0.92);
+        // Background: refined charcoal HUD (family palette).
+        let bg = theme::pill_bg();
         let bg_cg: *mut objc2::runtime::AnyObject = msg_send![&*bg, CGColor];
         let _: () = msg_send![layer, setBackgroundColor: bg_cg];
-        // Border: faint gray ring matching the reference screenshot.
-        let border = NSColor::colorWithCalibratedRed_green_blue_alpha(0.45, 0.45, 0.50, 0.65);
+        // Border: a hairline light ring, subtler than the old grey.
+        let border = theme::pill_border();
         let border_cg: *mut objc2::runtime::AnyObject = msg_send![&*border, CGColor];
         let _: () = msg_send![layer, setBorderColor: border_cg];
         let _: () = msg_send![layer, setBorderWidth: 1.0_f64];
@@ -1915,9 +1963,9 @@ fn build_pill_window(
             bar.setWantsLayer(true);
             let layer: *mut objc2::runtime::AnyObject = msg_send![&*bar, layer];
             let _: () = msg_send![layer, setCornerRadius: (BAR_W / 2.0)];
-            let white = NSColor::colorWithCalibratedRed_green_blue_alpha(0.92, 0.92, 0.95, 1.0);
-            let white_cg: *mut objc2::runtime::AnyObject = msg_send![&*white, CGColor];
-            let _: () = msg_send![layer, setBackgroundColor: white_cg];
+            let active = theme::bar_active();
+            let active_cg: *mut objc2::runtime::AnyObject = msg_send![&*active, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: active_cg];
         }
         content_view.addSubview(&bar);
         bars.push(bar);
@@ -2015,7 +2063,13 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             collapse_bars(globals);
             globals.pill_window.orderOut(None);
         }
-        UiState::Recording | UiState::Processing => {
+        UiState::Recording => {
+            set_bars_color(globals, &theme::bar_active());
+            position_pill_at_cursor_screen(&globals.pill_window);
+            globals.pill_window.orderFrontRegardless();
+        }
+        UiState::Processing => {
+            set_bars_color(globals, &theme::bar_busy());
             position_pill_at_cursor_screen(&globals.pill_window);
             globals.pill_window.orderFrontRegardless();
         }
@@ -2097,6 +2151,18 @@ fn animate_processing_bars(globals: &UiGlobals) {
         let new_h = displayed[i] * 0.6 + target * 0.4;
         displayed[i] = new_h;
         set_bar_height(bar, i, new_h);
+    }
+}
+
+/// Recolour every waveform bar (called on state change): off-white while
+/// recording, muted grey while "thinking", so the two states are distinct.
+fn set_bars_color(globals: &UiGlobals, color: &NSColor) {
+    for bar in globals.bars.iter() {
+        unsafe {
+            let layer: *mut objc2::runtime::AnyObject = msg_send![&**bar, layer];
+            let cg: *mut objc2::runtime::AnyObject = msg_send![color, CGColor];
+            let _: () = msg_send![layer, setBackgroundColor: cg];
+        }
     }
 }
 
