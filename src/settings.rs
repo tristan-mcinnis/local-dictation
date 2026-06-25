@@ -174,10 +174,11 @@ impl Settings {
     /// place backend choice is decided; the daemon and the CLI both go through
     /// it so they always agree.
     ///
-    /// Env knobs: `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`|`moonshine`),
+    /// Env knobs: `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`|`moonshine`|`whisper`),
     /// `DICTATE_COHERE_QUANT` (`int4`|`int8`), `DICTATE_COHERE_LANG`,
     /// `DICTATE_MOONSHINE_VARIANT` (`tiny`|`base`), `PARAKEET_MODEL_DIR`,
-    /// `DICTATE_COHERE_MODEL_DIR`, `DICTATE_MOONSHINE_MODEL_DIR`.
+    /// `DICTATE_COHERE_MODEL_DIR`, `DICTATE_MOONSHINE_MODEL_DIR`,
+    /// `DICTATE_WHISPER_MODEL_PATH`.
     pub fn resolve_asr(&self) -> crate::transcriber::AsrConfig {
         use crate::transcriber::{AsrBackend, AsrConfig, CohereQuant, MoonshineSize};
 
@@ -218,6 +219,9 @@ impl Settings {
         let moonshine_dir = std::env::var("DICTATE_MOONSHINE_MODEL_DIR")
             .unwrap_or_else(|_| crate::app_paths::moonshine_default_dir(moonshine_size.as_str()));
 
+        let whisper_model_path = std::env::var("DICTATE_WHISPER_MODEL_PATH")
+            .unwrap_or_else(|_| crate::app_paths::whisper_default_path());
+
         AsrConfig {
             backend,
             parakeet_dir,
@@ -226,6 +230,7 @@ impl Settings {
             cohere_language,
             moonshine_dir,
             moonshine_size,
+            whisper_model_path,
         }
     }
 

@@ -18,12 +18,19 @@ use parakeet_rs::{ParakeetTDT, TimestampMode, Transcriber};
 ///   input (no Whisper-style 30 s zero-padding). The clean Whisper alternative:
 ///   whisper.cpp/`whisper-rs` vendors ggml which collides with `llama-cpp-2`
 ///   (533+ duplicate symbols), so Whisper-via-C++ is blocked in this crate.
+/// - **Whisper**: OpenAI Whisper (large-v3-turbo / small / etc.) via
+///   whisper.cpp (`whisper-rs`) with Metal. The real Whisper — multilingual,
+///   punctuated output — but it vendors ggml which clashes with `llama-cpp-2`,
+///   so `whisper` and `cleaner` are mutually exclusive (build with
+///   `--features whisper-stack`: you get Whisper ASR but no LLM cleanup).
+///   Slower than Parakeet for short utterances (30 s zero-padding overhead).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AsrBackend {
     #[default]
     Parakeet,
     Cohere,
     Moonshine,
+    Whisper,
 }
 
 impl AsrBackend {
@@ -32,6 +39,7 @@ impl AsrBackend {
             AsrBackend::Parakeet => "parakeet",
             AsrBackend::Cohere => "cohere",
             AsrBackend::Moonshine => "moonshine",
+            AsrBackend::Whisper => "whisper",
         }
     }
 
@@ -42,6 +50,7 @@ impl AsrBackend {
             "parakeet" => Some(Self::Parakeet),
             "cohere" => Some(Self::Cohere),
             "moonshine" => Some(Self::Moonshine),
+            "whisper" => Some(Self::Whisper),
             _ => None,
         }
     }
@@ -123,6 +132,8 @@ pub struct AsrConfig {
     /// tokenizer.json).
     pub moonshine_dir: String,
     pub moonshine_size: MoonshineSize,
+    /// Path to the Whisper ggml model file (e.g. `ggml-large-v3-turbo-q5_0.bin`).
+    pub whisper_model_path: String,
 }
 
 impl Default for AsrConfig {
@@ -135,6 +146,7 @@ impl Default for AsrConfig {
             cohere_language: "en".to_string(),
             moonshine_dir: String::new(),
             moonshine_size: MoonshineSize::default(),
+            whisper_model_path: String::new(),
         }
     }
 }
@@ -154,6 +166,7 @@ impl AsrConfig {
             AsrBackend::Moonshine => {
                 format!("moonshine/{} · {}", self.moonshine_size.as_str(), self.moonshine_dir)
             }
+            AsrBackend::Whisper => format!("whisper · {}", self.whisper_model_path),
         }
     }
 }
@@ -174,8 +187,18 @@ enum Backend {
         model: transcribe_rs::onnx::moonshine::MoonshineModel,
         params: transcribe_rs::onnx::moonshine::MoonshineParams,
     },
+    #[cfg(feature = "whisper")]
+    Whisper {
+        engine: transcribe_rs::whisper_cpp::WhisperEngine,
+        params: transcribe_rs::whisper_cpp::WhisperInferenceParams,
+    },
     /// Featureless/test build only — no real backend compiled in.
-    #[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine")))]
+    #[cfg(not(any(
+        feature = "parakeet",
+        feature = "cohere",
+        feature = "moonshine",
+        feature = "whisper"
+    )))]
     Mock,
 }
 
@@ -195,12 +218,13 @@ impl LocalInferenceWorker {
     /// Load the ASR model selected by `cfg`. Available whenever at least one
     /// real backend feature is compiled in. Errors clearly if the selected
     /// backend's feature was not built.
-    #[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine"))]
+    #[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
     pub fn initialize(cfg: &AsrConfig) -> eyre::Result<Self> {
         let backend = match cfg.backend {
             AsrBackend::Parakeet => Self::load_parakeet(&cfg.parakeet_dir)?,
             AsrBackend::Cohere => Self::load_cohere(cfg)?,
             AsrBackend::Moonshine => Self::load_moonshine(cfg)?,
+            AsrBackend::Whisper => Self::load_whisper(cfg)?,
         };
         Ok(Self { backend })
     }
@@ -212,12 +236,12 @@ impl LocalInferenceWorker {
         Ok(Backend::Parakeet(model))
     }
 
-    #[cfg(all(not(feature = "parakeet"), any(feature = "cohere", feature = "moonshine")))]
+    #[cfg(all(not(feature = "parakeet"), any(feature = "cohere", feature = "moonshine", feature = "whisper")))]
     fn load_parakeet(_model_dir: &str) -> eyre::Result<Backend> {
         Err(eyre::eyre!(
             "ASR backend 'parakeet' was selected, but this binary was built \
              without the `parakeet` feature. Rebuild with --features parakeet \
-             (or full), or set the backend to 'cohere' / 'moonshine'."
+             (or full), or set the backend to 'cohere' / 'moonshine' / 'whisper'."
         ))
     }
 
@@ -288,7 +312,7 @@ impl LocalInferenceWorker {
         Ok(Backend::Cohere { model, params })
     }
 
-    #[cfg(all(not(feature = "cohere"), any(feature = "parakeet", feature = "moonshine")))]
+    #[cfg(all(not(feature = "cohere"), any(feature = "parakeet", feature = "moonshine", feature = "whisper")))]
     fn load_cohere(_cfg: &AsrConfig) -> eyre::Result<Backend> {
         Err(eyre::eyre!(
             "ASR backend 'cohere' was selected, but this binary was built \
@@ -359,7 +383,7 @@ impl LocalInferenceWorker {
         Ok(Backend::Moonshine { model, params })
     }
 
-    #[cfg(all(not(feature = "moonshine"), any(feature = "parakeet", feature = "cohere")))]
+    #[cfg(all(not(feature = "moonshine"), any(feature = "parakeet", feature = "cohere", feature = "whisper")))]
     fn load_moonshine(_cfg: &AsrConfig) -> eyre::Result<Backend> {
         Err(eyre::eyre!(
             "ASR backend 'moonshine' was selected, but this binary was built \
@@ -368,14 +392,72 @@ impl LocalInferenceWorker {
         ))
     }
 
-    #[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine")))]
+    #[cfg(feature = "whisper")]
+    fn load_whisper(cfg: &AsrConfig) -> eyre::Result<Backend> {
+        use transcribe_rs::whisper_cpp::{WhisperEngine, WhisperInferenceParams};
+        use transcribe_rs::WhisperAccelerator;
+
+        // Whisper (whisper.cpp) uses Metal on Apple Silicon — set the global
+        // accelerator before loading. `DICTATE_WHISPER_ACCEL=cpu` forces CPU
+        // (useful for A/B or if Metal misbehaves); default is GPU (Metal).
+        let use_gpu = match std::env::var("DICTATE_WHISPER_ACCEL")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("cpu" | "cpu_only") => {
+                transcribe_rs::set_whisper_accelerator(WhisperAccelerator::CpuOnly);
+                false
+            }
+            _ => {
+                transcribe_rs::set_whisper_accelerator(WhisperAccelerator::Auto);
+                true
+            }
+        };
+
+        let path = std::path::Path::new(&cfg.whisper_model_path);
+        let engine = WhisperEngine::load(path).map_err(|e| {
+            eyre::eyre!(
+                "WhisperEngine::load failed (use_gpu={use_gpu}, {}): {e:?}",
+                cfg.whisper_model_path
+            )
+        })?;
+
+        // Default to English (this is primarily an English dictation tool);
+        // `DICTATE_WHISPER_LANG` overrides (set to blank for Whisper auto-detect).
+        let language = std::env::var("DICTATE_WHISPER_LANG")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .or_else(|| Some("en".to_string()));
+
+        let params = WhisperInferenceParams {
+            language,
+            translate: false,
+            ..Default::default()
+        };
+        Ok(Backend::Whisper { engine, params })
+    }
+
+    #[cfg(all(not(feature = "whisper"), any(feature = "parakeet", feature = "cohere", feature = "moonshine")))]
+    fn load_whisper(_cfg: &AsrConfig) -> eyre::Result<Backend> {
+        Err(eyre::eyre!(
+            "ASR backend 'whisper' was selected, but this binary was built \
+             without the `whisper` feature. Rebuild with --features whisper-stack \
+             (parakeet + whisper + ax-inject; no cleaner — whisper and cleaner \
+             both vendor ggml and cannot coexist), or set the backend back to \
+             'parakeet' / 'cohere' / 'moonshine'."
+        ))
+    }
+
+    #[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper")))]
     pub fn initialize_mock() -> Self {
         Self {
             backend: Backend::Mock,
         }
     }
 
-    #[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine"))]
+    #[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
     pub fn initialize_mock() -> Self {
         panic!("initialize_mock is unavailable when built with an ASR backend feature; call initialize(&AsrConfig) instead");
     }
@@ -429,7 +511,14 @@ impl LocalInferenceWorker {
                     .map_err(|e| eyre::eyre!("moonshine transcribe_with failed: {e:?}"))?;
                 Ok(result.text)
             }
-            #[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine")))]
+            #[cfg(feature = "whisper")]
+            Backend::Whisper { engine, params } => {
+                let result = engine
+                    .transcribe_with(&buf, params)
+                    .map_err(|e| eyre::eyre!("whisper transcribe_with failed: {e:?}"))?;
+                Ok(result.text)
+            }
+            #[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper")))]
             Backend::Mock => Ok(format!(
                 "<mock transcript of {} samples @ {} Hz>",
                 buf.len(),
@@ -441,7 +530,7 @@ impl LocalInferenceWorker {
 
 /// WAV loader (mono 16 kHz expected; int16 PCM auto-converted to f32).
 /// Available with any ASR backend (all pull `hound`).
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine"))]
+#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
 pub fn load_wav_mono16k<P: AsRef<std::path::Path>>(path: P) -> eyre::Result<Vec<f32>> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
@@ -477,10 +566,12 @@ mod tests {
         assert_eq!(AsrBackend::parse("parakeet"), Some(AsrBackend::Parakeet));
         assert_eq!(AsrBackend::parse("  Cohere "), Some(AsrBackend::Cohere));
         assert_eq!(AsrBackend::parse("MOONSHINE"), Some(AsrBackend::Moonshine));
-        assert_eq!(AsrBackend::parse("whisper"), None);
+        assert_eq!(AsrBackend::parse("Whisper"), Some(AsrBackend::Whisper));
+        assert_eq!(AsrBackend::parse("sphinx"), None);
         assert_eq!(AsrBackend::Parakeet.as_str(), "parakeet");
         assert_eq!(AsrBackend::Cohere.as_str(), "cohere");
         assert_eq!(AsrBackend::Moonshine.as_str(), "moonshine");
+        assert_eq!(AsrBackend::Whisper.as_str(), "whisper");
         // default is the proven, lowest-latency backend
         assert_eq!(AsrBackend::default(), AsrBackend::Parakeet);
     }
@@ -516,6 +607,7 @@ mod tests {
             cohere_language: "en".into(),
             moonshine_dir: "/m/moonshine-base".into(),
             moonshine_size: MoonshineSize::Base,
+            whisper_model_path: "/m/ggml-large-v3-turbo-q5_0.bin".into(),
         };
         assert!(cfg.describe().contains("parakeet"));
         cfg.backend = AsrBackend::Cohere;
@@ -526,5 +618,9 @@ mod tests {
         let d = cfg.describe();
         assert!(d.contains("moonshine/base"));
         assert!(d.contains("/m/moonshine-base"));
+        cfg.backend = AsrBackend::Whisper;
+        let d = cfg.describe();
+        assert!(d.contains("whisper"));
+        assert!(d.contains("ggml-large-v3-turbo"));
     }
 }

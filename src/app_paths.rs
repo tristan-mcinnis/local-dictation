@@ -111,6 +111,19 @@ pub fn moonshine_default_dir(size: &str) -> String {
         .into_owned()
 }
 
+/// Default Whisper ASR model file
+/// (`<base>/dictation/whisper/ggml-large-v3-turbo-q5_0.bin`). Populated by
+/// `./scripts/download-models.sh --whisper`; overridable with
+/// `DICTATE_WHISPER_MODEL_PATH`. Whisper is opt-in (and mutually exclusive with
+/// the `cleaner` feature at build time), so this file may not exist unless the
+/// user has fetched it.
+pub fn whisper_default_path() -> String {
+    models_base_dir()
+        .join("dictation/whisper/ggml-large-v3-turbo-q5_0.bin")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Default cleanup model path
 /// (`<base>/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf`).
 /// Named `gemma_*` for historical reasons (Gemma was the original default);

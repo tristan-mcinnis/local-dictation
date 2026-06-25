@@ -707,11 +707,13 @@ fn build_asr_submenu(
     let resolved = settings.resolve_asr();
     let cohere_present = std::path::Path::new(&resolved.cohere_dir).is_dir();
     let moonshine_present = std::path::Path::new(&resolved.moonshine_dir).is_dir();
+    let whisper_present = std::path::Path::new(&resolved.whisper_model_path).is_file();
 
     for (backend, label) in [
         (AsrBackend::Parakeet, "Parakeet — fast (default)"),
         (AsrBackend::Cohere, "Cohere — accurate, 14 languages"),
         (AsrBackend::Moonshine, "Moonshine — fast, English (ONNX)"),
+        (AsrBackend::Whisper, "Whisper — accurate, multilingual (no cleanup)"),
     ] {
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -759,6 +761,9 @@ fn build_asr_submenu(
     }
     if !moonshine_present {
         add_hint(&submenu, "Moonshine: run  download-models.sh --moonshine");
+    }
+    if !whisper_present {
+        add_hint(&submenu, "Whisper: run  download-models.sh --whisper");
     }
 
     if env_locked {

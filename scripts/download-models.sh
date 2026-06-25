@@ -17,10 +17,16 @@
 #   ./scripts/download-models.sh --moonshine tiny    # …or the faster/rougher Tiny
 #   ./scripts/download-models.sh --moonshine-only base # ONLY fetch Moonshine
 #
+# Opt-in Whisper backend (whisper.cpp + Metal; mutually exclusive with the
+# `cleaner` feature at build time — both vendor ggml):
+#   ./scripts/download-models.sh --whisper         # large-v3-turbo q5_0 (default)
+#
 # Cohere is a 2B encoder/decoder (~1–2.5 GB on disk) and is NOT downloaded by
 # default — select it with the menu / `DICTATE_ASR_BACKEND=cohere` after fetching.
 # Moonshine is a 27M/61M encoder/decoder (~60-120 MB int8) — select it with the
 # menu / `DICTATE_ASR_BACKEND=moonshine` after fetching.
+# Whisper is a single ggml .bin (~547 MB q5_0) — select it with the menu /
+# `DICTATE_ASR_BACKEND=whisper` after fetching (build with --features whisper-stack).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -31,15 +37,18 @@ WANT_COHERE=0           # fetch Cohere
 COHERE_QUANT="int4"     # int4 | int8
 WANT_MOONSHINE=0        # fetch Moonshine
 MOONSHINE_SIZE="base"   # tiny | base
+WANT_WHISPER=0          # fetch Whisper
 while [ $# -gt 0 ]; do
   case "$1" in
     --cohere)       WANT_COHERE=1; [ "${2:-}" = "int4" -o "${2:-}" = "int8" ] && { COHERE_QUANT="$2"; shift; } ;;
     --cohere-only)  WANT_COHERE=1; WANT_DEFAULT=0; [ "${2:-}" = "int4" -o "${2:-}" = "int8" ] && { COHERE_QUANT="$2"; shift; } ;;
     --moonshine)       WANT_MOONSHINE=1; [ "${2:-}" = "tiny" -o "${2:-}" = "base" ] && { MOONSHINE_SIZE="$2"; shift; } ;;
     --moonshine-only)  WANT_MOONSHINE=1; WANT_DEFAULT=0; [ "${2:-}" = "tiny" -o "${2:-}" = "base" ] && { MOONSHINE_SIZE="$2"; shift; } ;;
+    --whisper)      WANT_WHISPER=1 ;;
+    --whisper-only) WANT_WHISPER=1; WANT_DEFAULT=0 ;;
     int4|int8)      COHERE_QUANT="$1" ;;
     tiny|base)      MOONSHINE_SIZE="$1" ;;
-    -h|--help)      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)      sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              echo "unknown arg: $1" >&2; exit 1 ;;
   esac
   shift
@@ -123,9 +132,29 @@ download_moonshine() {
   fetch "$base/tokenizer.json"                      "$dir/tokenizer.json"
 }
 
+# --- Whisper (optional fourth ASR backend, whisper.cpp + Metal) -------------
+# OpenAI Whisper via whisper.cpp (ggml format). A single .bin file loaded by
+# transcribe-rs' WhisperEngine. The default is large-v3-turbo q5_0 (~547 MB):
+# best speed/accuracy in the Whisper family (4 decoder layers vs 32 in large-v3).
+# NOTE: whisper.cpp vendors ggml, which clashes with llama-cpp-2 (the cleanup
+# LLM) — build with --features whisper-stack (no cleaner) to use this backend.
+download_whisper() {
+  local dir="models/dictation/whisper"
+  local file="ggml-large-v3-turbo-q5_0.bin"
+  local base="$HF_ENDPOINT/ggerganov/whisper.cpp/resolve/main"
+  mkdir -p "$dir"
+  echo
+  echo "==> Whisper large-v3-turbo (q5_0, ~547 MB) — from ggerganov/whisper.cpp"
+  echo "    Multilingual, punctuated output. whisper.cpp + Metal on Apple Silicon."
+  echo "    NOTE: mutually exclusive with the cleaner feature (both vendor ggml)."
+  echo "    Build with --features whisper-stack; select via DICTATE_ASR_BACKEND=whisper."
+  fetch "$base/$file" "$dir/$file"
+}
+
 if [ "$WANT_DEFAULT" -eq 0 ]; then
   [ "$WANT_COHERE" -eq 1 ]   && download_cohere "$COHERE_QUANT"
   [ "$WANT_MOONSHINE" -eq 1 ] && download_moonshine "$MOONSHINE_SIZE"
+  [ "$WANT_WHISPER" -eq 1 ]  && download_whisper
   echo; echo "==> Done. Total on disk:"; du -sh models/*/ 2>/dev/null || true
   exit 0
 fi
@@ -158,6 +187,11 @@ fi
 # Optional third ASR backend, only when --moonshine was passed.
 if [ "$WANT_MOONSHINE" -eq 1 ]; then
   download_moonshine "$MOONSHINE_SIZE"
+fi
+
+# Optional fourth ASR backend, only when --whisper was passed.
+if [ "$WANT_WHISPER" -eq 1 ]; then
+  download_whisper
 fi
 
 echo

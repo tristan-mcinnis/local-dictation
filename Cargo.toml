@@ -37,6 +37,19 @@ cohere = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs
 # collides with llama-cpp-2's ggml (533+ duplicate symbols), so Whisper-via-C++
 # is a hard blocker in this crate; Moonshine is the clean ONNX alternative.
 moonshine = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs/ort-coreml"]
+# Alternative ASR backend: OpenAI Whisper (large-v3-turbo / small / etc.) via
+# whisper.cpp (whisper-rs) with Metal. This is the real Whisper — but it vendors
+# ggml, which COLLIDES with llama-cpp-2's ggml (533+ duplicate symbols), so
+# `whisper` and `cleaner` are MUTUALLY EXCLUSIVE (enforced by build.rs). Build
+# with `--features whisper-stack` (= parakeet + whisper + ax-inject, no cleaner)
+# to use Whisper: you get Whisper ASR but lose LLM cleanup (the raw Whisper
+# output is already punctuated/capitalized, so cleanup is less critical).
+# NOT in `full` (full includes cleaner).
+whisper = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/whisper-metal"]
+# Convenience: Parakeet + Whisper + injection, no cleaner (avoids the ggml
+# clash). This is the Whisper-capable stack — select Whisper at runtime via
+# `DICTATE_ASR_BACKEND=whisper` after fetching a ggml model.
+whisper-stack = ["parakeet", "whisper", "ax-inject"]
 # Adds llama.cpp (via llama-cpp-2) with Metal for the cleanup engine.
 # llama-cpp-2 (despite its 0.1.x version) is the actively-maintained binding;
 # `llama_cpp` 0.3.x vendors a llama.cpp from April 2024 and cannot load Gemma 3.
