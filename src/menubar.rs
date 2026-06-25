@@ -98,7 +98,7 @@ mod theme {
 /// so the history / dictionary windows read as the same light monochrome surface
 /// as sync-pill regardless of the system's light/dark setting (the system
 /// semantic text colours then resolve to their dark-on-light variants).
-fn apply_light_chrome(window: &NSWindow) {
+pub(crate) fn apply_light_chrome(window: &NSWindow) {
     let name = NSString::from_str("NSAppearanceNameAqua");
     if let Some(aqua) = NSAppearance::appearanceNamed(&name) {
         window.setAppearance(Some(&aqua));
@@ -281,6 +281,11 @@ define_class!(
         fn open_commands_ref(&self, _sender: *mut AnyObject) {
             write_and_open_commands_reference();
         }
+
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: *mut AnyObject) {
+            crate::settings_window::show_settings_window();
+        }
     }
 );
 
@@ -414,7 +419,7 @@ struct StatusItemBuild {
 /// Generate the live voice-commands + settings reference and open it in the
 /// default text editor. Generated from the actual command tables + settings so
 /// it never drifts. Backs the menu's "Voice Commands & Shortcuts…" item.
-fn write_and_open_commands_reference() {
+pub(crate) fn write_and_open_commands_reference() {
     let s = Settings::load();
     let hotkey = settings::hotkey_name(s.hotkey_keycode.unwrap_or(0x3D));
 
@@ -518,6 +523,10 @@ fn build_status_item(
     let dictionary_item =
         action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
     menu.addItem(&dictionary_item);
+
+    // Native Settings window (⌘,): all tunables in one place, batched apply.
+    let settings_item = action_item(mtm, "Settings…", sel!(openSettings:), ",", actions);
+    menu.addItem(&settings_item);
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
@@ -1032,7 +1041,7 @@ fn write_settings_and_relaunch(mutate: impl FnOnce(&mut Settings)) {
 /// Spawn a fresh daemon (same binary, `daemon` subcommand) with stdout+stderr
 /// pointed at the log file — matching how the daemon is normally launched so
 /// Open/Export Log keep working — then terminate ourselves.
-fn relaunch_daemon() {
+pub(crate) fn relaunch_daemon() {
     use std::process::{Command, Stdio};
 
     let exe = match std::env::current_exe() {
@@ -1087,7 +1096,7 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
-fn export_log_to_downloads() {
+pub(crate) fn export_log_to_downloads() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
@@ -1110,7 +1119,7 @@ fn export_log_to_downloads() {
     }
 }
 
-fn open_corrections_folder() {
+pub(crate) fn open_corrections_folder() {
     let Some(dir) = crate::app_paths::config_dir() else {
         return;
     };
@@ -1136,7 +1145,7 @@ fn open_corrections_folder() {
 /// Edits take effect on the next daemon launch (prompts are read once at
 /// startup), so the comment tells the user to relaunch — e.g. toggle "Cleanup
 /// enabled" off and on, which relaunches the daemon.
-fn open_prompts_file() {
+pub(crate) fn open_prompts_file() {
     let Some(path) = crate::prompts::Prompts::config_path() else {
         eprintln!("[menu] cannot resolve prompts.json path (no $HOME?)");
         return;

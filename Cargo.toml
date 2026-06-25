@@ -129,6 +129,9 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     # system output while a call app is in front — see audio_duck.rs.
     "NSWorkspace",
     "NSRunningApplication",
+    # Native Settings window controls: popups for pickers, switches for toggles.
+    "NSPopUpButton",
+    "NSSwitch",
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
 

@@ -31,6 +31,9 @@ pub mod clipboard_paste;
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub mod menubar;
 
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub mod settings_window;
+
 // Push-to-talk daemon. Needs the full feature stack — Parakeet for ASR and
 // AX for the event tap + injection.
 #[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
