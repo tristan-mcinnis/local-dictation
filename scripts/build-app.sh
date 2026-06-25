@@ -84,8 +84,13 @@ fi
 echo "▶ Local Dictation.app  (v$VERSION)"
 
 # ── 1. compile the release binary ───────────────────────────────────────────
-echo "• building release binary (cargo build --features full --release)…"
-cargo build --features full --release
+# BUILD_FEATURES overrides the feature set (default: full = all backends +
+# cleaner + inject, no whisper). To include Whisper (which is mutually
+# exclusive with cleaner due to a ggml clash — see build.rs), build with:
+#   BUILD_FEATURES=parakeet,cohere,moonshine,whisper,ax-inject ./scripts/build-app.sh --install
+BUILD_FEATURES="${BUILD_FEATURES:-full}"
+echo "• building release binary (cargo build --features $BUILD_FEATURES --release)…"
+cargo build --features "$BUILD_FEATURES" --release
 [ -x "$BIN_SRC" ] || { echo "build produced no binary at $BIN_SRC" >&2; exit 1; }
 
 # ── 2. lay out the bundle skeleton ───────────────────────────────────────────
