@@ -83,6 +83,9 @@ cargo build --features full --release
 # Or build the .app bundle
 ./scripts/build-app.sh --install      # build, copy to /Applications, login item, launch
 ./scripts/build-app.sh --slim --dmg   # tiny DMG, models fetched on first run (the shipped release)
+
+# Whisper build (no cleaner — whisper.cpp and llama.cpp both vendor ggml)
+BUILD_FEATURES=parakeet,cohere,moonshine,whisper,ax-inject ./scripts/build-app.sh --install
 ```
 
 </details>
@@ -131,14 +134,34 @@ A 2 second clear utterance: transcribe about 90 ms (Parakeet TDT v3 INT8, CoreML
 
 ## Models
 
-Both run fully on-device. `./scripts/download-models.sh` fetches the two defaults.
+Both defaults run fully on-device. `./scripts/download-models.sh` fetches them.
 
 | Model | Size | Role |
 | --- | --- | --- |
-| Parakeet TDT v3 INT8 (ONNX) | 640 MB | Speech to text |
+| Parakeet TDT v3 INT8 (ONNX) | 640 MB | Speech to text (default) |
 | Qwen 2.5 1.5B-IT Q4_K_M (GGUF) | 1.0 GB | Cleanup |
 
 Qwen 2.5 1.5B won a bake-off of eight local models on 11 hard dictation cases ([`examples/model_bakeoff.rs`](./examples/model_bakeoff.rs)): 50 of 55 passes at 137 ms mean cleanup, beating Gemma 3 4B at a third of the size. Swap models from the menu bar or with `GEMMA_MODEL_PATH`.
+
+### Alternative ASR backends
+
+Parakeet is the default (lowest latency, single CTC/TDT pass). Two more ONNX backends share the same `ort` + CoreML stack (no new native deps), and Whisper uses whisper.cpp + Metal. All are selectable from the Speech Engine menu or `DICTATE_ASR_BACKEND`.
+
+| Backend | Model | Size | Latency (M5, 8.35 s audio) | Notes |
+| --- | --- | --- | --- | --- |
+| Parakeet (default) | TDT v3 INT8 | 640 MB | ~190 ms | Punctuated, multilingual |
+| Moonshine Base | v1 61M INT8 | 66 MB | ~320 ms | English-only, raw text (cleanup punctuates) |
+| Moonshine Tiny | v1 27M INT8 | 30 MB | ~230 ms | English-only, rougher accuracy |
+| Whisper | large-v3-turbo q5_0 | 547 MB | ~560 ms | Punctuated, multilingual, **no cleanup** (ggml clash) |
+
+Fetch optional backends:
+
+```bash
+./scripts/download-models.sh --moonshine base   # or tiny
+./scripts/download-models.sh --whisper          # large-v3-turbo q5_0
+```
+
+**Whisper trades cleanup for ASR.** whisper.cpp (`whisper-rs`) and llama.cpp (`llama-cpp-2`, the cleanup engine) both vendor ggml and cannot link into the same binary. Build with `--features whisper-stack` (Parakeet + Whisper + inject, no cleaner) to use Whisper — its output is already punctuated, so the missing cleanup is less critical. `build.rs` enforces the mutual exclusion with a clear error. Moonshine and Cohere have no such restriction (they use ONNX Runtime, not ggml).
 
 ## Compared to the alternatives
 
@@ -162,8 +185,11 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 | Var | Effect |
 | --- | --- |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key. Default `0x3D` (Right Option) |
+| `DICTATE_ASR_BACKEND` | ASR engine: `parakeet` (default), `cohere`, `moonshine`, or `whisper` |
 | `GEMMA_MODEL_PATH` | Cleanup model path (name is historical) |
-| `PARAKEET_MODEL_DIR` | ASR model directory |
+| `PARAKEET_MODEL_DIR` | Parakeet ASR model directory |
+| `DICTATE_MOONSHINE_VARIANT` | Moonshine size: `tiny` or `base` (default) |
+| `DICTATE_WHISPER_MODEL_PATH` | Path to Whisper ggml `.bin` file |
 | `DICTATE_FORMAT` | Active output-format preset |
 | `HF_ENDPOINT` | Model download mirror (for example `https://hf-mirror.com`) |
 | `DICTATE_QUIET` | Mute audio cues |
@@ -184,6 +210,7 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 ## Trade-offs
 
 * English-first. Parakeet is multilingual but the cleanup is tuned for English.
+* Whisper and cleanup cannot coexist: both vendor ggml. Build with `whisper-stack` (no cleaner) or `full` (no Whisper), not both.
 * Electron apps add about 185 ms (clipboard paste settle time). Native apps inject in about 5 ms.
 * Recording is bounded by key hold, not silence detection.
 * macOS and Apple Silicon only.
@@ -193,6 +220,7 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 ```bash
 cargo test                 # core unit and integration tests, no models needed
 cargo test --features full # adds the menubar, history, injector, and cleaner suites
+cargo build --features whisper-stack  # verify the Whisper (no-cleaner) stack compiles
 ```
 
 ## License
@@ -203,8 +231,8 @@ Models are not redistributed here. Parakeet TDT v3 is NVIDIA's under their licen
 
 ## Acknowledgements
 
-Standing on [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [Qwen 2.5](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct), [parakeet-rs](https://github.com/cdpierse/parakeet-rs), [ONNX Runtime](https://github.com/microsoft/onnxruntime) via [`ort`](https://github.com/pykeio/ort), [llama.cpp](https://github.com/ggml-org/llama.cpp) via [`llama-cpp-2`](https://github.com/utilityai/llama-cpp-rs), [cpal](https://github.com/RustAudio/cpal), [objc2](https://github.com/madsmtm/objc2), and [arboard](https://github.com/1Password/arboard).
+Standing on [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [Qwen 2.5](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct), [Moonshine](https://github.com/UsefulSensors/moonshine) by Useful Sensors, [OpenAI Whisper](https://github.com/openai/whisper) via [whisper.cpp](https://github.com/ggml-org/whisper.cpp), [transcribe-rs](https://github.com/cjpais/transcribe-rs), [parakeet-rs](https://github.com/cdpierse/parakeet-rs), [ONNX Runtime](https://github.com/microsoft/onnxruntime) via [`ort`](https://github.com/pykeio/ort), [llama.cpp](https://github.com/ggml-org/llama.cpp) via [`llama-cpp-2`](https://github.com/utilityai/llama-cpp-rs), [cpal](https://github.com/RustAudio/cpal), [objc2](https://github.com/madsmtm/objc2), and [arboard](https://github.com/1Password/arboard).
 
 ---
 
-Keywords: macOS dictation, speech to text, voice to text, voice typing, on-device, offline, local, private, push to talk, Parakeet, Qwen, local LLM, Apple Silicon, Superwhisper alternative, Wispr Flow alternative, MacWhisper alternative, Apple Dictation alternative, dictation for ChatGPT and Claude, low latency speech recognition, Rust.
+Keywords: macOS dictation, speech to text, voice to text, voice typing, on-device, offline, local, private, push to talk, Parakeet, Qwen, Whisper, Moonshine, local LLM, Apple Silicon, Superwhisper alternative, Wispr Flow alternative, MacWhisper alternative, Apple Dictation alternative, dictation for ChatGPT and Claude, low latency speech recognition, Rust.
