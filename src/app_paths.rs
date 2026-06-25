@@ -99,6 +99,18 @@ pub fn cohere_default_dir(quant: &str) -> String {
         .into_owned()
 }
 
+/// Default Moonshine ASR model directory for a given size
+/// (`<base>/dictation/moonshine-<size>`, e.g. `…/moonshine-base`). Populated
+/// by `./scripts/download-models.sh --moonshine <size>`; overridable with
+/// `DICTATE_MOONSHINE_MODEL_DIR`. Moonshine is opt-in, so this dir may not
+/// exist unless the user has selected the backend and fetched the weights.
+pub fn moonshine_default_dir(size: &str) -> String {
+    models_base_dir()
+        .join(format!("dictation/moonshine-{size}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Default cleanup model path
 /// (`<base>/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf`).
 /// Named `gemma_*` for historical reasons (Gemma was the original default);

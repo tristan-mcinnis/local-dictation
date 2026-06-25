@@ -29,6 +29,14 @@ parakeet = ["dep:parakeet-rs", "dep:hound"]
 # stays the default backend (lowest-latency CTC/TDT). Pulls hound for the WAV
 # loader shared with the parakeet path.
 cohere = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs/ort-coreml"]
+# Alternative ASR backend: Moonshine (UsefulSensors) v1 Tiny/Base via
+# transcribe-rs' ONNX engine. English-only, ~9-10% WER (Base), ~50 ms latency
+# on M-series, variable-length input (no Whisper-style 30 s padding). Shares the
+# same transcribe-rs + ort =2.0.0-rc.12 stack as `cohere` (cargo unifies — no
+# second onnxruntime, no ggml). NOT whisper.cpp: whisper-rs vendors ggml which
+# collides with llama-cpp-2's ggml (533+ duplicate symbols), so Whisper-via-C++
+# is a hard blocker in this crate; Moonshine is the clean ONNX alternative.
+moonshine = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs/ort-coreml"]
 # Adds llama.cpp (via llama-cpp-2) with Metal for the cleanup engine.
 # llama-cpp-2 (despite its 0.1.x version) is the actively-maintained binding;
 # `llama_cpp` 0.3.x vendors a llama.cpp from April 2024 and cannot load Gemma 3.
@@ -48,7 +56,7 @@ ax-inject = [
 # Convenience: everything on (both ASR backends + cleanup + injection). This is
 # what the shipped app and the feature-gated test suite build with, so the
 # bundle can offer Parakeet and Cohere as selectable backends.
-full = ["parakeet", "cohere", "cleaner", "ax-inject"]
+full = ["parakeet", "cohere", "moonshine", "cleaner", "ax-inject"]
 
 [dependencies]
 ringbuf = "0.4"

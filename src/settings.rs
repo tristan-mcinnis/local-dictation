@@ -52,7 +52,7 @@ pub fn hotkey_name(keycode: i64) -> String {
         .unwrap_or_else(|| format!("key 0x{keycode:x}"))
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// Absolute path to the cleanup model `.gguf`. `None` ⇒ use the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -103,6 +103,11 @@ pub struct Settings {
     /// `DICTATE_COHERE_LANG`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohere_language: Option<String>,
+    /// Moonshine model size: `"tiny"` (27M, fastest, ~12.6% WER) or `"base"`
+    /// (61M, recommended, ~9-10% WER). `None`/unknown ⇒ Base. Only used when
+    /// `asr_backend` is `"moonshine"`. Override: `DICTATE_MOONSHINE_VARIANT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moonshine_variant: Option<String>,
 }
 
 /// Default wake word for listen mode. Two distinct syllables, uncommon as a
@@ -122,7 +127,13 @@ impl Settings {
         let Some(path) = Self::config_path() else {
             return Self::default();
         };
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&path)
+    }
+
+    /// Load settings from an explicit path. Missing or corrupt files degrade to
+    /// defaults; this is the test entry point.
+    pub fn load_from(path: &Path) -> Self {
+        match std::fs::read_to_string(path) {
             Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
                 eprintln!("[warn] settings parse failed ({}): {e}", path.display());
                 Self::default()
@@ -135,12 +146,17 @@ impl Settings {
     pub fn save(&self) -> eyre::Result<()> {
         let path = Self::config_path()
             .ok_or_else(|| eyre::eyre!("cannot resolve settings path ($HOME unset)"))?;
+        self.save_to(&path)
+    }
+
+    /// Write settings to an explicit path. Test entry point.
+    pub fn save_to(&self, path: &Path) -> eyre::Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)
                 .map_err(|e| eyre::eyre!("create {}: {e}", dir.display()))?;
         }
         let body = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, body).map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
+        std::fs::write(path, body).map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
         Ok(())
     }
 
@@ -158,11 +174,12 @@ impl Settings {
     /// place backend choice is decided; the daemon and the CLI both go through
     /// it so they always agree.
     ///
-    /// Env knobs: `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`),
+    /// Env knobs: `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`|`moonshine`),
     /// `DICTATE_COHERE_QUANT` (`int4`|`int8`), `DICTATE_COHERE_LANG`,
-    /// `PARAKEET_MODEL_DIR`, `DICTATE_COHERE_MODEL_DIR`.
+    /// `DICTATE_MOONSHINE_VARIANT` (`tiny`|`base`), `PARAKEET_MODEL_DIR`,
+    /// `DICTATE_COHERE_MODEL_DIR`, `DICTATE_MOONSHINE_MODEL_DIR`.
     pub fn resolve_asr(&self) -> crate::transcriber::AsrConfig {
-        use crate::transcriber::{AsrBackend, AsrConfig, CohereQuant};
+        use crate::transcriber::{AsrBackend, AsrConfig, CohereQuant, MoonshineSize};
 
         let backend = std::env::var("DICTATE_ASR_BACKEND")
             .ok()
@@ -186,11 +203,20 @@ impl Settings {
             })
             .unwrap_or_else(|| "en".to_string());
 
+        let moonshine_size = std::env::var("DICTATE_MOONSHINE_VARIANT")
+            .ok()
+            .and_then(|v| MoonshineSize::parse(&v))
+            .or_else(|| self.moonshine_variant.as_deref().and_then(MoonshineSize::parse))
+            .unwrap_or_default();
+
         let parakeet_dir = std::env::var("PARAKEET_MODEL_DIR")
             .unwrap_or_else(|_| crate::app_paths::parakeet_default_dir());
 
         let cohere_dir = std::env::var("DICTATE_COHERE_MODEL_DIR")
             .unwrap_or_else(|_| crate::app_paths::cohere_default_dir(cohere_quant.as_str()));
+
+        let moonshine_dir = std::env::var("DICTATE_MOONSHINE_MODEL_DIR")
+            .unwrap_or_else(|_| crate::app_paths::moonshine_default_dir(moonshine_size.as_str()));
 
         AsrConfig {
             backend,
@@ -198,6 +224,8 @@ impl Settings {
             cohere_dir,
             cohere_quant,
             cohere_language,
+            moonshine_dir,
+            moonshine_size,
         }
     }
 
@@ -546,5 +574,108 @@ mod tests {
         assert_eq!(v[1].label, "zeta-model");
         assert!(v[0].path.ends_with("weights.gguf"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "fd-settings-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.hotkey_keycode = Some(0x36);
+        s.cleanup_enabled = Some(false);
+        s.active_format = Some("bullets".into());
+        s.preroll_ms = Some(400);
+        s.asr_backend = Some("cohere".into());
+        s.moonshine_variant = Some("tiny".into());
+        s.save_to(&path).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.hotkey_keycode, Some(0x36));
+        assert_eq!(loaded.cleanup_enabled, Some(false));
+        assert_eq!(loaded.active_format, Some("bullets".into()));
+        assert_eq!(loaded.preroll_ms, Some(400));
+        assert_eq!(loaded.asr_backend, Some("cohere".into()));
+        assert_eq!(loaded.moonshine_variant, Some("tiny".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_missing_file_returns_defaults() {
+        let path = std::env::temp_dir().join(format!(
+            "fd-settings-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let s = Settings::load_from(&path);
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn load_corrupt_file_returns_defaults() {
+        let dir = std::env::temp_dir().join(format!(
+            "fd-settings-corrupt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s, Settings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_streaming_cleanup_from_env_and_settings() {
+        if std::env::var_os("DICTATE_STREAMING_CLEANUP").is_none() {
+            assert!(!Settings::default().resolve_streaming_cleanup());
+            let mut s = Settings::default();
+            s.streaming_cleanup = Some(true);
+            assert!(s.resolve_streaming_cleanup());
+        }
+    }
+
+    #[test]
+    fn resolve_cohere_quant_and_language() {
+        if std::env::var_os("DICTATE_COHERE_QUANT").is_none()
+            && std::env::var_os("DICTATE_COHERE_LANG").is_none()
+        {
+            let s = Settings::default();
+            let cfg = s.resolve_asr();
+            assert_eq!(cfg.cohere_quant, crate::transcriber::CohereQuant::Int4);
+            assert_eq!(cfg.cohere_language, "en");
+        }
+    }
+
+    #[test]
+    fn resolve_moonshine_size_and_dir() {
+        if std::env::var_os("DICTATE_MOONSHINE_VARIANT").is_none()
+            && std::env::var_os("DICTATE_MOONSHINE_MODEL_DIR").is_none()
+            && std::env::var_os("DICTATE_ASR_BACKEND").is_none()
+        {
+            // Default: Base.
+            let s = Settings::default();
+            let cfg = s.resolve_asr();
+            assert_eq!(cfg.moonshine_size, crate::transcriber::MoonshineSize::Base);
+            assert!(cfg.moonshine_dir.ends_with("moonshine-base"));
+
+            // Settings-driven Tiny.
+            let mut s = Settings::default();
+            s.moonshine_variant = Some("tiny".into());
+            let cfg = s.resolve_asr();
+            assert_eq!(cfg.moonshine_size, crate::transcriber::MoonshineSize::Tiny);
+            assert!(cfg.moonshine_dir.ends_with("moonshine-tiny"));
+
+            // Unknown size falls back to Base.
+            let mut s = Settings::default();
+            s.moonshine_variant = Some("medium".into());
+            let cfg = s.resolve_asr();
+            assert_eq!(cfg.moonshine_size, crate::transcriber::MoonshineSize::Base);
+        }
     }
 }

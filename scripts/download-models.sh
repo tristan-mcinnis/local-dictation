@@ -10,8 +10,17 @@
 #   ./scripts/download-models.sh --cohere int8       # …or the int8 variant
 #   ./scripts/download-models.sh --cohere-only int4  # ONLY fetch Cohere, skip the defaults
 #
+# Opt-in alternative ASR backend (English-only, ONNX, no ggml — the clean
+# Whisper alternative; whisper.cpp/whisper-rs is blocked here by a ggml symbol
+# clash with llama-cpp-2):
+#   ./scripts/download-models.sh --moonshine         # Moonshine Base (default, ~9-10% WER)
+#   ./scripts/download-models.sh --moonshine tiny    # …or the faster/rougher Tiny
+#   ./scripts/download-models.sh --moonshine-only base # ONLY fetch Moonshine
+#
 # Cohere is a 2B encoder/decoder (~1–2.5 GB on disk) and is NOT downloaded by
 # default — select it with the menu / `DICTATE_ASR_BACKEND=cohere` after fetching.
+# Moonshine is a 27M/61M encoder/decoder (~60-120 MB int8) — select it with the
+# menu / `DICTATE_ASR_BACKEND=moonshine` after fetching.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -20,12 +29,17 @@ cd "$(dirname "$0")/.."
 WANT_DEFAULT=1          # fetch Parakeet + Qwen
 WANT_COHERE=0           # fetch Cohere
 COHERE_QUANT="int4"     # int4 | int8
+WANT_MOONSHINE=0        # fetch Moonshine
+MOONSHINE_SIZE="base"   # tiny | base
 while [ $# -gt 0 ]; do
   case "$1" in
     --cohere)       WANT_COHERE=1; [ "${2:-}" = "int4" -o "${2:-}" = "int8" ] && { COHERE_QUANT="$2"; shift; } ;;
     --cohere-only)  WANT_COHERE=1; WANT_DEFAULT=0; [ "${2:-}" = "int4" -o "${2:-}" = "int8" ] && { COHERE_QUANT="$2"; shift; } ;;
+    --moonshine)       WANT_MOONSHINE=1; [ "${2:-}" = "tiny" -o "${2:-}" = "base" ] && { MOONSHINE_SIZE="$2"; shift; } ;;
+    --moonshine-only)  WANT_MOONSHINE=1; WANT_DEFAULT=0; [ "${2:-}" = "tiny" -o "${2:-}" = "base" ] && { MOONSHINE_SIZE="$2"; shift; } ;;
     int4|int8)      COHERE_QUANT="$1" ;;
-    -h|--help)      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    tiny|base)      MOONSHINE_SIZE="$1" ;;
+    -h|--help)      sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)              echo "unknown arg: $1" >&2; exit 1 ;;
   esac
   shift
@@ -85,8 +99,33 @@ download_cohere() {
   fetch "$base/tokens.txt" "$dir/tokens.txt"
 }
 
+# --- Moonshine (optional third ASR backend, ONNX) ---------------------------
+# UsefulSensors Moonshine v1 (English-only). The transcribe-rs loader expects,
+# in the model dir: encoder_model.int8.onnx, decoder_model_merged.int8.onnx,
+# and tokenizer.json — see app_paths::moonshine_default_dir + transcriber.rs.
+# We fetch the int8 variants from onnx-community (smaller + faster on M-series;
+# the HF files use an underscore, so we rename to the dot-separated form the
+# loader's resolve_model_path looks for under Quantization::Int8).
+download_moonshine() {
+  local size="$1"
+  local size_pretty="Base"
+  [ "$size" = "tiny" ] && size_pretty="Tiny"
+  local dir="models/dictation/moonshine-$size"
+  local base="$HF_ENDPOINT/onnx-community/moonshine-${size}-ONNX/resolve/main"
+  mkdir -p "$dir"
+  echo
+  echo "==> Moonshine v1 $size_pretty ONNX (int8) — from onnx-community/moonshine-${size}-ONNX"
+  echo "    English-only encoder/decoder. Lower latency than Whisper (variable-length"
+  echo "    input, no 30 s zero-padding) and no ggml clash with the cleanup LLM."
+  echo "    Select it after download via the menu or DICTATE_ASR_BACKEND=moonshine."
+  fetch "$base/onnx/encoder_model_int8.onnx"        "$dir/encoder_model.int8.onnx"
+  fetch "$base/onnx/decoder_model_merged_int8.onnx" "$dir/decoder_model_merged.int8.onnx"
+  fetch "$base/tokenizer.json"                      "$dir/tokenizer.json"
+}
+
 if [ "$WANT_DEFAULT" -eq 0 ]; then
-  download_cohere "$COHERE_QUANT"
+  [ "$WANT_COHERE" -eq 1 ]   && download_cohere "$COHERE_QUANT"
+  [ "$WANT_MOONSHINE" -eq 1 ] && download_moonshine "$MOONSHINE_SIZE"
   echo; echo "==> Done. Total on disk:"; du -sh models/*/ 2>/dev/null || true
   exit 0
 fi
@@ -114,6 +153,11 @@ fetch "$LLM_BASE/qwen2.5-1.5b-instruct-q4_k_m.gguf" "$LLM_DIR/qwen2.5-1.5b-instr
 # Optional second ASR backend, only when --cohere was passed.
 if [ "$WANT_COHERE" -eq 1 ]; then
   download_cohere "$COHERE_QUANT"
+fi
+
+# Optional third ASR backend, only when --moonshine was passed.
+if [ "$WANT_MOONSHINE" -eq 1 ]; then
+  download_moonshine "$MOONSHINE_SIZE"
 fi
 
 echo

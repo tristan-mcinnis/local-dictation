@@ -680,10 +680,11 @@ fn build_status_item(
     })
 }
 
-/// Build the speech-engine (ASR backend) picker: Parakeet vs Cohere. The
-/// active backend is checked; selecting one writes `asr_backend` + relaunches.
-/// `DICTATE_ASR_BACKEND` locks the choice (disabled items + note). When Cohere
-/// is chosen but its model isn't downloaded, a disabled hint says how to get it.
+/// Build the speech-engine (ASR backend) picker: Parakeet vs Cohere vs
+/// Moonshine. The active backend is checked; selecting one writes
+/// `asr_backend` + relaunches. `DICTATE_ASR_BACKEND` locks the choice
+/// (disabled items + note). When a backend is chosen but its model isn't
+/// downloaded, a disabled hint says how to get it.
 fn build_asr_submenu(
     mtm: MainThreadMarker,
     actions: &Retained<MenuActions>,
@@ -702,13 +703,15 @@ fn build_asr_submenu(
         .and_then(AsrBackend::parse)
         .unwrap_or_default();
 
-    // Is the Cohere model actually present? (resolve_asr applies env + default.)
-    let cohere_dir = settings.resolve_asr().cohere_dir;
-    let cohere_present = std::path::Path::new(&cohere_dir).is_dir();
+    // Are the opt-in model weights actually present? (resolve_asr applies env + default.)
+    let resolved = settings.resolve_asr();
+    let cohere_present = std::path::Path::new(&resolved.cohere_dir).is_dir();
+    let moonshine_present = std::path::Path::new(&resolved.moonshine_dir).is_dir();
 
     for (backend, label) in [
         (AsrBackend::Parakeet, "Parakeet — fast (default)"),
         (AsrBackend::Cohere, "Cohere — accurate, 14 languages"),
+        (AsrBackend::Moonshine, "Moonshine — fast, English (ONNX)"),
     ] {
         let item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -733,19 +736,29 @@ fn build_asr_submenu(
         submenu.addItem(&item);
     }
 
-    // Hint when Cohere is selected/selectable but the weights aren't on disk.
-    if !cohere_present {
-        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+    // Hint when an opt-in backend's weights aren't on disk.
+    let mut added_sep = false;
+    let mut add_hint = |submenu: &Retained<NSMenu>, text: &str| {
+        if !added_sep {
+            submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+            added_sep = true;
+        }
         let note = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                &NSString::from_str("Cohere: run  download-models.sh --cohere"),
+                &NSString::from_str(text),
                 None,
                 &NSString::from_str(""),
             )
         };
         note.setEnabled(false);
         submenu.addItem(&note);
+    };
+    if !cohere_present {
+        add_hint(&submenu, "Cohere: run  download-models.sh --cohere");
+    }
+    if !moonshine_present {
+        add_hint(&submenu, "Moonshine: run  download-models.sh --moonshine");
     }
 
     if env_locked {
