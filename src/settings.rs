@@ -124,6 +124,37 @@ pub struct Settings {
     /// `asr_backend` is `"moonshine"`. Override: `DICTATE_MOONSHINE_VARIANT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moonshine_variant: Option<String>,
+
+    /// Modifier mask for the push-to-talk hotkey (a CGEventFlags bitmask of
+    /// Shift/Control/Option/Command). 0 means the hotkey is a bare modifier key
+    /// (the historical default, Right Option). Non-zero turns the hotkey into a
+    /// chord: `<modifiers> + <hotkey_keycode>`. Override:
+    /// `DICTATE_HOTKEY_MODIFIERS` (decimal or `0x`-hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey_modifiers: Option<u64>,
+
+    /// Ordered list of target languages for Translate mode, e.g.
+    /// `["Spanish", "Chinese"]`. Empty ⇒ bare "translate" is not available.
+    /// Override: `DICTATE_TRANSLATION_TARGETS` (comma-separated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation_targets: Option<Vec<String>>,
+
+    /// The active Translate-mode target language (must appear in
+    /// `translation_targets`). `None` ⇒ the first target is used. Override:
+    /// `DICTATE_ACTIVE_TRANSLATION_TARGET`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_translation_target: Option<String>,
+
+    /// How long to keep dictation history: `"forever"` (default), `"1year"`,
+    /// `"1month"`, `"1week"`, `"24hours"`, or `"never"`. Override:
+    /// `DICTATE_HISTORY_RETENTION`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_retention: Option<String>,
+
+    /// Whisper mode: lower the speech-detection threshold so quiet dictation is
+    /// captured. `None`/false ⇒ off. Override: `DICTATE_WHISPER_MODE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whisper_mode: Option<bool>,
 }
 
 /// Default wake word for listen mode. Two distinct syllables, uncommon as a
@@ -373,6 +404,92 @@ impl Settings {
         self.hotkey_keycode.unwrap_or(default)
     }
 
+    /// Resolve the hotkey modifier mask: `DICTATE_HOTKEY_MODIFIERS` env >
+    /// settings > 0 (bare modifier key). Env value may be decimal or `0x`-hex.
+    pub fn resolve_hotkey_modifiers(&self) -> u64 {
+        if let Some(mask) = std::env::var("DICTATE_HOTKEY_MODIFIERS")
+            .ok()
+            .and_then(|s| parse_u64(&s))
+        {
+            return mask;
+        }
+        self.hotkey_modifiers.unwrap_or(0)
+    }
+
+    /// Resolve the ordered Translate-mode target languages:
+    /// `DICTATE_TRANSLATION_TARGETS` env (comma-separated) > settings > empty.
+    /// Blank entries are dropped; leading/trailing whitespace is trimmed.
+    pub fn resolve_translation_targets(&self) -> Vec<String> {
+        if let Ok(v) = std::env::var("DICTATE_TRANSLATION_TARGETS") {
+            let list: Vec<String> = v
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if !list.is_empty() {
+                return list;
+            }
+        }
+        self.translation_targets
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Resolve the active Translate-mode target: `DICTATE_ACTIVE_TRANSLATION_TARGET`
+    /// env > settings > the first entry of `targets` (if any). Falls back to the
+    /// first target when the configured one isn't in the list.
+    pub fn resolve_active_translation_target(&self, targets: &[String]) -> Option<String> {
+        let pick = |candidate: Option<String>| -> Option<String> {
+            let candidate = candidate.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())?;
+            // Return the canonical spelling from `targets` (case-insensitive
+            // match) so a lowercased setting resolves to the list's casing.
+            targets
+                .iter()
+                .find(|t| t.eq_ignore_ascii_case(&candidate))
+                .cloned()
+        };
+        if let Ok(v) = std::env::var("DICTATE_ACTIVE_TRANSLATION_TARGET") {
+            if let Some(c) = pick(Some(v)) {
+                return Some(c);
+            }
+        }
+        if let Some(c) = pick(self.active_translation_target.clone()) {
+            return Some(c);
+        }
+        targets.first().cloned()
+    }
+
+    /// Resolve the history retention window: `DICTATE_HISTORY_RETENTION` env >
+    /// settings > `"forever"`. Returns the raw lowercased string; the concrete
+    /// cutoff is computed by [`crate::history`].
+    pub fn resolve_history_retention(&self) -> String {
+        if let Ok(v) = std::env::var("DICTATE_HISTORY_RETENTION") {
+            let v = v.trim().to_lowercase();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        self.history_retention
+            .as_ref()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "forever".to_string())
+    }
+
+    /// Resolve whisper mode: `DICTATE_WHISPER_MODE` env > settings > false.
+    pub fn resolve_whisper_mode(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_WHISPER_MODE") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.whisper_mode.unwrap_or(false)
+    }
+
     /// Resolve the active formatting preset: `DICTATE_FORMAT` env > settings >
     /// none. Blank/whitespace is treated as unset. The returned name is matched
     /// (case-insensitively) against `prompts.json`'s `formats` keys by the
@@ -407,6 +524,17 @@ pub fn parse_keycode(s: &str) -> Option<i64> {
     let s = s.trim();
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         i64::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// Parse an unsigned integer string that may be decimal (`1048576`) or hex
+/// (`0x00100000`). Used for the hotkey modifier mask.
+pub fn parse_u64(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(rest, 16).ok()
     } else {
         s.parse().ok()
     }
@@ -550,6 +678,88 @@ mod tests {
         assert_eq!(parse_keycode("0X3D"), Some(0x3d));
         assert_eq!(parse_keycode(" 0x36 "), Some(0x36));
         assert_eq!(parse_keycode("nonsense"), None);
+    }
+
+    #[test]
+    fn parse_u64_decimal_and_hex() {
+        assert_eq!(parse_u64("0"), Some(0));
+        assert_eq!(parse_u64("1048576"), Some(1 << 20));
+        assert_eq!(parse_u64("0x00100000"), Some(1 << 20));
+        assert_eq!(parse_u64("0X20000"), Some(1 << 17));
+        assert_eq!(parse_u64("junk"), None);
+    }
+
+    #[test]
+    fn hotkey_modifiers_default_zero_and_from_settings() {
+        if std::env::var_os("DICTATE_HOTKEY_MODIFIERS").is_none() {
+            assert_eq!(Settings::default().resolve_hotkey_modifiers(), 0);
+            let mut s = Settings::default();
+            s.hotkey_modifiers = Some(1 << 20); // Command
+            assert_eq!(s.resolve_hotkey_modifiers(), 1 << 20);
+        }
+    }
+
+    #[test]
+    fn translation_targets_parse_trim_and_drop_blanks() {
+        if std::env::var_os("DICTATE_TRANSLATION_TARGETS").is_none() {
+            assert!(Settings::default().resolve_translation_targets().is_empty());
+            let mut s = Settings::default();
+            s.translation_targets = Some(vec![
+                " Spanish ".into(),
+                "".into(),
+                "Chinese".into(),
+            ]);
+            assert_eq!(s.resolve_translation_targets(), vec!["Spanish", "Chinese"]);
+        }
+    }
+
+    #[test]
+    fn active_translation_target_falls_back_to_first() {
+        if std::env::var_os("DICTATE_ACTIVE_TRANSLATION_TARGET").is_none() {
+            let targets = vec!["Spanish".to_string(), "Chinese".to_string()];
+            assert_eq!(
+                Settings::default().resolve_active_translation_target(&targets),
+                Some("Spanish".to_string())
+            );
+            let mut s = Settings::default();
+            s.active_translation_target = Some("chinese".into());
+            assert_eq!(
+                s.resolve_active_translation_target(&targets),
+                Some("Chinese".to_string())
+            );
+            // A configured target not in the list falls back to the first.
+            let mut s2 = Settings::default();
+            s2.active_translation_target = Some("Klingon".into());
+            assert_eq!(
+                s2.resolve_active_translation_target(&targets),
+                Some("Spanish".to_string())
+            );
+            // No targets at all ⇒ None.
+            assert_eq!(
+                Settings::default().resolve_active_translation_target(&[]),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn history_retention_defaults_forever_and_normalizes() {
+        if std::env::var_os("DICTATE_HISTORY_RETENTION").is_none() {
+            assert_eq!(Settings::default().resolve_history_retention(), "forever");
+            let mut s = Settings::default();
+            s.history_retention = Some(" 1Month ".into());
+            assert_eq!(s.resolve_history_retention(), "1month");
+        }
+    }
+
+    #[test]
+    fn whisper_mode_off_by_default() {
+        if std::env::var_os("DICTATE_WHISPER_MODE").is_none() {
+            assert!(!Settings::default().resolve_whisper_mode());
+            let mut s = Settings::default();
+            s.whisper_mode = Some(true);
+            assert!(s.resolve_whisper_mode());
+        }
     }
 
     #[test]
