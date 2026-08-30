@@ -10,9 +10,12 @@
 //!      "press enter" and turn it into an action the caller executes after
 //!      injecting the body.
 //!
-//! Between corrections and the command parse, a whole-transcript **misfire
-//! artifact** ("Thank you." hallucinated from a near-silent accidental key
-//! press) is dropped deterministically: empty body + no action → `Skip`, so a
+//! Between corrections and the command parse, two deterministic artifact
+//! guards fire: a **trailing-artifact strip** (an ASR-invented closing
+//! pleasantry like "…as expected. Thank you.", hallucinated from the room
+//! tone tail-capture adds past release) and a whole-transcript **misfire
+//! artifact** drop ("Thank you." from a near-silent accidental key press).
+//! Both yield empty body + no action → `Skip` when nothing real remains, so a
 //! misfire never lands text in the focused app.
 //!
 //! The ordering is load-bearing: corrections run **before** the command parse
@@ -66,6 +69,77 @@ const MISFIRE_ARTIFACTS: &[&str] = &[
     "mhm",
     "mm hmm",
 ];
+
+/// Artifact phrases stripped when they appear at the END of an otherwise real
+/// utterance. Tail-capture keeps the mic open past release and the ASR renders
+/// that trailing room tone as a closing pleasantry ("…working as expected.
+/// Thank you."). Deliberately narrower than [`MISFIRE_ARTIFACTS`]: single
+/// words like "you"/"so" are too dangerous to strip off sentence tails.
+const TRAILING_ARTIFACTS: &[&str] = &[
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for listening",
+    "thanks for listening",
+    "thank you so much",
+    "thank you very much",
+    "thank you",
+    "thanks",
+    "goodbye",
+    "bye bye",
+    "bye",
+    "the end",
+];
+
+/// Strip trailing artifact phrases (up to 3 repeats) off the end of `text`,
+/// fixing a dangling comma left behind ("…expected, thank you" → "…expected.").
+/// Word-boundary aware: matches whole words at the text tail only.
+pub fn strip_trailing_artifact(text: &str) -> String {
+    let mut out = text.trim_end().to_string();
+    for _ in 0..3 {
+        // Word spans (alphanumeric runs) over the current text.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut start: Option<usize> = None;
+        for (i, c) in out.char_indices() {
+            if c.is_alphanumeric() {
+                start.get_or_insert(i);
+            } else if let Some(s) = start.take() {
+                spans.push((s, i));
+            }
+        }
+        if let Some(s) = start {
+            spans.push((s, out.len()));
+        }
+        if spans.is_empty() {
+            break;
+        }
+        // Try each artifact as a suffix of the words (multi-word first).
+        let words: Vec<String> = spans
+            .iter()
+            .map(|&(s, e)| out[s..e].to_ascii_lowercase())
+            .collect();
+        let mut cut: Option<usize> = None;
+        for artifact in TRAILING_ARTIFACTS {
+            let aw: Vec<&str> = artifact.split_whitespace().collect();
+            if aw.len() > words.len() {
+                continue;
+            }
+            let tail = &words[words.len() - aw.len()..];
+            if tail.iter().map(String::as_str).eq(aw.iter().copied()) {
+                cut = Some(spans[words.len() - aw.len()].0);
+                break;
+            }
+        }
+        let Some(cut) = cut else { break };
+        out = out[..cut].trim_end().to_string();
+        // "…expected," after losing "thank you" reads as a truncated list —
+        // close the sentence instead.
+        if out.ends_with(',') {
+            out.pop();
+            out.push('.');
+        }
+    }
+    out
+}
 
 /// True when the whole transcript is an ASR silence artifact (misfire).
 /// Normalization: lowercase, punctuation → space, whitespace collapsed.
@@ -184,6 +258,9 @@ impl Refiner {
     /// trigger phrase; the command parse then runs on the corrected text.
     pub fn refine(&self, cleaned_text: &str) -> RefinedDictation {
         let corrected = self.corrections.apply(cleaned_text);
+        // Strip an ASR-invented closing pleasantry ("…as expected. Thank you.")
+        // before anything else sees it.
+        let corrected = strip_trailing_artifact(&corrected);
         if is_misfire_artifact(&corrected) {
             // Accidental-press hallucination: inject nothing, press no key.
             return RefinedDictation {
@@ -332,6 +409,47 @@ mod tests {
         assert_eq!(r.refine("  THANK   YOU ! ").outcome(), DictationOutcome::Skip);
         assert_eq!(r.refine("Thanks for watching!").outcome(), DictationOutcome::Skip);
         assert_eq!(r.refine("Bye.").outcome(), DictationOutcome::Skip);
+    }
+
+    #[test]
+    fn trailing_artifact_stripped_off_real_text() {
+        let r = refiner(&[]);
+        // The exact pattern from the logs: tail-capture room tone rendered as a
+        // closing "Thank you." appended to real dictation.
+        match r.refine("It did it again. Thank you.").outcome() {
+            DictationOutcome::Inject { text, .. } => assert_eq!(text, "It did it again."),
+            other => panic!("expected inject, got {other:?}"),
+        }
+        match r.refine("Have you gotten stuck? Thank you.").outcome() {
+            DictationOutcome::Inject { text, .. } => assert_eq!(text, "Have you gotten stuck?"),
+            other => panic!("expected inject, got {other:?}"),
+        }
+        // Dangling comma closes as a sentence.
+        assert_eq!(
+            strip_trailing_artifact("make sure it works, thank you"),
+            "make sure it works."
+        );
+        // Repeated artifact ("Thank you. Thank you.") collapses to nothing.
+        assert_eq!(
+            r.refine("Thank you. Thank you.").outcome(),
+            DictationOutcome::Skip
+        );
+    }
+
+    #[test]
+    fn trailing_artifact_never_touches_safe_tails() {
+        // "you"/"so" tails are real language — not in the trailing list.
+        assert_eq!(strip_trailing_artifact("I love you"), "I love you");
+        assert_eq!(strip_trailing_artifact("and so"), "and so");
+        // Mid-text artifacts survive (not a tail).
+        assert_eq!(
+            strip_trailing_artifact("say thank you to the team"),
+            "say thank you to the team"
+        );
+        // A bare misfire "Thank you." is still dropped by the whole-transcript
+        // path even after the strip empties it.
+        let r = refiner(&[]);
+        assert_eq!(r.refine("Thank you.").outcome(), DictationOutcome::Skip);
     }
 
     #[test]

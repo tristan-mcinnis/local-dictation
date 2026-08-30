@@ -479,6 +479,41 @@ mod tests {
     }
 
     #[test]
+    fn trim_trailing_silence_cuts_quiet_tail_keeps_hangover() {
+        // 30 ms frames at 16 kHz: frame_len = 480. 10 loud frames + 20 quiet.
+        let frame_len = 480;
+        let frame_ms = 30;
+        let mut samples = Vec::new();
+        samples.extend(std::iter::repeat(0.3_f32).take(10 * frame_len)); // 300 ms speech
+        samples.extend(std::iter::repeat(0.001_f32).take(20 * frame_len)); // 600 ms tail
+        let threshold = speech_threshold(0.001); // max(0.003, 0.01) = 0.01
+        let keep = trim_trailing_silence(&samples, frame_len, threshold, frame_ms);
+        // Expect: 10 speech frames + ceil(120/30)=4 hangover frames = 14 frames.
+        assert_eq!(keep, 14 * frame_len);
+    }
+
+    #[test]
+    fn trim_trailing_silence_all_quiet_returns_zero() {
+        let samples = vec![0.001_f32; 480 * 10];
+        let threshold = speech_threshold(0.001);
+        assert_eq!(trim_trailing_silence(&samples, 480, threshold, 30), 0);
+    }
+
+    #[test]
+    fn transcribe_keep_len_skips_near_silence() {
+        // A 0.5 s misfire tap: well under MIN_SPEECH_MS of speech → skip.
+        let misfire = vec![0.002_f32; 480 * 17];
+        let threshold = speech_threshold(0.002);
+        assert_eq!(transcribe_keep_len(&misfire, 480, threshold, 30), None);
+        // 300 ms of speech + quiet tail → keep the speech + hangover.
+        let mut real = Vec::new();
+        real.extend(std::iter::repeat(0.3_f32).take(10 * 480));
+        real.extend(std::iter::repeat(0.001_f32).take(20 * 480));
+        let keep = transcribe_keep_len(&real, 480, speech_threshold(0.001), 30).unwrap();
+        assert_eq!(keep, 14 * 480);
+    }
+
+    #[test]
     fn noise_floor_estimator_tracks_recent_low_percentile_incrementally() {
         // Feed room tone first, then speech; the estimator (fed incrementally)
         // must land on the same low percentile as a one-shot sort over the same
@@ -1200,6 +1235,59 @@ pub fn tail_capture_engage(
     let engage_frames = quiet_frame_count(engage_ms, frame_ms);
     let engage = !frames_quiet(&frames, threshold, engage_frames);
     (threshold, engage)
+}
+
+/// Minimum above-threshold audio (ms) a chunk must hold to be worth
+/// transcribing at all. Below this the ASR only hallucinates — room tone in,
+/// "Thank you." out. A misfire tap (~0.5 s of near-silence) and a release-time
+/// tail both fall under this.
+pub const MIN_SPEECH_MS: f32 = 200.0;
+
+/// Trailing audio kept after the last above-threshold frame, so decaying word
+/// tails (fricatives, breath) aren't clipped by the trim.
+pub const TRIM_HANGOVER_MS: u32 = 120;
+
+/// Total above-`threshold` audio in `samples`, in milliseconds.
+pub fn speech_ms(samples: &[f32], frame_len: usize, threshold: f32, frame_ms: u32) -> f32 {
+    frame_rms(samples, frame_len)
+        .iter()
+        .filter(|&&r| r >= threshold)
+        .count() as f32
+        * frame_ms as f32
+}
+
+/// Keep-length after trimming trailing sub-threshold audio (+[`TRIM_HANGOVER_MS`]
+/// hangover). Returns 0 when nothing in `samples` crosses `threshold`.
+pub fn trim_trailing_silence(
+    samples: &[f32],
+    frame_len: usize,
+    threshold: f32,
+    frame_ms: u32,
+) -> usize {
+    let frames = frame_rms(samples, frame_len);
+    match frames.iter().rposition(|&r| r >= threshold) {
+        None => 0,
+        Some(last) => {
+            let keep_frames = last + 1 + quiet_frame_count(TRIM_HANGOVER_MS, frame_ms);
+            (keep_frames * frame_len).min(samples.len())
+        }
+    }
+}
+
+/// Pre-transcribe hallucination guard: trim trailing room tone and decide
+/// whether a chunk holds enough speech to transcribe. Returns `Some(keep_len)`
+/// — transcribe `&samples[..keep_len]` — or `None` to skip transcription
+/// entirely (the chunk is silence; ASR would only invent text).
+pub fn transcribe_keep_len(
+    samples: &[f32],
+    frame_len: usize,
+    threshold: f32,
+    frame_ms: u32,
+) -> Option<usize> {
+    if speech_ms(samples, frame_len, threshold, frame_ms) < MIN_SPEECH_MS {
+        return None;
+    }
+    Some(trim_trailing_silence(samples, frame_len, threshold, frame_ms).max(1))
 }
 
 /// Build a bounded chronological snapshot of ONLY the trailing `window_ms` of the

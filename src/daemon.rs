@@ -1096,7 +1096,13 @@ fn worker_loop(
                         if let Some((ao, cons)) = always.as_mut() {
                             let recflag = ao.recording_flag();
                             let buf = crate::audio::drain_session(cons, &recflag);
-                            match worker.transcribe_pcm(&buf) {
+                            let Some(keep) = guarded_transcribe_len(&buf, &noise_floor) else {
+                                eprintln!(
+                                    "  ◌    no speech above noise floor · nothing to transcribe"
+                                );
+                                break 'got String::new();
+                            };
+                            match worker.transcribe_pcm(&buf[..keep]) {
                                 Ok(t) => break 'got t,
                                 Err(err) => {
                                     eprintln!("[err]  transcribe failed: {err:?}");
@@ -1155,7 +1161,15 @@ fn worker_loop(
                                 "  ⟫ streaming fallback · whole-buffer transcribe ({} samples)",
                                 whole.len()
                             );
-                            worker.transcribe_pcm(&whole)
+                            match guarded_transcribe_len(&whole, &noise_floor) {
+                                Some(keep) => worker.transcribe_pcm(&whole[..keep]),
+                                None => {
+                                    eprintln!(
+                                        "  ◌    no speech above noise floor · nothing to transcribe"
+                                    );
+                                    Ok(String::new())
+                                }
+                            }
                         } else {
                             eprintln!(
                                 "  ⟫ streamed {} segment(s) during hold",
@@ -1180,7 +1194,11 @@ fn worker_loop(
                     // always-on path. Borrowing leaves the consumer in `consumer`
                     // so a warm-window reuse can keep it for the next dictation.
                     let buf = crate::audio::drain_session(c, r);
-                    match worker.transcribe_pcm(&buf) {
+                    let Some(keep) = guarded_transcribe_len(&buf, &noise_floor) else {
+                        eprintln!("  ◌    no speech above noise floor · nothing to transcribe");
+                        break 'got String::new();
+                    };
+                    match worker.transcribe_pcm(&buf[..keep]) {
                         Ok(t) => t,
                         Err(err) => {
                             eprintln!("[err]  transcribe failed: {err:?}");
@@ -1636,6 +1654,9 @@ fn stream_process_asr(
         st.take_complete()
     };
     let mut last_seg_ms = 0u128;
+    let frame_ms = crate::audio::DEFAULT_TAIL_FRAME_MS;
+    let frame_len = (frame_ms as f64 / 1000.0 * crate::audio::SAMPLE_RATE as f64) as usize;
+    let threshold = crate::audio::speech_threshold(noise_floor.floor(0.10));
     for (s, e) in segs {
         // A prior failure poisons the stream: keep draining audio into the backup
         // so the release fallback transcribes everything, but stop spending
@@ -1643,9 +1664,19 @@ fn stream_process_asr(
         if *poisoned {
             continue;
         }
-        let seg = st.buf()[s..e].to_vec();
+        let seg_full = &st.buf()[s..e];
+        // Hallucination guard: tail-capture keeps the mic open past release, so
+        // the final segment is often mostly room tone — which the ASR renders
+        // as a trailing "Thank you." Skip near-silent segments; trim the rest.
+        let Some(keep) =
+            crate::audio::transcribe_keep_len(seg_full, frame_len, threshold, frame_ms)
+        else {
+            eprintln!("  ◌    quiet segment below speech floor · skipped (hallucination guard)");
+            continue;
+        };
+        let seg = &seg_full[..keep];
         let t = Instant::now();
-        let raw = match worker.transcribe_pcm(&seg) {
+        let raw = match worker.transcribe_pcm(seg) {
             Ok(t) => t.trim().to_string(),
             Err(err) => {
                 eprintln!(
@@ -1675,6 +1706,27 @@ fn stream_process_asr(
         }
     }
     last_seg_ms
+}
+
+/// Pre-transcribe hallucination guard for the whole-buffer paths: trim
+/// trailing room tone and return the keep-length, or `None` when the buffer
+/// holds too little speech to transcribe at all (a misfire tap would only
+/// produce an invented "Thank you."). Floor comes from the incremental
+/// estimator when it was fed during capture, else a bounded estimate over the
+/// buffer itself.
+fn guarded_transcribe_len(
+    audio: &[f32],
+    estimator: &crate::audio::NoiseFloorEstimator,
+) -> Option<usize> {
+    let frame_ms = crate::audio::DEFAULT_TAIL_FRAME_MS;
+    let frame_len = (frame_ms as f64 / 1000.0 * crate::audio::SAMPLE_RATE as f64) as usize;
+    let floor = if estimator.is_empty() {
+        crate::audio::noise_floor_of_audio(audio, frame_len, 0.10)
+    } else {
+        estimator.floor(0.10)
+    };
+    let threshold = crate::audio::speech_threshold(floor);
+    crate::audio::transcribe_keep_len(audio, frame_len, threshold, frame_ms)
 }
 
 /// Spawn a background thread that resolves the currently-focused UI element +
