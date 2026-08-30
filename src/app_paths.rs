@@ -98,10 +98,14 @@ pub fn cohere_default_dir(quant: &str) -> String {
 }
 
 /// Fixed Cohere Q4 checkpoint converted for the public MLX Swift runtime.
+/// Canonicalized: the model dir may be a symlink into ~/Models (the canonical
+/// model home), and the native MLX bridge fails to load a symlinked model dir
+/// ("Not a directory"), so hand it the resolved real path.
 pub fn cohere_mlx_default_dir() -> String {
     std::env::var("DICTATE_COHERE_MLX_MODEL_DIR").unwrap_or_else(|_| {
-        models_base_dir()
-            .join("dictation/cohere-mlx-q4")
+        let dir = models_base_dir().join("dictation/cohere-mlx-q4");
+        std::fs::canonicalize(&dir)
+            .unwrap_or(dir)
             .to_string_lossy()
             .into_owned()
     })

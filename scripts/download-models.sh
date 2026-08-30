@@ -1,10 +1,15 @@
 #!/bin/zsh
 # Prepare this user's fixed local model stack. No model bytes are committed.
+#
+# Model BYTES live in ~/Models (the canonical local-models home, registered in
+# ~/Models/models.json); the repo's models/ entries are symlinks into it, so
+# app_paths resolution (./models, Application Support, bundle) is unchanged.
 set -euo pipefail
 
 repo_root="${0:A:h:h}"
 cd "$repo_root"
 
+models_home="${LOCAL_MODELS_HOME:-$HOME/Models}"
 super_root="${SUPERWHISPER_SUPPORT_DIR:-$HOME/Library/Application Support/superwhisper}"
 cohere_source="${SUPERWHISPER_COHERE_DIR:-$super_root/models/cohere-transcribe/cohere-transcribe-q4}"
 s1_source="${S1_MODEL_PATH:-$super_root/s1-mini.gguf}"
@@ -18,18 +23,22 @@ test -f "$s1_source" || {
   exit 2
 }
 
-python3 scripts/models/convert_superwhisper_cohere.py \
-  "$cohere_source" \
-  "$repo_root/models/dictation/cohere-mlx-q4"
+# Cohere: convert into ~/Models/cohere-mlx-q4, symlink the repo entry to it.
+cohere_dest="$models_home/cohere-mlx-q4"
+python3 scripts/models/convert_superwhisper_cohere.py "$cohere_source" "$cohere_dest"
+mkdir -p "$repo_root/models/dictation"
+ln -sfn "$cohere_dest" "$repo_root/models/dictation/cohere-mlx-q4"
 
-s1_dest="$repo_root/models/llm/s1-mini/s1-mini.gguf"
-mkdir -p "$repo_root/models/llm/s1-mini"
+# S1-mini: clonefile-copy into ~/Models/gguf, symlink the repo entry to it.
+s1_dest="$models_home/gguf/s1-mini.gguf"
+mkdir -p "$models_home/gguf" "$repo_root/models/llm/s1-mini"
 if [[ -f "$s1_dest" && $(stat -f %z "$s1_dest") == "$(stat -f %z "$s1_source")" ]]; then
   print "S1-mini already in place ($s1_dest)."
 else
   cp -c "$s1_source" "$s1_dest" 2>/dev/null || cp "$s1_source" "$s1_dest"
   print "Copied S1-mini to $s1_dest."
 fi
+ln -sfn "$s1_dest" "$repo_root/models/llm/s1-mini/s1-mini.gguf"
 
 native/cohere-mlx/build.sh >/dev/null
-print "Fixed Cohere MLX + S1-mini stack is ready."
+print "Fixed Cohere MLX + S1-mini stack is ready (bytes in ~/Models, repo symlinked)."
