@@ -545,13 +545,35 @@ fn worker_loop(
     // Whether the in-flight utterance is a transform instruction (Shift held).
     let mut transform_mode = false;
 
-    // ── Release tail-capture ──────────────────────────────────────────
-    // On key release, keep the mic open for a brief adaptive grace loop (draining
-    // new audio into the streaming path) so the last word of an utterance isn't
-    // clipped. Open-on-press only — always-on pre-roll already keeps rolling past
-    // the release, so the two don't compose.
+    // ── Capture mode (release tail-capture + warm-window reuse) ──────────
+    // Tail capture: on key release, keep the mic open for a brief adaptive grace
+    // loop (draining new audio into the streaming path) so the last word of an
+    // utterance isn't clipped. Open-on-press only — always-on pre-roll already
+    // keeps rolling past the release, so the two don't compose.
     let tail_capture = crate::settings::Settings::load().resolve_tail_capture();
     let tail_capture_cap_ms = crate::settings::Settings::load().resolve_tail_capture_cap_ms();
+    // Warm window: after a press-to-open recording stops, keep the input stream
+    // open this long so a back-to-back dictation reuses it (skipping cpal's
+    // ~120 ms open cost instead of paying it again). 0 = open fresh each time.
+    let warm_window_ms = crate::settings::Settings::load().resolve_warm_window_ms();
+    // True while a press-to-open engine is parked (idle but open) awaiting a
+    // cheap reuse within the warm window. Distinct from `engine.is_some()`
+    // (which also covers an actively-recording engine) so the event loop can
+    // run the warm-window expiry tick and the re-press can resume cleanly.
+    let mut warm_parked = false;
+    // When the parked stream expires (mic released). None while recording.
+    let mut warm_deadline: Option<Instant> = None;
+
+    // One-line boot log of the resolved capture mode.
+    if preroll_ms > 0 {
+        eprintln!("[boot] capture    mode: pre-roll {preroll_ms} ms (always-on mic)");
+    } else if warm_window_ms > 0 {
+        eprintln!(
+            "[boot] capture    mode: warm-window {warm_window_ms} ms (reuse mic within window)"
+        );
+    } else {
+        eprintln!("[boot] capture    mode: cold (press-to-open per utterance)");
+    }
     if tail_capture {
         eprintln!(
             "[boot] tail-capture on (release grace, up to {tail_capture_cap_ms} ms)"
@@ -596,25 +618,43 @@ fn worker_loop(
         // recv_timeout keeps everything on this one thread, which already owns the
         // ASR worker — no shared state.
         let event = {
-            // While recording with streaming ASR, wake periodically to transcribe
-            // any sentence a VAD pause has just closed; otherwise block for the
-            // next event. recv_timeout keeps everything on this one thread, which
-            // already owns the ASR worker — no shared state.
-            if streaming_asr && engine.is_some() {
+            // Ticks are needed while an engine is alive AND either streaming ASR
+            // is active (to transcribe VAD-closed sentences mid-hold) or the
+            // engine is warm-parked (to expire the warm window and release the
+            // mic once idle past the deadline). A quiet cold-open recording with
+            // no streaming and no warm-window blocks for the next event, exactly
+            // as before.
+            if engine.is_some() && (streaming_asr || warm_parked) {
                 match rx.recv_timeout(std::time::Duration::from_millis(120)) {
                     Ok(ev) => ev,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if let (Some(st), Some(c)) = (stream.as_mut(), consumer.as_mut()) {
-                            stream_process_asr(
-                                &mut worker,
-                                &refiner,
-                                st,
-                                c,
-                                &mut stream_segs,
-                                &mut stream_audio,
-                                &mut stream_poisoned,
-                                false,
-                            );
+                        if warm_parked {
+                            // Warm-window expiry: close the parked mic once idle
+                            // past the window, so we don't hold the input device
+                            // (and its orange indicator) forever between dictations.
+                            if let Some(deadline) = warm_deadline {
+                                if Instant::now() >= deadline {
+                                    drop(engine.take()); // releases the mic
+                                    consumer.take();
+                                    is_recording.take();
+                                    warm_parked = false;
+                                    warm_deadline = None;
+                                    eprintln!("[audio] warm-window expired · mic closed");
+                                }
+                            }
+                        } else if streaming_asr {
+                            if let (Some(st), Some(c)) = (stream.as_mut(), consumer.as_mut()) {
+                                stream_process_asr(
+                                    &mut worker,
+                                    &refiner,
+                                    st,
+                                    c,
+                                    &mut stream_segs,
+                                    &mut stream_audio,
+                                    &mut stream_poisoned,
+                                    false,
+                                );
+                            }
                         }
                         continue;
                     }
@@ -651,7 +691,21 @@ fn worker_loop(
                 transform_mode = false;
                 t_press.take();
                 if let Some(e) = on_demand_engine.as_mut() {
-                    e.stop_capture();
+                    if warm_window_ms > 0 && preroll_ms == 0 {
+                        // Warm-window cancel: park the mic for reuse, but first
+                        // drain + discard the cancelled audio so the next recording
+                        // starts from a clean ring.
+                        e.park();
+                        if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                            let _ = crate::audio::drain_session(c, r);
+                        }
+                        engine = on_demand_engine.take();
+                        warm_parked = true;
+                        warm_deadline = Some(Instant::now()
+                            + Duration::from_millis(warm_window_ms as u64));
+                    } else {
+                        e.stop_capture();
+                    }
                 }
                 if always_on_session {
                     // End the session and drain+discard the buffered audio so the
@@ -661,8 +715,9 @@ fn worker_loop(
                         let recflag = ao.recording_flag();
                         let _ = crate::audio::drain_session(cons, &recflag);
                     }
-                } else {
-                    // Drop the per-utterance consumer + recording flag unread.
+                } else if !warm_parked {
+                    // Drop the per-utterance consumer + recording flag unread (the
+                    // warm-park path keeps them for the next reuse).
                     consumer.take();
                     is_recording.take();
                 }
@@ -677,8 +732,59 @@ fn worker_loop(
                 eprintln!();
             }
             DaemonEvent::StartRecording { transform } => {
-                if engine.is_some() || session_active {
+                if session_active {
                     continue;
+                }
+                // Warm-window reuse: a parked engine (mic open but idle) is
+                // resumed in place, skipping cpal's ~120 ms stream-open cost for
+                // a back-to-back dictation. Rebuild instead if the default input
+                // changed since the stream was built.
+                if engine.is_some() {
+                    if warm_parked {
+                        let changed = engine
+                            .as_mut()
+                            .map(|e| e.device_changed())
+                            .unwrap_or(false);
+                        if changed {
+                            eprintln!("[audio] default input changed → rebuilt warm stream");
+                            drop(engine.take());
+                            consumer.take();
+                            is_recording.take();
+                            warm_parked = false;
+                            warm_deadline = None;
+                            // fall through to a fresh open below
+                        } else {
+                            let r = engine.as_mut().unwrap().resume();
+                            is_recording = Some(r);
+                            warm_parked = false;
+                            warm_deadline = None;
+                            transform_mode = transform;
+                            t_press = Some(Instant::now());
+                            cues::play_start();
+                            crate::audio_duck::mute();
+                            ui_channel::set_state(UiState::Recording);
+                            eprintln!("▶ recording (warm reuse)");
+                            crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+                            if streaming_asr {
+                                stream = Some(crate::vad::SegmentStream::new(
+                                    crate::audio::SAMPLE_RATE,
+                                    crate::vad::VadConfig::default(),
+                                ));
+                                // Reset the per-utterance streaming accumulators so
+                                // a warm-window reuse never carries stale segments
+                                // or a stale poison flag into the new utterance.
+                                stream_segs.clear();
+                                stream_audio.clear();
+                                stream_poisoned = false;
+                            }
+                            ui_channel::clear_live_transcript();
+                            continue;
+                        }
+                    } else {
+                        // An engine is already actively recording — swallow the
+                        // spurious re-press (same guard as before this change).
+                        continue;
+                    }
                 }
                 // Always-on (pre-roll) path: the stream is already warm — just
                 // open a session. The next audio callback flushes the pre-roll
@@ -877,11 +983,19 @@ fn worker_loop(
                 // `continue` and the normal fall-through, so the restore can't
                 // be forgotten on a new code path.
                 let _unmute = crate::audio_duck::RestoreOnDrop;
-                // Stop capture for whichever path is live. Open-on-press drops
-                // its engine (releasing the mic); always-on just ends the
-                // session — the warm stream keeps running for the next press.
+                // End capture for whichever path is live. Open-on-press either parks
+                // the stream (warm-window reuse) or drops it (releasing the mic);
+                // always-on just ends the session — the warm stream keeps running.
                 if let Some(e) = on_demand_engine.as_mut() {
-                    e.stop_capture();
+                    if warm_window_ms > 0 && preroll_ms == 0 {
+                        e.park();
+                        engine = on_demand_engine.take();
+                        warm_parked = true;
+                        warm_deadline =
+                            Some(Instant::now() + Duration::from_millis(warm_window_ms as u64));
+                    } else {
+                        e.stop_capture();
+                    }
                 }
                 if always_on_session {
                     if let Some((ao, _)) = always.as_ref() {
@@ -940,10 +1054,11 @@ fn worker_loop(
                     }
 
                     // Open-on-press path (and the streaming variant) own a
-                    // per-utterance consumer; take it only here.
-                    #[allow(unused_mut)]
-                    let mut c = consumer.take().unwrap();
-                    let r = is_recording.take().unwrap();
+                    // per-utterance consumer; borrow it here (rather than taking it)
+                    // so a warm-window reuse can keep the ring's read handle for the
+                    // next dictation. `c`/`r` are reborrowed each use.
+                    let c = consumer.as_mut().unwrap();
+                    let r = is_recording.as_ref().unwrap();
 
                     // Incremental streaming ASR: flush the final open segment, then
                     // join the cached segments into the transcript. Cleanup is NOT
@@ -962,7 +1077,7 @@ fn worker_loop(
                                 &mut worker,
                                 &refiner,
                                 st,
-                                &mut c,
+                                c,
                                 &mut stream_segs,
                                 &mut stream_audio,
                                 &mut stream_poisoned,
@@ -1003,7 +1118,12 @@ fn worker_loop(
                             }
                         }
                     }
-                    match rt.block_on(worker.run_inference_pipeline(c, r)) {
+                    // Non-streaming open-on-press path: drain the (borrowed)
+                    // consumer synchronously then transcribe, mirroring the
+                    // always-on path. Borrowing leaves the consumer in `consumer`
+                    // so a warm-window reuse can keep it for the next dictation.
+                    let buf = crate::audio::drain_session(c, r);
+                    match worker.transcribe_pcm(&buf) {
                         Ok(t) => t,
                         Err(err) => {
                             eprintln!("[err]  transcribe failed: {err:?}");
@@ -1015,6 +1135,14 @@ fn worker_loop(
                     }
                 };
                 let t_transcribe = t_pipeline.elapsed();
+
+                // Warm-window keeps the drained (now-empty) consumer + flag for the
+                // next reuse; otherwise drop them exactly as the pre-change code
+                // did, so cold mode returns to a fully None capture state.
+                if !warm_parked && !always_on_session {
+                    consumer = None;
+                    is_recording = None;
+                }
 
                 if transcript.trim().is_empty() {
                     eprintln!("  skip · empty transcript");

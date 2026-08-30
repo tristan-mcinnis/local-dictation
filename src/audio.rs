@@ -22,6 +22,15 @@ pub type HeapAudioProducer = HeapProd<f32>;
 
 /// Owns the cpal input Stream (held alive for the recording's duration) plus
 /// the recording flag. Drop the engine to stop capture and release the mic.
+///
+/// Lifecycle is three-state so a warm-window can reuse the stream across
+/// back-to-back dictations instead of paying cpal's stream-open cost each time:
+///   * **active**  — `start_microphone`/`resume` have set `is_recording` true;
+///     the callback pushes every resampled chunk into the producer.
+///   * **parked**  — `park` set `is_recording` false but left `stream` alive; the
+///     callback now *drops* chunks (no producer push) but the mic stays open, so
+///     the next `resume` costs nothing. The mic indicator stays lit.
+///   * **dropped** — `stop_capture`/`Drop` released the stream entirely.
 pub struct AudioCaptureEngine {
     is_recording: Arc<AtomicBool>,
     producer: Option<HeapAudioProducer>,
@@ -30,6 +39,10 @@ pub struct AudioCaptureEngine {
     // Useful for diagnostics / future smarter resampling.
     pub native_sample_rate: u32,
     pub native_channels: u16,
+    // Name of the input device this stream was opened on (empty until `start`).
+    // Needed so a warm-window reuse can detect the default input changing since
+    // the stream was built, and rebuild instead of silently reusing a stale one.
+    device_name: String,
 }
 
 // cpal::Stream is not Send (CoreAudio invariant); we keep AudioCaptureEngine
@@ -48,6 +61,7 @@ impl AudioCaptureEngine {
                 stream: None,
                 native_sample_rate: 0,
                 native_channels: 0,
+                device_name: String::new(),
             },
             consumer,
         )
@@ -104,6 +118,7 @@ impl AudioCaptureEngine {
 
         self.native_sample_rate = native_rate;
         self.native_channels = native_channels;
+        self.device_name = device_name.clone();
         eprintln!(
             "[audio] capturing on `{device_name}` @ {native_rate} Hz × {native_channels} ch ({:?}); resampling to {SAMPLE_RATE} Hz mono",
             sample_format
@@ -118,13 +133,18 @@ impl AudioCaptureEngine {
         // Carry: fractional sample position across callback boundaries.
         let mut pos: f64 = 0.0;
         let mut last: f32 = 0.0;
+        // Grip the recording flag so the callback can gate pushes: while parked
+        // (warm-window idle) it must drop chunks, not fill the ring with silence.
+        let recording = self.is_recording.clone();
         let err_fn = |e| eprintln!("[audio] cpal stream error: {e}");
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    push_resampled(data, channels, stride, &mut pos, &mut last, &mut producer);
+                    push_resampled(
+                        data, channels, stride, &mut pos, &mut last, &mut producer, &recording,
+                    );
                 },
                 err_fn,
                 None,
@@ -133,7 +153,7 @@ impl AudioCaptureEngine {
                 &config,
                 move |data: &[i16], _| {
                     let f: Vec<f32> = data.iter().map(|s| *s as f32 / 32_768.0).collect();
-                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer);
+                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording);
                 },
                 err_fn,
                 None,
@@ -145,7 +165,7 @@ impl AudioCaptureEngine {
                         .iter()
                         .map(|s| (*s as f32 - 32_768.0) / 32_768.0)
                         .collect();
-                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer);
+                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording);
                 },
                 err_fn,
                 None,
@@ -168,6 +188,38 @@ impl AudioCaptureEngine {
         // CoreAudio callback loop.
         self.stream.take();
     }
+
+    /// Park an idle engine: keep the stream (and thus the input device) open so a
+    /// follow-up dictation within the warm window can [`resume`](Self::resume)
+    /// without re-opening it, but drop incoming chunks so the ring doesn't fill
+    /// with silence. The recording flag goes false; the mic indicator stays lit.
+    pub fn park(&mut self) {
+        self.is_recording.store(false, Ordering::SeqCst);
+    }
+
+    /// Reuse a parked engine: flip the recording flag back true so the callback
+    /// pushes live audio into the (still-consumable) ring. Returns the flag. No
+    /// stream re-open, so this costs ~0 ms versus `start_microphone`'s ~120 ms.
+    pub fn resume(&mut self) -> Arc<AtomicBool> {
+        self.is_recording.store(true, Ordering::SeqCst);
+        self.is_recording.clone()
+    }
+
+    /// Name of the input device this stream is bound to (empty before `start`).
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    /// True if the system default input device has changed since this stream was
+    /// opened. A warm-window reuse must rebuild rather than keep capturing the old
+    /// device (e.g. AirPods connected mid-session). Conservative: if the current
+    /// default can't be read, returns false rather than churning the stream.
+    pub fn device_changed(&self) -> bool {
+        match default_input_name() {
+            Some(name) => name != self.device_name,
+            None => false,
+        }
+    }
 }
 
 /// Downmix interleaved native samples to mono, then linearly resample at
@@ -180,6 +232,7 @@ fn push_resampled(
     pos: &mut f64,
     last: &mut f32,
     producer: &mut HeapAudioProducer,
+    recording: &AtomicBool,
 ) {
     let frames = interleaved.len() / channels.max(1);
     if frames == 0 {
@@ -205,13 +258,19 @@ fn push_resampled(
 
     // Linear-interpolate at `stride`. `pos` indexes into the mono buffer.
     // When pos crosses a frame boundary the carry advances by `stride` again.
+    // Always advance `pos`/`last` so a warm-window [AudioCaptureEngine::resume]
+    // continues from a consistent position, but only push to the producer while
+    // recording — a parked engine keeps the mic open but must not fill the ring
+    // with room tone.
     while *pos < mono.len() as f64 {
         let idx = pos.floor() as usize;
         let frac = (*pos - idx as f64) as f32;
         let a = if idx == 0 { *last } else { mono[idx - 1] };
         let b = mono[idx];
         let sample = a + (b - a) * frac;
-        let _ = producer.try_push(sample);
+        if recording.load(Ordering::SeqCst) {
+            let _ = producer.try_push(sample);
+        }
         *pos += stride;
     }
     // Subtract the consumed frames so `pos` stays a small fractional offset
@@ -878,6 +937,13 @@ pub const TAIL_THRESHOLD_FLOOR_FACTOR: f32 = 3.0;
 pub const TAIL_ABS_FLOOR: f32 = 0.01;
 /// Low percentile of the per-frame RMS distribution used as the noise-floor proxy.
 pub const TAIL_NOISE_PERCENTILE: f32 = 0.10;
+
+/// Warm-window (ms): how long a press-to-open recording keeps the mic stream
+/// open after it stops, so a back-to-back dictation reuses the live stream and
+/// skips cpal's ~120 ms stream-open cost. 0 disables it (every utterance opens
+/// fresh; today's behaviour). Measured against the always-on path, which already
+/// never closes the mic.
+pub const DEFAULT_WARM_WINDOW_MS: u32 = 60_000;
 
 /// Per-frame RMS of a mono buffer: chunk `samples` into `frame_len`-sample
 /// frames and return the RMS of each. Empty/zero-frame input yields an empty

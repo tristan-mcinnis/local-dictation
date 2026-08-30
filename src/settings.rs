@@ -83,6 +83,12 @@ pub struct Settings {
     /// Override: `DICTATE_TAIL_CAPTURE_CAP_MS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_capture_cap_ms: Option<u32>,
+    /// Warm-window (ms): how long after a recording stops the mic stays open (in
+    /// the default press-to-open mode) so a follow-up dictation reuses the live
+    /// stream instead of paying cpal's ~120 ms open cost. 0 disables it (each
+    /// utterance opens fresh). `None` ⇒ 60000. Override: `DICTATE_WARM_WINDOW_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_window_ms: Option<u32>,
     /// Always-on mic: keep the input stream warm and retain this many ms of
     /// pre-roll, so the first words aren't clipped and there's no stream-open
     /// latency on key-press. `None`/absent ⇒ off (open-on-press, current
@@ -311,6 +317,20 @@ impl Settings {
         }
         self.tail_capture_cap_ms
             .unwrap_or(crate::audio::DEFAULT_TAIL_CAP_MS as u32)
+    }
+
+    /// Resolve the warm-window in ms: `DICTATE_WARM_WINDOW_MS` env > settings >
+    /// [`crate::audio::DEFAULT_WARM_WINDOW_MS`] (60000). 0 disables warm-window
+    /// reuse (each utterance opens the mic fresh). No-op when always-on pre-roll
+    /// is active — the always-on stream is already warm for the daemon's life.
+    pub fn resolve_warm_window_ms(&self) -> u32 {
+        if let Ok(v) = std::env::var("DICTATE_WARM_WINDOW_MS") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                return n;
+            }
+        }
+        self.warm_window_ms
+            .unwrap_or(crate::audio::DEFAULT_WARM_WINDOW_MS)
     }
 
     /// Resolve listen mode: `DICTATE_LISTEN_MODE` env > settings > false. Note
@@ -746,6 +766,19 @@ mod tests {
             let mut s = Settings::default();
             s.tail_capture_cap_ms = Some(800);
             assert_eq!(s.resolve_tail_capture_cap_ms(), 800);
+        }
+    }
+
+    #[test]
+    fn warm_window_defaults_and_can_be_zeroed() {
+        if std::env::var_os("DICTATE_WARM_WINDOW_MS").is_none() {
+            assert_eq!(Settings::default().resolve_warm_window_ms(), 60_000);
+            let mut s = Settings::default();
+            s.warm_window_ms = Some(0);
+            assert_eq!(s.resolve_warm_window_ms(), 0);
+            let mut s2 = Settings::default();
+            s2.warm_window_ms = Some(2500);
+            assert_eq!(s2.resolve_warm_window_ms(), 2500);
         }
     }
 
