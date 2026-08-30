@@ -509,20 +509,31 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     y = section(mtm, &container, y, "Experimental");
 
-    // Streaming ASR
+    // Streaming ASR — inert (forced off) while always-on pre-roll is active,
+    // so the switch is disabled with a hint rather than looking live.
     let streaming_switch = switch_row(mtm, &container, y, "Streaming ASR");
     streaming_switch.setState(if loaded.resolve_streaming_asr() {
         NSControlStateValueOn
     } else {
         NSControlStateValueOff
     });
+    let streaming_locked = std::env::var_os("DICTATE_STREAMING_ASR").is_some()
+        || loaded.resolve_preroll_ms() > 0;
     wire_switch(
         &streaming_switch,
         &controller,
         sel!(changeStreaming:),
-        std::env::var_os("DICTATE_STREAMING_ASR").is_some(),
+        streaming_locked,
     );
     y += ROW_H;
+    if loaded.resolve_preroll_ms() > 0 {
+        y = hint_line(
+            mtm,
+            &container,
+            y,
+            "Off while always-on pre-roll is on (they drain the ring differently).",
+        );
+    }
     y = hint_line(
         mtm,
         &container,

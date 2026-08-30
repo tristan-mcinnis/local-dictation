@@ -318,6 +318,7 @@ stack:
 | `DICTATE_PASTE_SETTLE_MS` | Override the clipboard-paste settle (ms) that waits for the target app to consume the Cmd+V before the background clipboard restore. Default is length-scaled (280 ms base +1 ms/3 chars, capped 1000); `0` disables the wait for the lowest latency |
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |
+| `DICTATE_DEBUG_STREAM` | Per-segment `⟫ seg` stream logging (default off) |
 | `DICTATE_NO_MUTE` | Do not duck other audio during capture |
 | `DICTATE_NO_NORMALIZE` | Skip ASR amplitude normalization |
 | `DICTATE_PROMPTS_PATH` / `DICTATE_CLEANUP_PROMPT` / `DICTATE_TRANSFORM_PROMPT` | Override the prompts file / cleanup prompt / transform prompt |

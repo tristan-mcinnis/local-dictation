@@ -3,9 +3,11 @@
 //!
 //! ```bash
 //! cargo run --release --features full --example segment_lab
+//! cargo run --release --features full --example segment_lab -- path/to.wav
 //! ```
 //!
-//! Loads `testdata/dictation_sample.wav` (mono 16 kHz) and runs the same ASR
+//! Loads `testdata/dictation_sample.wav` by default (mono 16 kHz), or the WAV
+//! given as the first CLI arg, and runs the same ASR
 //! worker two ways:
 //!   1. **whole-buffer** — `transcribe_pcm` on the entire clip (the proven,
 //!      non-streaming release path).
@@ -36,8 +38,10 @@ fn main() -> eyre::Result<()> {
     use fast_dictate_backend::vad::{SegmentStream, VadConfig};
     use std::time::Instant;
 
-    let wav_path = "testdata/dictation_sample.wav";
-    let audio = load_wav_mono16k(wav_path)?;
+    let wav_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "testdata/dictation_sample.wav".to_string());
+    let audio = load_wav_mono16k(&wav_path)?;
     eprintln!(
         "[seg] loaded {wav_path} · {} samples · {:.2}s @ {} Hz",
         audio.len(),

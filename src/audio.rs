@@ -477,6 +477,99 @@ mod tests {
         let thresh2 = speech_threshold(noise_floor(&rec2, 0.10));
         assert!(frames_quiet(&rec2, thresh2, quiet_frame_count(300, 30)));
     }
+
+    #[test]
+    fn noise_floor_estimator_tracks_recent_low_percentile_incrementally() {
+        // Feed room tone first, then speech; the estimator (fed incrementally)
+        // must land on the same low percentile as a one-shot sort over the same
+        // input, i.e. the incremental path is not just cheaper but equivalent.
+        let mut est = NoiseFloorEstimator::new(TAIL_FLOOR_RING_FRAMES);
+        let room_tone = vec![0.004_f32, 0.005, 0.006, 0.004, 0.005];
+        let speech = vec![0.2_f32, 0.3, 0.15];
+        let mut all = Vec::new();
+        for r in room_tone.iter().chain(speech.iter()) {
+            est.update(*r);
+            all.push(*r);
+        }
+        let expect = noise_floor(&all, 0.10);
+        assert!((est.floor(0.10) - expect).abs() < 1e-4);
+        // Empty estimator → 0.
+        assert_eq!(NoiseFloorEstimator::new(8).floor(0.10), 0.0);
+    }
+
+    #[test]
+    fn noise_floor_estimator_windows_to_capacity() {
+        // Once full, the oldest frames fall off so the floor reflects the recent
+        // window, not the whole history — this is what bounds the estimate.
+        let mut est = NoiseFloorEstimator::new(4);
+        for r in [0.001_f32, 0.002, 0.003, 0.004] {
+            est.update(r);
+        }
+        assert_eq!(est.len(), 4);
+        // Push two more; the two oldest (0.001, 0.002) are dropped.
+        est.update(0.005);
+        est.update(0.006);
+        assert_eq!(est.len(), 4);
+        assert_eq!(est.floor(1.0), 0.006); // newest stays
+        // clear() empties the window.
+        est.clear();
+        assert!(est.is_empty());
+        assert_eq!(est.floor(0.10), 0.0);
+    }
+
+    #[test]
+    fn tail_capture_engage_only_scans_the_trailing_window() {
+        // A release mid-speech: the bounded trailing window ends loud, so the
+        // adaptive (low) threshold says NOT quiet → grace engages.
+        let tail_loud = vec![0.004_f32, 0.2, 0.3]; // <300 ms, all short
+        let (_, engage) = tail_capture_engage(&tail_loud, 1, 0.005, 300, 30);
+        assert!(engage, "loud tail should engage the grace");
+
+        // A release in a proper (≥300 ms) pause: the trailing 10 frames are all
+        // quiet below the adaptive threshold → skip grace for zero added latency.
+        let mut tail_quiet = vec![0.004_f32, 0.2];
+        tail_quiet.extend(std::iter::repeat(0.0).take(10));
+        let (thresh, engage) =
+            tail_capture_engage(&tail_quiet, 1, noise_floor(&[0.004, 0.005], 0.10), 300, 30);
+        assert!(thresh >= TAIL_ABS_FLOOR, "threshold keeps the absolute floor");
+        assert!(!engage, "900-ms quiet tail should skip the grace");
+
+        // Threshold math is unchanged: floor*3, clamped to the absolute floor.
+        assert_eq!(speech_threshold(0.10), 0.30);
+        assert_eq!(speech_threshold(0.0), TAIL_ABS_FLOOR);
+    }
+
+    #[test]
+    fn recording_tail_only_returns_the_trailing_window() {
+        use ringbuf::traits::{Producer, Split};
+        // 1 ms at 16 kHz = 16 samples.
+        let win = (1.0 / 1000.0 * SAMPLE_RATE as f64) as usize;
+        assert_eq!(win, 16);
+
+        // stream_audio holds the OLDER drained samples; the ring the NEWER ones.
+        // ring_occupied=5 < 16 → from_stream = 11 → 11 newest stream_audio + 5 ring.
+        let (mut prod, mut cons) = HeapRb::<f32>::new(64).split();
+        let stream_audio = vec![1.0_f32; 40];
+        for &v in &[10.0_f32, 20.0, 30.0, 40.0, 50.0] {
+            let _ = prod.try_push(v);
+        }
+        let tail = recording_tail(&cons, &stream_audio, 1);
+        assert_eq!(tail.len(), 16);
+        assert_eq!(&tail[..11], &[1.0_f32; 11]);
+        assert_eq!(&tail[11..], &[10.0, 20.0, 30.0, 40.0, 50.0]);
+
+        // Ring alone covers the whole window → stream_audio contributes nothing.
+        let (mut prod2, mut cons2) = HeapRb::<f32>::new(64).split();
+        for &v in &[
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
+        ] {
+            let _ = prod2.try_push(v);
+        }
+        let tail2 = recording_tail(&cons2, &[99.0_f32; 100], 1);
+        assert_eq!(tail2.len(), 16);
+        assert_eq!(tail2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]);
+    }
 }
 
 /// Target RMS the ASR front-end normalizes each utterance toward (~ -18 dBFS).
@@ -976,6 +1069,72 @@ pub fn noise_floor(rms_frames: &[f32], percentile: f32) -> f32 {
     sorted[idx]
 }
 
+/// How many recent per-frame RMS values the [`NoiseFloorEstimator`] keeps to
+/// estimate the room's noise floor (~96 frames at 30 ms ≈ 2.9 s). A small,
+/// bounded window is enough: the noise floor is a stable property of the room,
+/// not of how long you talk, and keeping it bounded keeps the release-path
+/// floor computation O(ring-size) instead of O(utterance).
+pub const TAIL_FLOOR_RING_FRAMES: usize = 96;
+
+/// Bounded running estimate of the room's noise floor, fed incrementally
+/// DURING capture (a per-frame RMS value pushed as each frame is captured)
+/// rather than re-sorted from the whole utterance at release. Keeps a small
+/// ring of recent per-frame RMS values; [`floor`](Self::floor) returns the low
+/// percentile over that recent window. This is what removes the O(utterance)
+/// noise-floor sort from the release→inject critical path.
+pub struct NoiseFloorEstimator {
+    frames: std::collections::VecDeque<f32>,
+    capacity: usize,
+}
+
+impl NoiseFloorEstimator {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            frames: std::collections::VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Push one per-frame RMS value, dropping the oldest once the ring is full.
+    pub fn update(&mut self, rms: f32) {
+        if self.frames.len() == self.capacity {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(rms);
+    }
+
+    /// Low `percentile` of the recent per-frame RMS window (0.0 for empty).
+    pub fn floor(&self, percentile: f32) -> f32 {
+        if self.frames.is_empty() {
+            return 0.0;
+        }
+        let vals: Vec<f32> = self.frames.iter().copied().collect();
+        noise_floor(&vals, percentile)
+    }
+
+    /// Drop the whole window (called when a fresh utterance begins).
+    pub fn clear(&mut self) {
+        self.frames.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+}
+
+/// Estimate the room's noise floor directly from a bounded audio slice (the
+/// ~tail-engage-ms trailing window), for the whole-buffer path where the
+/// estimator wasn't fed during capture. Bounded: never scans the whole
+/// utterance, so the release path stays O(window).
+pub fn noise_floor_of_audio(audio: &[f32], frame_len: usize, percentile: f32) -> f32 {
+    let frames = frame_rms(audio, frame_len);
+    noise_floor(&frames, percentile)
+}
+
 /// Adaptive speech threshold from a measured noise floor: `max(floor × factor,
 /// abs_floor)`. The absolute floor guards against a hyper-quiet room where the
 /// floor is ~0, which would otherwise make even a whisper look like quiet.
@@ -1019,4 +1178,61 @@ pub fn quiet_run(rms_series: &[f32], dt_ms: u64, threshold: f32, quiet_ms: u64) 
         }
     }
     count * dt_ms >= quiet_ms
+}
+
+/// Tail-capture engage decision, bounded to a trailing window. Given ONLY a
+/// bounded slice of the last ~`engage_ms` before release (never the whole
+/// utterance) plus the already-decided adaptive floor, decide whether release
+/// happened mid-speech. `floor` comes from the incremental
+/// [`NoiseFloorEstimator`] (streaming) or a bounded [`noise_floor_of_audio`]
+/// pass over the same trailing window (whole-buffer). Scans only `tail` —
+/// O(window), never O(utterance). Returns the (threshold, engage) pair so the
+/// caller reuses the same threshold in the grace loop's quiet check.
+pub fn tail_capture_engage(
+    tail: &[f32],
+    frame_len: usize,
+    floor: f32,
+    engage_ms: u32,
+    frame_ms: u32,
+) -> (f32, bool) {
+    let threshold = speech_threshold(floor);
+    let frames = frame_rms(tail, frame_len);
+    let engage_frames = quiet_frame_count(engage_ms, frame_ms);
+    let engage = !frames_quiet(&frames, threshold, engage_frames);
+    (threshold, engage)
+}
+
+/// Build a bounded chronological snapshot of ONLY the trailing `window_ms` of the
+/// current utterance's captured audio, WITHOUT draining the live ring and WITHOUT
+/// copying the whole buffer. In the streaming path the drained samples live in
+/// `stream_audio` (older) and the sub-tick tail is still in the ring (newer); in
+/// the whole-buffer path the ring holds everything. Returns the trailing
+/// `window_ms` across that split, so the tail-capture engage check stays O(window)
+/// and never O(utterance).
+pub fn recording_tail(
+    consumer: &HeapAudioConsumer,
+    stream_audio: &[f32],
+    window_ms: u32,
+) -> Vec<f32> {
+    use ringbuf::traits::{Consumer, Observer};
+    let window = (window_ms as f64 / 1000.0 * SAMPLE_RATE as f64) as usize;
+    let ring_keep = consumer.occupied_len().min(window);
+    let from_stream = window.saturating_sub(ring_keep);
+    let mut out = Vec::with_capacity(window);
+    // Older drained samples first (the part of `stream_audio` still inside window).
+    let stream_start = stream_audio.len().saturating_sub(from_stream);
+    out.extend_from_slice(&stream_audio[stream_start..]);
+    // Then the newest ring samples, oldest→newest across the wrap: [tail of left][tail of right].
+    if ring_keep > 0 {
+        let (left, right) = consumer.as_slices();
+        let right_take = right.len().min(ring_keep);
+        let left_needed = ring_keep.saturating_sub(right_take);
+        if left_needed > 0 {
+            let left_start = left.len().saturating_sub(left_needed);
+            out.extend_from_slice(&left[left_start..]);
+        }
+        let right_start = right.len().saturating_sub(right_take);
+        out.extend_from_slice(&right[right_start..]);
+    }
+    out
 }

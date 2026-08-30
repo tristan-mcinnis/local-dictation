@@ -619,6 +619,11 @@ fn worker_loop(
     // True once any segment transcribe errored: stop segmenting and transcribe the
     // full `stream_audio` buffer as one batch at release (today's behaviour).
     let mut stream_poisoned = false;
+    // Incremental room-noise-floor estimate, fed per-frame RMS during capture
+    // (streaming) so the tail-capture engage check never re-sorts the whole
+    // utterance on the release→inject critical path.
+    let mut noise_floor =
+        crate::audio::NoiseFloorEstimator::new(crate::audio::TAIL_FLOOR_RING_FRAMES);
 
     'evloop: loop {
         // While recording with streaming ASR, wake periodically to transcribe any
@@ -660,6 +665,7 @@ fn worker_loop(
                                     &mut stream_segs,
                                     &mut stream_audio,
                                     &mut stream_poisoned,
+                                    &mut noise_floor,
                                     false,
                                 );
                             }
@@ -786,6 +792,7 @@ fn worker_loop(
                                 stream_audio.clear();
                                 stream_poisoned = false;
                             }
+                            noise_floor.clear();
                             ui_channel::clear_live_transcript();
                             pending_target = Some(spawn_focus_capture());
                             continue;
@@ -831,6 +838,7 @@ fn worker_loop(
                     if let Some((ao, _)) = always.as_ref() {
                         transform_mode = transform;
                         t_press = Some(Instant::now());
+                        noise_floor.clear();
                         ao.begin_session();
                         cues::play_start();
                         crate::audio_duck::mute();
@@ -858,6 +866,7 @@ fn worker_loop(
                 ) {
                     cues::play_error();
                 } else {
+                    noise_floor.clear();
                     pending_target = Some(spawn_focus_capture());
                 }
             }
@@ -891,11 +900,36 @@ fn worker_loop(
                 let tail_cap = Duration::from_millis(tail_capture_cap_ms as u64);
                 if tail_capture && on_demand_engine.is_some() {
                     let (threshold, engage) = {
-                        let snap = recording_snapshot(consumer.as_ref().unwrap(), &stream_audio);
                         let frame_len = (crate::audio::DEFAULT_TAIL_FRAME_MS as f64 / 1000.0
                             * crate::audio::SAMPLE_RATE as f64)
                             as usize;
-                        tail_capture_engage(&snap, frame_len)
+                        // Bounded trailing window — the engage decision never scans
+                        // or copies the whole utterance on this hot path.
+                        let tail = crate::audio::recording_tail(
+                            consumer.as_ref().unwrap(),
+                            &stream_audio,
+                            crate::audio::DEFAULT_TAIL_ENGAGE_MS,
+                        );
+                        // The floor comes from the estimator maintained during
+                        // capture (streaming) or, in the whole-buffer path, from a
+                        // bounded pass over the same trailing window — never a full
+                        // sort of the utterance.
+                        let floor = if noise_floor.is_empty() {
+                            crate::audio::noise_floor_of_audio(
+                                &tail,
+                                frame_len,
+                                crate::audio::TAIL_NOISE_PERCENTILE,
+                            )
+                        } else {
+                            noise_floor.floor(crate::audio::TAIL_NOISE_PERCENTILE)
+                        };
+                        crate::audio::tail_capture_engage(
+                            &tail,
+                            frame_len,
+                            floor,
+                            crate::audio::DEFAULT_TAIL_ENGAGE_MS,
+                            crate::audio::DEFAULT_TAIL_FRAME_MS,
+                        )
                     };
                     if engage {
                         let grace_start = Instant::now();
@@ -951,31 +985,44 @@ fn worker_loop(
                 // everything). Either way we skip the release pipeline below.
                 match grace_outcome {
                     Some(TailGraceOutcome::RePress { transform }) => {
-                        on_demand_engine.as_mut().unwrap().stop_capture();
-                        if begin_open_capture(
-                            &mut engine,
-                            &mut consumer,
-                            &mut is_recording,
-                            &mut stream,
-                            &mut stream_segs,
-                            &mut stream_audio,
-                            &mut stream_poisoned,
-                            &mut transform_mode,
-                            &mut t_press,
-                            streaming_asr,
-                            transform,
-                        ) {
-                            eprintln!("  ↻    re-press during tail-capture · started fresh");
-                            pending_target = Some(spawn_focus_capture());
-                        } else {
-                            cues::play_error();
+                        // The engine is still open and capturing during the grace
+                        // tail. Reuse it instead of dropping it for a ~120 ms cold
+                        // open: park (stop production), drain+discard the abandoned
+                        // utterance's audio, then resume in place on the same stream.
+                        if let Some(e) = on_demand_engine.as_mut() {
+                            e.park();
+                            if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                                let _ = crate::audio::drain_session(c, r);
+                            }
+                            e.resume();
                         }
+                        engine = on_demand_engine;
+                        transform_mode = transform;
+                        t_press = Some(Instant::now());
+                        stream_segs.clear();
+                        stream_audio.clear();
+                        stream_poisoned = false;
+                        noise_floor.clear();
+                        if streaming_asr {
+                            stream = Some(crate::vad::SegmentStream::new(
+                                crate::audio::SAMPLE_RATE,
+                                crate::vad::VadConfig::default(),
+                            ));
+                        }
+                        cues::play_start();
+                        crate::audio_duck::mute();
+                        ui_channel::set_state(UiState::Recording);
+                        crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+                        ui_channel::clear_live_transcript();
+                        eprintln!("  ↻    re-press during tail-capture · reused warm stream");
+                        pending_target = Some(spawn_focus_capture());
                         continue 'evloop;
                     }
                     Some(TailGraceOutcome::Cancel) => {
                         on_demand_engine.as_mut().unwrap().stop_capture();
                         consumer.take();
                         is_recording.take();
+                        pending_target = None; // discard the orphaned press-time capture
                         stream = None;
                         stream_segs.clear();
                         stream_audio.clear();
@@ -1090,6 +1137,7 @@ fn worker_loop(
                                 &mut stream_segs,
                                 &mut stream_audio,
                                 &mut stream_poisoned,
+                                &mut noise_floor,
                                 true,
                             )
                         } else {
@@ -1565,12 +1613,22 @@ fn stream_process_asr(
     segs_acc: &mut Vec<String>,
     audio_backup: &mut Vec<f32>,
     poisoned: &mut bool,
+    noise_floor: &mut crate::audio::NoiseFloorEstimator,
     final_flush: bool,
 ) -> u128 {
     let avail = drain_available(consumer);
     if !avail.is_empty() {
         st.push(&avail);
         audio_backup.extend_from_slice(&avail);
+        // Feed the incremental noise-floor estimator with this tick's frames so
+        // the release engage check reads a bounded floor instead of re-sorting
+        // the whole utterance on the hot path.
+        let frame_len = (crate::audio::DEFAULT_TAIL_FRAME_MS as f64 / 1000.0
+            * crate::audio::SAMPLE_RATE as f64)
+            as usize;
+        for r in crate::audio::frame_rms(&avail, frame_len) {
+            noise_floor.update(r);
+        }
     }
     let segs = if final_flush {
         st.take_final()
@@ -1607,7 +1665,9 @@ fn stream_process_asr(
         // model runs once on the whole utterance at release, not on partial
         // segments, so accuracy isn't traded for a marginal latency win.
         let corrected = refiner.apply_corrections(&raw);
-        eprintln!("  ⟫ seg · {raw:?}");
+        if std::env::var_os("DICTATE_DEBUG_STREAM").is_some() {
+            eprintln!("  ⟫ seg · {raw:?}");
+        }
         segs_acc.push(corrected);
         // Live preview: surface the joined cached text in the pill while recording.
         if !final_flush {
@@ -1682,50 +1742,6 @@ fn begin_open_capture(
     ui_channel::clear_live_transcript();
     eprintln!("▶ recording");
     true
-}
-
-/// Build a best-available chronological snapshot of the current utterance's
-/// captured audio WITHOUT draining the live ring (`peek_slice`), so the
-/// tail-capture noise-floor estimate can look at what was said without consuming
-/// audio the release pipeline is about to process. In the streaming path the
-/// drained samples live in `stream_audio` and the sub-120 ms tail is still in
-/// the ring; in the whole-buffer path the ring holds everything.
-fn recording_snapshot(
-    consumer: &crate::audio::HeapAudioConsumer,
-    stream_audio: &[f32],
-) -> Vec<f32> {
-    use ringbuf::traits::{Consumer, Observer};
-    let mut buf = stream_audio.to_vec();
-    let n = consumer.occupied_len();
-    if n > 0 {
-        let mut chunk = vec![0.0_f32; n];
-        let got = consumer.peek_slice(&mut chunk);
-        buf.extend_from_slice(&chunk[..got]);
-    }
-    buf
-}
-
-/// Tail-capture: from a snapshot of the utterance so far, decide the adaptive
-/// speech threshold and whether the release happened *mid-speech* (so the grace
-/// loop should engage). The threshold is `max(noise_floor × factor, abs_floor)`
-/// where the floor is the low percentile of the per-frame RMS distribution — so
-/// a noisy room raises the bar and a quiet one lowers it. `engage` is false when
-/// the last ~300 ms is already quiet (user let go in a pause) → skip the grace
-/// entirely for zero added latency.
-pub(crate) fn tail_capture_engage(
-    recording: &[f32],
-    frame_len: usize,
-) -> (f32 /*threshold*/, bool /*engage*/) {
-    use crate::audio::{frame_rms, frames_quiet, noise_floor, quiet_frame_count, speech_threshold};
-    let frames = frame_rms(recording, frame_len);
-    let floor = noise_floor(&frames, crate::audio::TAIL_NOISE_PERCENTILE);
-    let threshold = speech_threshold(floor);
-    let engage_frames = quiet_frame_count(
-        crate::audio::DEFAULT_TAIL_ENGAGE_MS,
-        crate::audio::DEFAULT_TAIL_FRAME_MS,
-    );
-    let engage = !frames_quiet(&frames, threshold, engage_frames);
-    (threshold, engage)
 }
 
 /// transform on the spoken body with the warm Gemma engine and inject the result
