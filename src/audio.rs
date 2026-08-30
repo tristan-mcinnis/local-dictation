@@ -623,9 +623,9 @@ mod tests {
 
 /// Target RMS the ASR front-end normalizes each utterance toward (~ -18 dBFS).
 /// Quiet / whispered speech is boosted up to this level and a raised voice is
-/// gently brought down, so Parakeet/Cohere see a consistent loudness no matter
-/// how close or loud you speak — this is what lets you dictate at a whisper
-/// instead of having to project (cloud tools like Wispr Flow do the same).
+/// gently brought down, so the Cohere MLX engine sees a consistent loudness no
+/// matter how close or loud you speak — this is what lets you dictate at a
+/// whisper instead of having to project (cloud tools like Wispr Flow do the same).
 pub const ASR_TARGET_RMS: f32 = 0.12;
 /// Hard ceiling on any sample after gain — keeps a boost from ever clipping.
 pub const ASR_PEAK_CEILING: f32 = 0.97;

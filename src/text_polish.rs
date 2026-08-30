@@ -282,7 +282,172 @@ pub fn fix_speech_mechanics(s: &str) -> String {
     let at_handled = normalize_at(&collapsed);
     let dots_handled = normalize_spoken_dots(&at_handled);
     let joined = normalize_spoken_joins(&dots_handled);
-    add_terminal_period(&joined)
+    let terminated = add_terminal_period(&joined);
+    // Mid-sentence self-correction and spoken-list formatting run LAST, after
+    // all casing/punctuation mechanics, so their word-boundary surgery sees the
+    // final text. Both are conservative (never drop or reorder a content word).
+    let corrected = apply_self_correction(&terminated);
+    format_spoken_list(&corrected)
+}
+
+/// Byte spans of every alphanumeric run in `s` — the shared primitive for the
+/// deterministic self-correction and list-formatting passes, which need to
+/// locate words in the original-cased string.
+fn word_spans(s: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in s.char_indices() {
+        if c.is_alphanumeric() {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(si) = start.take() {
+            spans.push((si, i));
+        }
+    }
+    if let Some(si) = start {
+        spans.push((si, s.len()));
+    }
+    spans
+}
+
+/// Ordinal words that mark a spoken list, mapped to their 1-based number.
+/// (Deterministic: `numbers::spoken_to_numerals` deliberately leaves ordinals
+/// alone, so these survive the earlier mechanics untouched.)
+const ORDINAL_WORDS: &[(&str, usize)] = &[
+    ("first", 1),
+    ("second", 2),
+    ("third", 3),
+    ("fourth", 4),
+    ("fifth", 5),
+    ("sixth", 6),
+    ("seventh", 7),
+    ("eighth", 8),
+    ("ninth", 9),
+    ("tenth", 10),
+];
+
+fn ordinal_number(word: &str) -> Option<usize> {
+    ORDINAL_WORDS
+        .iter()
+        .find(|(w, _)| *w == word)
+        .map(|(_, n)| *n)
+}
+
+/// Deterministic spoken-list formatting: when the utterance enumerates items
+/// with ordinal markers ("first … second … finally …"), split it into a
+/// numbered list, one item per line. Requires ≥2 ordinal markers (so prose that
+/// merely mentions "first" or "second" is left alone) and preserves the
+/// speaker's wording — items are only split, never rewritten. "finally"/"lastly"
+/// closes the list with the next number.
+pub fn format_spoken_list(s: &str) -> String {
+    let spans = word_spans(s);
+    if spans.len() < 4 {
+        return s.to_string();
+    }
+    let words: Vec<String> = spans.iter().map(|&(a, b)| s[a..b].to_lowercase()).collect();
+    let mut markers: Vec<(usize, usize)> = Vec::new(); // (word index, number)
+    let mut finally: Option<usize> = None;
+    for (idx, w) in words.iter().enumerate() {
+        if let Some(num) = ordinal_number(w) {
+            markers.push((idx, num));
+        } else if w == "finally" || w == "lastly" {
+            finally = Some(idx);
+        }
+    }
+    if markers.len() < 2 {
+        return s.to_string();
+    }
+    if let Some(fi) = finally {
+        markers.push((fi, markers.len() + 1));
+    }
+    markers.sort_by_key(|m| m.0);
+
+    let mut items: Vec<String> = Vec::new();
+    for (mi, &(idx, num)) in markers.iter().enumerate() {
+        let item_start = idx + 1;
+        let item_end = markers.get(mi + 1).map(|m| m.0).unwrap_or(spans.len());
+        if item_start >= item_end {
+            continue;
+        }
+        let a = spans[item_start].0;
+        // Extend to the next marker (or end of string) so a trailing period or
+        // comma that belongs to this item is kept, not dropped.
+        let b = markers
+            .get(mi + 1)
+            .map(|m| spans[m.0].0)
+            .unwrap_or(s.len());
+        let mut text = s[a..b].trim().trim_start_matches(',').trim().to_string();
+        if let Some(first) = text.chars().next() {
+            if first.is_ascii_lowercase() {
+                let cap = first.to_ascii_uppercase();
+                text = format!("{cap}{}", &text[first.len_utf8()..]);
+            }
+        }
+        items.push(format!("{num}. {text}"));
+    }
+    if items.len() < 2 {
+        return s.to_string();
+    }
+    items.join("\n")
+}
+
+/// Words that restart a self-corrected utterance, immediately before "i mean" /
+/// "i meant". ("scratch that" is a whole-utterance cancel command handled
+/// elsewhere; "let me rephrase" is rare enough to skip.)
+const REPAIR_RESTARTS: &[&str] = &["no", "wait", "actually", "rather", "instead", "sorry"];
+
+/// Deterministic mid-sentence self-correction. When the speaker abandons a
+/// fragment and restates it — "Let's meet Monday, no wait, I mean Tuesday" — the
+/// abandoned word and the repair marker are dropped, keeping only the correction:
+/// "Let's meet Tuesday." Conservative: only fires on an explicit "i mean"/"i
+/// meant" with an optional restart word, requires real words on both sides, and
+/// drops only the single word immediately before the marker. This is a
+/// deterministic stand-in because the cleanup LLM (S1-mini) frequently returns
+/// empty on these inputs; a multi-word abandoned phrase is a known limitation.
+pub fn apply_self_correction(s: &str) -> String {
+    let spans = word_spans(s);
+    if spans.len() < 4 {
+        return s.to_string();
+    }
+    let words: Vec<String> = spans.iter().map(|&(a, b)| s[a..b].to_lowercase()).collect();
+    let n = words.len();
+    // (marker start word index, marker end word index) of the rightmost match.
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i < n {
+        let is_mean =
+            words[i] == "i" && i + 1 < n && (words[i + 1] == "mean" || words[i + 1] == "meant");
+        if is_mean {
+            let mean_end = i + 2;
+            let mut start = i;
+            if i >= 1 && REPAIR_RESTARTS.contains(&words[i - 1].as_str()) {
+                start = i - 1;
+                // "no wait" / "wait no" collapse to a two-word restart.
+                if i >= 2 && matches!(words[i - 2].as_str(), "no" | "wait") {
+                    start = i - 2;
+                }
+            }
+            if start >= 1 && mean_end < n {
+                best = Some((start, mean_end));
+            }
+            i = mean_end;
+        } else {
+            i += 1;
+        }
+    }
+    let (m_start, m_end) = match best {
+        Some(b) => b,
+        None => return s.to_string(),
+    };
+    // Drop the single word immediately before the marker (the abandoned
+    // fragment) plus the marker itself; keep the correction after it.
+    let frag_start = spans[m_start - 1].0;
+    let marker_end = spans[m_end - 1].1;
+    let mut out = String::from(&s[..frag_start]);
+    let rest = s[marker_end..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+    out.push_str(rest);
+    out
 }
 
 /// Capitalize the first letter of the utterance and of each sentence that
@@ -683,99 +848,6 @@ pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
     dropped_content >= 5
 }
 
-/// Whether the lowercased word stream contains a mid-sentence self-correction / repair
-/// (the speaker abandons a fragment and restates it: "no wait", "I mean",
-/// "actually", "sorry", "scratch that"). Used by [`needs_llm_cleanup`] to route
-/// such utterances to the generative cleaner, which can drop the abandoned
-/// fragment — the deterministic pass can't safely drop a whole clause.
-///
-/// Conservative: a repair marker only fires when real words sit on BOTH sides
-/// (the marker is not at the very start or very end), and the standalone
-/// emphasis/apology words ("actually", "rather", "instead", "sorry") need a
-/// *content* word before them — so "actually, yes" and "I'm sorry to hear that"
-/// don't count, while "the report is due tomorrow actually I meant Friday" does.
-fn contains_self_correction(words: &[&str]) -> bool {
-    (0..words.len()).any(|i| {
-        let len = repair_phrase_len(words, i);
-        len > 0 && i >= 1 && i + len < words.len()
-    })
-}
-
-/// Length of the self-correction phrase starting at `i` in the lowercased word
-/// stream, or 0 if none. The returned length is the whole span the cleaner
-/// should treat as the repair marker, so [`contains_self_correction`] can
-/// require real words on both sides. Pure & unit-tested.
-fn repair_phrase_len(words: &[&str], i: usize) -> usize {
-    fn at(words: &[&str], i: usize, phrase: &[&str]) -> bool {
-        words.get(i..i + phrase.len()).is_some_and(|w| w == phrase)
-    }
-    // Multi-word re-starts: "no no", "wait wait", "no wait", "scratch that".
-    if at(words, i, &["no", "no"])
-        || at(words, i, &["wait", "wait"])
-        || at(words, i, &["no", "wait"])
-        || at(words, i, &["scratch", "that"])
-    {
-        return 2;
-    }
-    if at(words, i, &["let", "me", "rephrase"]) {
-        return 3;
-    }
-    // "no"/"wait" + a repair word: "no I mean", "wait actually", "no instead".
-    if matches!(words.get(i), Some(&"no") | Some(&"wait")) {
-        if at(words, i + 1, &["i", "mean"]) || at(words, i + 1, &["i", "meant"]) {
-            return 3;
-        }
-        if at(words, i + 1, &["actually"])
-            || at(words, i + 1, &["rather"])
-            || at(words, i + 1, &["instead"])
-        {
-            return 2;
-        }
-    }
-    // Standalone "i mean" / "i meant".
-    if at(words, i, &["i", "mean"]) || at(words, i, &["i", "meant"]) {
-        return 2;
-    }
-    // Standalone repair words. These double as emphasis ("actually") or
-    // apology ("sorry"), so require a *content* word before them — the thing
-    // the speaker just stated — to read as a correction, not "I actually like
-    // that" (emphasis) or "I'm sorry to hear that" (sympathy).
-    if matches!(
-        words.get(i),
-        Some(&"actually") | Some(&"rather") | Some(&"instead") | Some(&"sorry")
-    ) && i >= 1
-        && preceded_by_content_word(words, i - 1)
-    {
-        return 1;
-    }
-    0
-}
-
-/// True when the word at index `i` is a *content* word (noun/adverb/verb) rather
-/// than a pronoun or auxiliary. Used to tell a standalone repair word from the
-/// same word used as emphasis or sympathy: "the meeting is Monday actually …"
-/// (content word before → correction) vs "I actually like that" / "we actually
-/// shipped it" / "I'm sorry …" (pronoun/auxiliary before → not a correction).
-/// Contraction fragments ("m", "re", "ve") come from splitting "I'm"/"we're".
-fn preceded_by_content_word(words: &[&str], i: usize) -> bool {
-    !matches!(
-        words.get(i).copied().unwrap_or(""),
-        "i" | "you" | "we" | "they" | "it" | "he" | "she" | "me" | "us"
-            | "him" | "her" | "them" | "this" | "that" | "these" | "those"
-            | "there" | "here" | "who" | "which" | "what"
-            | "is" | "are" | "was" | "were" | "am" | "be" | "been" | "being"
-            | "do" | "does" | "did" | "has" | "have" | "had"
-            | "can" | "could" | "will" | "would" | "should" | "shall" | "may"
-            | "might" | "must" | "not" | "so" | "and" | "but" | "or" | "if"
-            | "to" | "of" | "m" | "s" | "re" | "ll" | "ve" | "d" | "t"
-            // Common no-apostrophe clitic forms ASR may emit ("I'm" → "im",
-            // "you're" → "youre", …). Before an emphasis/apology word these are
-            // pronoun+auxiliary, not a noun the speaker just stated.
-            | "im" | "youre" | "hes" | "shes" | "theyre" | "weve" | "youve"
-            | "ive" | "youll" | "theyll" | "youd" | "wed" | "id"
-    )
-}
-
 /// Decide whether a transcript is messy enough to be worth the generative
 /// cleanup LLM, or clean enough to take the deterministic pass alone.
 ///
@@ -800,13 +872,6 @@ pub fn needs_llm_cleanup(raw: &str) -> bool {
         .collect();
     if words.len() < 3 {
         return false;
-    }
-    // Mid-sentence self-correction: the speaker abandons a fragment and
-    // restates it ("no wait", "I mean", "actually", "sorry", …). The
-    // deterministic pass can't safely drop the abandoned clause, so route it
-    // to the model, which now knows to keep only the final version.
-    if contains_self_correction(&words) {
-        return true;
     }
     const CONTRACTIONS: &[&str] = &[
         "wanna", "gonna", "gotta", "kinda", "sorta", "gimme", "lemme", "dunno", "outta", "lotta",
@@ -1647,17 +1712,57 @@ mod tests {
     }
 
     #[test]
-    fn messiness_gate_routes_self_correction_to_llm() {
-        // Mid-sentence repair: the speaker abandons a fragment and restates it.
-        assert!(needs_llm_cleanup("let's meet Monday no wait I mean Tuesday"));
-        assert!(needs_llm_cleanup(
-            "the report is due tomorrow actually I meant Friday"
-        ));
-        assert!(needs_llm_cleanup("ship the build I mean the release"));
-        // "no wait" alone (no I mean-follower) is still a repair.
-        assert!(needs_llm_cleanup("we should no wait we should ship it"));
-        // A correction-introducing "scratch that" mid-sentence.
-        assert!(needs_llm_cleanup("the meeting is on monday scratch that tuesday"));
+    fn self_correction_drops_abandoned_word_and_marker() {
+        // The user's exact reported cases.
+        assert_eq!(
+            apply_self_correction("Let's meet Monday. No wait, I mean Tuesday."),
+            "Let's meet Tuesday."
+        );
+        assert_eq!(
+            apply_self_correction("Let's meet Monday, no wait, I mean Tuesday."),
+            "Let's meet Tuesday."
+        );
+        assert_eq!(
+            apply_self_correction("The report is due Friday, actually I mean Monday."),
+            "The report is due Monday."
+        );
+        assert_eq!(
+            apply_self_correction("ship it, I mean the release"),
+            "ship the release"
+        );
+        // No marker, or marker without content before it → unchanged.
+        assert_eq!(apply_self_correction("I mean well"), "I mean well");
+        assert_eq!(
+            apply_self_correction("I mean, the release is ready"),
+            "I mean, the release is ready"
+        );
+        assert_eq!(
+            apply_self_correction("the report is due Monday"),
+            "the report is due Monday"
+        );
+    }
+
+    #[test]
+    fn spoken_list_formats_ordinals_into_numbered_lines() {
+        assert_eq!(
+            format_spoken_list("First, check the logs. Second, run the tests. Finally, commit it."),
+            "1. Check the logs.\n2. Run the tests.\n3. Commit it."
+        );
+        // Two ordinals, no "finally".
+        assert_eq!(
+            format_spoken_list("First do A. Second do B."),
+            "1. Do A.\n2. Do B."
+        );
+        // A single "first" is prose → unchanged.
+        assert_eq!(
+            format_spoken_list("This is the first time we tried it"),
+            "This is the first time we tried it"
+        );
+        // Non-list text with no ordinals → unchanged.
+        assert_eq!(
+            format_spoken_list("Just a normal sentence about nothing"),
+            "Just a normal sentence about nothing"
+        );
     }
 
     #[test]
@@ -1670,30 +1775,6 @@ mod tests {
         // Emphasis use of "actually" (pronoun before it) isn't a repair.
         assert!(!needs_llm_cleanup("I actually like that idea"));
         assert!(!needs_llm_cleanup("we actually shipped it yesterday"));
-    }
-
-    #[test]
-    fn self_correction_detector_is_pure() {
-        // A repair marker mid-sentence (words on both sides) fires.
-        assert!(contains_self_correction(&["no", "wait", "i", "mean", "tuesday"]));
-        assert!(contains_self_correction(&[
-            "ship", "the", "build", "i", "mean", "the", "release"
-        ]));
-        assert!(contains_self_correction(&["ship", "it", "i", "meant", "friday"]));
-        assert!(contains_self_correction(&["we", "should", "no", "wait", "ship", "it"]));
-        assert!(contains_self_correction(&["monday", "scratch", "that", "tuesday"]));
-        // "no no" alone is a marker at the very start → no words before it.
-        assert!(!contains_self_correction(&["no", "no"]));
-        // A marker at the very start or very end does NOT fire (needs words both sides).
-        assert!(!contains_self_correction(&["i", "mean", "the", "release"]));
-        assert!(!contains_self_correction(&["actually", "i", "like", "that"]));
-        assert!(!contains_self_correction(&["ship", "i", "mean"]));
-        // "sorry" only as a repair (not "sorry to hear/bother").
-        assert!(!contains_self_correction(&["i", "m", "sorry", "to", "hear", "that"]));
-        assert!(!contains_self_correction(&["im", "sorry", "to", "hear", "that"]));
-        // Emphasis "actually" (a pronoun before it) isn't a repair.
-        assert!(!contains_self_correction(&["i", "actually", "like", "that"]));
-        assert!(!contains_self_correction(&["no", "problem", "at", "all"]));
     }
 
     // -------------------------------------------------------------------

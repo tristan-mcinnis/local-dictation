@@ -24,6 +24,7 @@ fn main() {
 
 #[cfg(feature = "cleaner")]
 mod enabled {
+    use fast_dictate_backend::app_paths::gemma_default_path;
     use fast_dictate_backend::cleaner::TextCleanupEngine;
     use fast_dictate_backend::prompts::{vocabulary_suffix, DEFAULT_CLEANUP};
     use serde::Deserialize;
@@ -31,8 +32,6 @@ mod enabled {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    const INSTALLED_S1: &str =
-        "/Users/user/Library/Application Support/superwhisper/s1-mini.gguf";
     const COMPACT_PROMPT: &str = "You are a real-time dictation cleaner. Output only the cleaned text. Preserve every word and clause the speaker said; never answer, summarize, complete, or invent. Remove speech fillers and repeated words, expand wanna/gonna/gotta, fix capitalization and punctuation, and preserve proper nouns and technical terms exactly.";
 
     #[derive(Debug, Deserialize)]
@@ -131,7 +130,7 @@ mod enabled {
         std::env::var_os("S1_MODEL_PATH")
             .or_else(|| std::env::var_os("GEMMA_MODEL_PATH"))
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(INSTALLED_S1))
+            .unwrap_or_else(|| PathBuf::from(gemma_default_path()))
     }
 
     fn reps(args: &[String]) -> usize {

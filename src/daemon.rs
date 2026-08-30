@@ -169,8 +169,7 @@ extern "C" {
 
 /// Configuration for the daemon. Built from CLI args / env vars in main.rs.
 pub struct DaemonConfig {
-    /// Resolved ASR selection (which backend + each model dir). Replaces the
-    /// old single `parakeet_dir`, so the daemon can run Parakeet or Cohere.
+    /// Resolved fixed Cohere MLX ASR configuration.
     pub asr: crate::transcriber::AsrConfig,
     #[cfg(feature = "cleaner")]
     pub gemma_path: String,
@@ -1497,7 +1496,7 @@ fn worker_loop(
                                 }
                                 // Deterministic cleanup (filler/casing/numbers on
                                 // top of already-corrected, already-punctuated
-                                // Parakeet text). Used both as the short-utterance
+                                // Cohere text). Used both as the short-utterance
                                 // shortcut and as the safe fallback when the LLM
                                 // over-deletes — it can never drop a clause.
                                 let deterministic =
@@ -1998,7 +1997,7 @@ fn handle_spoken_command(
 /// EXPERIMENTAL hands-free wake-word listener (the `listen` subcommand).
 ///
 /// Runs the always-on mic continuously, segments it at VAD pauses, transcribes
-/// each segment with the already-loaded Parakeet model, and watches for the
+/// each segment with the already-loaded Cohere model, and watches for the
 /// configured wake word. Hearing the wake word "arms" dictation: that segment's
 /// body (and every following segment) is cleaned, refined, and injected into the
 /// focused field — exactly like push-to-talk, but triggered by voice. The arm

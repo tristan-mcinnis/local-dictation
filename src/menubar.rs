@@ -50,14 +50,15 @@ use crate::ui_channel::{self, UiState};
 
 const LOG_PATH: &str = "/tmp/dictate-daemon.log";
 
-// Pill geometry — tuned to match Wispr Flow's compact pill.
-const PILL_W: f64 = 120.0;
-const PILL_EXPANDED_W: f64 = 272.0;
-const PILL_H: f64 = 44.0;
+// Pill geometry — deliberately smaller and lower-profile than the
+// Wispr Flow / Superwhisper pills the layout was originally modelled on.
+const PILL_W: f64 = 96.0;
+const PILL_EXPANDED_W: f64 = 256.0;
+const PILL_H: f64 = 34.0;
 const BAR_COUNT: usize = 14;
 const BAR_W: f64 = 3.0;
 const BAR_GAP: f64 = 2.0;
-const BAR_MAX_H: f64 = 26.0;
+const BAR_MAX_H: f64 = 18.0;
 const BAR_MIN_H: f64 = 2.0;
 
 /// Shared monochrome palette — the same design language as the other personal
@@ -297,20 +298,6 @@ define_class!(
             write_settings_and_relaunch(move |set| {
                 set.active_format = if name.is_empty() { None } else { Some(name.clone()) };
             });
-        }
-
-        #[unsafe(method(selectAsrBackend:))]
-        fn select_asr_backend(&self, sender: *mut AnyObject) {
-            // representedObject holds the backend name ("parakeet" / "cohere").
-            let name = unsafe {
-                let obj: *mut AnyObject = msg_send![sender, representedObject];
-                if obj.is_null() {
-                    return;
-                }
-                let s: &NSString = &*(obj as *const NSString);
-                s.to_string()
-            };
-            write_settings_and_relaunch(move |set| set.asr_backend = Some(name.clone()));
         }
 
         #[unsafe(method(openCommandsRef:))]
@@ -2149,10 +2136,10 @@ fn build_pill_window(
     // alone), and the buttons have persistent tooltips/accessibility names.
     let status = NSTextField::labelWithString(&NSString::from_str("Ready"), mtm);
     status.setFrame(NSRect::new(
-        NSPoint::new(PILL_W + 14.0, 13.0),
-        NSSize::new(92.0, 18.0),
+        NSPoint::new(PILL_W + 14.0, 8.0),
+        NSSize::new(68.0, 18.0),
     ));
-    status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
     unsafe {
         let _: () = msg_send![&*status, setTextColor: &*NSColor::whiteColor()];
         let _: () = msg_send![&*status, setAlphaValue: 0.0_f64];
@@ -2163,7 +2150,7 @@ fn build_pill_window(
     let cancel: Retained<NSButton> = unsafe {
         msg_send![
             NSButton::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 76.0, 6.0), NSSize::new(32.0, 32.0))
+            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 66.0, 4.0), NSSize::new(26.0, 26.0))
         ]
     };
     cancel.setTitle(&NSString::from_str("×"));
@@ -2173,7 +2160,7 @@ fn build_pill_window(
         let _: () = msg_send![&*cancel, setTarget: &**actions];
         let _: () = msg_send![&*cancel, setAction: sel!(cancelPill:)];
         let _: () = msg_send![&*cancel, setKeyEquivalent: &*NSString::from_str("\u{1b}")];
-        let _: () = msg_send![&*cancel, setFont: &*NSFont::systemFontOfSize(21.0)];
+        let _: () = msg_send![&*cancel, setFont: &*NSFont::systemFontOfSize(17.0)];
         let _: () =
             msg_send![&*cancel, setAccessibilityLabel: &*NSString::from_str("Cancel recording")];
         let _: () = msg_send![&*cancel, setAlphaValue: 0.0_f64];
@@ -2182,7 +2169,7 @@ fn build_pill_window(
     let settings: Retained<NSButton> = unsafe {
         msg_send![
             NSButton::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 42.0, 6.0), NSSize::new(32.0, 32.0))
+            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 36.0, 4.0), NSSize::new(26.0, 26.0))
         ]
     };
     settings.setTitle(&NSString::from_str("⚙"));
@@ -2191,7 +2178,7 @@ fn build_pill_window(
     unsafe {
         let _: () = msg_send![&*settings, setTarget: &**actions];
         let _: () = msg_send![&*settings, setAction: sel!(openSettings:)];
-        settings.setFont(Some(&NSFont::systemFontOfSize(16.0)));
+        settings.setFont(Some(&NSFont::systemFontOfSize(13.0)));
         let _: () = msg_send![&*settings, setAccessibilityLabel: &*NSString::from_str("Open Dictation settings")];
         let _: () = msg_send![&*settings, setAlphaValue: 0.0_f64];
     }
@@ -2479,7 +2466,7 @@ fn set_static_processing_bars(globals: &UiGlobals) {
 
 fn set_static_success_bars(globals: &UiGlobals) {
     for (i, bar) in globals.bars.iter().enumerate() {
-        set_bar_height(bar, i, if i % 2 == 0 { 16.0 } else { 10.0 });
+        set_bar_height(bar, i, if i % 2 == 0 { 12.0 } else { 8.0 });
     }
 }
 
@@ -2646,7 +2633,8 @@ fn position_pill_at_cursor_screen(window: &NSWindow) {
         }
         let win_frame = window.frame();
         let x = chosen.origin.x + (chosen.size.width - win_frame.size.width) / 2.0;
-        let y = chosen.origin.y + 80.0;
+        // Sit close to the bottom edge so the pill stays out of the way.
+        let y = chosen.origin.y + 32.0;
         window.setFrameOrigin(NSPoint::new(x, y));
     }
 }

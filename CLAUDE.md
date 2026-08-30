@@ -37,10 +37,12 @@ helper**), cleaned up (**S1-mini GGUF via llama-cpp-2 + Metal**), and injected a
 nothing hits the network at runtime. The crate is `fast-dictate-backend` (lib
 `fast_dictate_backend` + bin `fast-dictate-backend`).
 
-The ASR is **fixed**: it is always Cohere MLX. The `AsrBackend`/`CohereQuant`/`MoonshineSize`
-enums in `transcriber.rs` are legacy settings-migration shims kept only so an old
-`settings.json`/menu state decodes without breaking — they never change the runtime (see
-`Settings::resolve_asr`, which hard-pins `backend = AsrBackend::Cohere`).
+The ASR is **fixed**: it is always Cohere MLX Q4 and never changes at runtime; the only selectable
+ASR knob is the decoder language (`cohere_language` / `DICTATE_COHERE_LANG`). The old
+`AsrBackend`/`CohereQuant`/`MoonshineSize` enums and the multi-backend shims have been removed;
+`Settings::resolve_asr` in `settings.rs` now hard-pins the Cohere MLX Q4 engine. Legacy
+`asr_backend` / `cohere_quant` / `moonshine_variant` keys in an old `settings.json` are silently
+ignored by serde (the struct does not use `deny_unknown_fields`).
 
 ## The native Cohere MLX bridge
 
@@ -275,8 +277,9 @@ re-joining the path:
 - `settings.json` (`settings.rs`) — written by the menu bar. Keys: `gemma_model`, `hotkey_keycode`,
   `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`, `listen_mode`, `wake_word`,
   `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`.
-  The `asr_backend` / `cohere_quant` / `cohere_language` / `moonshine_variant` keys still exist but
-  are **ignored** — kept only so an old file doesn't fail to parse. (`gemma_model` holds whatever
+  `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
+  `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
+  silently ignored by serde — an old settings file still parses. (`gemma_model` holds whatever
   cleanup model is selected; the name is historical.)
 - `prompts.json` (`prompts.rs`) — hand-edited `cleanup` + `transform` system prompts, plus a
   `formats` map of named output-shape presets. Four presets ship built-in
@@ -325,11 +328,11 @@ stack:
 | `DICTATE_CONTROL_SOCK` | Override the daemon control-socket path |
 | `DICTATE_CORRECTIONS_PATH` / `DICTATE_DICTIONARY_PATH` | Override the corrections / dictionary file paths |
 
-The old multi-backend selectors (`DICTATE_ASR_BACKEND`, `DICTATE_COHERE_QUANT`,
+The old multi-backend selector env vars (`DICTATE_ASR_BACKEND`, `DICTATE_COHERE_QUANT`,
 `DICTATE_MOONSHINE_VARIANT`, `PARAKEET_MODEL_DIR`, `DICTATE_COHERE_MODEL_DIR`,
-`DICTATE_MOONSHINE_MODEL_DIR`, `DICTATE_WHISPER_MODEL_PATH`) are no longer honored; they remain only
-so an existing config parses. `FOCUS_APP` / `INJECT_DIAG` / `INJECT_PROFILE` are scripted-test
-helpers.
+`DICTATE_MOONSHINE_MODEL_DIR`, `DICTATE_WHISPER_MODEL_PATH`) no longer exist — the engine is fixed
+on Cohere MLX Q4. Only `DICTATE_COHERE_LANG` (decoder language) is honored. `FOCUS_APP` /
+`INJECT_DIAG` / `INJECT_PROFILE` are scripted-test helpers.
 
 ## Debugging
 

@@ -9,10 +9,12 @@ cargo run --release --features cleaner --example s1_mini_eval -- --reps 3
 cargo run --release --features cleaner --example s1_mini_eval -- --compact --json
 ```
 
-The runner uses `/Users/user/Library/Application Support/superwhisper/s1-mini.gguf`
-by default. Override it with `S1_MODEL_PATH=/path/to/model.gguf` or
-`--model /path/to/model.gguf`. `GEMMA_MODEL_PATH` remains accepted for
-compatibility with the older model labs.
+The runner resolves the model the same way the app does
+(`app_paths::gemma_default_path`: `S1_MODEL_PATH` / `GEMMA_MODEL_PATH` env,
+then the prepared model stack under the models base dir). Override it with
+`S1_MODEL_PATH=/path/to/model.gguf` or `--model /path/to/model.gguf`.
+`GEMMA_MODEL_PATH` remains accepted for compatibility with the older model
+labs.
 
 Each case scores content anchors, forbidden filler/answer text, exact
 dictionary spellings, runaway-output safety, and (where requested) terminal

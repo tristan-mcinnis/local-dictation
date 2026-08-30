@@ -2,7 +2,7 @@
 //!
 //! This is the *decision* primitive only — pure string work, no model and no
 //! audio. The daemon's listen loop transcribes each VAD-bounded speech segment
-//! with Parakeet (the model already loaded for push-to-talk), then asks this
+//! with Cohere (the model already loaded for push-to-talk), then asks this
 //! module: "does this segment open with the wake word, and if so what's the
 //! dictation body?" Keeping the decision deterministic and model-free means the
 //! always-on path never pays a second model on the hot loop, and the matching
@@ -17,7 +17,7 @@
 //!     "computer"
 //!   * each wake-word token tolerates a single-character ASR slip for tokens of
 //!     four or more characters ("computers" still matches "computer"), so the
-//!     trigger doesn't depend on Parakeet spelling the magic word perfectly
+//!     trigger doesn't depend on Cohere spelling the magic word perfectly
 //!
 //! The body returned is the *original* text after the matched span (original
 //! casing preserved, leading punctuation/space trimmed) so it flows into the
@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn fuzzy_absorbs_one_char_asr_slip() {
-        // Parakeet hears a trailing plural — still triggers.
+        // Cohere hears a trailing plural — still triggers.
         assert_eq!(
             body("computers open the door", "computer").as_deref(),
             Some("open the door")

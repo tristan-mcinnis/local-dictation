@@ -105,25 +105,14 @@ pub struct Settings {
     /// [`DEFAULT_WAKE_WORD`]. Override: `DICTATE_WAKE_WORD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_word: Option<String>,
-    /// Which ASR engine transcribes audio: `"parakeet"` (default, lowest
-    /// latency) or `"cohere"` (Cohere Transcribe 2B, higher accuracy + 14
-    /// languages). `None`/unknown ⇒ Parakeet. Override: `DICTATE_ASR_BACKEND`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub asr_backend: Option<String>,
-    /// Cohere weight quantization: `"int4"` (default) or `"int8"`. Only used
-    /// when `asr_backend` is `"cohere"`. Override: `DICTATE_COHERE_QUANT`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cohere_quant: Option<String>,
     /// Language hint for the Cohere decoder (it has no auto-detect), e.g.
     /// `"en"`, `"de"`, `"zh"`, `"ja"`. `None`/blank ⇒ `"en"`. Override:
-    /// `DICTATE_COHERE_LANG`.
+    /// `DICTATE_COHERE_LANG`. This is the only surviving ASR setting — the
+    /// engine itself is fixed to Cohere MLX Q4. (Legacy `asr_backend` /
+    /// `cohere_quant` / `moonshine_variant` keys in an old settings file are
+    /// silently ignored by serde — see `load_from`.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cohere_language: Option<String>,
-    /// Moonshine model size: `"tiny"` (27M, fastest, ~12.6% WER) or `"base"`
-    /// (61M, recommended, ~9-10% WER). `None`/unknown ⇒ Base. Only used when
-    /// `asr_backend` is `"moonshine"`. Override: `DICTATE_MOONSHINE_VARIANT`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub moonshine_variant: Option<String>,
 
     /// Modifier mask for the push-to-talk hotkey (a CGEventFlags bitmask of
     /// Shift/Control/Option/Command). 0 means the hotkey is a bare modifier key
@@ -221,28 +210,12 @@ impl Settings {
             .unwrap_or_else(|| default.to_string())
     }
 
-    /// Resolve the full ASR selection (backend + each model's directory) with
-    /// the usual **env > settings > default** precedence. This is the single
-    /// place backend choice is decided; the daemon and the CLI both go through
-    /// it so they always agree.
-    ///
-    /// Env knobs: `DICTATE_ASR_BACKEND` (`parakeet`|`cohere`|`moonshine`|`whisper`),
-    /// `DICTATE_COHERE_QUANT` (`int4`|`int8`), `DICTATE_COHERE_LANG`,
-    /// `DICTATE_MOONSHINE_VARIANT` (`tiny`|`base`), `PARAKEET_MODEL_DIR`,
-    /// `DICTATE_COHERE_MODEL_DIR`, `DICTATE_MOONSHINE_MODEL_DIR`,
-    /// `DICTATE_WHISPER_MODEL_PATH`.
+    /// Resolve the fixed Cohere MLX ASR configuration with the usual
+    /// **env > settings > default** precedence. The engine is hard-pinned to
+    /// Cohere MLX Q4; the only selectable knob is the decoder language.
+    /// Env knob: `DICTATE_COHERE_LANG`.
     pub fn resolve_asr(&self) -> crate::transcriber::AsrConfig {
-        use crate::transcriber::{AsrBackend, AsrConfig, CohereQuant, MoonshineSize};
-
-        // Existing backend settings are deliberately ignored: this is now a
-        // fixed Cohere MLX appliance. Keep decoding old fields for migration.
-        let backend = AsrBackend::Cohere;
-
-        let cohere_quant = std::env::var("DICTATE_COHERE_QUANT")
-            .ok()
-            .and_then(|v| CohereQuant::parse(&v))
-            .or_else(|| self.cohere_quant.as_deref().and_then(CohereQuant::parse))
-            .unwrap_or_default();
+        use crate::transcriber::AsrConfig;
 
         let cohere_language = std::env::var("DICTATE_COHERE_LANG")
             .ok()
@@ -254,41 +227,11 @@ impl Settings {
             })
             .unwrap_or_else(|| "en".to_string());
 
-        let moonshine_size = std::env::var("DICTATE_MOONSHINE_VARIANT")
-            .ok()
-            .and_then(|v| MoonshineSize::parse(&v))
-            .or_else(|| {
-                self.moonshine_variant
-                    .as_deref()
-                    .and_then(MoonshineSize::parse)
-            })
-            .unwrap_or_default();
-
-        let parakeet_dir = std::env::var("PARAKEET_MODEL_DIR")
-            .unwrap_or_else(|_| crate::app_paths::parakeet_default_dir());
-
-        let cohere_dir = std::env::var("DICTATE_COHERE_MODEL_DIR")
-            .unwrap_or_else(|_| crate::app_paths::cohere_default_dir(cohere_quant.as_str()));
-
-        let moonshine_dir = std::env::var("DICTATE_MOONSHINE_MODEL_DIR")
-            .unwrap_or_else(|_| crate::app_paths::moonshine_default_dir(moonshine_size.as_str()));
-
-        let whisper_model_path = std::env::var("DICTATE_WHISPER_MODEL_PATH")
-            .unwrap_or_else(|_| crate::app_paths::whisper_default_path());
-
         AsrConfig {
-            backend,
             helper_path: crate::app_paths::cohere_mlx_helper_path(),
             model_dir: crate::app_paths::cohere_mlx_default_dir(),
-            language: cohere_language.clone(),
+            language: cohere_language,
             max_tokens: 256,
-            parakeet_dir,
-            cohere_dir,
-            cohere_quant,
-            cohere_language,
-            moonshine_dir,
-            moonshine_size,
-            whisper_model_path,
         }
     }
 
@@ -889,8 +832,7 @@ mod tests {
         s.cleanup_enabled = Some(false);
         s.active_format = Some("bullets".into());
         s.preroll_ms = Some(400);
-        s.asr_backend = Some("cohere".into());
-        s.moonshine_variant = Some("tiny".into());
+        s.cohere_language = Some("de".into());
         s.save_to(&path).unwrap();
 
         let loaded = Settings::load_from(&path);
@@ -898,8 +840,37 @@ mod tests {
         assert_eq!(loaded.cleanup_enabled, Some(false));
         assert_eq!(loaded.active_format, Some("bullets".into()));
         assert_eq!(loaded.preroll_ms, Some(400));
-        assert_eq!(loaded.asr_backend, Some("cohere".into()));
-        assert_eq!(loaded.moonshine_variant, Some("tiny".into()));
+        assert_eq!(loaded.cohere_language, Some("de".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_settings_keys_still_deserialize() {
+        // An old settings file carries the removed multi-backend keys. serde
+        // must drop them silently (the struct has no deny_unknown_fields)
+        // while keeping the surviving live field(s).
+        let dir = std::env::temp_dir().join(format!("fd-settings-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "gemma_model": "/tmp/legacy.gguf",
+                "cohere_language": "ja",
+                "asr_backend": "cohere",
+                "cohere_quant": "int4",
+                "moonshine_variant": "tiny"
+            }"#,
+        )
+        .unwrap();
+
+        let mut expected = Settings::default();
+        expected.gemma_model = Some("/tmp/legacy.gguf".into());
+        expected.cohere_language = Some("ja".into());
+        // Legacy-only keys are dropped (not preserved as noise); live fields
+        // survive. Equality against `expected` proves this.
+        assert_eq!(Settings::load_from(&path), expected);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -993,41 +964,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cohere_quant_and_language() {
-        if std::env::var_os("DICTATE_COHERE_QUANT").is_none()
-            && std::env::var_os("DICTATE_COHERE_LANG").is_none()
-        {
+    fn resolve_cohere_language_defaults_and_from_settings() {
+        if std::env::var_os("DICTATE_COHERE_LANG").is_none() {
             let s = Settings::default();
-            let cfg = s.resolve_asr();
-            assert_eq!(cfg.cohere_quant, crate::transcriber::CohereQuant::Int4);
-            assert_eq!(cfg.cohere_language, "en");
-        }
-    }
+            assert_eq!(s.resolve_asr().language, "en");
 
-    #[test]
-    fn resolve_moonshine_size_and_dir() {
-        if std::env::var_os("DICTATE_MOONSHINE_VARIANT").is_none()
-            && std::env::var_os("DICTATE_MOONSHINE_MODEL_DIR").is_none()
-            && std::env::var_os("DICTATE_ASR_BACKEND").is_none()
-        {
-            // Default: Base.
-            let s = Settings::default();
-            let cfg = s.resolve_asr();
-            assert_eq!(cfg.moonshine_size, crate::transcriber::MoonshineSize::Base);
-            assert!(cfg.moonshine_dir.ends_with("moonshine-base"));
-
-            // Settings-driven Tiny.
-            let mut s = Settings::default();
-            s.moonshine_variant = Some("tiny".into());
-            let cfg = s.resolve_asr();
-            assert_eq!(cfg.moonshine_size, crate::transcriber::MoonshineSize::Tiny);
-            assert!(cfg.moonshine_dir.ends_with("moonshine-tiny"));
-
-            // Unknown size falls back to Base.
-            let mut s = Settings::default();
-            s.moonshine_variant = Some("medium".into());
-            let cfg = s.resolve_asr();
-            assert_eq!(cfg.moonshine_size, crate::transcriber::MoonshineSize::Base);
+            let mut s2 = Settings::default();
+            s2.cohere_language = Some("de".into());
+            assert_eq!(s2.resolve_asr().language, "de");
         }
     }
 }

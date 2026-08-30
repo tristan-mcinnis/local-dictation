@@ -799,7 +799,7 @@ mod imp {
 }
 
 /// Pre-captured focus target — owned, Send across threads. Created at
-/// key-release time and used at inject time after Parakeet+Gemma finish.
+/// key-release time and used at inject time after Cohere+S1-mini finish.
 /// Holds a retained AXUIElement and the surrounding caret context.
 ///
 /// Why this exists: `get_focused_element` is the dominant cost in the

@@ -168,7 +168,7 @@ fn refine_for_cli(cleaned: &str) -> String {
     refined.text
 }
 
-/// Download the default models (Parakeet TDT v3 + Qwen 2.5 1.5B) into a target
+/// Download the default models (Cohere Q4 + S1-mini) into a target dir
 /// dir — the same fetch the slim shipped app runs on first launch. With no
 /// argument it uses the writable Application Support models dir (where the app
 /// resolves them); pass an explicit dir to fetch elsewhere. Idempotent.
@@ -528,7 +528,7 @@ async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
 #[cfg(not(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject")))]
 async fn run_listen(_no_cleanup: bool) -> eyre::Result<()> {
     Err(eyre::eyre!(
-        "`listen` requires --features full (parakeet + cleaner + ax-inject) on macOS"
+        "`listen` requires --features full (cohere-mlx + cleaner + ax-inject) on macOS"
     ))
 }
 
@@ -561,7 +561,7 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
 #[cfg(not(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject")))]
 async fn run_daemon(_no_cleanup: bool) -> eyre::Result<()> {
     Err(eyre::eyre!(
-        "`daemon` requires --features full (parakeet + cleaner + ax-inject) on macOS"
+        "`daemon` requires --features full (cohere-mlx + cleaner + ax-inject) on macOS"
     ))
 }
 

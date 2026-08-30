@@ -77,26 +77,6 @@ pub fn models_base_dir() -> PathBuf {
     PathBuf::from("models")
 }
 
-/// Default Parakeet ASR model directory (`<base>/dictation/parakeet-tdt-v3-int8`).
-pub fn parakeet_default_dir() -> String {
-    models_base_dir()
-        .join("dictation/parakeet-tdt-v3-int8")
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Default Cohere ASR model directory for a given quantization
-/// (`<base>/dictation/cohere-<quant>`, e.g. `…/cohere-int4`). Populated by
-/// `./scripts/download-models.sh --cohere <quant>`; overridable with
-/// `DICTATE_COHERE_MODEL_DIR`. Cohere is opt-in, so this dir may not exist
-/// unless the user has selected the backend and fetched the weights.
-pub fn cohere_default_dir(quant: &str) -> String {
-    models_base_dir()
-        .join(format!("dictation/cohere-{quant}"))
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// Fixed Cohere Q4 checkpoint converted for the public MLX Swift runtime.
 /// Canonicalized: the model dir may be a symlink into ~/Models (the canonical
 /// model home), and the native MLX bridge fails to load a symlinked model dir
@@ -124,31 +104,6 @@ pub fn cohere_mlx_helper_path() -> String {
             .into_owned();
     }
     PathBuf::from("native/cohere-mlx/.build/xcode/Build/Products/Release/cohere-mlx-bridge")
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Default Moonshine ASR model directory for a given size
-/// (`<base>/dictation/moonshine-<size>`, e.g. `…/moonshine-base`). Populated
-/// by `./scripts/download-models.sh --moonshine <size>`; overridable with
-/// `DICTATE_MOONSHINE_MODEL_DIR`. Moonshine is opt-in, so this dir may not
-/// exist unless the user has selected the backend and fetched the weights.
-pub fn moonshine_default_dir(size: &str) -> String {
-    models_base_dir()
-        .join(format!("dictation/moonshine-{size}"))
-        .to_string_lossy()
-        .into_owned()
-}
-
-/// Default Whisper ASR model file
-/// (`<base>/dictation/whisper/ggml-large-v3-turbo-q5_0.bin`). Populated by
-/// `./scripts/download-models.sh --whisper`; overridable with
-/// `DICTATE_WHISPER_MODEL_PATH`. Whisper is opt-in (and mutually exclusive with
-/// the `cleaner` feature at build time), so this file may not exist unless the
-/// user has fetched it.
-pub fn whisper_default_path() -> String {
-    models_base_dir()
-        .join("dictation/whisper/ggml-large-v3-turbo-q5_0.bin")
         .to_string_lossy()
         .into_owned()
 }

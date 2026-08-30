@@ -3,114 +3,28 @@
 use crate::audio::{drain_until_stopped, HeapAudioConsumer, SAMPLE_RATE};
 use std::sync::{atomic::AtomicBool, Arc};
 
-/// Legacy settings values kept only so an existing settings file/UI can migrate
-/// without breaking. Runtime transcription is always Cohere MLX.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AsrBackend {
-    Parakeet,
-    #[default]
-    Cohere,
-    Moonshine,
-    Whisper,
-}
-
-impl AsrBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Parakeet => "parakeet",
-            Self::Cohere => "cohere",
-            Self::Moonshine => "moonshine",
-            Self::Whisper => "whisper",
-        }
-    }
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "parakeet" => Some(Self::Parakeet),
-            "cohere" => Some(Self::Cohere),
-            "moonshine" => Some(Self::Moonshine),
-            "whisper" => Some(Self::Whisper),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CohereQuant {
-    #[default]
-    Int4,
-    Int8,
-}
-impl CohereQuant {
-    pub fn as_str(self) -> &'static str {
-        if self == Self::Int4 {
-            "int4"
-        } else {
-            "int8"
-        }
-    }
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "int4" | "4" => Some(Self::Int4),
-            "int8" | "8" => Some(Self::Int8),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MoonshineSize {
-    Tiny,
-    #[default]
-    Base,
-}
-impl MoonshineSize {
-    pub fn as_str(self) -> &'static str {
-        if self == Self::Tiny {
-            "tiny"
-        } else {
-            "base"
-        }
-    }
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "tiny" => Some(Self::Tiny),
-            "base" => Some(Self::Base),
-            _ => None,
-        }
-    }
-}
-
+/// The fixed Cohere MLX ASR configuration. This is the only runtime ASR
+/// selection; the old Parakeet/Moonshine/Whisper backends and the Cohere
+/// quant-choice plumbing were removed with the migration shims.
 #[derive(Debug, Clone)]
 pub struct AsrConfig {
-    pub backend: AsrBackend,
+    /// Native MLX helper binary path.
     pub helper_path: String,
+    /// Fixed Cohere Q4 checkpoint directory.
     pub model_dir: String,
+    /// Decoder language hint (e.g. `"en"`). Override: `DICTATE_COHERE_LANG`.
     pub language: String,
+    /// Max tokens the decoder emits per utterance.
     pub max_tokens: usize,
-    pub parakeet_dir: String,
-    pub cohere_dir: String,
-    pub cohere_quant: CohereQuant,
-    pub cohere_language: String,
-    pub moonshine_dir: String,
-    pub moonshine_size: MoonshineSize,
-    pub whisper_model_path: String,
 }
 
 impl Default for AsrConfig {
     fn default() -> Self {
         Self {
-            backend: AsrBackend::Cohere,
             helper_path: crate::app_paths::cohere_mlx_helper_path(),
             model_dir: crate::app_paths::cohere_mlx_default_dir(),
             language: "en".into(),
             max_tokens: 256,
-            parakeet_dir: String::new(),
-            cohere_dir: crate::app_paths::cohere_mlx_default_dir(),
-            cohere_quant: CohereQuant::Int4,
-            cohere_language: "en".into(),
-            moonshine_dir: String::new(),
-            moonshine_size: MoonshineSize::Base,
-            whisper_model_path: String::new(),
         }
     }
 }

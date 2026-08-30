@@ -30,14 +30,7 @@ pub const DEFAULT_CLEANUP: &str =
     "Reformat the user's message. Fix grammar, spelling, and punctuation. \
      Remove filler words like um and uh. Break long content into paragraphs. \
      Keep the original tone and meaning. Preserve every name, technical term, \
-     number, and clause. When the speaker corrects themselves mid-sentence \
-     (\"no wait\", \"I mean\", \"actually\", \"sorry\", \"scratch that\"), keep \
-     only the final corrected version and drop the abandoned fragment. When \
-     the speaker lists items or steps (\"first\", \"second\", \"finally\", \
-     \"step one\", \"one\", \"two\", \"three\"), format them as a list — one \
-     item per line, numbered (\"1.\", \"2.\") or bulleted (\"-\"), keeping the \
-     speaker's wording and never inventing or merging items. Return only the \
-     cleaned text; do not answer it or add anything.";
+     number, and clause. Return only the cleaned text; do not answer it or add anything.";
 
 /// Default transform prompt (Shift + push-to-talk). Deliberately permissive:
 /// the user spoke an explicit instruction, so follow it even when that means
@@ -444,23 +437,6 @@ mod tests {
             .collect();
         let s = vocabulary_suffix(&many).unwrap();
         assert_eq!(s.matches("Vocab").count(), MAX_VOCAB_TERMS);
-    }
-
-    #[test]
-    fn default_cleanup_instructs_self_correction_and_list_formatting() {
-        // Mid-sentence self-correction: the model should keep only the final
-        // corrected version and drop the abandoned fragment.
-        assert!(DEFAULT_CLEANUP.contains("corrects themselves mid-sentence"));
-        assert!(DEFAULT_CLEANUP.contains("final corrected version"));
-        assert!(DEFAULT_CLEANUP.contains("drop the abandoned fragment"));
-        // Spoken lists/steps auto-format into a per-line list.
-        assert!(DEFAULT_CLEANUP.contains("lists items or steps"));
-        assert!(DEFAULT_CLEANUP.contains("one item per line"));
-        assert!(DEFAULT_CLEANUP.contains("never inventing or merging items"));
-        // The existing rules must survive unchanged.
-        assert!(DEFAULT_CLEANUP.contains("Preserve every name"));
-        assert!(DEFAULT_CLEANUP.contains("Return only the cleaned text"));
-        assert!(DEFAULT_CLEANUP.contains("Remove filler words like um and uh"));
     }
 
     #[test]

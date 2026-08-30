@@ -28,7 +28,6 @@ use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSSt
 
 use crate::menubar;
 use crate::settings::{self, Settings};
-use crate::transcriber::AsrBackend;
 
 use std::sync::{Mutex, OnceLock};
 
@@ -59,10 +58,7 @@ struct SettingsUi {
     preroll_switch: Retained<NSSwitch>,
     format_popup: Retained<NSPopUpButton>,
     // Speech
-    backend_popup: Retained<NSPopUpButton>,
-    cohere_quant_popup: Retained<NSPopUpButton>,
     cohere_lang_popup: Retained<NSPopUpButton>,
-    moonshine_popup: Retained<NSPopUpButton>,
     model_popup: Retained<NSPopUpButton>,
     // Advanced
     streaming_switch: Retained<NSSwitch>,
@@ -109,9 +105,8 @@ define_class!(
 // ─── Action target for every control in the window ───────────────────────
 //
 // One NSObject subclass receives every control's action. Each method reads the
-// sender, updates `pending` (no restart), and — for the backend picker —
-// refreshes the dependent Cohere/Moonshine field enablement. `applyAndRestart:`
-// flushes. The file/log buttons call straight through to the menubar helpers.
+// sender and updates `pending` (no restart). `applyAndRestart:` flushes. The
+// file/log buttons call straight through to the menubar helpers.
 define_class!(
     #[unsafe(super(NSObject))]
     #[name = "FDSettingsController"]
@@ -151,31 +146,10 @@ define_class!(
             });
         }
 
-        #[unsafe(method(changeBackend:))]
-        fn change_backend(&self, sender: *mut AnyObject) {
-            let name = popup_selected_rep(sender);
-            with_pending(|p| p.asr_backend = if name.is_empty() { None } else { Some(name) });
-            if let Some(ui) = SETTINGS_UI.get() {
-                refresh_backend_dependents(ui);
-            }
-        }
-
-        #[unsafe(method(changeCohereQuant:))]
-        fn change_cohere_quant(&self, sender: *mut AnyObject) {
-            let v = popup_selected_rep(sender);
-            with_pending(|p| p.cohere_quant = if v.is_empty() { None } else { Some(v) });
-        }
-
         #[unsafe(method(changeCohereLang:))]
         fn change_cohere_lang(&self, sender: *mut AnyObject) {
             let v = popup_selected_rep(sender);
             with_pending(|p| p.cohere_language = if v.is_empty() { None } else { Some(v) });
-        }
-
-        #[unsafe(method(changeMoonshine:))]
-        fn change_moonshine(&self, sender: *mut AnyObject) {
-            let v = popup_selected_rep(sender);
-            with_pending(|p| p.moonshine_variant = if v.is_empty() { None } else { Some(v) });
         }
 
         #[unsafe(method(changeModel:))]
@@ -585,33 +559,15 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     y = section(mtm, &container, y, "Speech engine");
 
-    // ASR backend
-    let backend_popup = popup(mtm, &container, y, "Speech engine");
-    let backend_locked = std::env::var_os("DICTATE_ASR_BACKEND").is_some();
-    for (backend, label_str) in [(AsrBackend::Cohere, "Cohere Transcribe — native MLX")] {
-        popup_add_item(&backend_popup, label_str, None, Some(backend.as_str()));
-    }
+    // The speech engine is fixed to Cohere Transcribe via the native MLX helper
+    // (Q4 checkpoint); the only live ASR setting is the decoder language.
     let resolved_asr = loaded.resolve_asr();
-    select_popup_rep(&backend_popup, resolved_asr.backend.as_str());
-    wire_popup(&backend_popup, &controller, sel!(changeBackend:), true);
-    y += ROW_H;
-    if backend_locked {
-        y = env_hint(mtm, &container, y, "DICTATE_ASR_BACKEND");
-    }
-
-    // Cohere quant
-    let cohere_quant_popup = popup(mtm, &container, y, "Cohere quality");
-    for (v, l) in [("int4", "Q4 — fixed personal checkpoint")] {
-        popup_add_item(&cohere_quant_popup, l, None, Some(v));
-    }
-    select_popup_rep(&cohere_quant_popup, resolved_asr.cohere_quant.as_str());
-    wire_popup(
-        &cohere_quant_popup,
-        &controller,
-        sel!(changeCohereQuant:),
-        true,
+    y = hint_line(
+        mtm,
+        &container,
+        y,
+        "Fixed engine: Cohere Transcribe — native MLX (Q4)",
     );
-    y += ROW_H;
 
     // Cohere language
     let cohere_lang_popup = popup(mtm, &container, y, "Cohere language");
@@ -635,23 +591,13 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     for (code, l) in LANGS {
         popup_add_item(&cohere_lang_popup, l, None, Some(code));
     }
-    select_popup_rep(&cohere_lang_popup, &resolved_asr.cohere_language);
+    select_popup_rep(&cohere_lang_popup, &resolved_asr.language);
     wire_popup(
         &cohere_lang_popup,
         &controller,
         sel!(changeCohereLang:),
         std::env::var_os("DICTATE_COHERE_LANG").is_some(),
     );
-    y += ROW_H;
-
-    // Native runtime is fixed; retain the control object only to keep the
-    // settings window's stable ownership layout.
-    let moonshine_popup = popup(mtm, &container, y, "Inference runtime");
-    for (v, l) in [("base", "MLX helper — persistent and warmed")] {
-        popup_add_item(&moonshine_popup, l, None, Some(v));
-    }
-    select_popup_rep(&moonshine_popup, resolved_asr.moonshine_size.as_str());
-    wire_popup(&moonshine_popup, &controller, sel!(changeMoonshine:), true);
     y += ROW_H;
 
     // Cleanup model
@@ -845,10 +791,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         cleanup_switch,
         preroll_switch,
         format_popup,
-        backend_popup,
-        cohere_quant_popup,
         cohere_lang_popup,
-        moonshine_popup,
         model_popup,
         streaming_switch,
         tail_capture_switch,
@@ -864,7 +807,6 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         original: loaded,
         _controller: controller,
     };
-    refresh_backend_dependents(&ui);
     ui
 }
 
@@ -1242,27 +1184,6 @@ fn with_pending<F: FnOnce(&mut Settings)>(f: F) {
         let mut p = ui.pending.lock().unwrap();
         f(&mut p);
     }
-}
-
-/// Enable Cohere-only / Moonshine-only fields based on the *pending* backend
-/// (so toggling the engine in the window live-enables its dependents), while
-/// still respecting per-field env locks.
-fn refresh_backend_dependents(ui: &SettingsUi) {
-    let backend = {
-        let p = ui.pending.lock().unwrap();
-        p.asr_backend
-            .as_deref()
-            .and_then(AsrBackend::parse)
-            .unwrap_or_default()
-    };
-    let cohere = backend == AsrBackend::Cohere;
-    let moonshine = backend == AsrBackend::Moonshine;
-    ui.cohere_quant_popup
-        .setEnabled(cohere && std::env::var_os("DICTATE_COHERE_QUANT").is_none());
-    ui.cohere_lang_popup
-        .setEnabled(cohere && std::env::var_os("DICTATE_COHERE_LANG").is_none());
-    ui.moonshine_popup
-        .setEnabled(moonshine && std::env::var_os("DICTATE_MOONSHINE_VARIANT").is_none());
 }
 
 fn apply_and_restart(ui: &SettingsUi) {
