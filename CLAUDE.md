@@ -210,6 +210,8 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
   → injector.rs (AX direct, or clipboard paste for Electron) + trailing-action keystroke
 ```
 
+**Focus capture at key-press** (default on): the focused UI element + caret context (`kAXValue` + `kAXSelectedTextRange`) are resolved on a background thread when recording *starts*, so the AX wake / cross-process cost is paid while the user is speaking rather than after the pipelines finish. At release the daemon joins that result and injects via `inject_with_target`, skipping the resolve-now path. If the press-time capture failed, or the frontmost app changed by inject time, it re-resolves fresh at release (correctness over speed); a very short hold just blocks on the join (same cost as a release-time spawn). The clipboard fallback's snapshot restore runs on a *detached* thread after the Cmd+V settle, so a slow restore can't pin the next dictation.
+
 **Release tail-capture** (default on, open-on-press only): on key release the daemon used to drop
 the mic immediately, clipping a word still being spoken. Instead it now enters a short grace loop
 (polling the live level every ~40 ms) that keeps the engine open and stops once the level has stayed
@@ -313,6 +315,7 @@ stack:
 | `DICTATE_TAIL_CAPTURE` | Release tail-capture: keep the mic open briefly after release so the last word isn't clipped (default on; `0`/`false`/`off` disables). Off while pre-roll is active |
 | `DICTATE_TAIL_CAPTURE_CAP_MS` | Hard cap on the tail-capture grace loop (default 1500) |
 | `DICTATE_WARM_WINDOW_MS` | After a press-to-open recording stops, keep the mic open this long for a cheap back-to-back reuse (default 60000; 0 = open fresh each time). No-op while pre-roll is active |
+| `DICTATE_PASTE_SETTLE_MS` | Override the clipboard-paste settle (ms) that waits for the target app to consume the Cmd+V before the background clipboard restore. Default is length-scaled (280 ms base +1 ms/3 chars, capped 1000); `0` disables the wait for the lowest latency |
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_NO_MUTE` | Do not duck other audio during capture |

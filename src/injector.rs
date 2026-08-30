@@ -197,6 +197,31 @@ pub fn reset_inject_state() {
     }
 }
 
+/// The PID of the OS-frontmost application, or `None` when it can't be read
+/// (no frontmost app, or the AppKit read failed). Best-effort; used to detect
+/// whether the focused app changed between key-press and inject time.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn frontmost_pid() -> Option<i32> {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|app| app.processIdentifier())
+}
+
+/// True when a press-time [`FocusTarget`] still points at the OS-frontmost app
+/// at release time. Trust the retained element when AX didn't disclose its PID
+/// (nothing to verify), when the current frontmost PID can't be read, or when
+/// the two match. A mismatch means the user switched apps during the hold —
+/// writing into the retained element would land in a background app, so the
+/// caller must re-resolve fresh.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn focus_target_still_current(t: &FocusTarget) -> bool {
+    match t.inner_pid() {
+        Some(target_pid) => frontmost_pid().is_none_or(|cur| cur == target_pid),
+        None => true,
+    }
+}
+
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 mod imp {
     use super::*;
@@ -205,7 +230,8 @@ mod imp {
         kAXSelectedTextRangeAttribute, kAXTrustedCheckOptionPrompt, kAXValueAttribute,
         kAXValueTypeCFRange, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
         AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
-        AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
+        AXUIElementSetMessagingTimeout, AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue,
+        AXValueRef,
     };
     use core_foundation::base::{CFRange, CFTypeRef, TCFType};
     use core_foundation::boolean::CFBoolean;
@@ -214,6 +240,21 @@ mod imp {
     use libc::pid_t;
     use std::ffi::c_void;
     use std::ptr;
+
+    /// Bound AX messaging so a hung target app can't freeze the daemon. Without
+    /// a timeout an AX API call to an unresponsive app blocks indefinitely;
+    /// with a bound it returns after ~[`AX_MESSAGING_TIMEOUT_SECS`] and the
+    /// inject ladder demotes to the clipboard-paste fallback (see
+    /// `write_padded`), exactly as it does for any other non-success error.
+    const AX_MESSAGING_TIMEOUT_SECS: f32 = 1.5;
+
+    /// Best-effort: set the AX messaging timeout on an element so a slow or hung
+    /// target app can't pin the daemon on an AX call. Ignores the AXError — if
+    /// the OS declines the bound we just fall back to the unbounded default for
+    /// that element.
+    unsafe fn bound_messaging_timeout(el: AXUIElementRef) {
+        let _ = AXUIElementSetMessagingTimeout(el, AX_MESSAGING_TIMEOUT_SECS);
+    }
 
     pub fn ensure_trusted_or_prompt() -> bool {
         unsafe {
@@ -235,6 +276,7 @@ mod imp {
             if root.is_null() {
                 return Err(eyre::eyre!("AXUIElementCreateSystemWide returned null"));
             }
+            bound_messaging_timeout(root);
             let result = inject_through(root, text);
             cf_release(root as CFTypeRef);
             result
@@ -252,6 +294,7 @@ mod imp {
                     "AXUIElementCreateApplication({pid}) returned null"
                 ));
             }
+            bound_messaging_timeout(app);
             let result = inject_through(app, text);
             cf_release(app as CFTypeRef);
             result
@@ -292,6 +335,7 @@ mod imp {
             return r;
         }
         let focused = focused_ref as AXUIElementRef;
+        bound_messaging_timeout(focused);
 
         // 2. Context (with the ax-blind shortcut), then tail fallback when the
         //    element doesn't expose AXValue (Electron / web views / some Java).
@@ -668,6 +712,7 @@ mod imp {
             if root.is_null() {
                 return Err(eyre::eyre!("AXUIElementCreateSystemWide returned null"));
             }
+            bound_messaging_timeout(root);
             let mut focused_ref: CFTypeRef = ptr::null();
             let focused_attr = CFString::new(kAXFocusedUIElementAttribute);
             let err = AXUIElementCopyAttributeValue(
@@ -682,6 +727,7 @@ mod imp {
                 ));
             }
             let focused = focused_ref as AXUIElementRef;
+            bound_messaging_timeout(focused);
 
             // Read context immediately while we have the element handy. In
             // AX-blind apps this returns (None, None, None) quickly.

@@ -545,6 +545,14 @@ fn worker_loop(
     // Whether the in-flight utterance is a transform instruction (Shift held).
     let mut transform_mode = false;
 
+    // Focus capture at key-press. The currently-focused UI element + caret
+    // context are resolved on a background thread when recording starts, so the
+    // AX wake / cross-process cost is paid while the user is speaking. At
+    // release we join this receiver (usually instant) and reuse the target; a
+    // failed or stale press-time capture re-resolves fresh. `None` means no
+    // capture is in flight (between utterances / after a cancel).
+    let mut pending_target: Option<std::sync::mpsc::Receiver<eyre::Result<FocusTarget>>> = None;
+
     // ── Capture mode (release tail-capture + warm-window reuse) ──────────
     // Tail capture: on key release, keep the mic open for a brief adaptive grace
     // loop (draining new audio into the streaming path) so the last word of an
@@ -690,6 +698,7 @@ fn worker_loop(
                 let _unmute = crate::audio_duck::RestoreOnDrop;
                 transform_mode = false;
                 t_press.take();
+                pending_target = None; // discard the orphaned press-time capture
                 if let Some(e) = on_demand_engine.as_mut() {
                     if warm_window_ms > 0 && preroll_ms == 0 {
                         // Warm-window cancel: park the mic for reuse, but first
@@ -778,6 +787,7 @@ fn worker_loop(
                                 stream_poisoned = false;
                             }
                             ui_channel::clear_live_transcript();
+                            pending_target = Some(spawn_focus_capture());
                             continue;
                         }
                     } else {
@@ -828,6 +838,7 @@ fn worker_loop(
                         eprintln!("▶ recording · pre-roll");
                         session_active = true;
                         crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+                        pending_target = Some(spawn_focus_capture());
                     }
                     continue;
                 }
@@ -846,6 +857,8 @@ fn worker_loop(
                     transform,
                 ) {
                     cues::play_error();
+                } else {
+                    pending_target = Some(spawn_focus_capture());
                 }
             }
             DaemonEvent::StopRecording => {
@@ -953,6 +966,7 @@ fn worker_loop(
                             transform,
                         ) {
                             eprintln!("  ↻    re-press during tail-capture · started fresh");
+                            pending_target = Some(spawn_focus_capture());
                         } else {
                             cues::play_error();
                         }
@@ -1009,16 +1023,11 @@ fn worker_loop(
                 let held = press_to_release.unwrap_or_default();
                 eprintln!("⏹ stopped · held {}", secs(held));
 
-                // Spawn AX focus capture in parallel with the inference
-                // pipeline. By the time Parakeet+Gemma finish, the focused
-                // element is already known — get_focused_element drops off
-                // the critical path.
-                let (target_tx, target_rx) =
-                    std::sync::mpsc::channel::<eyre::Result<FocusTarget>>();
-                std::thread::spawn(move || {
-                    let _ = target_tx.send(FocusTarget::capture());
-                });
-
+                // Focus capturing now starts at key-press (StartRecording), not
+                // at release — see `spawn_focus_capture`. The AX wake /
+                // cross-process cost is paid while the user is speaking, so by
+                // the time the pipelines here finish the focused element is
+                // already known. At release we simply join it (below).
                 let t_pipeline = Instant::now();
                 // Streaming ASR now performs NO per-segment cleanup — the cleanup
                 // model runs once on the joined transcript at release. So there's
@@ -1172,18 +1181,35 @@ fn worker_loop(
                     continue;
                 }
 
-                // Receive the focus target now (capture ran in parallel with
-                // inference and is almost always ready by here). We need the
-                // target app *before* cleanup so we can skip Gemma when the
-                // destination is a terminal — and we reuse this same captured
-                // target for injection, keeping get_focused_element off the
+                // Receive the focus target captured at key-press. It ran for
+                // the whole hold, so it's almost always ready by here — the join
+                // is a no-op. A very short hold just blocks on the join; the
+                // cost is the same as the old release-time spawn, and usually
+                // strictly less because the AX wake happened during speech, not
+                // after. We need the target app *before* cleanup so we can skip
+                // Gemma when the destination is a terminal — and we reuse this
+                // same target for injection, keeping get_focused_element off the
                 // critical path.
-                let captured_target: Option<FocusTarget> = match target_rx.try_recv() {
-                    Ok(Ok(t)) => Some(t),
-                    Ok(Err(_)) => None,
-                    Err(_) => target_rx.recv().ok().and_then(|r| r.ok()),
+                let press_target: Option<FocusTarget> = match pending_target.take() {
+                    Some(rx) => rx.recv().ok().and_then(|r| r.ok()),
+                    None => None,
                 };
+                // Stale-target fallback: if the press-time capture failed, or
+                // the frontmost app changed since the key was pressed (a long
+                // hold or hands-free can out-last the user's focus), the retained
+                // element belongs to a background app and writing to it would be
+                // wrong. Trust it when AX didn't disclose a PID (nothing to
+                // verify) or when the OS-frontmost app still matches. Otherwise
+                // re-resolve fresh at inject exactly as the pre-press-capture
+                // code did — correctness over speed.
+                let captured_target: Option<FocusTarget> = press_target
+                    .filter(crate::injector::focus_target_still_current);
                 let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
+                if captured_target.is_some() {
+                    eprintln!("  ⌖    reuse press-time focus target");
+                } else {
+                    eprintln!("  ⌖    fresh focus capture (press target failed/stale)");
+                }
 
                 // ─── Spoken prefix command (e.g. "translate to Chinese …") ──
                 // A recognised lead-in at the START of the utterance turns the
@@ -1589,6 +1615,20 @@ fn stream_process_asr(
         }
     }
     last_seg_ms
+}
+
+/// Spawn a background thread that resolves the currently-focused UI element +
+/// caret context and returns a receiver for its result. Called at key-PRESS so
+/// the AX wake / cross-process cost is paid while the user is speaking, and the
+/// result is joined (usually instantly) at release. A very short hold simply
+/// blocks on the join — the same cost the old release-time spawn paid, and
+/// usually strictly less because the resolve happened during speech, not after.
+fn spawn_focus_capture() -> std::sync::mpsc::Receiver<eyre::Result<FocusTarget>> {
+    let (tx, rx) = std::sync::mpsc::channel::<eyre::Result<FocusTarget>>();
+    std::thread::spawn(move || {
+        let _ = tx.send(FocusTarget::capture());
+    });
+    rx
 }
 
 /// Start a fresh open-on-press recording: build a new engine, open the mic,
