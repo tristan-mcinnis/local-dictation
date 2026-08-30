@@ -250,7 +250,7 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 `corrections.rs`, `history.rs`, `dictionary.rs`, the menu bar) shares the same location rather than
 re-joining the path:
 - `settings.json` (`settings.rs`) — written by the menu bar. Keys: `gemma_model`, `hotkey_keycode`,
-  `cleanup_enabled`, `active_format`, `streaming_cleanup`, `preroll_ms`, `listen_mode`, `wake_word`.
+  `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`, `listen_mode`, `wake_word`.
   The `asr_backend` / `cohere_quant` / `cohere_language` / `moonshine_variant` keys still exist but
   are **ignored** — kept only so an old file doesn't fail to parse. (`gemma_model` holds whatever
   cleanup model is selected; the name is historical.)
@@ -286,7 +286,7 @@ stack:
 | `S1_MODEL_PATH` | S1-mini GGUF path (also `GEMMA_MODEL_PATH`, a compat alias) |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `0x3D` Right Option; decimal or `0x` hex) |
 | `DICTATE_FORMAT` | Active output-format preset |
-| `DICTATE_STREAMING_CLEANUP=1` | Clean each sentence at VAD pauses during the hold (experimental, default off) |
+| `DICTATE_STREAMING_ASR` | Incremental streaming ASR: transcribe each VAD-paused sentence during the hold for a live preview (default on; `0`/`false`/`off` disables). Whole-utterance cleanup still runs at release. Off while pre-roll is active |
 | `DICTATE_PREROLL_MS` | Always-on mic lookback ms (default 0 = off; e.g. 400) |
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |

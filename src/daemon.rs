@@ -530,59 +530,53 @@ fn worker_loop(
     // Whether the in-flight utterance is a transform instruction (Shift held).
     let mut transform_mode = false;
 
-    // EXPERIMENTAL streaming cleanup (off unless the setting/env enables it AND
-    // the cleaner is loaded). When on, sentences are transcribed + cleaned at VAD
-    // pauses *during* the hold, so only the final segment is outstanding at
-    // release. The flag-off path below is byte-identical to before.
-    // Streaming cleanup and always-on pre-roll are mutually exclusive for now
-    // (both are experimental and drain the capture ring differently). Pre-roll
-    // wins when both are set — keep the always-on path on the simple
-    // whole-buffer transcribe.
-    #[cfg(feature = "cleaner")]
-    let streaming = cleaner.is_some()
-        && always.is_none()
-        && crate::settings::Settings::load().resolve_streaming_cleanup();
-    #[cfg(not(feature = "cleaner"))]
-    let streaming = false;
-    if streaming {
-        eprintln!("[boot] streaming   cleanup ENABLED (experimental · VAD-segmented during hold)");
+    // Incremental streaming ASR (default ON): transcribe completed sentences at
+    // VAD pauses *during* the hold for a live preview, then reassemble the cached
+    // segments at release. No per-segment cleanup — whole-utterance cleanup still
+    // runs at release (accuracy). Streaming ASR and always-on pre-roll are
+    // mutually exclusive for now (they drain the capture ring differently);
+    // pre-roll wins and streaming falls back to the proven whole-buffer path.
+    let streaming_asr = crate::settings::Settings::load().resolve_streaming_asr();
+    if streaming_asr {
+        eprintln!("[boot] streaming   asr ENABLED (VAD-segmented transcribe during hold)");
     }
     // When an output-format preset (numbered/bullets/email/…) is active, every
     // dictation must go through the LLM to be reshaped — so the short-utterance
     // deterministic shortcut is disabled. Default cleanup has no such need.
     #[cfg(feature = "cleaner")]
     let format_active = crate::settings::Settings::load().resolve_format().is_some();
-    // Per-utterance streaming accumulators (only used when `streaming`).
-    #[cfg(feature = "cleaner")]
+    // Per-utterance streaming accumulators (only used when `streaming_asr`). These
+    // are the whole incremental-ASR state, independent of the cleaner feature:
+    // transcribe_pcm + SegmentStream + corrections need no LLM.
     let mut stream: Option<crate::vad::SegmentStream> = None;
-    #[cfg(feature = "cleaner")]
-    let mut stream_raw: Vec<String> = Vec::new();
-    #[cfg(feature = "cleaner")]
-    let mut stream_clean: Vec<String> = Vec::new();
+    // Cached corrected text of each completed segment (VAD-pause-bounded).
+    let mut stream_segs: Vec<String> = Vec::new();
+    // Backup of every drained sample, for the whole-buffer fallback on a poisoned
+    // stream / transform / empty result — never lose audio.
+    let mut stream_audio: Vec<f32> = Vec::new();
+    // True once any segment transcribe errored: stop segmenting and transcribe the
+    // full `stream_audio` buffer as one batch at release (today's behaviour).
+    let mut stream_poisoned = false;
 
     'evloop: loop {
-        // While recording in streaming mode, wake periodically to process any
-        // sentence that a VAD pause has just closed; otherwise block for the next
-        // event. recv_timeout keeps everything on this one thread, which already
-        // owns the Parakeet worker, the cleaner, and the runtime — no shared state.
+        // While recording with streaming ASR, wake periodically to transcribe any
+        // sentence a VAD pause has just closed; otherwise block for the next event.
+        // recv_timeout keeps everything on this one thread, which already owns the
+        // ASR worker — no shared state.
         let event = {
-            #[cfg(feature = "cleaner")]
-            if streaming && engine.is_some() {
+            if streaming_asr && engine.is_some() {
                 match rx.recv_timeout(std::time::Duration::from_millis(120)) {
                     Ok(ev) => ev,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        if let (Some(st), Some(c), Some(cl)) =
-                            (stream.as_mut(), consumer.as_mut(), cleaner.as_ref())
-                        {
-                            stream_process(
+                        if let (Some(st), Some(c)) = (stream.as_mut(), consumer.as_mut()) {
+                            stream_process_asr(
                                 &mut worker,
-                                cl,
                                 &refiner,
-                                &rt,
                                 st,
                                 c,
-                                &mut stream_raw,
-                                &mut stream_clean,
+                                &mut stream_segs,
+                                &mut stream_audio,
+                                &mut stream_poisoned,
                                 false,
                             );
                         }
@@ -595,11 +589,6 @@ fn worker_loop(
                     Ok(ev) => ev,
                     Err(_) => break,
                 }
-            }
-            #[cfg(not(feature = "cleaner"))]
-            match rx.recv() {
-                Ok(ev) => ev,
-                Err(_) => break,
             }
         };
         match event {
@@ -641,12 +630,11 @@ fn worker_loop(
                     consumer.take();
                     is_recording.take();
                 }
-                #[cfg(feature = "cleaner")]
-                {
-                    stream = None;
-                    stream_raw.clear();
-                    stream_clean.clear();
-                }
+                stream = None;
+                stream_segs.clear();
+                stream_audio.clear();
+                stream_poisoned = false;
+                ui_channel::clear_live_transcript();
                 cues::play_cancel();
                 ui_channel::set_state(UiState::Idle);
                 eprintln!("⌫ cancelled · discarded");
@@ -723,15 +711,16 @@ fn worker_loop(
                 engine = Some(e);
                 consumer = Some(c);
                 is_recording = Some(r);
-                #[cfg(feature = "cleaner")]
-                if streaming {
+                if streaming_asr {
                     stream = Some(crate::vad::SegmentStream::new(
                         crate::audio::SAMPLE_RATE,
                         crate::vad::VadConfig::default(),
                     ));
-                    stream_raw.clear();
-                    stream_clean.clear();
+                    stream_segs.clear();
+                    stream_audio.clear();
+                    stream_poisoned = false;
                 }
+                ui_channel::clear_live_transcript();
             }
             DaemonEvent::StopRecording => {
                 // Either capture path may be live: open-on-press (`engine`) or
@@ -766,6 +755,7 @@ fn worker_loop(
                 }
                 cues::play_stop();
                 ui_channel::set_state(UiState::Processing);
+                ui_channel::clear_live_transcript();
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 let held = press_to_release.unwrap_or_default();
                 eprintln!("⏹ stopped · held {}", secs(held));
@@ -781,16 +771,18 @@ fn worker_loop(
                 });
 
                 let t_pipeline = Instant::now();
-                // When cleanup already happened per-segment during the hold,
-                // carry the assembled cleaned text forward so the cleanup step
-                // below reuses it instead of re-running Gemma on the whole thing.
-                #[cfg(feature = "cleaner")]
-                let mut precleaned_override: Option<String> = None;
+                // Streaming ASR now performs NO per-segment cleanup — the cleanup
+                // model runs once on the joined transcript at release. So there's
+                // no assembled cleaned text to carry forward anymore.
+                // Streaming segment bookkeeping for the per-utterance timing log.
+                let mut segs_cached = 0usize;
+                let mut timing_final_seg_ms = 0u128;
 
-                // Acquire the transcript. Streaming mode (experimental) assembles
-                // it from the sentences cleaned during the hold + a final tail
-                // segment; everything else takes the proven whole-buffer path,
-                // byte-for-byte unchanged.
+                // Acquire the transcript. Streaming ASR assembles it from the
+                // sentences transcribed (NOT cleaned) during the hold + a final
+                // open segment; everything else (pre-roll, poisoned / transform
+                // fallback) takes the proven whole-buffer path, byte-for-byte
+                // unchanged.
                 let transcript: String = 'got: {
                     // Always-on pre-roll: drain the warm stream's queued audio
                     // (the pre-roll lookback the callback flushed at press +
@@ -818,58 +810,63 @@ fn worker_loop(
                     let mut c = consumer.take().unwrap();
                     let r = is_recording.take().unwrap();
 
-                    #[cfg(feature = "cleaner")]
-                    if streaming && stream.is_some() {
-                        // Clean the final outstanding segment(s) now (this is the
-                        // only cleanup left post-release — the win).
-                        if let (Some(st), Some(cl)) = (stream.as_mut(), cleaner.as_ref()) {
-                            stream_process(
+                    // Incremental streaming ASR: flush the final open segment, then
+                    // join the cached segments into the transcript. Cleanup is NOT
+                    // done per-segment — the joined text feeds the existing
+                    // whole-utterance release pipeline unchanged. Falls back to a
+                    // single whole-buffer transcribe of everything captured when the
+                    // streamed result can't be trusted: a segment failed (poisoned),
+                    // the utterance is a transform instruction (keep the proven path
+                    // so commands / transform never see a VAD-split rerender), or
+                    // nothing was cached (e.g. pure silence). Audio loss is
+                    // impossible — `stream_audio` holds every drained sample, so the
+                    // fallback is byte-for-byte today's behaviour.
+                    if streaming_asr && stream.is_some() {
+                        let final_seg_ms = if let Some(st) = stream.as_mut() {
+                            stream_process_asr(
                                 &mut worker,
-                                cl,
                                 &refiner,
-                                &rt,
                                 st,
                                 &mut c,
-                                &mut stream_raw,
-                                &mut stream_clean,
+                                &mut stream_segs,
+                                &mut stream_audio,
+                                &mut stream_poisoned,
                                 true,
-                            );
-                        }
-                        let whole = stream
-                            .as_ref()
-                            .map(|s| s.buf().to_vec())
-                            .unwrap_or_default();
-                        // Use the streamed result only for genuinely multi-sentence
-                        // dictations; short utterances / transforms fall back to the
-                        // proven whole-buffer path so commands & transform still work.
-                        let result = if !transform && stream_clean.len() >= 2 {
-                            // Strip a trailing "yeah/yep/…" on the ASSEMBLED text: in
-                            // streaming, a standalone trailing "Yeah." is its own
-                            // segment and the per-segment pass keeps it (looks like a
-                            // whole-utterance ack); only the join reveals it's trailing.
-                            let joined =
-                                crate::text_polish::strip_trailing_filler(&stream_clean.join(" "));
-                            precleaned_override = Some(joined);
-                            eprintln!(
-                                "  ⟫ streamed {} sentence segment(s) during hold",
-                                stream_clean.len()
-                            );
-                            stream_raw.join(" ")
+                            )
                         } else {
-                            match worker.transcribe_pcm(&whole) {
-                                Ok(t) => t,
-                                Err(err) => {
-                                    eprintln!("[err]  transcribe failed: {err:?}");
-                                    cues::play_error();
-                                    ui_channel::set_state(UiState::Idle);
-                                    eprintln!();
-                                    stream = None;
-                                    continue 'evloop;
-                                }
-                            }
+                            0
+                        };
+                        segs_cached = stream_segs.len();
+                        timing_final_seg_ms = final_seg_ms;
+                        let joined = stream_segs.join(" ");
+                        let fallback = stream_poisoned || transform || stream_segs.is_empty();
+                        // Take the backup buffer so the fallback transcribes exactly
+                        // what was captured (and frees it for the next utterance).
+                        let whole = std::mem::take(&mut stream_audio);
+                        let result = if fallback {
+                            eprintln!(
+                                "  ⟫ streaming fallback · whole-buffer transcribe ({} samples)",
+                                whole.len()
+                            );
+                            worker.transcribe_pcm(&whole)
+                        } else {
+                            eprintln!(
+                                "  ⟫ streamed {} segment(s) during hold",
+                                stream_segs.len()
+                            );
+                            Ok(joined)
                         };
                         stream = None;
-                        break 'got result;
+                        match result {
+                            Ok(t) => break 'got t,
+                            Err(err) => {
+                                eprintln!("[err]  transcribe failed: {err:?}");
+                                cues::play_error();
+                                ui_channel::set_state(UiState::Idle);
+                                eprintln!();
+                                continue 'evloop;
+                            }
+                        }
                     }
                     match rt.block_on(worker.run_inference_pipeline(c, r)) {
                         Ok(t) => t,
@@ -982,17 +979,6 @@ fn worker_loop(
                     #[cfg(feature = "cleaner")]
                     {
                         match cleaner {
-                            // Already cleaned per-sentence during the hold — reuse
-                            // it (the whole point of streaming). Skips a redundant
-                            // whole-buffer Gemma pass. Terminals still take raw.
-                            Some(_) if !is_terminal && precleaned_override.is_some() => {
-                                let pre = precleaned_override.take().unwrap();
-                                eprintln!(
-                                    "  ⟫    streamed cleanup ({} chars)",
-                                    pre.chars().count()
-                                );
-                                pre
-                            }
                             Some(ref c) if !is_terminal => {
                                 if !screen_vocab.is_empty() {
                                     eprintln!("  ⌕    screen vocab: {}", screen_vocab.join(", "));
@@ -1123,6 +1109,9 @@ fn worker_loop(
                     t_cleanup_ms,
                     t_inject_ms
                 );
+                if streaming_asr {
+                    eprintln!("  segs={segs_cached} cached · finalseg={timing_final_seg_ms} ms");
+                }
                 if let Some(pid) = target_pid {
                     eprintln!("  app  {} (pid {})", app_name(pid), pid);
                 } else if used_fresh_capture {
@@ -1252,7 +1241,6 @@ fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextCleanupEngine, i
 /// Pop everything currently sitting in the capture ring buffer (non-blocking).
 /// Used by the streaming path to pull newly captured audio on each tick + at
 /// release without waiting on the recording flag.
-#[cfg(feature = "cleaner")]
 fn drain_available(consumer: &mut crate::audio::HeapAudioConsumer) -> Vec<f32> {
     use ringbuf::traits::{Consumer, Observer};
     let n = consumer.occupied_len();
@@ -1265,64 +1253,79 @@ fn drain_available(consumer: &mut crate::audio::HeapAudioConsumer) -> Vec<f32> {
     buf
 }
 
-/// One streaming step: pull available audio into the segment stream, then
-/// transcribe + clean each segment the VAD reports (finished-only on a tick,
-/// everything remaining when `final_flush`). Cleaned pieces carry the prior
-/// cleaned text as left-context. Results append to `raw_acc` / `clean_acc`.
-#[cfg(feature = "cleaner")]
-#[allow(clippy::too_many_arguments)]
-fn stream_process(
+/// One incremental ASR step: pull available audio into the segment stream, then
+/// transcribe each completed segment (NO cleanup — whole-utterance cleanup stays
+/// at release) and cache the corrected text in `segs_acc`. Every drained sample
+/// is also appended to `audio_backup`, so a poisoned stream / transform / empty
+/// result can fall back to a single whole-buffer transcribe at release without
+/// losing audio. With `final_flush` the remaining open segment is flushed too.
+///
+/// Transcribe calls run on this (worker) thread, which already owns the ASR
+/// worker. Trade-off kept deliberately: a StopRecording event may wait behind one
+/// in-flight short-segment transcribe (~50-150 ms) rather than a background
+/// thread — the single-threaded ownership keeps the segment model memory-stable.
+///
+/// Returns the transcribe latency (ms) of the LAST segment — the meaningful
+/// "final segment" cost only when `final_flush` is set (used for the
+/// per-utterance timing log). Callers ignore it during the hold.
+fn stream_process_asr(
     worker: &mut LocalInferenceWorker,
-    cleaner: &TextCleanupEngine,
     refiner: &Refiner,
-    rt: &tokio::runtime::Runtime,
     st: &mut crate::vad::SegmentStream,
     consumer: &mut crate::audio::HeapAudioConsumer,
-    raw_acc: &mut Vec<String>,
-    clean_acc: &mut Vec<String>,
+    segs_acc: &mut Vec<String>,
+    audio_backup: &mut Vec<f32>,
+    poisoned: &mut bool,
     final_flush: bool,
-) {
+) -> u128 {
     let avail = drain_available(consumer);
     if !avail.is_empty() {
         st.push(&avail);
+        audio_backup.extend_from_slice(&avail);
     }
     let segs = if final_flush {
         st.take_final()
     } else {
         st.take_complete()
     };
+    let mut last_seg_ms = 0u128;
     for (s, e) in segs {
+        // A prior failure poisons the stream: keep draining audio into the backup
+        // so the release fallback transcribes everything, but stop spending
+        // transcribe calls on individual segments.
+        if *poisoned {
+            continue;
+        }
         let seg = st.buf()[s..e].to_vec();
+        let t = Instant::now();
         let raw = match worker.transcribe_pcm(&seg) {
             Ok(t) => t.trim().to_string(),
             Err(err) => {
-                eprintln!("[warn] stream seg transcribe: {err:?}");
+                eprintln!(
+                    "[warn] stream seg transcribe: {err:?} — falling back to whole-buffer at release"
+                );
+                *poisoned = true;
                 continue;
             }
         };
+        last_seg_ms = ms(t.elapsed());
         if raw.is_empty() {
             continue;
         }
-        // Fix known proper nouns in this segment *before* cleanup — same as the
-        // whole-buffer path — so the small model sees the intended spelling
-        // (e.g. "to do list" → "Todoist") instead of mangling a garbled one.
-        // The final assembled text is still refined again at release.
-        // Screen-context vocab isn't known until release (focus capture), so
-        // streamed segments use the static corrections vocab only.
+        // Fix known proper nouns in this segment before caching — same as the
+        // whole-buffer path — so the assembled text carries the intended spelling
+        // (e.g. "to do list" → "Todoist"). No per-segment cleanup: the cleanup
+        // model runs once on the whole utterance at release, not on partial
+        // segments, so accuracy isn't traded for a marginal latency win.
         let corrected = refiner.apply_corrections(&raw);
-        let prior = clean_acc.join(" ");
-        let cleaned =
-            match rt.block_on(cleaner.process_segment_with_context(&corrected, &[], &prior)) {
-                Ok(c) => c,
-                Err(err) => {
-                    eprintln!("[warn] stream seg cleanup: {err:?}; using raw");
-                    corrected.clone()
-                }
-            };
-        eprintln!("  ⟫ seg · {raw:?} → {cleaned:?}");
-        raw_acc.push(raw);
-        clean_acc.push(cleaned);
+        eprintln!("  ⟫ seg · {raw:?}");
+        segs_acc.push(corrected);
+        // Live preview: surface the joined cached text in the pill while recording.
+        if !final_flush {
+            ui_channel::set_live_transcript(&segs_acc.join(" "));
+        }
     }
+    last_seg_ms
 }
 
 /// transform on the spoken body with the warm Gemma engine and inject the result

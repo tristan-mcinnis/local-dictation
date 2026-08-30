@@ -145,6 +145,9 @@ struct UiGlobals {
     /// 0 = compact, 1 = expanded. The timer eases this value so hover can be
     /// interrupted without a second animation system or a bounce.
     pill_expanded: Mutex<f64>,
+    /// The last live-transcript text rendered on the pill, so the 30 FPS timer
+    /// only sets it again when the streaming-ASR preview actually changed.
+    last_live: Mutex<String>,
     reduced_motion: bool,
     last_state: AtomicU8,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
@@ -389,6 +392,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         pill_cancel: pill.cancel,
         pill_settings: pill.settings,
         pill_expanded: Mutex::new(0.0),
+        last_live: Mutex::new(String::new()),
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
@@ -1937,7 +1941,10 @@ fn install_poll_timer() {
         // bars from live mic RMS; Processing has no mic input, so we run a
         // synthetic "thinking" wave instead of letting the bars sit frozen.
         match state {
-            UiState::Recording => update_bars(globals),
+            UiState::Recording => {
+                update_bars(globals);
+                update_live_transcript(globals);
+            }
             UiState::Processing => {
                 if globals.reduced_motion {
                     set_static_processing_bars(globals);
@@ -2064,6 +2071,38 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             globals.pill_window.orderFrontRegardless();
         }
     }
+}
+
+/// Refresh the recording pill's text with the live streaming-ASR transcript.
+/// Reads the ui_channel live transcript and swaps it onto `pill_status` when it
+/// changes, so the preview appears as sentences are transcribed during the hold
+/// without hammering AppKit on every 30 FPS tick when nothing changed. Empty
+/// live transcript (no segment completed yet) falls back to the default hint.
+fn update_live_transcript(globals: &UiGlobals) {
+    let live = ui_channel::live_transcript();
+    let shown = {
+        let mut last = globals.last_live.lock().unwrap();
+        if *last == live {
+            return;
+        }
+        *last = live.clone();
+        if live.is_empty() {
+            "Recording · release to finish".to_string()
+        } else {
+            // The compact pill is only ~120 px wide — show the head of the running
+            // transcript, ellipsized.
+            let one_line = live.replace('\n', " ");
+            let truncated: String = one_line.chars().take(26).collect();
+            if one_line.chars().count() > 26 {
+                format!("{truncated}…")
+            } else {
+                truncated
+            }
+        }
+    };
+    globals
+        .pill_status
+        .setStringValue(&NSString::from_str(&shown));
 }
 
 /// Read the pointer directly instead of installing a global event monitor.

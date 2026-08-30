@@ -172,7 +172,7 @@ define_class!(
         #[unsafe(method(changeStreaming:))]
         fn change_streaming(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
-            with_pending(|p| p.streaming_cleanup = Some(on));
+            with_pending(|p| p.streaming_asr = Some(on));
         }
 
         #[unsafe(method(changeListen:))]
@@ -502,9 +502,9 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     y = section(mtm, &container, y, "Experimental");
 
-    // Streaming cleanup
-    let streaming_switch = switch_row(mtm, &container, y, "Streaming cleanup");
-    streaming_switch.setState(if loaded.resolve_streaming_cleanup() {
+    // Streaming ASR
+    let streaming_switch = switch_row(mtm, &container, y, "Streaming ASR");
+    streaming_switch.setState(if loaded.resolve_streaming_asr() {
         NSControlStateValueOn
     } else {
         NSControlStateValueOff
@@ -513,14 +513,14 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         &streaming_switch,
         &controller,
         sel!(changeStreaming:),
-        std::env::var_os("DICTATE_STREAMING_CLEANUP").is_some(),
+        std::env::var_os("DICTATE_STREAMING_ASR").is_some(),
     );
     y += ROW_H;
     y = hint_line(
         mtm,
         &container,
         y,
-        "Clean each sentence during the hold (VAD-segmented). Off = whole-buffer.",
+        "Transcribe sentences during the hold for a live preview (VAD-segmented). Off = whole-buffer at release.",
     );
 
     // Listen mode

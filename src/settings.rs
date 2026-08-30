@@ -66,12 +66,13 @@ pub struct Settings {
     /// `formats` map). `None`/blank ⇒ the default cleanup prompt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_format: Option<String>,
-    /// EXPERIMENTAL: stream cleanup per sentence during the hold (VAD-segmented)
-    /// so the post-release wait stops scaling with utterance length. `None`/false
-    /// ⇒ the proven whole-buffer path. Off by default; flip to test on real mic.
-    /// Overridable via `DICTATE_STREAMING_CLEANUP=1`.
+    /// Incremental streaming ASR (default ON): transcribe completed sentences
+    /// during the hold (VAD-segmented) for a live preview, then reassemble the
+    /// cached segments at release. Whole-utterance cleanup still runs at release.
+    /// Disabled while always-on pre-roll is active (they drain the capture ring
+    /// differently). Override: `DICTATE_STREAMING_ASR=0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub streaming_cleanup: Option<bool>,
+    pub streaming_asr: Option<bool>,
     /// Always-on mic: keep the input stream warm and retain this many ms of
     /// pre-roll, so the first words aren't clipped and there's no stream-open
     /// latency on key-press. `None`/absent ⇒ off (open-on-press, current
@@ -244,14 +245,23 @@ impl Settings {
         }
     }
 
-    /// Resolve streaming-cleanup mode: `DICTATE_STREAMING_CLEANUP` env > settings
-    /// > false. Env accepts `1`/`true`/`on` (case-insensitive) to enable.
-    pub fn resolve_streaming_cleanup(&self) -> bool {
-        if let Ok(v) = std::env::var("DICTATE_STREAMING_CLEANUP") {
-            let v = v.trim().to_ascii_lowercase();
-            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+    /// Resolve incremental streaming ASR: `DICTATE_STREAMING_ASR` env > settings
+    /// > true (on by default). Returns false when always-on pre-roll is active,
+    /// because the two drain the capture ring differently and a later workstream
+    /// reconciles capture. Env accepts `0`/`false`/`off`/`no` (case-insensitive)
+    /// to disable.
+    pub fn resolve_streaming_asr(&self) -> bool {
+        if self.resolve_preroll_ms() > 0 {
+            eprintln!(
+                "[boot] streaming asr disabled (pre-roll active — capture reconciliation pending)"
+            );
+            return false;
         }
-        self.streaming_cleanup.unwrap_or(false)
+        if let Ok(v) = std::env::var("DICTATE_STREAMING_ASR") {
+            let v = v.trim().to_ascii_lowercase();
+            return !matches!(v.as_str(), "0" | "false" | "off" | "no");
+        }
+        self.streaming_asr.unwrap_or(true)
     }
 
     /// Resolve the pre-roll lookback in ms: `DICTATE_PREROLL_MS` env > settings
@@ -647,12 +657,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_streaming_cleanup_from_env_and_settings() {
-        if std::env::var_os("DICTATE_STREAMING_CLEANUP").is_none() {
-            assert!(!Settings::default().resolve_streaming_cleanup());
+    fn resolve_streaming_asr_defaults_on_and_settings_can_disable() {
+        if std::env::var_os("DICTATE_STREAMING_ASR").is_none() {
+            assert!(Settings::default().resolve_streaming_asr());
             let mut s = Settings::default();
-            s.streaming_cleanup = Some(true);
-            assert!(s.resolve_streaming_cleanup());
+            s.streaming_asr = Some(false);
+            assert!(!s.resolve_streaming_asr());
+        }
+    }
+
+    #[test]
+    fn resolve_streaming_asr_disabled_by_preroll() {
+        // Pre-roll and streaming are mutually exclusive for now (both drain the
+        // capture ring differently); pre-roll wins. Only assert when no env knob
+        // pins the outcome (env is process-global).
+        if std::env::var_os("DICTATE_STREAMING_ASR").is_none()
+            && std::env::var_os("DICTATE_PREROLL_MS").is_none()
+        {
+            let mut s = Settings::default();
+            s.preroll_ms = Some(400);
+            assert!(!s.resolve_streaming_asr());
         }
     }
 
