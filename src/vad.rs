@@ -38,6 +38,18 @@ impl Default for VadConfig {
     }
 }
 
+impl VadConfig {
+    /// Whisper-mode configuration: a lower `peak_frac` so quiet speech clears
+    /// the speech threshold (default `0.04` is tuned for a normal speaking
+    /// voice). Otherwise identical to [`VadConfig::default`].
+    pub fn whisper() -> Self {
+        Self {
+            peak_frac: 0.015,
+            ..Self::default()
+        }
+    }
+}
+
 /// Split `audio` (mono f32 at `sr` Hz) into speech segments as inclusive-start /
 /// exclusive-end sample ranges. Silence-only or empty input yields a single
 /// whole-buffer segment, so callers can always treat the result as "the pieces to
@@ -222,6 +234,36 @@ mod tests {
         assert_eq!(segment_speech(&[], SR, &cfg), vec![(0, 0)]);
         let sil = vec![0.0f32; SR as usize];
         assert_eq!(segment_speech(&sil, SR, &cfg), vec![(0, sil.len())]);
+    }
+
+    #[test]
+    fn whisper_config_lowers_peak_threshold_and_keeps_default_otherwise() {
+        let d = VadConfig::default();
+        let w = VadConfig::whisper();
+        assert!(w.peak_frac < d.peak_frac, "whisper peak_frac must be lower");
+        // Everything else is unchanged from the default.
+        assert_eq!(w.frame_ms, d.frame_ms);
+        assert_eq!(w.min_pause_ms, d.min_pause_ms);
+        assert_eq!(w.pad_ms, d.pad_ms);
+    }
+
+    #[test]
+    fn whisper_segments_quiet_speech_the_default_misses() {
+        // A short LOUD burst sets a high peak RMS; a later QUIET utterance sits
+        // between the whisper threshold and the default threshold. Default 4%
+        // of the peak misses it; whisper 1.5% catches it.
+        let mut a = Vec::new();
+        silence(&mut a, 0.2);
+        tone(&mut a, 0.3, 0.5); // loud burst → peak ≈ 0.5
+        silence(&mut a, 0.5);
+        tone(&mut a, 1.0, 0.01); // quiet utterance
+        silence(&mut a, 0.2);
+        // Default: peak 0.5 → threshold 0.02; the 0.01 utterance reads as silence.
+        let d = segment_speech(&a, SR, &VadConfig::default());
+        assert_eq!(d.len(), 1, "default should miss the quiet utterance: {d:?}");
+        // Whisper: peak 0.5 → threshold 0.0075; the 0.01 utterance is now speech.
+        let w = segment_speech(&a, SR, &VadConfig::whisper());
+        assert_eq!(w.len(), 2, "whisper should find both utterances: {w:?}");
     }
 
     #[test]

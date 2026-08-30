@@ -418,6 +418,20 @@ mod tests {
     }
 
     #[test]
+    fn whisper_threshold_is_strictly_lower_than_normal() {
+        for floor in [0.0_f32, 0.001, 0.005, 0.02, 0.05, 0.1] {
+            let normal = speech_threshold_with_mode(floor, false);
+            let whisper = speech_threshold_with_mode(floor, true);
+            assert_eq!(normal, speech_threshold(floor), "normal path must match legacy fn");
+            assert!(whisper < normal, "floor {floor}: whisper {whisper} !< normal {normal}");
+            assert!(whisper > 0.002, "whisper floor {whisper} must stay above a tiny positive floor");
+        }
+        // Hushed room: whisper's lower absolute floor kicks in.
+        assert_eq!(speech_threshold_with_mode(0.0, true), WHISPER_ABS_FLOOR);
+        assert!(WHISPER_ABS_FLOOR < TAIL_ABS_FLOOR);
+    }
+
+    #[test]
     fn frames_quiet_checks_only_the_trailing_window() {
         let frames = vec![0.5, 0.5, 0.002, 0.003, 0.002];
         let thresh = 0.01;
@@ -1060,6 +1074,12 @@ pub const DEFAULT_TAIL_ENGAGE_MS: u32 = 300;
 /// (floor × factor). A factor of 3 keeps real speech well above ambient tone
 /// without being blind to soft speech in a noisy room.
 pub const TAIL_THRESHOLD_FLOOR_FACTOR: f32 = 3.0;
+/// Whisper-mode multiplier on the noise floor: lower than the normal ×3 so
+/// quiet speech stays above the threshold. See [`speech_threshold_with_mode`].
+pub const WHISPER_THRESHOLD_FLOOR_FACTOR: f32 = 1.5;
+/// Whisper-mode absolute floor: lower than [`TAIL_ABS_FLOOR`] so a hushed
+/// whisper in a near-silent room still registers as speech.
+pub const WHISPER_ABS_FLOOR: f32 = 0.005;
 /// Absolute floor on the speech threshold, so an ultra-quiet room can never push
 /// the threshold to zero (and thus never treat pure silence as "speech").
 pub const TAIL_ABS_FLOOR: f32 = 0.01;
@@ -1174,8 +1194,20 @@ pub fn noise_floor_of_audio(audio: &[f32], frame_len: usize, percentile: f32) ->
 /// abs_floor)`. The absolute floor guards against a hyper-quiet room where the
 /// floor is ~0, which would otherwise make even a whisper look like quiet.
 pub fn speech_threshold(floor: f32) -> f32 {
-    let boosted = floor * TAIL_THRESHOLD_FLOOR_FACTOR;
-    boosted.max(TAIL_ABS_FLOOR)
+    speech_threshold_with_mode(floor, false)
+}
+
+/// Like [`speech_threshold`] but with a whisper-mode option. Whisper mode uses
+/// a lower floor multiplier and a lower absolute floor so quiet speech is
+/// detected as speech rather than silence. The normal path is bit-identical to
+/// [`speech_threshold`].
+pub fn speech_threshold_with_mode(floor: f32, whisper: bool) -> f32 {
+    let (factor, abs_floor) = if whisper {
+        (WHISPER_THRESHOLD_FLOOR_FACTOR, WHISPER_ABS_FLOOR)
+    } else {
+        (TAIL_THRESHOLD_FLOOR_FACTOR, TAIL_ABS_FLOOR)
+    };
+    (floor * factor).max(abs_floor)
 }
 
 /// True if the last `n` frames (`rms_frames`) are all below `threshold` — i.e.
@@ -1230,7 +1262,20 @@ pub fn tail_capture_engage(
     engage_ms: u32,
     frame_ms: u32,
 ) -> (f32, bool) {
-    let threshold = speech_threshold(floor);
+    tail_capture_engage_with_mode(tail, frame_len, floor, engage_ms, frame_ms, false)
+}
+
+/// Like [`tail_capture_engage`] but with a whisper-mode option so the daemon can
+/// thread the user's whisper preference through the tail-capture engage decision.
+pub fn tail_capture_engage_with_mode(
+    tail: &[f32],
+    frame_len: usize,
+    floor: f32,
+    engage_ms: u32,
+    frame_ms: u32,
+    whisper: bool,
+) -> (f32, bool) {
+    let threshold = speech_threshold_with_mode(floor, whisper);
     let frames = frame_rms(tail, frame_len);
     let engage_frames = quiet_frame_count(engage_ms, frame_ms);
     let engage = !frames_quiet(&frames, threshold, engage_frames);
