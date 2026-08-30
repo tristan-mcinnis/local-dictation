@@ -10,6 +10,11 @@
 //!      "press enter" and turn it into an action the caller executes after
 //!      injecting the body.
 //!
+//! Between corrections and the command parse, a whole-transcript **misfire
+//! artifact** ("Thank you." hallucinated from a near-silent accidental key
+//! press) is dropped deterministically: empty body + no action → `Skip`, so a
+//! misfire never lands text in the focused app.
+//!
 //! The ordering is load-bearing: corrections run **before** the command parse
 //! so that a correction can never rewrite (and accidentally fire, or destroy)
 //! the trigger phrase. Previously this sequence — plus the empty-string
@@ -25,6 +30,59 @@
 
 use crate::corrections::Corrections;
 use crate::voice_commands::{parse_trailing_command, TrailingAction};
+
+/// Whole-transcript ASR silence artifacts. Near-silent audio (an accidental
+/// key press) is hallucinated by the ASR into one of these stock phrases —
+/// the classic being "Thank you." on a sub-second misfire. When the ENTIRE
+/// transcript normalizes to one of these, it is dropped: inject nothing.
+/// Deliberately excludes plausible one-word messages ("yes", "no", "okay",
+/// "hi") — those survive.
+const MISFIRE_ARTIFACTS: &[&str] = &[
+    "thank you",
+    "thanks",
+    "thank you for watching",
+    "thanks for watching",
+    "thank you for listening",
+    "thanks for listening",
+    "thank you so much",
+    "thank you very much",
+    "bye",
+    "goodbye",
+    "bye bye",
+    "you",
+    "the end",
+    "so",
+    "music",
+    "applause",
+    "laughter",
+    "silence",
+    "subtitles",
+    "hmm",
+    "huh",
+    "oh",
+    "ah",
+    "um",
+    "uh",
+    "mhm",
+    "mm hmm",
+];
+
+/// True when the whole transcript is an ASR silence artifact (misfire).
+/// Normalization: lowercase, punctuation → space, whitespace collapsed.
+pub fn is_misfire_artifact(text: &str) -> bool {
+    let normalized: String = text
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let collapsed = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    !collapsed.is_empty() && MISFIRE_ARTIFACTS.contains(&collapsed.as_str())
+}
 
 /// The result of refining one utterance: the body to inject plus any trailing
 /// action to perform afterwards.
@@ -126,6 +184,13 @@ impl Refiner {
     /// trigger phrase; the command parse then runs on the corrected text.
     pub fn refine(&self, cleaned_text: &str) -> RefinedDictation {
         let corrected = self.corrections.apply(cleaned_text);
+        if is_misfire_artifact(&corrected) {
+            // Accidental-press hallucination: inject nothing, press no key.
+            return RefinedDictation {
+                text: String::new(),
+                action: TrailingAction::None,
+            };
+        }
         let (text, action) = parse_trailing_command(&corrected);
         RefinedDictation { text, action }
     }
@@ -257,5 +322,30 @@ mod tests {
     fn outcome_empty_is_skip() {
         let r = refiner(&[]);
         assert_eq!(r.refine("   ").outcome(), DictationOutcome::Skip);
+    }
+
+    #[test]
+    fn misfire_thank_you_is_dropped() {
+        let r = refiner(&[]);
+        assert_eq!(r.refine("Thank you.").outcome(), DictationOutcome::Skip);
+        assert_eq!(r.refine("thank you").outcome(), DictationOutcome::Skip);
+        assert_eq!(r.refine("  THANK   YOU ! ").outcome(), DictationOutcome::Skip);
+        assert_eq!(r.refine("Thanks for watching!").outcome(), DictationOutcome::Skip);
+        assert_eq!(r.refine("Bye.").outcome(), DictationOutcome::Skip);
+    }
+
+    #[test]
+    fn misfire_never_fires_inside_real_text() {
+        let r = refiner(&[]);
+        // Artifact phrase inside a real utterance survives.
+        let out = r.refine("say thank you to the team").outcome();
+        assert!(matches!(out, DictationOutcome::Inject { .. }));
+        let out = r.refine("thank you for the update").outcome();
+        assert!(matches!(out, DictationOutcome::Inject { .. }));
+        // Plausible one-word messages are NOT artifacts.
+        for word in ["yes", "no", "okay", "hi", "sure", "done"] {
+            let out = r.refine(word).outcome();
+            assert!(matches!(out, DictationOutcome::Inject { .. }), "{word} must survive");
+        }
     }
 }
