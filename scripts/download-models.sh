@@ -22,8 +22,14 @@ python3 scripts/models/convert_superwhisper_cohere.py \
   "$cohere_source" \
   "$repo_root/models/dictation/cohere-mlx-q4"
 
+s1_dest="$repo_root/models/llm/s1-mini/s1-mini.gguf"
 mkdir -p "$repo_root/models/llm/s1-mini"
-ln -sfn "$s1_source" "$repo_root/models/llm/s1-mini/s1-mini.gguf"
+if [[ -f "$s1_dest" && $(stat -f %z "$s1_dest") == "$(stat -f %z "$s1_source")" ]]; then
+  print "S1-mini already in place ($s1_dest)."
+else
+  cp -c "$s1_source" "$s1_dest" 2>/dev/null || cp "$s1_source" "$s1_dest"
+  print "Copied S1-mini to $s1_dest."
+fi
 
 native/cohere-mlx/build.sh >/dev/null
 print "Fixed Cohere MLX + S1-mini stack is ready."
