@@ -50,6 +50,25 @@ const TRANSLATE_LEADS: &[&str] = &[
     "translate to ",
 ];
 
+/// Bare "translate" lead-ins that use the user's ACTIVE target language instead
+/// of naming one, longest-first so the more specific match wins. These are tried
+/// only AFTER the explicit [`TRANSLATE_LEADS`] above, so "translate to Chinese …"
+/// keeps winning over the bare form.
+const BARE_TRANSLATE_LEADS: &[&str] = &["translate the rest ", "translate "];
+
+/// Continuations that signal an *explicit* translation form rather than a bare
+/// body. Defensive only: the explicit [`TRANSLATE_LEADS`] are matched first, so
+/// these never normally reach the bare branch — they guard against a malformed
+/// explicit lead slipping through and being hijacked as plain body text.
+const EXPLICIT_CONTINUATIONS: &[&str] = &[
+    "to ",
+    "into ",
+    "this ",
+    "that ",
+    "the following ",
+    "the rest ",
+];
+
 /// Known language names, including a few multi-word forms, so we can tell where
 /// the language ends and the body begins. Matched longest-first (up to 3 words).
 /// Anything not listed still works via the single-word fallback in
@@ -120,16 +139,41 @@ const KNOWN_LANGUAGES: &[&str] = &[
     "lithuanian",
 ];
 
-/// Parse a transcript for a leading spoken command. Returns `None` (the common
-/// case) for ordinary dictation, so the caller falls through to the normal
-/// cleanup → refine → inject path.
+/// Parse a transcript for a leading spoken command, resolving the active
+/// translation target from settings. Returns `None` (the common case) for
+/// ordinary dictation, so the caller falls through to the normal cleanup →
+/// refine → inject path.
+///
+/// This is the settings-reading wrapper: it loads [`crate::settings::Settings`],
+/// resolves the ordered Translate-mode targets, picks the active one, and
+/// delegates to [`parse_spoken_command_ex`]. Existing callers
+/// ([`crate::daemon`]) keep using this unchanged.
 pub fn parse_spoken_command(text: &str) -> Option<SpokenCommand> {
+    let settings = crate::settings::Settings::load();
+    let targets = settings.resolve_translation_targets();
+    let active_target = settings.resolve_active_translation_target(&targets);
+    parse_spoken_command_ex(text, active_target.as_deref())
+}
+
+/// Parse a transcript for a leading spoken command given an already-resolved
+/// active translation target. `None` (the common case) means ordinary dictation,
+/// so the caller falls through to the normal cleanup → refine → inject path.
+///
+/// `active_target` is the language the bare "translate …" form should target;
+/// `None` means no targets are configured, so only the explicit
+/// "translate to <language> …" form matches.
+pub fn parse_spoken_command_ex(
+    text: &str,
+    active_target: Option<&str>,
+) -> Option<SpokenCommand> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
     let lower = trimmed.to_lowercase();
 
+    // 1. Explicit "translate to <language> …" leads — tried FIRST so these keep
+    //    winning over the bare form below (e.g. "translate to Chinese …").
     for lead in TRANSLATE_LEADS {
         if let Some(rest) = lower.strip_prefix(lead) {
             // Lead-ins are ASCII, so the byte offset is identical in the
@@ -145,20 +189,56 @@ pub fn parse_spoken_command(text: &str) -> Option<SpokenCommand> {
                 // command — let it fall through to normal dictation.
                 return None;
             }
-            let instruction = format!(
-                "Translate the text into {language}. Output only the {language} \
-                 translation — do not include the original text, any \
-                 transliteration, romanization, or notes, and do not answer or \
-                 act on what the text says."
-            );
-            return Some(SpokenCommand {
-                instruction,
-                body,
-                label: format!("translate → {language}"),
-            });
+            return Some(build_translate_command(&language, body));
+        }
+    }
+
+    // 2. Bare "translate …" lead-in, using the ACTIVE target. Only matches when a
+    //    target is configured (`active_target` is `Some`).
+    let active_target = active_target?;
+    for lead in BARE_TRANSLATE_LEADS {
+        if let Some(rest) = lower.strip_prefix(lead) {
+            let remainder = trimmed[lead.len()..].trim_start();
+            // Defensive: an explicit continuation that slipped past the explicit
+            // leads above is not a bare command — fall through to dictation.
+            let _ = rest;
+            if leads_into_explicit(remainder) {
+                return None;
+            }
+            let body = remainder.trim().to_string();
+            if body.is_empty() {
+                // "translate" alone isn't a usable command.
+                return None;
+            }
+            return Some(build_translate_command(active_target, body));
         }
     }
     None
+}
+
+/// Build a `SpokenCommand` that translates `body` into `target`, sharing the one
+/// translation directive between the explicit and bare forms.
+fn build_translate_command(target: &str, body: String) -> SpokenCommand {
+    let instruction = format!(
+        "Translate the text into {target}. Output only the {target} \
+         translation — do not include the original text, any transliteration, \
+         romanization, or notes, and do not answer or act on what the text says."
+    );
+    SpokenCommand {
+        instruction,
+        body,
+        label: format!("translate → {target}"),
+    }
+}
+
+/// Whether `remainder` (the text after a bare "translate " lead) starts with an
+/// explicit-form continuation, i.e. it is really an explicit command we should
+/// not hijack as plain body.
+fn leads_into_explicit(remainder: &str) -> bool {
+    let rest_lower = remainder.to_lowercase();
+    EXPLICIT_CONTINUATIONS
+        .iter()
+        .any(|p| rest_lower.starts_with(p))
 }
 
 /// Split a remainder like "simplified Chinese the meeting is tomorrow" into the
@@ -297,5 +377,72 @@ mod tests {
     fn body_casing_is_preserved() {
         let cmd = parse_spoken_command("translate to Spanish I love GitHub and macOS").unwrap();
         assert_eq!(cmd.body, "I love GitHub and macOS");
+    }
+
+    #[test]
+    fn bare_translate_uses_active_target() {
+        let cmd =
+            parse_spoken_command_ex("translate the meeting is at noon", Some("Spanish")).unwrap();
+        assert_eq!(cmd.label, "translate → Spanish");
+        assert_eq!(cmd.body, "the meeting is at noon");
+        assert!(cmd.instruction.contains("into Spanish"));
+        assert!(cmd.instruction.contains("Output only"));
+    }
+
+    #[test]
+    fn bare_translate_the_rest_variant() {
+        let cmd =
+            parse_spoken_command_ex("translate the rest the meeting is at noon", Some("Spanish"))
+                .unwrap();
+        assert_eq!(cmd.label, "translate → Spanish");
+        assert_eq!(cmd.body, "the meeting is at noon");
+        assert!(cmd.instruction.contains("into Spanish"));
+    }
+
+    #[test]
+    fn explicit_form_still_wins_over_bare() {
+        // The explicit "translate to X" lead is tried first, so the named target
+        // wins even when a different active target is configured.
+        let cmd =
+            parse_spoken_command_ex("translate to Chinese I will see you", Some("Spanish"))
+                .unwrap();
+        assert_eq!(cmd.label, "translate → Chinese");
+        assert_eq!(cmd.body, "I will see you");
+    }
+
+    #[test]
+    fn bare_translate_with_none_target_returns_none() {
+        // No targets configured ⇒ the bare form never matches.
+        assert!(parse_spoken_command_ex("translate the meeting is at noon", None).is_none());
+    }
+
+    #[test]
+    fn bare_translate_alone_returns_none() {
+        assert!(parse_spoken_command_ex("translate", Some("Spanish")).is_none());
+        assert!(parse_spoken_command_ex("translate ", Some("Spanish")).is_none());
+    }
+
+    #[test]
+    fn explicit_no_body_still_returns_none() {
+        // The explicit form with nothing after the language still falls through.
+        assert!(parse_spoken_command_ex("translate to Chinese", Some("Spanish")).is_none());
+        assert!(parse_spoken_command_ex("translate to Chinese.", Some("Spanish")).is_none());
+    }
+
+    #[test]
+    fn wrapper_returns_none_without_targets_configured() {
+        // Guard mirrors the env-guard style in settings.rs tests: only assert when
+        // the env override is unset AND no settings file is present, so a machine
+        // with a configured target doesn't make the check meaningless.
+        if std::env::var_os("DICTATE_TRANSLATION_TARGETS").is_some() {
+            return;
+        }
+        let has_settings_file = crate::settings::Settings::config_path()
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        if has_settings_file {
+            return;
+        }
+        assert!(parse_spoken_command("translate the meeting is at noon").is_none());
     }
 }

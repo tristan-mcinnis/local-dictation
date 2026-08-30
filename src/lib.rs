@@ -1,4 +1,5 @@
 pub mod app_paths;
+pub mod app_tones;
 pub mod audio;
 pub mod audio_duck;
 #[cfg(feature = "cohere-mlx")]
@@ -7,6 +8,7 @@ pub mod corrections;
 pub mod cues;
 pub mod dictionary;
 pub mod history;
+pub mod hotkeys;
 pub mod injector;
 pub mod ipc;
 pub mod model_fetch;

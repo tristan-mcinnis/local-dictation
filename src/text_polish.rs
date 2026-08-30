@@ -683,6 +683,99 @@ pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
     dropped_content >= 5
 }
 
+/// Whether the lowercased word stream contains a mid-sentence self-correction / repair
+/// (the speaker abandons a fragment and restates it: "no wait", "I mean",
+/// "actually", "sorry", "scratch that"). Used by [`needs_llm_cleanup`] to route
+/// such utterances to the generative cleaner, which can drop the abandoned
+/// fragment — the deterministic pass can't safely drop a whole clause.
+///
+/// Conservative: a repair marker only fires when real words sit on BOTH sides
+/// (the marker is not at the very start or very end), and the standalone
+/// emphasis/apology words ("actually", "rather", "instead", "sorry") need a
+/// *content* word before them — so "actually, yes" and "I'm sorry to hear that"
+/// don't count, while "the report is due tomorrow actually I meant Friday" does.
+fn contains_self_correction(words: &[&str]) -> bool {
+    (0..words.len()).any(|i| {
+        let len = repair_phrase_len(words, i);
+        len > 0 && i >= 1 && i + len < words.len()
+    })
+}
+
+/// Length of the self-correction phrase starting at `i` in the lowercased word
+/// stream, or 0 if none. The returned length is the whole span the cleaner
+/// should treat as the repair marker, so [`contains_self_correction`] can
+/// require real words on both sides. Pure & unit-tested.
+fn repair_phrase_len(words: &[&str], i: usize) -> usize {
+    fn at(words: &[&str], i: usize, phrase: &[&str]) -> bool {
+        words.get(i..i + phrase.len()).is_some_and(|w| w == phrase)
+    }
+    // Multi-word re-starts: "no no", "wait wait", "no wait", "scratch that".
+    if at(words, i, &["no", "no"])
+        || at(words, i, &["wait", "wait"])
+        || at(words, i, &["no", "wait"])
+        || at(words, i, &["scratch", "that"])
+    {
+        return 2;
+    }
+    if at(words, i, &["let", "me", "rephrase"]) {
+        return 3;
+    }
+    // "no"/"wait" + a repair word: "no I mean", "wait actually", "no instead".
+    if matches!(words.get(i), Some(&"no") | Some(&"wait")) {
+        if at(words, i + 1, &["i", "mean"]) || at(words, i + 1, &["i", "meant"]) {
+            return 3;
+        }
+        if at(words, i + 1, &["actually"])
+            || at(words, i + 1, &["rather"])
+            || at(words, i + 1, &["instead"])
+        {
+            return 2;
+        }
+    }
+    // Standalone "i mean" / "i meant".
+    if at(words, i, &["i", "mean"]) || at(words, i, &["i", "meant"]) {
+        return 2;
+    }
+    // Standalone repair words. These double as emphasis ("actually") or
+    // apology ("sorry"), so require a *content* word before them — the thing
+    // the speaker just stated — to read as a correction, not "I actually like
+    // that" (emphasis) or "I'm sorry to hear that" (sympathy).
+    if matches!(
+        words.get(i),
+        Some(&"actually") | Some(&"rather") | Some(&"instead") | Some(&"sorry")
+    ) && i >= 1
+        && preceded_by_content_word(words, i - 1)
+    {
+        return 1;
+    }
+    0
+}
+
+/// True when the word at index `i` is a *content* word (noun/adverb/verb) rather
+/// than a pronoun or auxiliary. Used to tell a standalone repair word from the
+/// same word used as emphasis or sympathy: "the meeting is Monday actually …"
+/// (content word before → correction) vs "I actually like that" / "we actually
+/// shipped it" / "I'm sorry …" (pronoun/auxiliary before → not a correction).
+/// Contraction fragments ("m", "re", "ve") come from splitting "I'm"/"we're".
+fn preceded_by_content_word(words: &[&str], i: usize) -> bool {
+    !matches!(
+        words.get(i).copied().unwrap_or(""),
+        "i" | "you" | "we" | "they" | "it" | "he" | "she" | "me" | "us"
+            | "him" | "her" | "them" | "this" | "that" | "these" | "those"
+            | "there" | "here" | "who" | "which" | "what"
+            | "is" | "are" | "was" | "were" | "am" | "be" | "been" | "being"
+            | "do" | "does" | "did" | "has" | "have" | "had"
+            | "can" | "could" | "will" | "would" | "should" | "shall" | "may"
+            | "might" | "must" | "not" | "so" | "and" | "but" | "or" | "if"
+            | "to" | "of" | "m" | "s" | "re" | "ll" | "ve" | "d" | "t"
+            // Common no-apostrophe clitic forms ASR may emit ("I'm" → "im",
+            // "you're" → "youre", …). Before an emphasis/apology word these are
+            // pronoun+auxiliary, not a noun the speaker just stated.
+            | "im" | "youre" | "hes" | "shes" | "theyre" | "weve" | "youve"
+            | "ive" | "youll" | "theyll" | "youd" | "wed" | "id"
+    )
+}
+
 /// Decide whether a transcript is messy enough to be worth the generative
 /// cleanup LLM, or clean enough to take the deterministic pass alone.
 ///
@@ -707,6 +800,13 @@ pub fn needs_llm_cleanup(raw: &str) -> bool {
         .collect();
     if words.len() < 3 {
         return false;
+    }
+    // Mid-sentence self-correction: the speaker abandons a fragment and
+    // restates it ("no wait", "I mean", "actually", "sorry", …). The
+    // deterministic pass can't safely drop the abandoned clause, so route it
+    // to the model, which now knows to keep only the final version.
+    if contains_self_correction(&words) {
+        return true;
     }
     const CONTRACTIONS: &[&str] = &[
         "wanna", "gonna", "gotta", "kinda", "sorta", "gimme", "lemme", "dunno", "outta", "lotta",
@@ -1544,6 +1644,56 @@ mod tests {
             after that we went over to the place and grabbed the stuff and then \
             came back and started again with the first part of the whole process once more";
         assert!(needs_llm_cleanup(runon));
+    }
+
+    #[test]
+    fn messiness_gate_routes_self_correction_to_llm() {
+        // Mid-sentence repair: the speaker abandons a fragment and restates it.
+        assert!(needs_llm_cleanup("let's meet Monday no wait I mean Tuesday"));
+        assert!(needs_llm_cleanup(
+            "the report is due tomorrow actually I meant Friday"
+        ));
+        assert!(needs_llm_cleanup("ship the build I mean the release"));
+        // "no wait" alone (no I mean-follower) is still a repair.
+        assert!(needs_llm_cleanup("we should no wait we should ship it"));
+        // A correction-introducing "scratch that" mid-sentence.
+        assert!(needs_llm_cleanup("the meeting is on monday scratch that tuesday"));
+    }
+
+    #[test]
+    fn messiness_gate_ignores_ordinary_non_repair_uses() {
+        // "actually"/"sorry"/"no" in ordinary, non-repair senses must NOT route
+        // to the LLM — the deterministic pass handles them.
+        assert!(!needs_llm_cleanup("actually I like that"));
+        assert!(!needs_llm_cleanup("I'm sorry to hear that"));
+        assert!(!needs_llm_cleanup("no problem at all"));
+        // Emphasis use of "actually" (pronoun before it) isn't a repair.
+        assert!(!needs_llm_cleanup("I actually like that idea"));
+        assert!(!needs_llm_cleanup("we actually shipped it yesterday"));
+    }
+
+    #[test]
+    fn self_correction_detector_is_pure() {
+        // A repair marker mid-sentence (words on both sides) fires.
+        assert!(contains_self_correction(&["no", "wait", "i", "mean", "tuesday"]));
+        assert!(contains_self_correction(&[
+            "ship", "the", "build", "i", "mean", "the", "release"
+        ]));
+        assert!(contains_self_correction(&["ship", "it", "i", "meant", "friday"]));
+        assert!(contains_self_correction(&["we", "should", "no", "wait", "ship", "it"]));
+        assert!(contains_self_correction(&["monday", "scratch", "that", "tuesday"]));
+        // "no no" alone is a marker at the very start → no words before it.
+        assert!(!contains_self_correction(&["no", "no"]));
+        // A marker at the very start or very end does NOT fire (needs words both sides).
+        assert!(!contains_self_correction(&["i", "mean", "the", "release"]));
+        assert!(!contains_self_correction(&["actually", "i", "like", "that"]));
+        assert!(!contains_self_correction(&["ship", "i", "mean"]));
+        // "sorry" only as a repair (not "sorry to hear/bother").
+        assert!(!contains_self_correction(&["i", "m", "sorry", "to", "hear", "that"]));
+        assert!(!contains_self_correction(&["im", "sorry", "to", "hear", "that"]));
+        // Emphasis "actually" (a pronoun before it) isn't a repair.
+        assert!(!contains_self_correction(&["i", "actually", "like", "that"]));
+        assert!(!contains_self_correction(&["no", "problem", "at", "all"]));
     }
 
     // -------------------------------------------------------------------

@@ -303,6 +303,24 @@ impl TextCleanupEngine {
         raw_text: &str,
         screen_vocab: &[String],
     ) -> eyre::Result<String> {
+        self.process_transcript_with_vocab_tone(raw_text, screen_vocab, None)
+            .await
+    }
+
+    /// Like [`Self::process_transcript_with_vocab`], but optionally appends a
+    /// per-app tone directive to the cleanup prompt based on the app the user is
+    /// dictating into (see [`crate::app_tones`]). When `tone` is `None` the
+    /// behaviour is byte-for-byte identical to
+    /// [`Self::process_transcript_with_vocab`] — the default cleanup prompt. The
+    /// tone fragment is appended after the vocabulary block (and before the
+    /// "Raw transcript:" user message) so it reads as part of the instruction,
+    /// not the transcript.
+    pub async fn process_transcript_with_vocab_tone(
+        &self,
+        raw_text: &str,
+        screen_vocab: &[String],
+        tone: Option<&str>,
+    ) -> eyre::Result<String> {
         let raw = raw_text.trim();
         if raw.is_empty() {
             return Ok(String::new());
@@ -318,6 +336,12 @@ impl TextCleanupEngine {
             if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
                 prompt_body.push_str(&suffix);
             }
+        }
+        // Per-app tone directive: appended after the vocabulary block and before
+        // the user transcript message so it steers the style of the whole
+        // cleanup. `None` leaves the default prompt untouched.
+        if let Some(tone) = tone {
+            prompt_body.push_str(&crate::app_tones::tone_suffix(tone));
         }
         // Cleanup never summarizes (the prompt forbids it), so the cleaned text
         // tracks the input length — stripping filler makes it a touch shorter,

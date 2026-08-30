@@ -165,6 +165,74 @@ impl Corrections {
         Self::build(map)
     }
 
+    /// Merge CSV rows into the dictionary, returning the number of net-new
+    /// entries added (an existing key that gets overwritten is not counted).
+    ///
+    /// Row semantics:
+    ///   * `from,to`  → a substitution (`from` keyed lowercased, `to` verbatim).
+    ///   * `word`     → an identity entry (word → word), preserving the spelling.
+    ///   * Blank lines and empty cells are skipped. A header row — one of
+    ///     `from,to`, `heard,correct`, `word`, `from`, `phrase,replacement`
+    ///     (case-insensitive, first data row only) — is skipped too.
+    ///
+    /// The merge is done by reading the existing `map`, recombining it with the
+    /// parsed rows, and rebuilding through [`Self::build`] so the phrase index
+    /// can't drift.
+    pub fn import_csv(&mut self, csv_body: &str) -> eyre::Result<usize> {
+        let records = parse_csv(csv_body);
+        let mut map: HashMap<String, String> = self.map.clone();
+        let mut added = 0usize;
+        let mut first_data_row = true;
+
+        for cells in records {
+            // Blank line: every cell empty.
+            if cells.iter().all(|c| c.trim().is_empty()) {
+                continue;
+            }
+            // Header detection applies only to the first non-blank row.
+            if first_data_row {
+                first_data_row = false;
+                if is_header_row(&cells) {
+                    continue;
+                }
+            }
+            let fields: Vec<&str> = cells
+                .iter()
+                .map(|c| c.trim())
+                .filter(|c| !c.is_empty())
+                .collect();
+            match fields.len() {
+                0 => {}                    // all empty cells (already blank)
+                1 => {
+                    // Identity entry: word → word, so the spelling is preserved.
+                    let word = fields[0];
+                    if map.insert(word.to_lowercase(), word.to_string()).is_none() {
+                        added += 1;
+                    }
+                }
+                2 => {
+                    // Substitution: from → to, key lowercased via `build`'s funnel.
+                    let (from, to) = (fields[0], fields[1]);
+                    if map.insert(from.to_lowercase(), to.to_string()).is_none() {
+                        added += 1;
+                    }
+                }
+                _ => {}                    // >2 columns: ignore the extra cells
+            }
+        }
+
+        *self = Self::build(map);
+        Ok(added)
+    }
+
+    /// Read the CSV file at `path` and merge it via [`Self::import_csv`],
+    /// returning the number of entries added. (The menu bar will use this.)
+    pub fn import_csv_path(&mut self, path: &Path) -> eyre::Result<usize> {
+        let body = std::fs::read_to_string(path)
+            .map_err(|e| eyre::eyre!(r#"read {}: {e}"#, path.display()))?;
+        self.import_csv(&body)
+    }
+
     /// Write the map to `path` as a pretty, key-sorted JSON object.
     pub fn save_to(&self, path: &Path) -> eyre::Result<()> {
         if let Some(dir) = path.parent() {
@@ -381,6 +449,97 @@ fn split_arrow(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Is `cells` a CSV header row? Matched on the first data row only, and
+/// case-insensitively. Recognized headers: `from,to`, `heard,correct`,
+/// `word`, `from`, `phrase,replacement`.
+fn is_header_row(cells: &[String]) -> bool {
+    let norm: Vec<String> = cells.iter().map(|c| c.trim().to_lowercase()).collect();
+    match norm.len() {
+        1 => norm[0] == "word" || norm[0] == "from",
+        2 => (norm[0] == "from" && norm[1] == "to")
+            || (norm[0] == "heard" && norm[1] == "correct")
+            || (norm[0] == "phrase" && norm[1] == "replacement"),
+        _ => false,
+    }
+}
+
+/// Minimal RFC4180-style CSV parser: fields separated by commas, records by
+/// `\n` or `\r\n`. A field may be double-quoted — a quoted field can contain
+/// commas and newlines, and a doubled `""` inside quotes is a literal `"`.
+/// Surrounding whitespace is trimmed on unquoted fields; quoted fields keep
+/// their bytes verbatim (so interior spacing isn't lost). Returns one record
+/// per row; physical lines inside a quoted field stay part of that field.
+fn parse_csv(body: &str) -> Vec<Vec<String>> {
+    let mut records: Vec<Vec<String>> = Vec::new();
+    let mut record: Vec<String> = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut quoted = false; // whether the field currently being built is quoted
+    let mut chars = body.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                // A doubled quote inside quotes is a literal `"`; a single
+                // one closes the quoted field.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else {
+            match c {
+                '"' => {
+                    in_quotes = true;
+                    quoted = true;
+                }
+                ',' => {
+                    record.push(finish_field(&field, quoted));
+                    field.clear();
+                    quoted = false;
+                }
+                '\r' => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    record.push(finish_field(&field, quoted));
+                    field.clear();
+                    quoted = false;
+                    records.push(std::mem::take(&mut record));
+                }
+                '\n' => {
+                    record.push(finish_field(&field, quoted));
+                    field.clear();
+                    quoted = false;
+                    records.push(std::mem::take(&mut record));
+                }
+                _ => field.push(c),
+            }
+        }
+    }
+    // Flush the last record (handles a missing trailing newline, including a
+    // trailing comma's empty field, e.g. `a,b,`).
+    if !field.is_empty() || !record.is_empty() {
+        record.push(finish_field(&field, quoted));
+        records.push(record);
+    }
+    records
+}
+
+/// Finalize a field: quoted fields are kept verbatim; unquoted fields have
+/// surrounding whitespace trimmed.
+fn finish_field(field: &str, quoted: bool) -> String {
+    if quoted {
+        field.to_string()
+    } else {
+        field.trim().to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,5 +727,114 @@ mod tests {
         let c2 = Corrections::from_editor_text(&text);
         assert_eq!(c2.apply("lings"), "Lumen");
         assert_eq!(c2.apply("macos"), "macOS");
+    }
+
+    // --- CSV parser ---
+
+    #[test]
+    fn parse_csv_quoted_field_with_comma() {
+        assert_eq!(parse_csv("\"a,b\",c"), vec![vec!["a,b", "c"]]);
+    }
+
+    #[test]
+    fn parse_csv_quoted_field_with_escaped_quote() {
+        assert_eq!(
+            parse_csv("\"say \"\"hi\"\"\",x"),
+            vec![vec!["say \"hi\"", "x"]]
+        );
+    }
+
+    #[test]
+    fn parse_csv_quoted_field_with_newline() {
+        assert_eq!(parse_csv("\"line1\nline2\",x"), vec![vec!["line1\nline2", "x"]]);
+    }
+
+    #[test]
+    fn parse_csv_simple_unquoted_row() {
+        assert_eq!(parse_csv("a,b,c"), vec![vec!["a", "b", "c"]]);
+    }
+
+    #[test]
+    fn parse_csv_trailing_empty_field() {
+        assert_eq!(parse_csv("a,b,"), vec![vec!["a", "b", ""]]);
+    }
+
+    #[test]
+    fn parse_csv_trims_unquoted_fields() {
+        assert_eq!(parse_csv("  a ,  b  "), vec![vec!["a", "b"]]);
+    }
+
+    // --- import_csv ---
+
+    #[test]
+    fn import_csv_two_column_substitution() {
+        let mut c = Corrections::empty();
+        assert_eq!(c.import_csv("lings,Lumen").unwrap(), 1);
+        assert_eq!(c.apply("hello lings"), "hello Lumen");
+    }
+
+    #[test]
+    fn import_csv_one_column_identity() {
+        let mut c = Corrections::empty();
+        assert_eq!(c.import_csv("macOS").unwrap(), 1);
+        assert_eq!(c.apply("macos"), "macOS");
+    }
+
+    #[test]
+    fn import_csv_skips_header_row() {
+        let mut c = Corrections::empty();
+        assert_eq!(c.import_csv("from,to\nlings,Lumen").unwrap(), 1);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.apply("lings"), "Lumen");
+    }
+
+    #[test]
+    fn import_csv_skips_recognized_headers_case_insensitively() {
+        let mut c = Corrections::empty();
+        assert_eq!(c.import_csv("Heard,Correct\nfoo,Foo").unwrap(), 1);
+        assert_eq!(c.apply("foo"), "Foo");
+    }
+
+    #[test]
+    fn import_csv_skips_blank_lines() {
+        let mut c = Corrections::empty();
+        assert_eq!(c.import_csv("\n\nlings,Lumen\n\n").unwrap(), 1);
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn import_csv_merges_without_wiping_existing() {
+        let mut c = dict(&[("teh", "the")]);
+        assert_eq!(c.import_csv("lings,Lumen").unwrap(), 1);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c.apply("teh lings"), "the Lumen");
+    }
+
+    #[test]
+    fn import_csv_count_returns_net_new_entries() {
+        let mut c = Corrections::empty();
+        let n = c
+            .import_csv("from,to\nlings,Lumen\nfoo,Bar\n\n")
+            .unwrap();
+        assert_eq!(n, 2); // header + blank skipped
+        assert_eq!(c.apply("foo"), "Bar");
+    }
+
+    #[test]
+    fn import_csv_overwrites_existing_key_without_counting() {
+        let mut c = dict(&[("lings", "Lumen")]);
+        // Same key, new value → 0 added (net-new only).
+        assert_eq!(c.import_csv("lings,Ling2").unwrap(), 0);
+        assert_eq!(c.apply("lings"), "Ling2");
+        assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn import_csv_quoted_fields_with_commas() {
+        let mut c = Corrections::empty();
+        // A multi-word phrase key with a comma inside a quoted value, and a
+        // quoted identity word preserved verbatim.
+        assert_eq!(c.import_csv("\"secret phrase\",\"Secret, LLC\"").unwrap(), 1);
+        assert_eq!(c.apply("the secret phrase"), "the Secret, LLC");
     }
 }

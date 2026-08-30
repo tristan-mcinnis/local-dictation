@@ -151,6 +151,23 @@ fn set_muted(muted: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_muted(_muted: bool) {}
 
+/// The frontmost app's bundle id, read via `NSWorkspace.frontmostApplication`
+/// (no extra permission, no `osascript` round-trip). Best-effort: `None` when
+/// it can't be read. Used for per-app tone detection and conferencing checks.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn frontmost_bundle_id() -> Option<String> {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .and_then(|app| app.bundleIdentifier())
+        .map(|s| s.to_string())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+pub fn frontmost_bundle_id() -> Option<String> {
+    None
+}
+
 /// True when the frontmost app is a known video/voice call client. Reads
 /// `NSWorkspace.frontmostApplication` (no extra permission, no `osascript`
 /// round-trip) and matches its bundle id against [`is_conferencing_bundle_id`].
@@ -158,12 +175,7 @@ fn set_muted(_muted: bool) {}
 /// bundle id can't be read.
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn frontmost_is_conferencing() -> bool {
-    use objc2_app_kit::NSWorkspace;
-    let bundle_id = NSWorkspace::sharedWorkspace()
-        .frontmostApplication()
-        .and_then(|app| app.bundleIdentifier())
-        .map(|s| s.to_string());
-    match bundle_id {
+    match frontmost_bundle_id() {
         Some(id) => is_conferencing_bundle_id(&id),
         None => false,
     }

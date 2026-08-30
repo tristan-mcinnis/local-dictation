@@ -214,6 +214,11 @@ enum DaemonEvent {
     /// PTT + Space chord recognised mid-hold: the session became hands-free, so
     /// releasing the keys won't stop recording. Worker just plays the cue.
     LatchArmed,
+    /// Re-run the pipeline on the last utterance's audio (re-transcribe +
+    /// cleanup + inject at the current cursor). Reached only via the control
+    /// socket ("retry") or the menu-bar item. A no-op when nothing has been
+    /// dictated yet this session.
+    Retry,
 }
 
 /// How a tail-capture grace loop ended, when it was cut short by an event rather
@@ -257,12 +262,28 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // The CGEventTap callback runs on the main CFRunLoop thread. Keep it
     // FAST — just send to the worker.
     let tx_for_callback = tx.clone();
-    let hotkey_keycode = read_hotkey_keycode();
-    // The hold is detected by watching the modifier-flag bit that THIS key
-    // toggles — Option vs Command vs Control vs Shift. Without this, any
-    // non-Option hotkey would never register a press (the old code checked
-    // the Alternate bit unconditionally).
-    let hotkey_flag = keycode_to_modifier_flag(hotkey_keycode);
+    let hotkey = crate::hotkeys::Hotkey::from_settings();
+    let hotkey_keycode = hotkey.keycode;
+    let modifier_only = hotkey.is_modifier_only();
+    // A modifier-only hotkey (Right Option etc.) is detected via FlagsChanged
+    // on its own modifier bit; a chord hotkey is detected via KeyDown/KeyUp of
+    // the non-modifier key while the required modifiers are held.
+    let hotkey_flag = if modifier_only {
+        Some(keycode_to_modifier_flag(hotkey_keycode))
+    } else {
+        None
+    };
+    let required_mask = if modifier_only {
+        CGEventFlags::empty()
+    } else {
+        modifiers_from_mask(hotkey.modifiers)
+    };
+
+    // Warn (but do not block) when another app has already registered the same
+    // combo system-wide — the hotkey may not fire reliably.
+    if let Some(msg) = crate::hotkeys::detect_conflict(&hotkey) {
+        eprintln!("[hotkey] ⚠ conflict: {msg}");
+    }
 
     // Hands-free latch state shared with the callback. `state` is the ST_*
     // machine driven by `ptt_transition`; `space_down` lets us swallow the
@@ -272,6 +293,30 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let space_down = Arc::new(AtomicBool::new(false));
     let state_cb = state.clone();
     let space_down_cb = space_down.clone();
+    // Whether the (chord) hotkey's non-modifier key is currently held, so we
+    // swallow its matching key-up and never emit a stray release.
+    let hotkey_down = Arc::new(AtomicBool::new(false));
+    let hotkey_down_cb = hotkey_down.clone();
+
+    // Drive the latch state machine once, forwarding any Start/Stop decision to
+    // the worker. Shared by the modifier-only and chord hotkey detection paths.
+    let drive = {
+        let tx = tx_for_callback.clone();
+        let scb = state_cb.clone();
+        move |input: PttInput| {
+            let (next, decision) = ptt_transition(scb.load(Ordering::SeqCst), input);
+            scb.store(next, Ordering::SeqCst);
+            match decision {
+                PttDecision::Start { transform } => {
+                    let _ = tx.send(DaemonEvent::StartRecording { transform });
+                }
+                PttDecision::Stop => {
+                    let _ = tx.send(DaemonEvent::StopRecording);
+                }
+                _ => {}
+            }
+        }
+    };
 
     // Install CGEventTap manually so we can hand the main thread over to
     // NSApplication.run() (needed for the menu-bar item + floating pill).
@@ -300,36 +345,49 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     }
                 }
                 CGEventType::FlagsChanged => {
+                    // Only the modifier-only hotkey uses FlagsChanged; a chord
+                    // hotkey reads its modifiers off the KeyDown event's flags.
+                    if !modifier_only {
+                        return CallbackResult::Keep;
+                    }
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                     if keycode != hotkey_keycode {
                         return CallbackResult::Keep;
                     }
                     let flags = event.get_flags();
-                    let input = if flags.contains(hotkey_flag) {
-                        // Shift co-held at press → transform mode (rewrite the
-                        // selection). The user holds Shift *before* the PTT key.
-                        PttInput::HotkeyPress {
-                            shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                    let input = if let Some(hf) = hotkey_flag {
+                        if flags.contains(hf) {
+                            // Shift co-held at press → transform mode (rewrite the
+                            // selection). The user holds Shift *before* the PTT key.
+                            PttInput::HotkeyPress {
+                                shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                            }
+                        } else {
+                            PttInput::HotkeyRelease
                         }
                     } else {
                         PttInput::HotkeyRelease
                     };
-                    let (next, decision) = ptt_transition(state_cb.load(Ordering::SeqCst), input);
-                    state_cb.store(next, Ordering::SeqCst);
-                    match decision {
-                        PttDecision::Start { transform } => {
-                            let _ = tx_for_callback.send(DaemonEvent::StartRecording { transform });
-                        }
-                        PttDecision::Stop => {
-                            let _ = tx_for_callback.send(DaemonEvent::StopRecording);
-                        }
-                        _ => {}
-                    }
+                    drive(input);
                     // FlagsChanged is never swallowed — let the modifier through.
                 }
                 CGEventType::KeyDown => {
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                    if keycode == SPACE_KEYCODE {
+                    if !modifier_only && keycode == hotkey_keycode {
+                        // Chord hotkey: the non-modifier key went down with the
+                        // required modifiers held. Swallow it so the keystroke
+                        // never reaches the app (no stray character / menu).
+                        let flags = event.get_flags();
+                        if flags.contains(required_mask) {
+                            let shift = flags.contains(CGEventFlags::CGEventFlagShift)
+                                && !required_mask.contains(CGEventFlags::CGEventFlagShift);
+                            drive(PttInput::HotkeyPress { shift });
+                            hotkey_down_cb.store(true, Ordering::SeqCst);
+                            return CallbackResult::Drop;
+                        }
+                        return CallbackResult::Keep;
+                    }
+                    if modifier_only && keycode == SPACE_KEYCODE {
                         let (next, decision) =
                             ptt_transition(state_cb.load(Ordering::SeqCst), PttInput::SpaceDown);
                         state_cb.store(next, Ordering::SeqCst);
@@ -351,7 +409,15 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                 }
                 CGEventType::KeyUp => {
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-                    if keycode == SPACE_KEYCODE && space_down_cb.swap(false, Ordering::SeqCst) {
+                    if !modifier_only && keycode == hotkey_keycode {
+                        // Chord hotkey release: swallow the matching key-up.
+                        if hotkey_down_cb.swap(false, Ordering::SeqCst) {
+                            drive(PttInput::HotkeyRelease);
+                            return CallbackResult::Drop;
+                        }
+                        return CallbackResult::Keep;
+                    }
+                    if modifier_only && keycode == SPACE_KEYCODE && space_down_cb.swap(false, Ordering::SeqCst) {
                         // Swallow the key-up matching a swallowed key-down.
                         return CallbackResult::Drop;
                     }
@@ -383,11 +449,18 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     std::mem::forget(tap);
     std::mem::forget(loop_source);
 
-    eprintln!(
-        "[boot] ready · hold {key} (0x{hotkey_keycode:x}) to dictate · \
-         {key}+Space then release = hands-free (tap {key} to stop) · ⌘Q quits",
-        key = crate::settings::hotkey_name(hotkey_keycode),
-    );
+    let hotkey_label = hotkey.display();
+    if modifier_only {
+        eprintln!(
+            "[boot] ready · hold {hotkey_label} to dictate · \
+             {hotkey_label}+Space then release = hands-free (tap {hotkey_label} to stop) · ⌘Q quits"
+        );
+    } else {
+        eprintln!(
+            "[boot] ready · hold {hotkey_label} to dictate · ⌘Q quits \
+             (hands-free Space chord is not available for a chord hotkey)"
+        );
+    }
     eprintln!();
     ui_channel::set_state(UiState::Idle);
 
@@ -403,6 +476,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             Command::Start => tx_for_ctl.send(DaemonEvent::StartRecording { transform: false }),
             Command::Stop => tx_for_ctl.send(DaemonEvent::StopRecording),
             Command::Cancel => tx_for_ctl.send(DaemonEvent::CancelRecording),
+            Command::Retry => tx_for_ctl.send(DaemonEvent::Retry),
             // The server resolves Toggle → Start/Stop before dispatch, so a
             // Toggle reaching here would be a bug; treat it as a no-op.
             Command::Toggle => Ok(()),
@@ -420,9 +494,37 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     Ok(())
 }
 
-fn read_hotkey_keycode() -> i64 {
-    // Precedence: DICTATE_HOTKEY_KEYCODE env > settings.json > default.
-    crate::settings::Settings::load().resolve_hotkey(DEFAULT_HOTKEY_KEYCODE)
+/// Convert a hotkey modifier mask (raw CGEventFlags bits) into a CGEventFlags
+/// set. Used to turn the settings-stored `u64` into the flag bits the event tap
+/// checks against the live key-event flags.
+fn modifiers_from_mask(mask: u64) -> CGEventFlags {
+    let mut f = CGEventFlags::empty();
+    if mask & crate::hotkeys::SHIFT != 0 {
+        f |= CGEventFlags::CGEventFlagShift;
+    }
+    if mask & crate::hotkeys::CONTROL != 0 {
+        f |= CGEventFlags::CGEventFlagControl;
+    }
+    if mask & crate::hotkeys::OPTION != 0 {
+        f |= CGEventFlags::CGEventFlagAlternate;
+    }
+    if mask & crate::hotkeys::COMMAND != 0 {
+        f |= CGEventFlags::CGEventFlagCommand;
+    }
+    if mask & crate::hotkeys::CAPS_LOCK != 0 {
+        f |= CGEventFlags::CGEventFlagAlphaShift;
+    }
+    f
+}
+
+/// The VAD config for the push-to-talk path: whisper mode uses a lower speech
+/// threshold so quiet dictation is captured.
+fn vad_config(whisper: bool) -> crate::vad::VadConfig {
+    if whisper {
+        crate::vad::VadConfig::whisper()
+    } else {
+        crate::vad::VadConfig::default()
+    }
 }
 
 /// Map a modifier-key keycode to the CGEvent flag bit it toggles. On a
@@ -514,6 +616,13 @@ fn worker_loop(
     // no stream-open latency on press. `None` ⇒ the proven open-on-press path
     // (default). Created on the worker thread because the cpal Stream is !Send.
     let preroll_ms = crate::settings::Settings::load().resolve_preroll_ms();
+    // Whisper mode lowers the speech threshold so quiet dictation is captured.
+    // Read once at boot (like every other setting); threaded into the VAD + the
+    // tail-capture engage threshold below.
+    let whisper_mode = crate::settings::Settings::load().resolve_whisper_mode();
+    if whisper_mode {
+        eprintln!("[boot] whisper     mode ON (lower speech threshold)");
+    }
     let mut always: Option<(
         crate::audio::AlwaysOnCapture,
         crate::audio::HeapAudioConsumer,
@@ -624,6 +733,9 @@ fn worker_loop(
     // utterance on the release→inject critical path.
     let mut noise_floor =
         crate::audio::NoiseFloorEstimator::new(crate::audio::TAIL_FLOOR_RING_FRAMES);
+    // The raw PCM of the last transcribed utterance, kept so "retry" can re-run
+    // the pipeline on the same audio. Empty until the first dictation.
+    let mut last_audio: Vec<f32> = Vec::new();
 
     'evloop: loop {
         // While recording with streaming ASR, wake periodically to transcribe any
@@ -667,6 +779,7 @@ fn worker_loop(
                                     &mut stream_poisoned,
                                     &mut noise_floor,
                                     false,
+                                    whisper_mode,
                                 );
                             }
                         }
@@ -687,6 +800,15 @@ fn worker_loop(
                 // keys are released. Just give audible feedback + a log line.
                 cues::play_latch();
                 eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
+            }
+            DaemonEvent::Retry => {
+                // Re-run the pipeline on the last utterance's audio (control
+                // socket "retry" / menu-bar item). No-op until the first
+                // successful dictation has stashed its audio.
+                #[cfg(feature = "cleaner")]
+                retry_last(&rt, &mut worker, cleaner.as_ref(), &refiner, &last_audio);
+                #[cfg(not(feature = "cleaner"))]
+                retry_last(&mut worker, &refiner, &last_audio);
             }
             DaemonEvent::CancelRecording => {
                 // External "cancel" (control socket only): stop capture and throw
@@ -783,7 +905,7 @@ fn worker_loop(
                             if streaming_asr {
                                 stream = Some(crate::vad::SegmentStream::new(
                                     crate::audio::SAMPLE_RATE,
-                                    crate::vad::VadConfig::default(),
+                                    vad_config(whisper_mode),
                                 ));
                                 // Reset the per-utterance streaming accumulators so
                                 // a warm-window reuse never carries stale segments
@@ -863,6 +985,7 @@ fn worker_loop(
                     &mut t_press,
                     streaming_asr,
                     transform,
+                    whisper_mode,
                 ) {
                     cues::play_error();
                 } else {
@@ -923,12 +1046,13 @@ fn worker_loop(
                         } else {
                             noise_floor.floor(crate::audio::TAIL_NOISE_PERCENTILE)
                         };
-                        crate::audio::tail_capture_engage(
+                        crate::audio::tail_capture_engage_with_mode(
                             &tail,
                             frame_len,
                             floor,
                             crate::audio::DEFAULT_TAIL_ENGAGE_MS,
                             crate::audio::DEFAULT_TAIL_FRAME_MS,
+                            whisper_mode,
                         )
                     };
                     if engage {
@@ -958,7 +1082,9 @@ fn worker_loop(
                                 }
                                 // A duplicate release or a stray latch cue during the
                                 // grace tail is harmless: keep waiting for quiet.
-                                Ok(DaemonEvent::StopRecording) | Ok(DaemonEvent::LatchArmed) => {}
+                                Ok(DaemonEvent::StopRecording)
+                                | Ok(DaemonEvent::LatchArmed)
+                                | Ok(DaemonEvent::Retry) => {}
                                 Err(_) => {}
                             }
                             recovered_ms = grace_start.elapsed().as_millis();
@@ -1006,7 +1132,7 @@ fn worker_loop(
                         if streaming_asr {
                             stream = Some(crate::vad::SegmentStream::new(
                                 crate::audio::SAMPLE_RATE,
-                                crate::vad::VadConfig::default(),
+                                vad_config(whisper_mode),
                             ));
                         }
                         cues::play_start();
@@ -1096,12 +1222,13 @@ fn worker_loop(
                         if let Some((ao, cons)) = always.as_mut() {
                             let recflag = ao.recording_flag();
                             let buf = crate::audio::drain_session(cons, &recflag);
-                            let Some(keep) = guarded_transcribe_len(&buf, &noise_floor) else {
+                            let Some(keep) = guarded_transcribe_len(&buf, &noise_floor, whisper_mode) else {
                                 eprintln!(
                                     "  ◌    no speech above noise floor · nothing to transcribe"
                                 );
                                 break 'got String::new();
                             };
+                            last_audio = buf[..keep].to_vec();
                             match worker.transcribe_pcm(&buf[..keep]) {
                                 Ok(t) => break 'got t,
                                 Err(err) => {
@@ -1145,6 +1272,7 @@ fn worker_loop(
                                 &mut stream_poisoned,
                                 &mut noise_floor,
                                 true,
+                                whisper_mode,
                             )
                         } else {
                             0
@@ -1161,8 +1289,11 @@ fn worker_loop(
                                 "  ⟫ streaming fallback · whole-buffer transcribe ({} samples)",
                                 whole.len()
                             );
-                            match guarded_transcribe_len(&whole, &noise_floor) {
-                                Some(keep) => worker.transcribe_pcm(&whole[..keep]),
+                            match guarded_transcribe_len(&whole, &noise_floor, whisper_mode) {
+                                Some(keep) => {
+                                    last_audio = whole[..keep].to_vec();
+                                    worker.transcribe_pcm(&whole[..keep])
+                                }
                                 None => {
                                     eprintln!(
                                         "  ◌    no speech above noise floor · nothing to transcribe"
@@ -1175,6 +1306,7 @@ fn worker_loop(
                                 "  ⟫ streamed {} segment(s) during hold",
                                 stream_segs.len()
                             );
+                            last_audio = whole.clone();
                             Ok(joined)
                         };
                         stream = None;
@@ -1194,10 +1326,11 @@ fn worker_loop(
                     // always-on path. Borrowing leaves the consumer in `consumer`
                     // so a warm-window reuse can keep it for the next dictation.
                     let buf = crate::audio::drain_session(c, r);
-                    let Some(keep) = guarded_transcribe_len(&buf, &noise_floor) else {
+                    let Some(keep) = guarded_transcribe_len(&buf, &noise_floor, whisper_mode) else {
                         eprintln!("  ◌    no speech above noise floor · nothing to transcribe");
                         break 'got String::new();
                     };
+                    last_audio = buf[..keep].to_vec();
                     match worker.transcribe_pcm(&buf[..keep]) {
                         Ok(t) => t,
                         Err(err) => {
@@ -1329,6 +1462,20 @@ fn worker_loop(
                     .map(|t| t.screen_terms(SCREEN_VOCAB_CAP))
                     .unwrap_or_default();
 
+                // Per-app tone: a short style hint for cleanup, derived from the
+                // frontmost app (chat vs email vs code …). Feeds the same
+                // whole-utterance cleanup prompt as the vocabulary block.
+                #[cfg(feature = "cleaner")]
+                let tone: Option<&'static str> = {
+                    let bundle = crate::audio_duck::frontmost_bundle_id();
+                    let name = target_pid.map(app_name).unwrap_or_default();
+                    let t = crate::app_tones::tone_for(&name, bundle.as_deref());
+                    if let Some(t) = t {
+                        eprintln!("  ♪    tone: {t}");
+                    }
+                    t
+                };
+
                 let mut t_cleanup_ms = 0_u128;
                 let final_text = {
                     #[cfg(feature = "cleaner")]
@@ -1373,9 +1520,10 @@ fn worker_loop(
                                     deterministic
                                 } else {
                                     let t_clean = Instant::now();
-                                    match rt.block_on(c.process_transcript_with_vocab(
+                                    match rt.block_on(c.process_transcript_with_vocab_tone(
                                         &pre_corrected,
                                         &screen_vocab,
+                                        tone,
                                     )) {
                                         Ok(cleaned) => {
                                             t_cleanup_ms = ms(t_clean.elapsed());
@@ -1633,6 +1781,7 @@ fn stream_process_asr(
     poisoned: &mut bool,
     noise_floor: &mut crate::audio::NoiseFloorEstimator,
     final_flush: bool,
+    whisper: bool,
 ) -> u128 {
     let avail = drain_available(consumer);
     if !avail.is_empty() {
@@ -1656,7 +1805,7 @@ fn stream_process_asr(
     let mut last_seg_ms = 0u128;
     let frame_ms = crate::audio::DEFAULT_TAIL_FRAME_MS;
     let frame_len = (frame_ms as f64 / 1000.0 * crate::audio::SAMPLE_RATE as f64) as usize;
-    let threshold = crate::audio::speech_threshold(noise_floor.floor(0.10));
+    let threshold = crate::audio::speech_threshold_with_mode(noise_floor.floor(0.10), whisper);
     for (s, e) in segs {
         // A prior failure poisons the stream: keep draining audio into the backup
         // so the release fallback transcribes everything, but stop spending
@@ -1717,6 +1866,7 @@ fn stream_process_asr(
 fn guarded_transcribe_len(
     audio: &[f32],
     estimator: &crate::audio::NoiseFloorEstimator,
+    whisper: bool,
 ) -> Option<usize> {
     let frame_ms = crate::audio::DEFAULT_TAIL_FRAME_MS;
     let frame_len = (frame_ms as f64 / 1000.0 * crate::audio::SAMPLE_RATE as f64) as usize;
@@ -1725,7 +1875,7 @@ fn guarded_transcribe_len(
     } else {
         estimator.floor(0.10)
     };
-    let threshold = crate::audio::speech_threshold(floor);
+    let threshold = crate::audio::speech_threshold_with_mode(floor, whisper);
     crate::audio::transcribe_keep_len(audio, frame_len, threshold, frame_ms)
 }
 
@@ -1762,6 +1912,7 @@ fn begin_open_capture(
     t_press: &mut Option<Instant>,
     streaming_asr: bool,
     transform: bool,
+    whisper: bool,
 ) -> bool {
     *transform_mode = transform;
     *t_press = Some(Instant::now());
@@ -1785,7 +1936,7 @@ fn begin_open_capture(
     if streaming_asr {
         *stream = Some(crate::vad::SegmentStream::new(
             crate::audio::SAMPLE_RATE,
-            crate::vad::VadConfig::default(),
+            vad_config(whisper),
         ));
         stream_segs.clear();
         stream_audio.clear();
@@ -2007,6 +2158,69 @@ fn listen_dictate(
 #[cfg(not(feature = "cleaner"))]
 fn listen_dictate(refiner: &Refiner, body: &str) {
     inject_refined(refiner, body);
+}
+
+/// Re-run the pipeline on the last utterance's raw audio (the "retry" control
+/// command / menu item): re-transcribe, clean (when a cleaner is loaded), refine,
+/// and inject at the current cursor. Faithful to the original cleanup path — the
+/// deterministic seed makes cleanup reproduce the same text. A no-op (with an
+/// error cue) when there is no stashed audio yet.
+#[cfg(feature = "cleaner")]
+fn retry_last(
+    rt: &tokio::runtime::Runtime,
+    worker: &mut LocalInferenceWorker,
+    cleaner: Option<&TextCleanupEngine>,
+    refiner: &Refiner,
+    audio: &[f32],
+) {
+    if audio.is_empty() {
+        eprintln!("  ↻    retry: nothing to retry yet");
+        cues::play_error();
+        return;
+    }
+    let transcript = match worker.transcribe_pcm(audio) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  ↻    retry transcribe failed: {e:?}");
+            cues::play_error();
+            return;
+        }
+    };
+    if transcript.trim().is_empty() {
+        eprintln!("  ↻    retry: empty transcript");
+        return;
+    }
+    let cleaned = match cleaner {
+        Some(c) => rt
+            .block_on(c.process_transcript_with_vocab(&transcript, &[]))
+            .unwrap_or_else(|_| transcript.clone()),
+        None => transcript,
+    };
+    inject_refined(refiner, &cleaned);
+}
+
+/// Non-cleaner build: retry re-transcribes and injects the raw transcript
+/// (no cleanup engine).
+#[cfg(not(feature = "cleaner"))]
+fn retry_last(
+    worker: &mut LocalInferenceWorker,
+    refiner: &Refiner,
+    audio: &[f32],
+) {
+    if audio.is_empty() {
+        eprintln!("  ↻    retry: nothing to retry yet");
+        cues::play_error();
+        return;
+    }
+    let transcript = match worker.transcribe_pcm(audio) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("  ↻    retry transcribe failed: {e:?}");
+            cues::play_error();
+            return;
+        }
+    };
+    inject_refined(refiner, &transcript);
 }
 
 /// Shared tail of `listen_dictate`: run the refiner's terminal classification

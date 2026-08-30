@@ -52,6 +52,7 @@ async fn main() -> eyre::Result<()> {
         "start" => run_control(fast_dictate_backend::ipc::Command::Start),
         "stop" => run_control(fast_dictate_backend::ipc::Command::Stop),
         "cancel" => run_control(fast_dictate_backend::ipc::Command::Cancel),
+        "retry" => run_control(fast_dictate_backend::ipc::Command::Retry),
         "synth-press" => run_synth_press(
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
@@ -60,7 +61,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, mock-loop"
         )),
     }
 }

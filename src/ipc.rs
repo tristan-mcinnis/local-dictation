@@ -34,6 +34,10 @@ pub enum Command {
     Stop,
     Toggle,
     Cancel,
+    /// Re-run the pipeline on the last utterance's audio (re-transcribe +
+    /// cleanup + inject at the current cursor). No-op when nothing has been
+    /// dictated yet in this daemon session.
+    Retry,
 }
 
 impl Command {
@@ -45,6 +49,7 @@ impl Command {
             "stop" => Some(Command::Stop),
             "toggle" => Some(Command::Toggle),
             "cancel" => Some(Command::Cancel),
+            "retry" => Some(Command::Retry),
             _ => None,
         }
     }
@@ -56,6 +61,7 @@ impl Command {
             Command::Stop => "stop",
             Command::Toggle => "toggle",
             Command::Cancel => "cancel",
+            Command::Retry => "retry",
         }
     }
 }
