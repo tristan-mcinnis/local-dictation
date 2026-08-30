@@ -55,19 +55,48 @@ pub fn polish_multiline(raw: &str) -> String {
     polish_with(raw, true)
 }
 
+/// Reasoning-block tags a thinking model can leak before its answer (Qwen/S1
+/// uses `<think>…</think>`; DeepSeek-style uses `<|begin_of_thought|>…`). The
+/// block and its contents are stripped before visible-text cleanup. An OPEN tag
+/// with no matching CLOSE means the model was cut off mid-reason and produced no
+/// usable answer — everything from the open tag on is dropped.
+const REASONING_OPEN_TAGS: &[&str] = &["<think>", "<|begin_of_thought|>"];
+const REASONING_CLOSE_TAGS: &[&str] = &["</think>", "<|end_of_thought|>"];
+
+fn strip_reasoning_blocks(s: &str) -> String {
+    let lower = s.to_lowercase();
+    // Earliest open tag that is preceded only by whitespace (a leading block,
+    // never a mid-sentence literal).
+    let mut open_pos: Option<usize> = None;
+    for open in REASONING_OPEN_TAGS {
+        if let Some(p) = lower.find(open) {
+            if s[..p].trim().is_empty() {
+                open_pos = Some(open_pos.map_or(p, |cur| cur.min(p)));
+            }
+        }
+    }
+    let Some(op) = open_pos else {
+        return s.to_string();
+    };
+    // Earliest closing tag after the open tag.
+    let mut close_end: Option<usize> = None;
+    for close in REASONING_CLOSE_TAGS {
+        if let Some(p) = lower[op..].find(close) {
+            let end = op + p + close.len();
+            close_end = Some(close_end.map_or(end, |cur| cur.min(end)));
+        }
+    }
+    match close_end {
+        Some(end) => format!("{}{}", &s[..op], &s[end..]),
+        None => s[..op].trim().to_string(),
+    }
+}
+
 fn polish_with(raw: &str, preserve_newlines: bool) -> String {
     let mut s = raw.to_string();
 
-    // Remove Qwen/S1 reasoning blocks before applying visible-text cleanup.
-    let lower_reasoning = s.to_lowercase();
-    if let (Some(start), Some(end)) = (
-        lower_reasoning.find("<think>"),
-        lower_reasoning.find("</think>"),
-    ) {
-        if start == 0 && end >= start {
-            s = s[end + "</think>".len()..].to_string();
-        }
-    }
+    // Remove a thinking model's reasoning block before visible-text cleanup.
+    s = strip_reasoning_blocks(&s);
 
     // 1. Strip known trailing chat-template tokens.
     for marker in TRAILING_ARTEFACTS {
@@ -1351,6 +1380,27 @@ mod tests {
     fn strips_chat_template_artefacts() {
         assert_eq!(polish("Hello world.<end_of_turn>"), "Hello world.");
         assert_eq!(polish("Hello world.</s>"), "Hello world.");
+    }
+
+    #[test]
+    fn strips_reasoning_blocks_closed_and_unclosed() {
+        // Closed block: keep what follows the closing tag.
+        assert_eq!(
+            polish("<think>the user wants a greeting</think>\nHello"),
+            "Hello"
+        );
+        // Unclosed block (model cut off mid-reason): drop everything.
+        assert_eq!(polish("<think>"), "");
+        assert_eq!(polish("<think>let me consider"), "");
+        // DeepSeek-style tags, case-insensitive.
+        assert_eq!(
+            polish("<Think>reasoning</Think>Answer"),
+            "Answer"
+        );
+        // No tag → untouched.
+        assert_eq!(polish("plain answer"), "plain answer");
+        // A mid-sentence literal is never a reasoning block.
+        assert_eq!(polish("I think this is fine"), "I think this is fine");
     }
 
     #[test]
