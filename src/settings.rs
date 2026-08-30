@@ -73,6 +73,16 @@ pub struct Settings {
     /// differently). Override: `DICTATE_STREAMING_ASR=0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streaming_asr: Option<bool>,
+    /// Release tail-capture (default ON): on key release, keep the mic open for a
+    /// brief adaptive grace loop so the last word of an utterance isn't clipped,
+    /// then stop. `None`/true ⇒ enabled. Override: `DICTATE_TAIL_CAPTURE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_capture: Option<bool>,
+    /// Hard ceiling (ms) on the tail-capture grace loop — the longest the daemon
+    /// will keep listening after release for a trailing word. `None` ⇒ 1500.
+    /// Override: `DICTATE_TAIL_CAPTURE_CAP_MS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_capture_cap_ms: Option<u32>,
     /// Always-on mic: keep the input stream warm and retain this many ms of
     /// pre-roll, so the first words aren't clipped and there's no stream-open
     /// latency on key-press. `None`/absent ⇒ off (open-on-press, current
@@ -274,6 +284,33 @@ impl Settings {
             }
         }
         self.preroll_ms.unwrap_or(0)
+    }
+
+    /// Resolve release tail-capture: `DICTATE_TAIL_CAPTURE` env > settings > true
+    /// (on). Turned OFF when always-on pre-roll is active, because the two drain
+    /// the capture ring differently and pre-roll's always-on stream already keeps
+    /// rolling past the release.
+    pub fn resolve_tail_capture(&self) -> bool {
+        if self.resolve_preroll_ms() > 0 {
+            return false;
+        }
+        if let Ok(v) = std::env::var("DICTATE_TAIL_CAPTURE") {
+            let v = v.trim().to_ascii_lowercase();
+            return !matches!(v.as_str(), "0" | "false" | "off" | "no");
+        }
+        self.tail_capture.unwrap_or(true)
+    }
+
+    /// Resolve the tail-capture grace cap in ms: `DICTATE_TAIL_CAPTURE_CAP_MS` env
+    /// > settings > [`crate::audio::DEFAULT_TAIL_CAP_MS`] (1500).
+    pub fn resolve_tail_capture_cap_ms(&self) -> u32 {
+        if let Ok(v) = std::env::var("DICTATE_TAIL_CAPTURE_CAP_MS") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                return n;
+            }
+        }
+        self.tail_capture_cap_ms
+            .unwrap_or(crate::audio::DEFAULT_TAIL_CAP_MS as u32)
     }
 
     /// Resolve listen mode: `DICTATE_LISTEN_MODE` env > settings > false. Note
@@ -677,6 +714,38 @@ mod tests {
             let mut s = Settings::default();
             s.preroll_ms = Some(400);
             assert!(!s.resolve_streaming_asr());
+        }
+    }
+
+    #[test]
+    fn tail_capture_defaults_on_and_can_be_disabled() {
+        if std::env::var_os("DICTATE_TAIL_CAPTURE").is_none() {
+            assert!(Settings::default().resolve_tail_capture());
+            let mut s = Settings::default();
+            s.tail_capture = Some(false);
+            assert!(!s.resolve_tail_capture());
+        }
+    }
+
+    #[test]
+    fn tail_capture_disabled_by_preroll() {
+        // Always-on pre-roll keeps rolling past release, so release grace is off.
+        if std::env::var_os("DICTATE_TAIL_CAPTURE").is_none()
+            && std::env::var_os("DICTATE_PREROLL_MS").is_none()
+        {
+            let mut s = Settings::default();
+            s.preroll_ms = Some(400);
+            assert!(!s.resolve_tail_capture());
+        }
+    }
+
+    #[test]
+    fn tail_capture_cap_defaults_and_parses() {
+        if std::env::var_os("DICTATE_TAIL_CAPTURE_CAP_MS").is_none() {
+            assert_eq!(Settings::default().resolve_tail_capture_cap_ms(), 1500);
+            let mut s = Settings::default();
+            s.tail_capture_cap_ms = Some(800);
+            assert_eq!(s.resolve_tail_capture_cap_ms(), 800);
         }
     }
 

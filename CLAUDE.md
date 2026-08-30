@@ -199,7 +199,8 @@ When adding code, gate it behind the right feature and keep the default (feature
 drains audio and runs the pipeline:
 
 ```
-audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with optional PreRoll/AlwaysOnCapture
+audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with optional PreRoll/AlwaysOnCapture,
+  and release tail-capture grace                           (see below)
   → transcriber.rs / cohere_mlx.rs (spawn bridge, NDJSON transcribe, normalize_for_asr → raw text)
   → cleaner.rs (S1-mini; skipped when the deterministic gate says the speech is clean
     and no format preset is active — clear dictation goes straight through)
@@ -208,6 +209,17 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
   → smart_pad.rs (spacing/capitalization from caret context)
   → injector.rs (AX direct, or clipboard paste for Electron) + trailing-action keystroke
 ```
+
+**Release tail-capture** (default on, open-on-press only): on key release the daemon used to drop
+the mic immediately, clipping a word still being spoken. Instead it now enters a short grace loop
+(polling the live level every ~40 ms) that keeps the engine open and stops once the level has stayed
+below an *adaptive* speech threshold for ~250 ms continuously, or a `DICTATE_TAIL_CAPTURE_CAP_MS`
+cap (default 1500) hits. The threshold is `max(noise_floor × 3, 0.01)`, where the floor is the low
+percentile of per-frame RMS across the utterance, so it adapts to the room. It only engages when
+the release plausibly happened mid-speech — a release in a pause (last ~300 ms quiet) skips it
+entirely for zero added latency. The recovered audio accumulates in the ring and is drained by the
+release pipeline (so the streaming final-segment flush includes it). Skipped entirely under always-on
+pre-roll (which already keeps rolling past release).
 
 `cleaner.rs` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
 `LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in a
@@ -250,7 +262,8 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 `corrections.rs`, `history.rs`, `dictionary.rs`, the menu bar) shares the same location rather than
 re-joining the path:
 - `settings.json` (`settings.rs`) — written by the menu bar. Keys: `gemma_model`, `hotkey_keycode`,
-  `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`, `listen_mode`, `wake_word`.
+  `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`, `listen_mode`, `wake_word`,
+  `tail_capture`, `tail_capture_cap_ms`.
   The `asr_backend` / `cohere_quant` / `cohere_language` / `moonshine_variant` keys still exist but
   are **ignored** — kept only so an old file doesn't fail to parse. (`gemma_model` holds whatever
   cleanup model is selected; the name is historical.)
@@ -288,6 +301,8 @@ stack:
 | `DICTATE_FORMAT` | Active output-format preset |
 | `DICTATE_STREAMING_ASR` | Incremental streaming ASR: transcribe each VAD-paused sentence during the hold for a live preview (default on; `0`/`false`/`off` disables). Whole-utterance cleanup still runs at release. Off while pre-roll is active |
 | `DICTATE_PREROLL_MS` | Always-on mic lookback ms (default 0 = off; e.g. 400) |
+| `DICTATE_TAIL_CAPTURE` | Release tail-capture: keep the mic open briefly after release so the last word isn't clipped (default on; `0`/`false`/`off` disables). Off while pre-roll is active |
+| `DICTATE_TAIL_CAPTURE_CAP_MS` | Hard cap on the tail-capture grace loop (default 1500) |
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_NO_MUTE` | Do not duck other audio during capture |

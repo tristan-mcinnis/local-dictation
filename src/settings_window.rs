@@ -66,6 +66,7 @@ struct SettingsUi {
     model_popup: Retained<NSPopUpButton>,
     // Advanced
     streaming_switch: Retained<NSSwitch>,
+    tail_capture_switch: Retained<NSSwitch>,
     listen_switch: Retained<NSSwitch>,
     wake_field: Retained<NSTextField>,
     /// In-memory edits, not yet written. Updated by every control action;
@@ -173,6 +174,12 @@ define_class!(
         fn change_streaming(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
             with_pending(|p| p.streaming_asr = Some(on));
+        }
+
+        #[unsafe(method(changeTailCapture:))]
+        fn change_tail_capture(&self, sender: *mut AnyObject) {
+            let on = switch_on(sender);
+            with_pending(|p| p.tail_capture = Some(on));
         }
 
         #[unsafe(method(changeListen:))]
@@ -523,6 +530,27 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         "Transcribe sentences during the hold for a live preview (VAD-segmented). Off = whole-buffer at release.",
     );
 
+    // Tail-capture (release grace)
+    let tail_capture_switch = switch_row(mtm, &container, y, "Tail-capture (release grace)");
+    tail_capture_switch.setState(if loaded.resolve_tail_capture() {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    wire_switch(
+        &tail_capture_switch,
+        &controller,
+        sel!(changeTailCapture:),
+        std::env::var_os("DICTATE_TAIL_CAPTURE").is_some(),
+    );
+    y += ROW_H;
+    y = hint_line(
+        mtm,
+        &container,
+        y,
+        "Keep listening ~250 ms after release so the last word isn't clipped.",
+    );
+
     // Listen mode
     let listen_switch = switch_row(mtm, &container, y, "Listen mode (wake word)");
     listen_switch.setState(if loaded.resolve_listen_mode() {
@@ -630,6 +658,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         moonshine_popup,
         model_popup,
         streaming_switch,
+        tail_capture_switch,
         listen_switch,
         wake_field,
         pending: Mutex::new(loaded.clone()),

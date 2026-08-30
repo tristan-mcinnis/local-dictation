@@ -216,6 +216,21 @@ enum DaemonEvent {
     LatchArmed,
 }
 
+/// How a tail-capture grace loop ended, when it was cut short by an event rather
+/// than by a natural quiet run / cap. The StopRecording arm uses this to decide
+/// whether to restart a fresh recording (the user re-pressed mid-grace) or cancel
+/// the abandoned utterance, instead of proceeding to release the first one.
+#[derive(Debug)]
+enum TailGraceOutcome {
+    /// The user pressed again during the grace tail: abandon the previous
+    /// utterance and start a new recording cleanly. Carries the new gesture.
+    RePress {
+        transform: bool,
+    },
+    /// An external cancel arrived during the grace tail: discard everything.
+    Cancel,
+}
+
 pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // Surface the AX permission prompt up front — if we're not trusted, the
     // event tap below will silently fail.
@@ -530,6 +545,23 @@ fn worker_loop(
     // Whether the in-flight utterance is a transform instruction (Shift held).
     let mut transform_mode = false;
 
+    // ── Release tail-capture ──────────────────────────────────────────
+    // On key release, keep the mic open for a brief adaptive grace loop (draining
+    // new audio into the streaming path) so the last word of an utterance isn't
+    // clipped. Open-on-press only — always-on pre-roll already keeps rolling past
+    // the release, so the two don't compose.
+    let tail_capture = crate::settings::Settings::load().resolve_tail_capture();
+    let tail_capture_cap_ms = crate::settings::Settings::load().resolve_tail_capture_cap_ms();
+    if tail_capture {
+        eprintln!(
+            "[boot] tail-capture on (release grace, up to {tail_capture_cap_ms} ms)"
+        );
+    } else if preroll_ms > 0 {
+        eprintln!(
+            "[boot] tail-capture skipped (always-on pre-roll keeps rolling past release)"
+        );
+    }
+
     // Incremental streaming ASR (default ON): transcribe completed sentences at
     // VAD pauses *during* the hold for a live preview, then reassemble the cached
     // segments at release. No per-segment cleanup — whole-utterance cleanup still
@@ -564,6 +596,10 @@ fn worker_loop(
         // recv_timeout keeps everything on this one thread, which already owns the
         // ASR worker — no shared state.
         let event = {
+            // While recording with streaming ASR, wake periodically to transcribe
+            // any sentence a VAD pause has just closed; otherwise block for the
+            // next event. recv_timeout keeps everything on this one thread, which
+            // already owns the ASR worker — no shared state.
             if streaming_asr && engine.is_some() {
                 match rx.recv_timeout(std::time::Duration::from_millis(120)) {
                     Ok(ev) => ev,
@@ -689,38 +725,22 @@ fn worker_loop(
                     }
                     continue;
                 }
-                transform_mode = transform;
-                t_press = Some(Instant::now());
-                let (mut e, c) = AudioCaptureEngine::new(BUFFER_CAPACITY);
-                let r = match e.start_microphone() {
-                    Ok(r) => r,
-                    Err(err) => {
-                        eprintln!("[err]  mic open failed: {err:?}");
-                        cues::play_error();
-                        continue;
-                    }
-                };
-                cues::play_start();
-                // Mute any other system audio for the duration of capture +
-                // processing; restored on every StopRecording exit path below
-                // via the RestoreOnDrop guard.
-                crate::audio_duck::mute();
-                ui_channel::set_state(UiState::Recording);
-                eprintln!("▶ recording");
-                crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
-                engine = Some(e);
-                consumer = Some(c);
-                is_recording = Some(r);
-                if streaming_asr {
-                    stream = Some(crate::vad::SegmentStream::new(
-                        crate::audio::SAMPLE_RATE,
-                        crate::vad::VadConfig::default(),
-                    ));
-                    stream_segs.clear();
-                    stream_audio.clear();
-                    stream_poisoned = false;
+                // Fresh cold open (no parked engine to reuse).
+                if !begin_open_capture(
+                    &mut engine,
+                    &mut consumer,
+                    &mut is_recording,
+                    &mut stream,
+                    &mut stream_segs,
+                    &mut stream_audio,
+                    &mut stream_poisoned,
+                    &mut transform_mode,
+                    &mut t_press,
+                    streaming_asr,
+                    transform,
+                ) {
+                    cues::play_error();
                 }
-                ui_channel::clear_live_transcript();
             }
             DaemonEvent::StopRecording => {
                 // Either capture path may be live: open-on-press (`engine`) or
@@ -732,16 +752,131 @@ fn worker_loop(
                 if on_demand_engine.is_none() && !always_on_session {
                     continue;
                 }
+                // Capture (and reset) whether this utterance is a transform. Done
+                // up-front so the tail-capture re-press restart can re-set it with
+                // the new gesture.
+                #[allow(unused_variables)]
+                let transform = transform_mode;
+                transform_mode = false;
+
+                // ── Tail-capture grace (open-on-press only) ──────────────
+                // On release the mic used to be dropped immediately, which clipped
+                // a word still being spoken. Keep the engine open for a brief
+                // adaptive grace: poll the live level, and stop once it stays below
+                // a room-adaptive threshold for a short quiet run (or the cap). The
+                // grace audio accumulates in the ring and is drained by the release
+                // pipeline next. Only engages when release plausibly happened
+                // mid-speech; a release in a pause costs nothing. Skipped entirely
+                // under always-on pre-roll, which already keeps rolling past release.
+                let mut grace_outcome: Option<TailGraceOutcome> = None;
+                let tail_cap = Duration::from_millis(tail_capture_cap_ms as u64);
+                if tail_capture && on_demand_engine.is_some() {
+                    let (threshold, engage) = {
+                        let snap = recording_snapshot(consumer.as_ref().unwrap(), &stream_audio);
+                        let frame_len = (crate::audio::DEFAULT_TAIL_FRAME_MS as f64 / 1000.0
+                            * crate::audio::SAMPLE_RATE as f64)
+                            as usize;
+                        tail_capture_engage(&snap, frame_len)
+                    };
+                    if engage {
+                        let grace_start = Instant::now();
+                        let poll = Duration::from_millis(crate::audio::DEFAULT_TAIL_POLL_MS);
+                        let quiet_ms = crate::audio::DEFAULT_TAIL_QUIET_MS;
+                        let mut series: Vec<f32> = Vec::new();
+                        let mut recovered_ms: u128 = 0;
+                        loop {
+                            if let Some(level) = ui_channel::recent_levels().last().copied() {
+                                series.push(level);
+                                if series.len() > 16 {
+                                    series.remove(0);
+                                }
+                            }
+                            // A re-press or cancel during the grace tail must not be
+                            // lost. Consuming it here abandons the grace so we can
+                            // restart/cancel cleanly instead of waiting out the tail.
+                            match rx.try_recv() {
+                                Ok(DaemonEvent::StartRecording { transform }) => {
+                                    grace_outcome = Some(TailGraceOutcome::RePress { transform });
+                                    break;
+                                }
+                                Ok(DaemonEvent::CancelRecording) => {
+                                    grace_outcome = Some(TailGraceOutcome::Cancel);
+                                    break;
+                                }
+                                // A duplicate release or a stray latch cue during the
+                                // grace tail is harmless: keep waiting for quiet.
+                                Ok(DaemonEvent::StopRecording) | Ok(DaemonEvent::LatchArmed) => {}
+                                Err(_) => {}
+                            }
+                            recovered_ms = grace_start.elapsed().as_millis();
+                            if recovered_ms >= tail_cap.as_millis() {
+                                break;
+                            }
+                            if crate::audio::quiet_run(
+                                &series,
+                                crate::audio::DEFAULT_TAIL_POLL_MS,
+                                threshold,
+                                quiet_ms,
+                            ) {
+                                break;
+                            }
+                            std::thread::sleep(poll);
+                        }
+                        if recovered_ms > 0 && grace_outcome.is_none() {
+                            eprintln!("  tail +{recovered_ms} ms recovered");
+                        }
+                    }
+                }
+                // React to a grace interrupt: the user re-pressed (restart a fresh
+                // recording, abandoning the previous utterance) or cancelled (drop
+                // everything). Either way we skip the release pipeline below.
+                match grace_outcome {
+                    Some(TailGraceOutcome::RePress { transform }) => {
+                        on_demand_engine.as_mut().unwrap().stop_capture();
+                        if begin_open_capture(
+                            &mut engine,
+                            &mut consumer,
+                            &mut is_recording,
+                            &mut stream,
+                            &mut stream_segs,
+                            &mut stream_audio,
+                            &mut stream_poisoned,
+                            &mut transform_mode,
+                            &mut t_press,
+                            streaming_asr,
+                            transform,
+                        ) {
+                            eprintln!("  ↻    re-press during tail-capture · started fresh");
+                        } else {
+                            cues::play_error();
+                        }
+                        continue 'evloop;
+                    }
+                    Some(TailGraceOutcome::Cancel) => {
+                        on_demand_engine.as_mut().unwrap().stop_capture();
+                        consumer.take();
+                        is_recording.take();
+                        stream = None;
+                        stream_segs.clear();
+                        stream_audio.clear();
+                        stream_poisoned = false;
+                        ui_channel::clear_live_transcript();
+                        cues::play_cancel();
+                        ui_channel::set_state(UiState::Idle);
+                        let _unmute = crate::audio_duck::RestoreOnDrop;
+                        eprintln!("⌫ cancelled · discarded");
+                        eprintln!();
+                        continue 'evloop;
+                    }
+                    None => {}
+                }
+
                 // Un-mute other audio when this arm exits — by any path
                 // (transcribe error, empty/discarded utterance, transform,
                 // or successful inject). The guard's Drop runs on every
                 // `continue` and the normal fall-through, so the restore can't
                 // be forgotten on a new code path.
                 let _unmute = crate::audio_duck::RestoreOnDrop;
-                // Capture (and reset) whether this utterance is a transform.
-                #[allow(unused_variables)]
-                let transform = transform_mode;
-                transform_mode = false;
                 // Stop capture for whichever path is live. Open-on-press drops
                 // its engine (releasing the mic); always-on just ends the
                 // session — the warm stream keeps running for the next press.
@@ -1326,6 +1461,103 @@ fn stream_process_asr(
         }
     }
     last_seg_ms
+}
+
+/// Start a fresh open-on-press recording: build a new engine, open the mic,
+/// arm the streaming segment stream, and set the per-utterance state (engine,
+/// consumer, flag, segment accumulators). Returns false if the mic failed to
+/// open (caller fires the error cue). Shared by the event-tap StartRecording and
+/// the tail-capture re-press restart so a fast re-press reuses identical setup
+/// instead of duplicating it.
+#[allow(clippy::too_many_arguments)]
+fn begin_open_capture(
+    engine: &mut Option<AudioCaptureEngine>,
+    consumer: &mut Option<crate::audio::HeapAudioConsumer>,
+    is_recording: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    stream: &mut Option<crate::vad::SegmentStream>,
+    stream_segs: &mut Vec<String>,
+    stream_audio: &mut Vec<f32>,
+    stream_poisoned: &mut bool,
+    transform_mode: &mut bool,
+    t_press: &mut Option<Instant>,
+    streaming_asr: bool,
+    transform: bool,
+) -> bool {
+    *transform_mode = transform;
+    *t_press = Some(Instant::now());
+    let (mut e, c) = AudioCaptureEngine::new(BUFFER_CAPACITY);
+    let r = match e.start_microphone() {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("[err]  mic open failed: {err:?}");
+            return false;
+        }
+    };
+    cues::play_start();
+    // Mute any other system audio for the duration of capture + processing;
+    // restored on every release exit path via the RestoreOnDrop guard.
+    crate::audio_duck::mute();
+    ui_channel::set_state(UiState::Recording);
+    crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+    *engine = Some(e);
+    *consumer = Some(c);
+    *is_recording = Some(r);
+    if streaming_asr {
+        *stream = Some(crate::vad::SegmentStream::new(
+            crate::audio::SAMPLE_RATE,
+            crate::vad::VadConfig::default(),
+        ));
+        stream_segs.clear();
+        stream_audio.clear();
+        *stream_poisoned = false;
+    }
+    ui_channel::clear_live_transcript();
+    eprintln!("▶ recording");
+    true
+}
+
+/// Build a best-available chronological snapshot of the current utterance's
+/// captured audio WITHOUT draining the live ring (`peek_slice`), so the
+/// tail-capture noise-floor estimate can look at what was said without consuming
+/// audio the release pipeline is about to process. In the streaming path the
+/// drained samples live in `stream_audio` and the sub-120 ms tail is still in
+/// the ring; in the whole-buffer path the ring holds everything.
+fn recording_snapshot(
+    consumer: &crate::audio::HeapAudioConsumer,
+    stream_audio: &[f32],
+) -> Vec<f32> {
+    use ringbuf::traits::{Consumer, Observer};
+    let mut buf = stream_audio.to_vec();
+    let n = consumer.occupied_len();
+    if n > 0 {
+        let mut chunk = vec![0.0_f32; n];
+        let got = consumer.peek_slice(&mut chunk);
+        buf.extend_from_slice(&chunk[..got]);
+    }
+    buf
+}
+
+/// Tail-capture: from a snapshot of the utterance so far, decide the adaptive
+/// speech threshold and whether the release happened *mid-speech* (so the grace
+/// loop should engage). The threshold is `max(noise_floor × factor, abs_floor)`
+/// where the floor is the low percentile of the per-frame RMS distribution — so
+/// a noisy room raises the bar and a quiet one lowers it. `engage` is false when
+/// the last ~300 ms is already quiet (user let go in a pause) → skip the grace
+/// entirely for zero added latency.
+pub(crate) fn tail_capture_engage(
+    recording: &[f32],
+    frame_len: usize,
+) -> (f32 /*threshold*/, bool /*engage*/) {
+    use crate::audio::{frame_rms, frames_quiet, noise_floor, quiet_frame_count, speech_threshold};
+    let frames = frame_rms(recording, frame_len);
+    let floor = noise_floor(&frames, crate::audio::TAIL_NOISE_PERCENTILE);
+    let threshold = speech_threshold(floor);
+    let engage_frames = quiet_frame_count(
+        crate::audio::DEFAULT_TAIL_ENGAGE_MS,
+        crate::audio::DEFAULT_TAIL_FRAME_MS,
+    );
+    let engage = !frames_quiet(&frames, threshold, engage_frames);
+    (threshold, engage)
 }
 
 /// transform on the spoken body with the warm Gemma engine and inject the result

@@ -321,6 +321,103 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(*out.last().unwrap(), 0.5);
     }
+
+    #[test]
+    fn frame_rms_chunks_into_frames() {
+        let data = vec![0.5f32; 4];
+        assert_eq!(frame_rms(&data, 2), vec![0.5, 0.5]);
+        assert_eq!(frame_rms(&data, 4), vec![0.5]);
+        // A non-divisible tail is its own (shorter) frame.
+        assert_eq!(frame_rms(&[0.0, 0.0, 0.0, 0.0, 0.0], 4).len(), 2);
+        // Zero/empty input.
+        assert!(frame_rms(&[], 4).is_empty());
+        assert!(frame_rms(&data, 0).is_empty());
+    }
+
+    #[test]
+    fn noise_floor_tracks_low_percentile() {
+        // Mostly quiet room tone with a burst of speech near the top.
+        let frames = vec![0.004, 0.005, 0.006, 0.004, 0.005, 0.2, 0.3, 0.15, 0.006, 0.005];
+        let floor = noise_floor(&frames, 0.10);
+        assert!(floor < 0.01, "low percentile must stay near room tone, got {floor}");
+        assert!(floor > 0.0);
+        // Empty input → 0.
+        assert_eq!(noise_floor(&[], 0.10), 0.0);
+        // Higher percentile sits above the floor.
+        assert!(noise_floor(&frames, 0.5) > floor);
+    }
+
+    #[test]
+    fn speech_threshold_scales_floor_and_has_absolute_floor() {
+        // Loud room: floor*3.
+        assert_eq!(speech_threshold(0.10), 0.30);
+        // Hushed room: absolute floor kicks in so a whisper still reads as speech.
+        assert_eq!(speech_threshold(0.0), TAIL_ABS_FLOOR);
+        assert_eq!(speech_threshold(0.0001), TAIL_ABS_FLOOR);
+        // A quiet-but-not-dead floor that triples under the absolute floor.
+        assert_eq!(speech_threshold(0.002), 0.01); // 0.002*3=0.006 < 0.01
+    }
+
+    #[test]
+    fn frames_quiet_checks_only_the_trailing_window() {
+        let frames = vec![0.5, 0.5, 0.002, 0.003, 0.002];
+        let thresh = 0.01;
+        // Whole tail is quiet.
+        assert!(frames_quiet(&frames, thresh, 3));
+        // Including the loud prefix would fail.
+        assert!(!frames_quiet(&frames, thresh, 5));
+        // More frames than available: only the available (all-quiet) ones matter.
+        assert!(frames_quiet(&[0.002, 0.003], thresh, 10));
+        // Not quiet.
+        let loud = vec![0.5, 0.5, 0.5];
+        assert!(!frames_quiet(&loud, thresh, 3));
+        // n == 0 is trivially quiet.
+        assert!(frames_quiet(&frames, thresh, 0));
+    }
+
+    #[test]
+    fn quiet_frame_count_rounds_up_to_cover_the_window() {
+        assert_eq!(quiet_frame_count(250, 30), 9);  // 250/30 = 8.33 → 9
+        assert_eq!(quiet_frame_count(300, 30), 10); // 300/30 = 10
+        assert_eq!(quiet_frame_count(0, 30), 0);
+        assert_eq!(quiet_frame_count(250, 0), 0);
+    }
+
+    #[test]
+    fn quiet_run_requires_continuous_silence_for_the_quiet_duration() {
+        let thresh = 0.01;
+        // dt=40ms, quiet_ms=250 → need 7 consecutive quiet samples (240 < 250,
+        // so 7×40=280 ≥ 250).
+        let seven_quiet = vec![0.5, 0.5, 0.002, 0.002, 0.002, 0.002, 0.002, 0.002, 0.002, 0.002];
+        assert!(quiet_run(&seven_quiet, 40, thresh, 250));
+        // Only 6 quiet trailing (6×40=240 < 250) → not yet.
+        let six_quiet = vec![0.002, 0.002, 0.002, 0.002, 0.002, 0.002, 0.5, 0.5];
+        assert!(!quiet_run(&six_quiet, 40, thresh, 250));
+        // A loud sample within the last 7 breaks the run (only 4 quiet trail).
+        let interrupted = vec![0.002, 0.002, 0.002, 0.9, 0.002, 0.002, 0.002, 0.002];
+        assert!(!quiet_run(&interrupted, 40, thresh, 250));
+        // Empty series is never quiet.
+        assert!(!quiet_run(&[], 40, thresh, 250));
+        // quiet_ms of 0 is trivially satisfied.
+        assert!(quiet_run(&[0.5], 40, thresh, 0));
+    }
+
+    #[test]
+    fn noise_floor_adaptive_threshold_engages_on_speech_tail() {
+        // A recording that ends mid-speech: the low-percentile floor stays low
+        // (most of the clip is room tone), so the threshold is small and the
+        // last (loud) frames are decidedly NOT quiet → grace should engage.
+        let rec: Vec<f32> = vec![0.004, 0.005, 0.004, 0.2, 0.3, 0.25];
+        let floor = noise_floor(&rec, 0.10);
+        let thresh = speech_threshold(floor);
+        assert!(!frames_quiet(&rec, thresh, quiet_frame_count(300, 30)));
+        // A release during a proper (>300 ms) pause: the trailing 10 frames are
+        // all quiet below the (adaptive, low) threshold → skip grace.
+        let mut rec2 = vec![0.004, 0.005, 0.2];
+        rec2.extend(std::iter::repeat(0.0).take(10));
+        let thresh2 = speech_threshold(noise_floor(&rec2, 0.10));
+        assert!(frames_quiet(&rec2, thresh2, quiet_frame_count(300, 30)));
+    }
 }
 
 /// Target RMS the ASR front-end normalizes each utterance toward (~ -18 dBFS).
@@ -743,4 +840,117 @@ pub async fn drain_until_stopped(
         }
     }
     audio_buffer
+}
+
+// ─── Tail capture (release grace) ───────────────────────────────────────
+//
+// On key release the daemon used to drop the input stream immediately, which
+// clipped the last syllable of a word that was still being spoken. Tail capture
+// keeps the mic open for a brief grace loop after release, draining newly
+// arrived audio into the same path the streaming ASR uses, and stops once the
+// level has stayed below an *adaptive* speech threshold for a short quiet run
+// (or a hard cap). The decision logic below is pure + tested on synthetic RMS
+// series so the tuning is provable without a microphone.
+
+/// Tail-capture grace: how long the level must stay below the speech threshold
+/// before we declare the utterance over. 250 ms is a comfortable inter-word
+/// pause; any shorter risks stopping mid-word, any longer just adds latency.
+pub const DEFAULT_TAIL_QUIET_MS: u64 = 250;
+/// Tail-capture grace: how often the grace loop polls + re-samples the level.
+pub const DEFAULT_TAIL_POLL_MS: u64 = 40;
+/// Tail-capture grace: hard ceiling the grace loop will never exceed, so a
+/// user who keeps talking indefinitely can't stall the release pipeline.
+pub const DEFAULT_TAIL_CAP_MS: u64 = 1500;
+/// Tail-capture analysis frame length (ms) used to compute per-frame RMS for
+/// the noise-floor estimate and the release-tail quietness check. 30 ms is long
+/// enough to average out a noisy click while staying finer than a 250 ms pause.
+pub const DEFAULT_TAIL_FRAME_MS: u32 = 30;
+/// Tail-capture grace: how quiet (below threshold) the last `DEFAULT_TAIL_ENGAGE_MS`
+/// before release must already be for us to skip the grace entirely. If the user
+/// let go during a natural pause, there's nothing to recover — zero added latency.
+pub const DEFAULT_TAIL_ENGAGE_MS: u32 = 300;
+/// How much the adaptive speech threshold rises above the measured noise floor
+/// (floor × factor). A factor of 3 keeps real speech well above ambient tone
+/// without being blind to soft speech in a noisy room.
+pub const TAIL_THRESHOLD_FLOOR_FACTOR: f32 = 3.0;
+/// Absolute floor on the speech threshold, so an ultra-quiet room can never push
+/// the threshold to zero (and thus never treat pure silence as "speech").
+pub const TAIL_ABS_FLOOR: f32 = 0.01;
+/// Low percentile of the per-frame RMS distribution used as the noise-floor proxy.
+pub const TAIL_NOISE_PERCENTILE: f32 = 0.10;
+
+/// Per-frame RMS of a mono buffer: chunk `samples` into `frame_len`-sample
+/// frames and return the RMS of each. Empty/zero-frame input yields an empty
+/// Vec. This is the primitive the tail-capture decision logic operates on.
+pub fn frame_rms(samples: &[f32], frame_len: usize) -> Vec<f32> {
+    if frame_len == 0 || samples.is_empty() {
+        return Vec::new();
+    }
+    samples
+        .chunks(frame_len)
+        .map(|c| {
+            let sum: f32 = c.iter().map(|x| x * x).sum();
+            (sum / c.len() as f32).sqrt()
+        })
+        .collect()
+}
+
+/// Estimate the room's noise floor as the low `percentile` of the frame-RMS
+/// distribution observed during the recording. Speech pushes the upper tail up;
+/// the bottom decile stays representative of ambient tone, so returning it as the
+/// floor makes the speech threshold adaptive to the room (quiet study vs. a fan
+/// running). Returns 0.0 for empty input.
+pub fn noise_floor(rms_frames: &[f32], percentile: f32) -> f32 {
+    if rms_frames.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f32> = rms_frames.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = ((sorted.len() - 1) as f32 * percentile.clamp(0.0, 1.0)).round() as usize;
+    sorted[idx]
+}
+
+/// Adaptive speech threshold from a measured noise floor: `max(floor × factor,
+/// abs_floor)`. The absolute floor guards against a hyper-quiet room where the
+/// floor is ~0, which would otherwise make even a whisper look like quiet.
+pub fn speech_threshold(floor: f32) -> f32 {
+    let boosted = floor * TAIL_THRESHOLD_FLOOR_FACTOR;
+    boosted.max(TAIL_ABS_FLOOR)
+}
+
+/// True if the last `n` frames (`rms_frames`) are all below `threshold` — i.e.
+/// the release happens during a pause. Used both for the grace-engagement check
+/// (last ~300 ms) and as a building block. Fewer than `n` frames returns true
+/// only if every available frame is below threshold (nothing to lose).
+pub fn frames_quiet(rms_frames: &[f32], threshold: f32, n: usize) -> bool {
+    let start = rms_frames.len().saturating_sub(n);
+    let tail = &rms_frames[start..];
+    tail.iter().all(|&r| r < threshold)
+}
+
+/// Number of consecutive frames needed to represent `ms` of audio at `frame_ms`
+/// per frame (ceiling, so a partial frame still counts as covering the window).
+pub fn quiet_frame_count(ms: u32, frame_ms: u32) -> usize {
+    if frame_ms == 0 {
+        return 0;
+    }
+    (ms as f32 / frame_ms as f32).ceil() as usize
+}
+
+/// Pure quiet-run detector for the grace loop. `rms_series` is the per-poll RMS
+/// sequence (newest last), sampled every `dt_ms`. Returns true once the trailing
+/// run of below-`threshold` samples has persisted for at least `quiet_ms` of
+/// wall-clock time — i.e. the speaker has been silent long enough to declare the
+/// utterance finished. Kept free of `Instant` so it's unit-testable on synthetic
+/// series: `dt_ms` is the caller's poll interval, not a real clock.
+pub fn quiet_run(rms_series: &[f32], dt_ms: u64, threshold: f32, quiet_ms: u64) -> bool {
+    let mut count: u64 = 0;
+    for &r in rms_series.iter().rev() {
+        if r < threshold {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count * dt_ms >= quiet_ms
 }
