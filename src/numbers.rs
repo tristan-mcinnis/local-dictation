@@ -78,7 +78,10 @@ fn tokenize(text: &str) -> Vec<Tok> {
 
 fn flush(toks: &mut Vec<Tok>, buf: &str, is_word: bool) {
     if is_word {
-        toks.push(Tok::Word { orig: buf.to_string(), lower: buf.to_lowercase() });
+        toks.push(Tok::Word {
+            orig: buf.to_string(),
+            lower: buf.to_lowercase(),
+        });
     } else {
         toks.push(Tok::Sep(buf.to_string()));
     }
@@ -86,26 +89,49 @@ fn flush(toks: &mut Vec<Tok>, buf: &str, is_word: bool) {
 
 fn unit(w: &str) -> Option<u64> {
     Some(match w {
-        "zero" => 0, "one" => 1, "two" => 2, "three" => 3, "four" => 4,
-        "five" => 5, "six" => 6, "seven" => 7, "eight" => 8, "nine" => 9,
-        "ten" => 10, "eleven" => 11, "twelve" => 12, "thirteen" => 13,
-        "fourteen" => 14, "fifteen" => 15, "sixteen" => 16, "seventeen" => 17,
-        "eighteen" => 18, "nineteen" => 19,
+        "zero" => 0,
+        "one" => 1,
+        "two" => 2,
+        "three" => 3,
+        "four" => 4,
+        "five" => 5,
+        "six" => 6,
+        "seven" => 7,
+        "eight" => 8,
+        "nine" => 9,
+        "ten" => 10,
+        "eleven" => 11,
+        "twelve" => 12,
+        "thirteen" => 13,
+        "fourteen" => 14,
+        "fifteen" => 15,
+        "sixteen" => 16,
+        "seventeen" => 17,
+        "eighteen" => 18,
+        "nineteen" => 19,
         _ => return None,
     })
 }
 
 fn tens(w: &str) -> Option<u64> {
     Some(match w {
-        "twenty" => 20, "thirty" => 30, "forty" => 40, "fifty" => 50,
-        "sixty" => 60, "seventy" => 70, "eighty" => 80, "ninety" => 90,
+        "twenty" => 20,
+        "thirty" => 30,
+        "forty" => 40,
+        "fifty" => 50,
+        "sixty" => 60,
+        "seventy" => 70,
+        "eighty" => 80,
+        "ninety" => 90,
         _ => return None,
     })
 }
 
 fn scale(w: &str) -> Option<u64> {
     Some(match w {
-        "hundred" => 100, "thousand" => 1_000, "million" => 1_000_000,
+        "hundred" => 100,
+        "thousand" => 1_000,
+        "million" => 1_000_000,
         "billion" => 1_000_000_000,
         _ => return None,
     })

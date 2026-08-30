@@ -22,9 +22,7 @@ pub fn bundle_resources_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let macos = exe.parent()?; // …/Contents/MacOS
     let contents = macos.parent()?; // …/Contents
-    if macos.file_name()?.to_str()? != "MacOS"
-        || contents.file_name()?.to_str()? != "Contents"
-    {
+    if macos.file_name()?.to_str()? != "MacOS" || contents.file_name()?.to_str()? != "Contents" {
         return None;
     }
     Some(contents.join("Resources"))
@@ -99,6 +97,33 @@ pub fn cohere_default_dir(quant: &str) -> String {
         .into_owned()
 }
 
+/// Fixed Cohere Q4 checkpoint converted for the public MLX Swift runtime.
+pub fn cohere_mlx_default_dir() -> String {
+    std::env::var("DICTATE_COHERE_MLX_MODEL_DIR").unwrap_or_else(|_| {
+        models_base_dir()
+            .join("dictation/cohere-mlx-q4")
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+/// Persistent native helper executable. A packaged app carries it in
+/// Resources; development builds resolve the Xcode SwiftPM product.
+pub fn cohere_mlx_helper_path() -> String {
+    if let Ok(path) = std::env::var("DICTATE_COHERE_MLX_BRIDGE") {
+        return path;
+    }
+    if let Some(resources) = bundle_resources_dir() {
+        return resources
+            .join("cohere-mlx-bridge")
+            .to_string_lossy()
+            .into_owned();
+    }
+    PathBuf::from("native/cohere-mlx/.build/xcode/Build/Products/Release/cohere-mlx-bridge")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Default Moonshine ASR model directory for a given size
 /// (`<base>/dictation/moonshine-<size>`, e.g. `…/moonshine-base`). Populated
 /// by `./scripts/download-models.sh --moonshine <size>`; overridable with
@@ -124,14 +149,11 @@ pub fn whisper_default_path() -> String {
         .into_owned()
 }
 
-/// Default cleanup model path
-/// (`<base>/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf`).
-/// Named `gemma_*` for historical reasons (Gemma was the original default);
-/// the recommended cleanup model is now Qwen 2.5 1.5B — see the bake-off in
-/// `examples/model_bakeoff.rs` and the README "Models" section.
+/// Default S1-mini cleanup model path.
+/// `gemma_*` is retained temporarily as a source-compatibility name.
 pub fn gemma_default_path() -> String {
     models_base_dir()
-        .join("llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf")
+        .join("llm/s1-mini/s1-mini.gguf")
         .to_string_lossy()
         .into_owned()
 }
@@ -152,7 +174,10 @@ mod tests {
             assert!(dir.ends_with("local-dictation"));
             let f = config_file("settings.json").expect("HOME set ⇒ Some");
             assert_eq!(f.parent(), Some(dir.as_path()));
-            assert_eq!(f.file_name().and_then(|s| s.to_str()), Some("settings.json"));
+            assert_eq!(
+                f.file_name().and_then(|s| s.to_str()),
+                Some("settings.json")
+            );
         }
     }
 }

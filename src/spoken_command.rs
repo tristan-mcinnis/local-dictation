@@ -171,7 +171,10 @@ fn split_language(remainder: &str) -> Option<(String, String)> {
     if words.is_empty() {
         return None;
     }
-    let norm: Vec<String> = words.iter().map(|w| strip_punct(w).to_lowercase()).collect();
+    let norm: Vec<String> = words
+        .iter()
+        .map(|w| strip_punct(w).to_lowercase())
+        .collect();
 
     let max_take = words.len().min(3);
     for take in (1..=max_take).rev() {
@@ -254,7 +257,8 @@ mod tests {
     #[test]
     fn comma_after_language_is_stripped() {
         // ASR often inserts a comma: "Translate to Chinese, ...".
-        let cmd = parse_spoken_command("Translate to Chinese, I want to meet you tomorrow").unwrap();
+        let cmd =
+            parse_spoken_command("Translate to Chinese, I want to meet you tomorrow").unwrap();
         assert_eq!(cmd.label, "translate → Chinese");
         assert_eq!(cmd.body, "I want to meet you tomorrow");
     }

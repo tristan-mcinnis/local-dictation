@@ -29,7 +29,12 @@ pub struct VadConfig {
 
 impl Default for VadConfig {
     fn default() -> Self {
-        Self { frame_ms: 20.0, min_pause_ms: 400.0, peak_frac: 0.04, pad_ms: 60.0 }
+        Self {
+            frame_ms: 20.0,
+            min_pause_ms: 400.0,
+            peak_frac: 0.04,
+            pad_ms: 60.0,
+        }
     }
 }
 
@@ -105,7 +110,12 @@ pub struct SegmentStream {
 impl SegmentStream {
     pub fn new(sr: u32, cfg: VadConfig) -> Self {
         // No audio overlap in the streaming path (measured to hurt).
-        Self { sr, cfg: VadConfig { pad_ms: 0.0, ..cfg }, buf: Vec::new(), committed: 0 }
+        Self {
+            sr,
+            cfg: VadConfig { pad_ms: 0.0, ..cfg },
+            buf: Vec::new(),
+            committed: 0,
+        }
     }
 
     /// Append newly captured samples.

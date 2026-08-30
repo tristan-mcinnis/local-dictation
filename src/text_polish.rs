@@ -22,6 +22,14 @@ const PREAMBLE_PREFIXES: &[&str] = &[
     "sure!",
     "okay,",
     "ok,",
+    "assistant:",
+    "assistant ",
+    "utterance:",
+    "utterance ",
+    "utterer:",
+    "utterer ",
+    "users:",
+    "user:",
 ];
 
 const TRAILING_ARTEFACTS: &[&str] = &[
@@ -50,6 +58,17 @@ pub fn polish_multiline(raw: &str) -> String {
 fn polish_with(raw: &str, preserve_newlines: bool) -> String {
     let mut s = raw.to_string();
 
+    // Remove Qwen/S1 reasoning blocks before applying visible-text cleanup.
+    let lower_reasoning = s.to_lowercase();
+    if let (Some(start), Some(end)) = (
+        lower_reasoning.find("<think>"),
+        lower_reasoning.find("</think>"),
+    ) {
+        if start == 0 && end >= start {
+            s = s[end + "</think>".len()..].to_string();
+        }
+    }
+
     // 1. Strip known trailing chat-template tokens.
     for marker in TRAILING_ARTEFACTS {
         if let Some(idx) = s.find(marker) {
@@ -65,10 +84,17 @@ fn polish_with(raw: &str, preserve_newlines: bool) -> String {
     s = peel_code_fence(&s);
 
     // 2. Strip a known preamble prefix if the output starts with one.
-    let lower = s.to_lowercase();
-    for pre in PREAMBLE_PREFIXES {
-        if lower.starts_with(pre) {
-            s = s[pre.len()..].trim_start().to_string();
+    for _ in 0..3 {
+        let lower = s.to_lowercase();
+        let mut removed = false;
+        for pre in PREAMBLE_PREFIXES {
+            if lower.starts_with(pre) {
+                s = s[pre.len()..].trim_start().to_string();
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
             break;
         }
     }
@@ -145,13 +171,21 @@ fn peel_code_fence(s: &str) -> String {
     }
     // Opening fence: a run of backticks (2+) then an optional language token.
     let open = lines[0].trim();
-    if open.trim_start_matches('`').trim().chars().any(|c| !c.is_alphanumeric()) {
+    if open
+        .trim_start_matches('`')
+        .trim()
+        .chars()
+        .any(|c| !c.is_alphanumeric())
+    {
         return s.to_string();
     }
     // Closing fence: a line that is nothing but backticks.
     if lines
         .last()
-        .map(|l| { let t = l.trim(); t.len() >= 2 && t.chars().all(|c| c == '`') })
+        .map(|l| {
+            let t = l.trim();
+            t.len() >= 2 && t.chars().all(|c| c == '`')
+        })
         .unwrap_or(false)
     {
         lines.remove(0);
@@ -174,8 +208,17 @@ fn is_list_marker(line: &str) -> bool {
 
 /// Chatty list-intro openers a small model emits before a list.
 const LIST_INTRO_TELLS: &[&str] = &[
-    "here", "below", "sure", "okay", "ok,", "the following", "these are",
-    "this is", "i've", "i have", "certainly",
+    "here",
+    "below",
+    "sure",
+    "okay",
+    "ok,",
+    "the following",
+    "these are",
+    "this is",
+    "i've",
+    "i have",
+    "certainly",
 ];
 
 /// Drop a leaked intro line that sits before a list body. Fires only when the
@@ -196,8 +239,7 @@ fn strip_leading_list_intro(s: &str) -> String {
         return s.to_string();
     }
     let lower = first.to_lowercase();
-    let looks_intro =
-        first.ends_with(':') || LIST_INTRO_TELLS.iter().any(|t| lower.starts_with(t));
+    let looks_intro = first.ends_with(':') || LIST_INTRO_TELLS.iter().any(|t| lower.starts_with(t));
     if !looks_intro {
         return s.to_string();
     }
@@ -207,8 +249,7 @@ fn strip_leading_list_intro(s: &str) -> String {
 /// Interjection tokens that are never real English words — always filler.
 /// Kept deliberately conservative: "ah"/"er" are excluded (they shade into
 /// real interjections a speaker might want), and removal is whole-word only.
-const FILLER_INTERJECTIONS: &[&str] =
-    &["um", "umm", "uhm", "uh", "uhh", "erm", "hmm", "mm", "mhm"];
+const FILLER_INTERJECTIONS: &[&str] = &["um", "umm", "uhm", "uh", "uhh", "erm", "hmm", "mm", "mhm"];
 
 /// Mechanical fixes for dictation-cleanup output that a 1B model does
 /// unreliably but a deterministic pass nails every time:
@@ -327,8 +368,22 @@ const TRAILING_FILLERS: &[&str] = &["yeah", "yep", "yup", "you know"];
 /// connective. Strips at most ONE (so "Yeah, okay, sure." → "Okay, sure.", not
 /// "Sure."), and a whole-utterance "Yeah." has no comma so it's kept.
 const LEADING_FILLERS: &[&str] = &[
-    "yeah", "yep", "yup", "so", "okay", "ok", "well", "right", "um", "uh", "er",
-    "anyway", "look", "like", "basically", "honestly",
+    "yeah",
+    "yep",
+    "yup",
+    "so",
+    "okay",
+    "ok",
+    "well",
+    "right",
+    "um",
+    "uh",
+    "er",
+    "anyway",
+    "look",
+    "like",
+    "basically",
+    "honestly",
 ];
 
 fn strip_leading_filler(s: &str) -> String {
@@ -428,7 +483,8 @@ fn drop_filler_interjections(s: &str) -> String {
             out.push(c);
         }
     }
-    out.trim_start_matches(|c: char| c == ',' || c == ' ').to_string()
+    out.trim_start_matches(|c: char| c == ',' || c == ' ')
+        .to_string()
 }
 
 /// Capitalize the standalone pronoun "i" (word-bounded), including its
@@ -512,10 +568,38 @@ fn word_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
 /// must NOT count as dropped *content* when judging whether the model gutted a
 /// clause, or heavy-but-correct filler removal would trip the guard.
 const DROPPABLE_DISCOURSE: &[&str] = &[
-    "like", "just", "yeah", "yep", "yup", "okay", "well", "right", "anyway",
-    "actually", "basically", "literally", "seriously", "honestly", "really",
-    "mean", "know", "sort", "kind", "guess", "maybe", "stuff", "very", "even",
-    "gonna", "wanna", "gotta", "kinda", "sorta", "dunno", "lemme", "gimme",
+    "like",
+    "just",
+    "yeah",
+    "yep",
+    "yup",
+    "okay",
+    "well",
+    "right",
+    "anyway",
+    "actually",
+    "basically",
+    "literally",
+    "seriously",
+    "honestly",
+    "really",
+    "mean",
+    "know",
+    "sort",
+    "kind",
+    "guess",
+    "maybe",
+    "stuff",
+    "very",
+    "even",
+    "gonna",
+    "wanna",
+    "gotta",
+    "kinda",
+    "sorta",
+    "dunno",
+    "lemme",
+    "gimme",
 ];
 
 /// Heuristic guard: did the generative cleanup **drop real content** (rewrite
@@ -581,8 +665,8 @@ pub fn needs_llm_cleanup(raw: &str) -> bool {
         return false;
     }
     const CONTRACTIONS: &[&str] = &[
-        "wanna", "gonna", "gotta", "kinda", "sorta", "gimme", "lemme", "dunno",
-        "outta", "lotta", "shoulda", "coulda", "woulda",
+        "wanna", "gonna", "gotta", "kinda", "sorta", "gimme", "lemme", "dunno", "outta", "lotta",
+        "shoulda", "coulda", "woulda",
     ];
     if words.iter().any(|w| CONTRACTIONS.contains(w)) {
         return true;
@@ -632,6 +716,12 @@ mod tests {
     }
 
     #[test]
+    fn strips_repeated_s1_role_labels() {
+        assert_eq!(polish("Assistant Assistant: I sent it."), "I sent it.");
+        assert_eq!(polish("Utterance: test this."), "test this.");
+    }
+
+    #[test]
     fn peels_wrapping_quotes() {
         assert_eq!(polish("\"We should ship.\""), "We should ship.");
         assert_eq!(polish("'Hello world'"), "Hello world");
@@ -675,7 +765,10 @@ mod tests {
             fix_speech_mechanics("Um, yeah, so the cache keeps growing."),
             "So the cache keeps growing."
         );
-        assert_eq!(fix_speech_mechanics("uh we never evict anything"), "We never evict anything");
+        assert_eq!(
+            fix_speech_mechanics("uh we never evict anything"),
+            "We never evict anything"
+        );
     }
 
     #[test]
@@ -684,7 +777,10 @@ mod tests {
             fix_speech_mechanics("i don't know if i should"),
             "I don't know if I should"
         );
-        assert_eq!(fix_speech_mechanics("i'm not sure i'll make it"), "I'm not sure I'll make it");
+        assert_eq!(
+            fix_speech_mechanics("i'm not sure i'll make it"),
+            "I'm not sure I'll make it"
+        );
     }
 
     #[test]
@@ -726,10 +822,7 @@ mod tests {
             "1. First\n2. Second"
         );
         // With a language tag on the opening fence.
-        assert_eq!(
-            polish_multiline("```rust\nlet x = 1;\n```"),
-            "let x = 1;"
-        );
+        assert_eq!(polish_multiline("```rust\nlet x = 1;\n```"), "let x = 1;");
     }
 
     #[test]
@@ -773,10 +866,16 @@ mod tests {
 
     #[test]
     fn strips_standalone_trailing_filler() {
-        assert_eq!(strip_trailing_filler("the models we can use. Yeah."), "the models we can use.");
+        assert_eq!(
+            strip_trailing_filler("the models we can use. Yeah."),
+            "the models we can use."
+        );
         assert_eq!(strip_trailing_filler("do it. yeah"), "do it.");
         assert_eq!(strip_trailing_filler("that's cool, yeah"), "that's cool.");
-        assert_eq!(strip_trailing_filler("ship it tomorrow. You know."), "ship it tomorrow.");
+        assert_eq!(
+            strip_trailing_filler("ship it tomorrow. You know."),
+            "ship it tomorrow."
+        );
     }
 
     #[test]
@@ -787,15 +886,22 @@ mod tests {
         assert_eq!(strip_trailing_filler("Yeah."), "Yeah.");
         assert_eq!(strip_trailing_filler("yeah"), "yeah");
         // whole-word only: must not chop the end of a real word
-        assert_eq!(strip_trailing_filler("the deal is conveyed"), "the deal is conveyed");
+        assert_eq!(
+            strip_trailing_filler("the deal is conveyed"),
+            "the deal is conveyed"
+        );
     }
 
     #[test]
     fn detects_lists_vs_prose() {
         assert!(looks_like_list("1. Buy milk.\n2. Buy eggs.\n3. Buy flour."));
         assert!(looks_like_list("- one\n- two\n- three"));
-        assert!(!looks_like_list("I went to the store and bought milk, eggs, and flour."));
-        assert!(!looks_like_list("First we set up the repo. Second we ship it.")); // one line
+        assert!(!looks_like_list(
+            "I went to the store and bought milk, eggs, and flour."
+        ));
+        assert!(!looks_like_list(
+            "First we set up the repo. Second we ship it."
+        )); // one line
         assert!(!looks_like_list("3.11 is the version we shipped today.")); // single line, not a list
     }
 
@@ -855,16 +961,25 @@ mod tests {
     #[test]
     fn dropped_content_skips_short_utterances() {
         // Too short to judge — never fire (avoids nuking genuinely terse edits).
-        assert!(!cleanup_dropped_content("yeah sounds good to me", "Sounds good."));
+        assert!(!cleanup_dropped_content(
+            "yeah sounds good to me",
+            "Sounds good."
+        ));
     }
 
     #[test]
     fn messiness_gate_skips_clean_speech() {
         // The exact failure case: clean, no mess → skip the LLM, so it can't
         // turn "open pencil" into "open source".
-        assert!(!needs_llm_cleanup("I don't use open pencil, you can remove that."));
-        assert!(!needs_llm_cleanup("So that we could then update the basketball room slide sketch."));
-        assert!(!needs_llm_cleanup("Give me the key structure that would appear inside a brief."));
+        assert!(!needs_llm_cleanup(
+            "I don't use open pencil, you can remove that."
+        ));
+        assert!(!needs_llm_cleanup(
+            "So that we could then update the basketball room slide sketch."
+        ));
+        assert!(!needs_llm_cleanup(
+            "Give me the key structure that would appear inside a brief."
+        ));
     }
 
     #[test]
@@ -935,10 +1050,14 @@ mod tests {
 
     #[test]
     fn messiness_gate_routes_messy_speech_to_llm() {
-        assert!(needs_llm_cleanup("we're gonna wanna refactor this kinda soon")); // contractions
+        assert!(needs_llm_cleanup(
+            "we're gonna wanna refactor this kinda soon"
+        )); // contractions
         assert!(needs_llm_cleanup("I think the the build is slow")); // stutter / false start
-        assert!(needs_llm_cleanup("it was like really slow and like you know kind of broken")); // dense soft filler
-        // A 40+ word run-on with no sentence breaks needs re-segmenting.
+        assert!(needs_llm_cleanup(
+            "it was like really slow and like you know kind of broken"
+        )); // dense soft filler
+            // A 40+ word run-on with no sentence breaks needs re-segmenting.
         let runon = "so then we did the thing and then the other thing and then \
             after that we went over to the place and grabbed the stuff and then \
             came back and started again with the first part of the whole process once more";

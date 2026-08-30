@@ -18,6 +18,7 @@
 //! sequences, so it works for any model/template and degrades gracefully (a
 //! cleanup→transform switch simply shares fewer tokens).
 
+use crate::prompts::Prompts;
 use eyre::Context;
 use llama_cpp_2::{
     context::params::LlamaContextParams,
@@ -27,7 +28,6 @@ use llama_cpp_2::{
     sampling::LlamaSampler,
     token::LlamaToken,
 };
-use crate::prompts::Prompts;
 use std::{
     num::NonZeroU32,
     path::Path,
@@ -96,8 +96,35 @@ fn cleanup_ran_away(raw: &str, cleaned: &str) -> bool {
     if out_chars > raw_chars * 4 + 32 {
         return true; // ballooned — almost certainly hallucinated
     }
+    let words: Vec<String> = cleaned
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
+        .filter(|word| !word.is_empty())
+        .collect();
+    let mut run = 1usize;
+    for pair in words.windows(2) {
+        if pair[0] == pair[1] {
+            run += 1;
+            if run >= 4 {
+                return true;
+            }
+        } else {
+            run = 1;
+        }
+    }
     // Belt-and-suspenders past `polish`: any leaked chat-template marker.
-    const MARKERS: &[&str] = &["<|", "<start_of_turn>", "<end_of_turn>", "</s>", "<s>"];
+    const MARKERS: &[&str] = &[
+        "<|",
+        "<start_of_turn>",
+        "<end_of_turn>",
+        "</s>",
+        "<s>",
+        "<think>",
+        "<Think>",
+    ];
     MARKERS.iter().any(|m| cleaned.contains(m))
 }
 
@@ -169,10 +196,17 @@ impl TextCleanupEngine {
         let base_cleanup = prompts.cleanup_for(active_format.as_deref()).to_string();
         let mut format_active = false;
         if let Some(name) = &active_format {
-            format_active = prompts.format_names().iter().any(|f| f.eq_ignore_ascii_case(name));
+            format_active = prompts
+                .format_names()
+                .iter()
+                .any(|f| f.eq_ignore_ascii_case(name));
             eprintln!(
                 "[boot] format      {name} ({})",
-                if format_active { "applied" } else { "unknown — using default cleanup" }
+                if format_active {
+                    "applied"
+                } else {
+                    "unknown — using default cleanup"
+                }
             );
         }
 
@@ -201,12 +235,9 @@ impl TextCleanupEngine {
         // the constant instruction block is in the KV cache before the first
         // dictation. Vocabulary is appended per-utterance after this prefix, so
         // the worker still reuses the warmed instructions every time.
-        let warm_prompt = Self::template_user_msg(
-            &model,
-            &chat_template,
-            &format!("{cleanup_prompt}\n\nRaw transcript:\n"),
-        )
-        .ok();
+        let warm_prompt =
+            Self::template_messages(&model, &chat_template, &cleanup_prompt, "Raw transcript:\n")
+                .ok();
 
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<eyre::Result<()>>();
@@ -236,15 +267,18 @@ impl TextCleanupEngine {
         })
     }
 
-    /// Apply the model's chat template to a single user message. Shared by the
-    /// hot path and the boot-time warm prefill so they tokenize identically.
-    fn template_user_msg(
+    /// Apply the model's chat template. S1-mini's merged Qwen3 template emits
+    /// EOG immediately when given a separate system role, so its instruction
+    /// and transcript deliberately share one user turn (matching Superwhisper).
+    fn template_messages(
         model: &LlamaModel,
         chat_template: &LlamaChatTemplate,
+        system_msg: &str,
         user_msg: &str,
     ) -> eyre::Result<String> {
-        let messages = vec![LlamaChatMessage::new("user".into(), user_msg.into())
-            .map_err(|e| eyre::eyre!("invalid chat message: {e:?}"))?];
+        let combined = format!("{system_msg}\n\n{user_msg}");
+        let messages = vec![LlamaChatMessage::new("user".into(), combined)
+            .map_err(|e| eyre::eyre!("invalid user message: {e:?}"))?];
         model
             .apply_chat_template(chat_template, &messages, true)
             .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))
@@ -278,15 +312,13 @@ impl TextCleanupEngine {
         // `vocabulary_suffix` dedups case-insensitively (first-seen casing wins)
         // and caps the total, so a noisy screen can't balloon the prompt.
         if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
-            let mut combined =
-                Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
+            let mut combined = Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
             combined.extend_from_slice(&self.static_vocab);
             combined.extend_from_slice(screen_vocab);
             if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
                 prompt_body.push_str(&suffix);
             }
         }
-        let user_msg = format!("{prompt_body}\n\nRaw transcript:\n{raw}");
         // Cleanup never summarizes (the prompt forbids it), so the cleaned text
         // tracks the input length — stripping filler makes it a touch shorter,
         // expanding contractions a touch longer. Budget off the raw transcript
@@ -297,7 +329,15 @@ impl TextCleanupEngine {
         // them: an active format preset, or an AUTO-DETECTED list (the model
         // formatted an enumeration as 1./2./3. or bullets), preserves structure;
         // ordinary prose flattens to a single line as dictation always has.
-        let cleaned = self.run_chat(user_msg, budget, true, false).await?;
+        let cleaned = self
+            .run_chat(
+                prompt_body,
+                format!("Raw transcript:\n{raw}"),
+                budget,
+                true,
+                false,
+            )
+            .await?;
         // Deterministic mechanics the 1B does unreliably (leading "um", lone
         // lowercase "i") — cheap, exact, and always safe on speech.
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
@@ -306,6 +346,7 @@ impl TextCleanupEngine {
         } else {
             crate::text_polish::flatten_to_line(&cleaned)
         };
+        let deterministic = crate::text_polish::fix_speech_mechanics(raw);
         // Runaway guard: a 1B can occasionally hallucinate — drop everything, or
         // balloon a short utterance into paragraphs, or leak chat-template
         // markers past `polish`. Cleanup never legitimately expands much, so on
@@ -318,9 +359,13 @@ impl TextCleanupEngine {
                 raw.chars().count(),
                 cleaned.chars().count()
             );
-            return Ok(raw.to_string());
+            return Ok(deterministic);
         }
-        Ok(cleaned)
+        if cleaned.trim() == raw && deterministic != raw {
+            Ok(deterministic)
+        } else {
+            Ok(cleaned)
+        }
     }
 
     /// Clean ONE sentence-segment of a longer dictation, given the text already
@@ -350,8 +395,7 @@ impl TextCleanupEngine {
         }
         let mut prompt_body = self.cleanup_prompt.clone();
         if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
-            let mut combined =
-                Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
+            let mut combined = Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
             combined.extend_from_slice(&self.static_vocab);
             combined.extend_from_slice(screen_vocab);
             if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
@@ -368,12 +412,19 @@ impl TextCleanupEngine {
                 "\n\nFor context, the preceding text (already cleaned, do not repeat it) ended with: {tail}\nClean only the new fragment below and output just the cleaned new fragment."
             ));
         }
-        let user_msg = format!("{prompt_body}\n\nRaw transcript:\n{raw}");
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
         // Keep line breaks only if this segment is itself a list (a list spoken
         // in one breath lands in one segment); otherwise flatten. Multi-segment
         // lists (items separated by long pauses) won't unify — known limitation.
-        let cleaned = self.run_chat(user_msg, budget, true, false).await?;
+        let cleaned = self
+            .run_chat(
+                prompt_body,
+                format!("Raw transcript:\n{raw}"),
+                budget,
+                true,
+                false,
+            )
+            .await?;
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
         let cleaned = if crate::text_polish::looks_like_list(&cleaned) {
             cleaned
@@ -419,12 +470,27 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let user_msg = format!("{cleanup_prompt}\n\nRaw transcript:\n{raw}");
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        let cleaned = self.run_chat(user_msg, budget, preserve_newlines, false).await?;
+        let cleaned = self
+            .run_chat(
+                cleanup_prompt.to_string(),
+                format!("Raw transcript:\n{raw}"),
+                budget,
+                preserve_newlines,
+                false,
+            )
+            .await?;
         // Mirror production: apply the same deterministic speech-mechanics pass
         // so the lab measures what the daemon would actually inject.
-        Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
+        let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
+        let deterministic = crate::text_polish::fix_speech_mechanics(raw);
+        if cleanup_ran_away(raw, &cleaned) {
+            Ok(deterministic)
+        } else if cleaned.trim() == raw && deterministic != raw {
+            Ok(deterministic)
+        } else {
+            Ok(cleaned)
+        }
     }
 
     /// Like [`Self::eval_cleanup`] but forces a full prefill (no KV reuse). Used
@@ -440,10 +506,25 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let user_msg = format!("{cleanup_prompt}\n\nRaw transcript:\n{raw}");
         let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        let cleaned = self.run_chat(user_msg, budget, preserve_newlines, true).await?;
-        Ok(crate::text_polish::fix_speech_mechanics(&cleaned))
+        let cleaned = self
+            .run_chat(
+                cleanup_prompt.to_string(),
+                format!("Raw transcript:\n{raw}"),
+                budget,
+                preserve_newlines,
+                true,
+            )
+            .await?;
+        let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
+        let deterministic = crate::text_polish::fix_speech_mechanics(raw);
+        if cleanup_ran_away(raw, &cleaned) {
+            Ok(deterministic)
+        } else if cleaned.trim() == raw && deterministic != raw {
+            Ok(deterministic)
+        } else {
+            Ok(cleaned)
+        }
     }
 
     /// Evaluate an arbitrary candidate **transform** system prompt against an
@@ -459,11 +540,10 @@ impl TextCleanupEngine {
         if instruction.is_empty() || selection.is_empty() {
             return Ok(selection.to_string());
         }
-        let user_msg = format!(
-            "{transform_prompt}\n\nInstruction: {instruction}\n\nText:\n{selection}"
-        );
+        let user_msg = format!("Instruction: {instruction}\n\nText:\n{selection}");
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
-        self.run_chat(user_msg, budget, true, false).await
+        self.run_chat(transform_prompt.to_string(), user_msg, budget, true, false)
+            .await
     }
 
     /// Apply a spoken `instruction` to `selection` and return the edited text.
@@ -476,15 +556,19 @@ impl TextCleanupEngine {
         if instruction.is_empty() || selection.is_empty() {
             return Ok(selection.to_string());
         }
-        let user_msg = format!(
-            "{}\n\nInstruction: {instruction}\n\nText:\n{selection}",
-            self.prompts.transform
-        );
+        let user_msg = format!("Instruction: {instruction}\n\nText:\n{selection}");
         // Give the output room for a rewrite that's somewhat longer than the
         // input (e.g. "expand this"), capped to keep within the context window.
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
         // Preserve line structure: transforms may legitimately be lists/paras.
-        self.run_chat(user_msg, budget, true, false).await
+        self.run_chat(
+            self.prompts.transform.clone(),
+            user_msg,
+            budget,
+            true,
+            false,
+        )
+        .await
     }
 
     /// Build the templated prompt and hand it to the persistent-context worker,
@@ -492,17 +576,25 @@ impl TextCleanupEngine {
     /// SmolLM without per-family hardcoding (the template comes from the GGUF).
     async fn run_chat(
         &self,
+        system_msg: String,
         user_msg: String,
         max_tokens: i32,
         preserve_newlines: bool,
         no_reuse: bool,
     ) -> eyre::Result<String> {
-        let prompt = Self::template_user_msg(&self.model, &self.chat_template, &user_msg)?;
+        let prompt =
+            Self::template_messages(&self.model, &self.chat_template, &system_msg, &user_msg)?;
         let (reply, rx) = oneshot::channel();
         self.job_tx
             .as_ref()
             .ok_or_else(|| eyre::eyre!("cleanup worker is gone"))?
-            .send(Job { prompt, max_tokens, preserve_newlines, no_reuse, reply })
+            .send(Job {
+                prompt,
+                max_tokens,
+                preserve_newlines,
+                no_reuse,
+                reply,
+            })
             .map_err(|_| eyre::eyre!("cleanup worker is gone"))?;
         rx.await
             .map_err(|_| eyre::eyre!("cleanup worker dropped the reply"))?
@@ -564,7 +656,15 @@ fn run_worker(
     let _ = ready_tx.send(Ok(()));
 
     while let Some(job) = job_rx.blocking_recv() {
-        let res = run_job(&model, &mut ctx, &mut resident, job.prompt, job.max_tokens, job.preserve_newlines, job.no_reuse);
+        let res = run_job(
+            &model,
+            &mut ctx,
+            &mut resident,
+            job.prompt,
+            job.max_tokens,
+            job.preserve_newlines,
+            job.no_reuse,
+        );
         let _ = job.reply.send(res);
     }
 }
@@ -617,11 +717,10 @@ fn run_job(
     ctx.decode(&mut batch)
         .map_err(|e| eyre::eyre!("decode prompt failed: {e:?}"))?;
 
-    // Low temperature for deterministic cleanup; fixed seed → reproducible.
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::temp(0.2),
-        LlamaSampler::dist(1234),
-    ]);
+    // Low-temperature fixed-seed sampling is deterministic while avoiding the
+    // immediate EOG produced by greedy/default Qwen sampling on S1-mini.
+    let mut sampler =
+        LlamaSampler::chain_simple([LlamaSampler::temp(0.2), LlamaSampler::dist(1234)]);
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut out = String::new();
@@ -672,7 +771,10 @@ mod tests {
     #[test]
     fn runaway_guard() {
         // Normal cleanup (slightly shorter/longer) is fine.
-        assert!(!cleanup_ran_away("um so i think we should ship it", "I think we should ship it."));
+        assert!(!cleanup_ran_away(
+            "um so i think we should ship it",
+            "I think we should ship it."
+        ));
         assert!(!cleanup_ran_away("call it parakeet", "Call it Parakeet."));
         // Empty input → never a runaway.
         assert!(!cleanup_ran_away("", ""));
@@ -683,6 +785,17 @@ mod tests {
         let huge = "Here is a long elaboration ".repeat(20);
         assert!(cleanup_ran_away(raw, &huge));
         // Leaked chat-template marker → runaway even if length is reasonable.
-        assert!(cleanup_ran_away("ship it now please", "Ship it now please.<end_of_turn>"));
+        assert!(cleanup_ran_away(
+            "ship it now please",
+            "Ship it now please.<end_of_turn>"
+        ));
+    }
+
+    #[test]
+    fn repeated_token_run_is_runaway() {
+        assert!(cleanup_ran_away(
+            "send the draft tomorrow",
+            "users users users users users users"
+        ));
     }
 }

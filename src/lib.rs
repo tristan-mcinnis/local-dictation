@@ -1,6 +1,8 @@
 pub mod app_paths;
 pub mod audio;
 pub mod audio_duck;
+#[cfg(feature = "cohere-mlx")]
+pub mod cohere_mlx;
 pub mod corrections;
 pub mod cues;
 pub mod dictionary;
@@ -34,7 +36,6 @@ pub mod menubar;
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub mod settings_window;
 
-// Push-to-talk daemon. Needs the full feature stack — Parakeet for ASR and
-// AX for the event tap + injection.
-#[cfg(all(target_os = "macos", feature = "parakeet", feature = "ax-inject"))]
+// Push-to-talk daemon. Needs the fixed Cohere MLX stack and AX injection.
+#[cfg(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject"))]
 pub mod daemon;

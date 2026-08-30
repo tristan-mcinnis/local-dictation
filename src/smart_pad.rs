@@ -27,8 +27,8 @@ pub fn smart_pad(
         None => false,
         Some(c) if c.is_whitespace() => false,
         // After opening punctuation, don't add a space.
-        Some('(') | Some('[') | Some('{') | Some('"') | Some('\'')
-        | Some('“') | Some('‘') | Some('—') => false,
+        Some('(') | Some('[') | Some('{') | Some('"') | Some('\'') | Some('“') | Some('‘')
+        | Some('—') => false,
         Some(_) => true,
     };
 
@@ -45,9 +45,8 @@ pub fn smart_pad(
         None => false,
         Some(c) if c.is_whitespace() => false,
         // Don't pad before closing punctuation.
-        Some('.') | Some(',') | Some(';') | Some(':') | Some('!') | Some('?')
-        | Some(')') | Some(']') | Some('}') | Some('"') | Some('\'')
-        | Some('”') | Some('’') => false,
+        Some('.') | Some(',') | Some(';') | Some(':') | Some('!') | Some('?') | Some(')')
+        | Some(']') | Some('}') | Some('"') | Some('\'') | Some('”') | Some('’') => false,
         Some(_) => true,
     };
 
@@ -90,19 +89,13 @@ mod tests {
 
     #[test]
     fn at_start_of_empty_field_capitalizes_no_space() {
-        assert_eq!(
-            smart_pad("hello world", None, None, None),
-            "Hello world"
-        );
+        assert_eq!(smart_pad("hello world", None, None, None), "Hello world");
     }
 
     #[test]
     fn after_period_space_capitalizes_no_extra_space() {
         // "Hello. |"  cursor right after the space → capitalize, no leading space
-        assert_eq!(
-            smart_pad("world", Some(' '), Some('.'), None),
-            "World"
-        );
+        assert_eq!(smart_pad("world", Some(' '), Some('.'), None), "World");
     }
 
     #[test]
@@ -110,45 +103,30 @@ mod tests {
         // "abc|def" — cursor in middle of a word (rare but possible).
         // Treat dictation as a word, so split: "abc xyz def" rather than
         // mashing "abcxyzdef".
-        assert_eq!(
-            smart_pad("xyz", Some('c'), Some('c'), Some('d')),
-            " xyz "
-        );
+        assert_eq!(smart_pad("xyz", Some('c'), Some('c'), Some('d')), " xyz ");
     }
 
     #[test]
     fn after_word_with_no_space_adds_leading_space() {
         // "Hello|" cursor right after 'o' with no space → add space before
-        assert_eq!(
-            smart_pad("world", Some('o'), Some('o'), None),
-            " world"
-        );
+        assert_eq!(smart_pad("world", Some('o'), Some('o'), None), " world");
     }
 
     #[test]
     fn after_opening_paren_no_leading_space() {
-        assert_eq!(
-            smart_pad("hello", Some('('), Some('('), None),
-            "hello"
-        );
+        assert_eq!(smart_pad("hello", Some('('), Some('('), None), "hello");
     }
 
     #[test]
     fn before_closing_punctuation_no_trailing_space() {
         // "say |." — cursor before period, don't add trailing space
-        assert_eq!(
-            smart_pad("hi", Some(' '), Some('y'), Some('.')),
-            "hi"
-        );
+        assert_eq!(smart_pad("hi", Some(' '), Some('y'), Some('.')), "hi");
     }
 
     #[test]
     fn before_word_adds_trailing_space() {
         // "I said |world" → "I said hi world"
-        assert_eq!(
-            smart_pad("hi", Some(' '), Some('d'), Some('w')),
-            "hi "
-        );
+        assert_eq!(smart_pad("hi", Some(' '), Some('d'), Some('w')), "hi ");
     }
 
     #[test]
@@ -172,9 +150,6 @@ mod tests {
     fn strips_caller_provided_whitespace() {
         // The caller may pass text with leading/trailing whitespace from the
         // cleaner; smart_pad should normalize and then re-pad itself.
-        assert_eq!(
-            smart_pad("  hello  ", Some(' '), Some('.'), None),
-            "Hello"
-        );
+        assert_eq!(smart_pad("  hello  ", Some(' '), Some('.'), None), "Hello");
     }
 }

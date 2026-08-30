@@ -40,8 +40,13 @@ pub enum TrailingAction {
 }
 
 /// Phrases that, when they form the *entire* utterance, cancel it.
-const CANCEL_PHRASES: &[&str] =
-    &["scratch that", "cancel that", "never mind", "delete that", "forget that"];
+const CANCEL_PHRASES: &[&str] = &[
+    "scratch that",
+    "cancel that",
+    "never mind",
+    "delete that",
+    "forget that",
+];
 
 /// Phrases that, when they form the *entire* utterance, synthesize Cmd+Z.
 const UNDO_PHRASES: &[&str] = &["undo that", "undo", "undo last"];
@@ -77,7 +82,12 @@ pub fn reference_text() -> String {
         TrailingAction::Cancel => "discard the whole dictation",
         TrailingAction::None => "",
     };
-    let quoted = |ps: &[&str]| ps.iter().map(|p| format!("\"{p}\"")).collect::<Vec<_>>().join(" / ");
+    let quoted = |ps: &[&str]| {
+        ps.iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
 
     // Group trailing phrases by the action they trigger, preserving first-seen order.
     let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
@@ -95,7 +105,10 @@ pub fn reference_text() -> String {
         s.push_str(&format!("  {}\n      → {label}\n", quoted(phrases)));
     }
     s.push_str("\nUNDO — say as the whole utterance:\n");
-    s.push_str(&format!("  {}\n      → undo (Cmd+Z)\n", quoted(UNDO_PHRASES)));
+    s.push_str(&format!(
+        "  {}\n      → undo (Cmd+Z)\n",
+        quoted(UNDO_PHRASES)
+    ));
     s.push_str("\nCANCEL — say as the whole utterance to throw it away:\n");
     s.push_str(&format!("  {}\n", quoted(CANCEL_PHRASES)));
     s.push_str("\nNote: trailing commands match on a word boundary, so \"compress enter\" or\n\"I want to press enter on the keyboard\" do NOT fire.\n");
@@ -155,7 +168,13 @@ mod tests {
     #[test]
     fn reference_text_lists_real_commands() {
         let r = reference_text();
-        for needle in ["press enter", "new paragraph", "scratch that", "undo", "press Tab"] {
+        for needle in [
+            "press enter",
+            "new paragraph",
+            "scratch that",
+            "undo",
+            "press Tab",
+        ] {
             assert!(r.contains(needle), "reference missing {needle:?}");
         }
     }
@@ -182,8 +201,7 @@ mod tests {
 
     #[test]
     fn does_not_fire_mid_sentence() {
-        let (body, act) =
-            parse_trailing_command("I want to press enter on the keyboard");
+        let (body, act) = parse_trailing_command("I want to press enter on the keyboard");
         assert_eq!(body, "I want to press enter on the keyboard");
         assert_eq!(act, TrailingAction::None);
     }

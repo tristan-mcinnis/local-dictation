@@ -64,11 +64,7 @@ fn app_name(pid: i32) -> String {
                 return before.to_string();
             }
             // Fallback: basename of the binary path
-            trimmed
-                .rsplit('/')
-                .next()
-                .unwrap_or(trimmed)
-                .to_string()
+            trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
         })
         .unwrap_or_else(|| format!("pid {pid}"))
 }
@@ -86,7 +82,6 @@ const DEFAULT_HOTKEY_KEYCODE: i64 = 0x3D;
 /// start distracting the 1B model from basic cleanup. Combined with the curated
 /// corrections vocabulary, this stays well under that regression threshold.
 const SCREEN_VOCAB_CAP: usize = 16;
-
 
 // Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
 const SPACE_KEYCODE: i64 = 0x31;
@@ -127,7 +122,9 @@ enum PttInput {
 enum PttDecision {
     Nothing,
     /// Begin capture. `transform` carries the Shift-at-press gesture.
-    Start { transform: bool },
+    Start {
+        transform: bool,
+    },
     /// End capture and run the pipeline.
     Stop,
     /// First Space of a hold: arm hands-free (cue) and swallow the Space.
@@ -206,7 +203,9 @@ impl DaemonConfig {
 enum DaemonEvent {
     /// `transform` is set when Shift was co-held at press time — the utterance
     /// is an instruction to rewrite the current selection, not text to insert.
-    StartRecording { transform: bool },
+    StartRecording {
+        transform: bool,
+    },
     StopRecording,
     /// Cancel an in-flight utterance: stop capture and discard it (no
     /// transcribe, no inject). Reached only via the control socket — there's no
@@ -286,8 +285,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     }
                 }
                 CGEventType::FlagsChanged => {
-                    let keycode =
-                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                     if keycode != hotkey_keycode {
                         return CallbackResult::Keep;
                     }
@@ -305,8 +303,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     state_cb.store(next, Ordering::SeqCst);
                     match decision {
                         PttDecision::Start { transform } => {
-                            let _ =
-                                tx_for_callback.send(DaemonEvent::StartRecording { transform });
+                            let _ = tx_for_callback.send(DaemonEvent::StartRecording { transform });
                         }
                         PttDecision::Stop => {
                             let _ = tx_for_callback.send(DaemonEvent::StopRecording);
@@ -316,8 +313,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     // FlagsChanged is never swallowed — let the modifier through.
                 }
                 CGEventType::KeyDown => {
-                    let keycode =
-                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                     if keycode == SPACE_KEYCODE {
                         let (next, decision) =
                             ptt_transition(state_cb.load(Ordering::SeqCst), PttInput::SpaceDown);
@@ -339,8 +335,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     }
                 }
                 CGEventType::KeyUp => {
-                    let keycode =
-                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                     if keycode == SPACE_KEYCODE && space_down_cb.swap(false, Ordering::SeqCst) {
                         // Swallow the key-up matching a swallowed key-down.
                         return CallbackResult::Drop;
@@ -352,9 +347,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         },
     )
     .map_err(|_| {
-        eyre::eyre!(
-            "failed to install CGEventTap — Accessibility permission missing or revoked"
-        )
+        eyre::eyre!("failed to install CGEventTap — Accessibility permission missing or revoked")
     })?;
 
     // Stash the tap's port so the callback can re-enable it after a
@@ -435,6 +428,7 @@ fn worker_loop(
     rx: std::sync::mpsc::Receiver<DaemonEvent>,
     config: DaemonConfig,
 ) -> eyre::Result<()> {
+    cues::preload();
     let t_load = Instant::now();
     let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
     eprintln!(
@@ -475,7 +469,10 @@ fn worker_loop(
     if let Some(ref c) = cleaner {
         let _ = rt.block_on(c.process_transcript("warmup")).ok();
     }
-    eprintln!("[boot] warm-up     done   in {:>4} ms", ms(t_warm.elapsed()));
+    eprintln!(
+        "[boot] warm-up     done   in {:>4} ms",
+        ms(t_warm.elapsed())
+    );
 
     // Load personal corrections dictionary (no-op if no file) and wrap it in
     // the refiner that applies corrections + voice-command parsing in the
@@ -502,23 +499,25 @@ fn worker_loop(
     // no stream-open latency on press. `None` ⇒ the proven open-on-press path
     // (default). Created on the worker thread because the cpal Stream is !Send.
     let preroll_ms = crate::settings::Settings::load().resolve_preroll_ms();
-    let mut always: Option<(crate::audio::AlwaysOnCapture, crate::audio::HeapAudioConsumer)> =
-        if preroll_ms > 0 {
-            let preroll = crate::audio::preroll_samples(preroll_ms);
-            let (mut ao, cons) = crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
-            match ao.start() {
-                Ok(()) => {
-                    eprintln!("[boot] always-on  mic warm · pre-roll {preroll_ms} ms");
-                    Some((ao, cons))
-                }
-                Err(e) => {
-                    eprintln!("[warn] always-on capture failed ({e}); using press-to-open");
-                    None
-                }
+    let mut always: Option<(
+        crate::audio::AlwaysOnCapture,
+        crate::audio::HeapAudioConsumer,
+    )> = if preroll_ms > 0 {
+        let preroll = crate::audio::preroll_samples(preroll_ms);
+        let (mut ao, cons) = crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
+        match ao.start() {
+            Ok(()) => {
+                eprintln!("[boot] always-on  mic warm · pre-roll {preroll_ms} ms");
+                Some((ao, cons))
             }
-        } else {
-            None
-        };
+            Err(e) => {
+                eprintln!("[warn] always-on capture failed ({e}); using press-to-open");
+                None
+            }
+        }
+    } else {
+        None
+    };
     // True between a pre-roll StartRecording and its StopRecording (the
     // always-on analogue of `engine.is_some()` for the open-on-press path).
     let mut session_active = false;
@@ -576,8 +575,15 @@ fn worker_loop(
                             (stream.as_mut(), consumer.as_mut(), cleaner.as_ref())
                         {
                             stream_process(
-                                &mut worker, cl, &refiner, &rt, st, c,
-                                &mut stream_raw, &mut stream_clean, false,
+                                &mut worker,
+                                cl,
+                                &refiner,
+                                &rt,
+                                st,
+                                c,
+                                &mut stream_raw,
+                                &mut stream_clean,
+                                false,
                             );
                         }
                         continue;
@@ -661,7 +667,11 @@ fn worker_loop(
                     // we capture from the *current* device instead of silently
                     // recording the old one. Cheap host query; only the rare
                     // device-change case pays the rebuild.
-                    if always.as_ref().map(|(ao, _)| ao.device_changed()).unwrap_or(false) {
+                    if always
+                        .as_ref()
+                        .map(|(ao, _)| ao.device_changed())
+                        .unwrap_or(false)
+                    {
                         let preroll = crate::audio::preroll_samples(preroll_ms);
                         let (mut ao2, cons2) =
                             crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
@@ -814,11 +824,21 @@ fn worker_loop(
                         // only cleanup left post-release — the win).
                         if let (Some(st), Some(cl)) = (stream.as_mut(), cleaner.as_ref()) {
                             stream_process(
-                                &mut worker, cl, &refiner, &rt, st, &mut c,
-                                &mut stream_raw, &mut stream_clean, true,
+                                &mut worker,
+                                cl,
+                                &refiner,
+                                &rt,
+                                st,
+                                &mut c,
+                                &mut stream_raw,
+                                &mut stream_clean,
+                                true,
                             );
                         }
-                        let whole = stream.as_ref().map(|s| s.buf().to_vec()).unwrap_or_default();
+                        let whole = stream
+                            .as_ref()
+                            .map(|s| s.buf().to_vec())
+                            .unwrap_or_default();
                         // Use the streamed result only for genuinely multi-sentence
                         // dictations; short utterances / transforms fall back to the
                         // proven whole-buffer path so commands & transform still work.
@@ -827,9 +847,13 @@ fn worker_loop(
                             // streaming, a standalone trailing "Yeah." is its own
                             // segment and the per-segment pass keeps it (looks like a
                             // whole-utterance ack); only the join reveals it's trailing.
-                            let joined = crate::text_polish::strip_trailing_filler(&stream_clean.join(" "));
+                            let joined =
+                                crate::text_polish::strip_trailing_filler(&stream_clean.join(" "));
                             precleaned_override = Some(joined);
-                            eprintln!("  ⟫ streamed {} sentence segment(s) during hold", stream_clean.len());
+                            eprintln!(
+                                "  ⟫ streamed {} sentence segment(s) during hold",
+                                stream_clean.len()
+                            );
                             stream_raw.join(" ")
                         } else {
                             match worker.transcribe_pcm(&whole) {
@@ -963,7 +987,10 @@ fn worker_loop(
                             // whole-buffer Gemma pass. Terminals still take raw.
                             Some(_) if !is_terminal && precleaned_override.is_some() => {
                                 let pre = precleaned_override.take().unwrap();
-                                eprintln!("  ⟫    streamed cleanup ({} chars)", pre.chars().count());
+                                eprintln!(
+                                    "  ⟫    streamed cleanup ({} chars)",
+                                    pre.chars().count()
+                                );
                                 pre
                             }
                             Some(ref c) if !is_terminal => {
@@ -1005,9 +1032,10 @@ fn worker_loop(
                                     deterministic
                                 } else {
                                     let t_clean = Instant::now();
-                                    match rt.block_on(
-                                        c.process_transcript_with_vocab(&pre_corrected, &screen_vocab),
-                                    ) {
+                                    match rt.block_on(c.process_transcript_with_vocab(
+                                        &pre_corrected,
+                                        &screen_vocab,
+                                    )) {
                                         Ok(cleaned) => {
                                             t_cleanup_ms = ms(t_clean.elapsed());
                                             // (2) Diff-guard: if the generative
@@ -1136,8 +1164,11 @@ fn worker_loop(
                 if let Err(err) = &inject_result {
                     eprintln!("  ✗    inject failed: {err:?}");
                     cues::play_error();
+                    ui_channel::show_transient(UiState::Error, Duration::from_millis(650));
                 } else {
                     eprintln!("  ✓    \"{final_text}\"");
+                    cues::play_success();
+                    ui_channel::show_transient(UiState::Success, Duration::from_millis(420));
                     // Remember it for the menu-bar "Copy last dictation" item.
                     ui_channel::set_last_dictation(&final_text);
                     // Persist to the browsable dictation history (best-effort;
@@ -1150,7 +1181,9 @@ fn worker_loop(
                     }
                 }
                 eprintln!();
-                ui_channel::set_state(UiState::Idle);
+                if ui_channel::state() == UiState::Processing {
+                    ui_channel::set_state(UiState::Idle);
+                }
             }
         }
 
@@ -1167,11 +1200,7 @@ fn worker_loop(
 /// the selection. Read + replace both go through the clipboard so it works in
 /// AX-blind apps. All failures are logged + cue'd; never fatal.
 #[cfg(feature = "cleaner")]
-fn handle_transform(
-    rt: &tokio::runtime::Runtime,
-    cleaner: &TextCleanupEngine,
-    instruction: &str,
-) {
+fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextCleanupEngine, instruction: &str) {
     let selection = match crate::clipboard_paste::copy_selection_via_clipboard() {
         Ok(Some(s)) => s,
         Ok(None) => {
@@ -1185,7 +1214,11 @@ fn handle_transform(
             return;
         }
     };
-    eprintln!("  ✎    \"{}\"  ·  {} chars selected", instruction.trim(), selection.chars().count());
+    eprintln!(
+        "  ✎    \"{}\"  ·  {} chars selected",
+        instruction.trim(),
+        selection.chars().count()
+    );
 
     let t = Instant::now();
     let result = match rt.block_on(cleaner.transform(instruction, &selection)) {
@@ -1204,7 +1237,10 @@ fn handle_transform(
     }
 
     match crate::clipboard_paste::paste_via_clipboard(result) {
-        Ok(()) => eprintln!("  ✓    transformed in {} ms → \"{result}\"", ms(t.elapsed())),
+        Ok(()) => eprintln!(
+            "  ✓    transformed in {} ms → \"{result}\"",
+            ms(t.elapsed())
+        ),
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
             cues::play_error();
@@ -1250,7 +1286,11 @@ fn stream_process(
     if !avail.is_empty() {
         st.push(&avail);
     }
-    let segs = if final_flush { st.take_final() } else { st.take_complete() };
+    let segs = if final_flush {
+        st.take_final()
+    } else {
+        st.take_complete()
+    };
     for (s, e) in segs {
         let seg = st.buf()[s..e].to_vec();
         let raw = match worker.transcribe_pcm(&seg) {
@@ -1271,13 +1311,14 @@ fn stream_process(
         // streamed segments use the static corrections vocab only.
         let corrected = refiner.apply_corrections(&raw);
         let prior = clean_acc.join(" ");
-        let cleaned = match rt.block_on(cleaner.process_segment_with_context(&corrected, &[], &prior)) {
-            Ok(c) => c,
-            Err(err) => {
-                eprintln!("[warn] stream seg cleanup: {err:?}; using raw");
-                corrected.clone()
-            }
-        };
+        let cleaned =
+            match rt.block_on(cleaner.process_segment_with_context(&corrected, &[], &prior)) {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("[warn] stream seg cleanup: {err:?}; using raw");
+                    corrected.clone()
+                }
+            };
         eprintln!("  ⟫ seg · {raw:?} → {cleaned:?}");
         raw_acc.push(raw);
         clean_acc.push(cleaned);
@@ -1443,8 +1484,8 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
             // wake word, or we're still armed from a recent trigger.
             let armed = armed_until.map(|t| Instant::now() < t).unwrap_or(false);
             let body = match crate::wake_word::detect(&raw, &wake_word) {
-                Some(m) => m.body,                 // wake word heard → its body
-                None if armed => raw.clone(),      // armed continuation → whole segment
+                Some(m) => m.body,            // wake word heard → its body
+                None if armed => raw.clone(), // armed continuation → whole segment
                 None => {
                     eprintln!("  ·    (ignored) {raw:?}");
                     continue;
@@ -1484,7 +1525,9 @@ fn listen_dictate(
     cleaner: Option<&TextCleanupEngine>,
 ) {
     let cleaned = match cleaner {
-        Some(c) => rt.block_on(c.process_transcript(body)).unwrap_or_else(|_| body.to_string()),
+        Some(c) => rt
+            .block_on(c.process_transcript(body))
+            .unwrap_or_else(|_| body.to_string()),
         None => body.to_string(),
     };
     inject_refined(refiner, &cleaned);
@@ -1534,7 +1577,9 @@ fn inject_refined(refiner: &Refiner, text: &str) {
 /// Run a trailing voice command's keystroke(s). `None`/`Cancel` are no-ops
 /// (the caller handles `Cancel` earlier). Errors are logged, never fatal.
 fn execute_trailing_action(action: &TrailingAction) {
-    use crate::clipboard_paste::{synthesize_escape, synthesize_return, synthesize_tab, synthesize_undo};
+    use crate::clipboard_paste::{
+        synthesize_escape, synthesize_return, synthesize_tab, synthesize_undo,
+    };
     let result = match action {
         TrailingAction::None | TrailingAction::Cancel => return,
         TrailingAction::PressEnter => synthesize_return(),
@@ -1682,7 +1727,10 @@ mod tests {
         ]);
         assert_eq!(
             decisions,
-            vec![PttDecision::Start { transform: false }, PttDecision::Nothing]
+            vec![
+                PttDecision::Start { transform: false },
+                PttDecision::Nothing
+            ]
         );
         assert_eq!(end, ST_HOLDING);
     }

@@ -146,27 +146,48 @@ mod tests {
 
     #[test]
     fn case_insensitive() {
-        assert_eq!(body("COMPUTER send it", "computer").as_deref(), Some("send it"));
-        assert_eq!(body("computer Send It", "Computer").as_deref(), Some("Send It"));
+        assert_eq!(
+            body("COMPUTER send it", "computer").as_deref(),
+            Some("send it")
+        );
+        assert_eq!(
+            body("computer Send It", "Computer").as_deref(),
+            Some("Send It")
+        );
     }
 
     #[test]
     fn optional_lead_in_before_wake_word() {
-        assert_eq!(body("hey computer what time is it", "computer").as_deref(), Some("what time is it"));
-        assert_eq!(body("okay, computer. begin", "computer").as_deref(), Some("begin"));
+        assert_eq!(
+            body("hey computer what time is it", "computer").as_deref(),
+            Some("what time is it")
+        );
+        assert_eq!(
+            body("okay, computer. begin", "computer").as_deref(),
+            Some("begin")
+        );
     }
 
     #[test]
     fn multi_word_wake_phrase() {
-        assert_eq!(body("hey jarvis turn on the lights", "hey jarvis").as_deref(), Some("turn on the lights"));
+        assert_eq!(
+            body("hey jarvis turn on the lights", "hey jarvis").as_deref(),
+            Some("turn on the lights")
+        );
         // lead-in logic must not double-count "hey" that is part of the phrase
-        assert_eq!(body("Hey Jarvis, dictate this", "hey jarvis").as_deref(), Some("dictate this"));
+        assert_eq!(
+            body("Hey Jarvis, dictate this", "hey jarvis").as_deref(),
+            Some("dictate this")
+        );
     }
 
     #[test]
     fn fuzzy_absorbs_one_char_asr_slip() {
         // Parakeet hears a trailing plural — still triggers.
-        assert_eq!(body("computers open the door", "computer").as_deref(), Some("open the door"));
+        assert_eq!(
+            body("computers open the door", "computer").as_deref(),
+            Some("open the door")
+        );
     }
 
     #[test]

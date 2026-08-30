@@ -3,10 +3,10 @@ name = "fast-dictate-backend"
 version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Low-latency local dictation pipeline for Apple Silicon: Parakeet TDT v3 + Qwen 2.5 + macOS AX inject."
+description = "Low-latency private dictation for Apple Silicon: Cohere Transcribe MLX + S1-mini."
 repository = "https://github.com/tristan-mcinnis/local-dictation"
 readme = "README.md"
-keywords = ["dictation", "speech-to-text", "parakeet", "qwen", "macos"]
+keywords = ["dictation", "speech-to-text", "cohere", "mlx", "macos"]
 categories = ["multimedia::audio", "command-line-utilities"]
 
 [lib]
@@ -19,37 +19,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-# Pulls parakeet-rs + ort (downloads onnxruntime binary at build time) + CoreML EP.
-parakeet = ["dep:parakeet-rs", "dep:hound"]
-# Alternative ASR backend: Cohere Transcribe (2B Conformer encoder/decoder,
-# 14 languages) via transcribe-rs. It pins the SAME `ort =2.0.0-rc.12` as
-# parakeet-rs, so cargo unifies them — no second onnxruntime gets linked.
-# `transcribe-rs/ort-coreml` routes inference through the CoreML EP (Neural
-# Engine / GPU) on Apple Silicon, matching the Parakeet path. Opt-in; Parakeet
-# stays the default backend (lowest-latency CTC/TDT). Pulls hound for the WAV
-# loader shared with the parakeet path.
-cohere = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs/ort-coreml"]
-# Alternative ASR backend: Moonshine (UsefulSensors) v1 Tiny/Base via
-# transcribe-rs' ONNX engine. English-only, ~9-10% WER (Base), ~50 ms latency
-# on M-series, variable-length input (no Whisper-style 30 s padding). Shares the
-# same transcribe-rs + ort =2.0.0-rc.12 stack as `cohere` (cargo unifies — no
-# second onnxruntime, no ggml). NOT whisper.cpp: whisper-rs vendors ggml which
-# collides with llama-cpp-2's ggml (533+ duplicate symbols), so Whisper-via-C++
-# is a hard blocker in this crate; Moonshine is the clean ONNX alternative.
-moonshine = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/onnx", "transcribe-rs/ort-coreml"]
-# Alternative ASR backend: OpenAI Whisper (large-v3-turbo / small / etc.) via
-# whisper.cpp (whisper-rs) with Metal. This is the real Whisper — but it vendors
-# ggml, which COLLIDES with llama-cpp-2's ggml (533+ duplicate symbols), so
-# `whisper` and `cleaner` are MUTUALLY EXCLUSIVE (enforced by build.rs). Build
-# with `--features whisper-stack` (= parakeet + whisper + ax-inject, no cleaner)
-# to use Whisper: you get Whisper ASR but lose LLM cleanup (the raw Whisper
-# output is already punctuated/capitalized, so cleanup is less critical).
-# NOT in `full` (full includes cleaner).
-whisper = ["dep:transcribe-rs", "dep:hound", "transcribe-rs/whisper-metal"]
-# Convenience: Parakeet + Whisper + injection, no cleaner (avoids the ggml
-# clash). This is the Whisper-capable stack — select Whisper at runtime via
-# `DICTATE_ASR_BACKEND=whisper` after fetching a ggml model.
-whisper-stack = ["parakeet", "whisper", "ax-inject"]
+cohere-mlx = ["dep:base64", "dep:hound"]
 # Adds llama.cpp (via llama-cpp-2) with Metal for the cleanup engine.
 # llama-cpp-2 (despite its 0.1.x version) is the actively-maintained binding;
 # `llama_cpp` 0.3.x vendors a llama.cpp from April 2024 and cannot load Gemma 3.
@@ -66,10 +36,8 @@ ax-inject = [
     "dep:objc2-app-kit",
     "dep:objc2-core-foundation",
 ]
-# Convenience: everything on (both ASR backends + cleanup + injection). This is
-# what the shipped app and the feature-gated test suite build with, so the
-# bundle can offer Parakeet and Cohere as selectable backends.
-full = ["parakeet", "cohere", "moonshine", "cleaner", "ax-inject"]
+# The one-user production stack: Cohere MLX + S1-mini + native Mac UI/output.
+full = ["cohere-mlx", "cleaner", "ax-inject"]
 
 [dependencies]
 ringbuf = "0.4"
@@ -81,10 +49,7 @@ serde_json = "1"
 # Lightweight on-device dictation history store. `bundled` compiles SQLite
 # from source so we don't depend on the system libsqlite3 version.
 rusqlite = { version = "0.39", features = ["bundled"] }
-parakeet-rs = { version = "0.3", optional = true, features = ["coreml"] }
-# Multi-engine ASR library; we use only its Cohere ONNX engine (behind the
-# `cohere` feature). Shares ort =2.0.0-rc.12 with parakeet-rs (unified).
-transcribe-rs = { version = "0.3", optional = true, default-features = false }
+base64 = { version = "0.22", optional = true }
 hound = { version = "3.5", optional = true }
 llama-cpp-2 = { version = "0.1", optional = true, default-features = false, features = ["metal"] }
 encoding_rs = { version = "0.8", optional = true }
@@ -135,8 +100,4 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
 ] }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
 
-# Round-3b VAD experiment only (examples/silero_seg.rs, vad_stream_lab.rs).
-# Same ort version + features as parakeet-rs pulls, so the crate unifies and we
-# don't double-link onnxruntime. Dev-only: never compiled into the daemon.
 [dev-dependencies]
-ort = { version = "=2.0.0-rc.12", features = ["std", "ndarray", "api-24"] }

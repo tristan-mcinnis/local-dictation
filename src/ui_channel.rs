@@ -5,7 +5,8 @@
 //! between them, all via process-wide statics so neither side needs a handle
 //! to the other:
 //!
-//!   * **state** — the current `UiState` (idle / recording / processing),
+//!   * **state** — the current `UiState` (idle / recording / processing /
+//!     success / error),
 //!     which drives the status-item icon and shows/hides the floating pill.
 //!   * **last dictation** — the most recent injected text, for the menu's
 //!     "Copy last dictation" item and "Last: …" preview.
@@ -35,6 +36,13 @@ pub enum UiState {
     Idle = 0,
     Recording = 1,
     Processing = 2,
+    /// A short-lived completion cue. The daemon may immediately return to
+    /// `Idle`; the pill still knows how to render this state for callers that
+    /// want an explicit hand-off.
+    Success = 3,
+    /// A recoverable failure cue. This is deliberately separate from
+    /// `Processing` so the UI can provide a redundant text/icon signal.
+    Error = 4,
 }
 
 impl UiState {
@@ -43,6 +51,8 @@ impl UiState {
         match v {
             1 => UiState::Recording,
             2 => UiState::Processing,
+            3 => UiState::Success,
+            4 => UiState::Error,
             _ => UiState::Idle,
         }
     }
@@ -66,6 +76,21 @@ static AUDIO_LEVELS: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::new());
 /// Broadcast a new UI state.
 pub fn set_state(state: UiState) {
     SHARED_STATE.store(state as u8, Ordering::SeqCst);
+}
+
+/// Show a terminal state long enough for the AppKit poller to render it,
+/// without blocking injection or clobbering a newer recording state.
+pub fn show_transient(state: UiState, duration: std::time::Duration) {
+    set_state(state);
+    std::thread::spawn(move || {
+        std::thread::sleep(duration);
+        let _ = SHARED_STATE.compare_exchange(
+            state as u8,
+            UiState::Idle as u8,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    });
 }
 
 /// Record the most recent injected text.

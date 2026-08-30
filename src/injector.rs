@@ -201,10 +201,9 @@ pub fn reset_inject_state() {
 mod imp {
     use super::*;
     use accessibility_sys::{
-        kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute,
-        kAXSelectedTextAttribute, kAXSelectedTextRangeAttribute,
-        kAXTrustedCheckOptionPrompt, kAXValueAttribute, kAXValueTypeCFRange,
-        AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
+        kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute, kAXSelectedTextAttribute,
+        kAXSelectedTextRangeAttribute, kAXTrustedCheckOptionPrompt, kAXValueAttribute,
+        kAXValueTypeCFRange, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
         AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
         AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
@@ -249,7 +248,9 @@ mod imp {
         unsafe {
             let app = AXUIElementCreateApplication(pid);
             if app.is_null() {
-                return Err(eyre::eyre!("AXUIElementCreateApplication({pid}) returned null"));
+                return Err(eyre::eyre!(
+                    "AXUIElementCreateApplication({pid}) returned null"
+                ));
             }
             let result = inject_through(app, text);
             cf_release(app as CFTypeRef);
@@ -274,7 +275,9 @@ mod imp {
             focused_attr.as_concrete_TypeRef(),
             &mut focused_ref,
         );
-        if prof { eprintln!("[inject-prof] get_focused_element: {:?}", t.elapsed()); }
+        if prof {
+            eprintln!("[inject-prof] get_focused_element: {:?}", t.elapsed());
+        }
         if err != kAXErrorSuccess || focused_ref.is_null() {
             // No focused field exposed — try clipboard paste against whatever
             // is frontmost. Still apply smart-pad using the remembered tail
@@ -353,7 +356,9 @@ mod imp {
         // always works because it goes through the system-level Cmd+V handler.
         if let Some(pid) = pid {
             if super::is_clipboard_only_pid(pid) {
-                if prof { eprintln!("[inject-prof] clipboard-only pid {pid} — clipboard paste"); }
+                if prof {
+                    eprintln!("[inject-prof] clipboard-only pid {pid} — clipboard paste");
+                }
                 let r = crate::clipboard_paste::paste_via_clipboard(padded);
                 if r.is_ok() {
                     super::remember_tail(padded);
@@ -371,10 +376,17 @@ mod imp {
             sel_attr.as_concrete_TypeRef(),
             payload.as_concrete_TypeRef() as CFTypeRef,
         );
-        if prof { eprintln!("[inject-prof] set_selected_text: {:?} (err={sel_err})", t.elapsed()); }
+        if prof {
+            eprintln!(
+                "[inject-prof] set_selected_text: {:?} (err={sel_err})",
+                t.elapsed()
+            );
+        }
         if sel_err == kAXErrorSuccess {
             let r = confirm_or_fallback(focused, pid, padded, prof);
-            if prof { eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed()); }
+            if prof {
+                eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
+            }
             return r;
         }
 
@@ -385,10 +397,14 @@ mod imp {
             val_attr.as_concrete_TypeRef(),
             payload.as_concrete_TypeRef() as CFTypeRef,
         );
-        if prof { eprintln!("[inject-prof] set_value: {:?} (err={val_err})", t.elapsed()); }
+        if prof {
+            eprintln!("[inject-prof] set_value: {:?} (err={val_err})", t.elapsed());
+        }
         if val_err == kAXErrorSuccess {
             let r = confirm_or_fallback(focused, pid, padded, prof);
-            if prof { eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed()); }
+            if prof {
+                eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
+            }
             return r;
         }
 
@@ -489,7 +505,10 @@ mod imp {
         if err != kAXErrorSuccess || range_ref.is_null() {
             return None;
         }
-        let mut cf_range = CFRange { location: 0, length: 0 };
+        let mut cf_range = CFRange {
+            location: 0,
+            length: 0,
+        };
         let got = AXValueGetValue(
             range_ref as AXValueRef,
             kAXValueTypeCFRange,
@@ -530,11 +549,8 @@ mod imp {
     unsafe fn read_value(focused: AXUIElementRef) -> Option<String> {
         let mut value_ref: CFTypeRef = ptr::null();
         let val_attr = CFString::new(kAXValueAttribute);
-        let err = AXUIElementCopyAttributeValue(
-            focused,
-            val_attr.as_concrete_TypeRef(),
-            &mut value_ref,
-        );
+        let err =
+            AXUIElementCopyAttributeValue(focused, val_attr.as_concrete_TypeRef(), &mut value_ref);
         if err != kAXErrorSuccess || value_ref.is_null() {
             return None;
         }
@@ -688,15 +704,12 @@ mod imp {
                     &mut role_ref,
                 );
                 let role = if r_err == kAXErrorSuccess && !role_ref.is_null() {
-                    let s = CFString::wrap_under_create_rule(role_ref as CFStringRef)
-                        .to_string();
+                    let s = CFString::wrap_under_create_rule(role_ref as CFStringRef).to_string();
                     s
                 } else {
                     format!("<unknown AXError {r_err}>")
                 };
-                eprintln!(
-                    "[inject-diag] focus capture: pid={focused_pid:?} role={role}"
-                );
+                eprintln!("[inject-diag] focus capture: pid={focused_pid:?} role={role}");
             }
 
             // Retain — focused_ref was returned by AXUIElementCopyAttributeValue
@@ -720,14 +733,13 @@ mod imp {
         let prof = std::env::var("INJECT_PROFILE").is_ok();
 
         // Apply remembered tail fallback if context was empty.
-        let (immediate_before, last_nws_before) = if target.immediate_before.is_none()
-            && target.last_nws_before.is_none()
-        {
-            let tail = super::recall_tail();
-            (tail, tail)
-        } else {
-            (target.immediate_before, target.last_nws_before)
-        };
+        let (immediate_before, last_nws_before) =
+            if target.immediate_before.is_none() && target.last_nws_before.is_none() {
+                let tail = super::recall_tail();
+                (tail, tail)
+            } else {
+                (target.immediate_before, target.last_nws_before)
+            };
 
         let padded = smart_pad(text, immediate_before, last_nws_before, target.char_after);
         if padded.is_empty() {

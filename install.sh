@@ -6,7 +6,7 @@
 #
 # Turns a fresh clone into an installed, login-at-launch menu-bar app:
 #   1. checks prerequisites (Rust, Xcode Command Line Tools, cmake)
-#   2. downloads the speech + cleanup models (if not already present)
+#   2. prepares the local Cohere Q4 + S1-mini model stack
 #   3. builds and installs "Local Dictation.app" into /Applications
 #   4. registers it as a Login Item and launches it
 #
@@ -47,7 +47,7 @@ fi
 # ── 1. prerequisites ─────────────────────────────────────────────────────────
 bold "1/4  Checking prerequisites"
 
-# Xcode Command Line Tools (provides the compiler/linker Rust needs).
+# Full Xcode is required to build MLX's Metal resource bundle.
 if ! xcode-select -p >/dev/null 2>&1; then
   warn "Xcode Command Line Tools are missing."
   if confirm "Trigger their installer now?"; then
@@ -58,6 +58,7 @@ if ! xcode-select -p >/dev/null 2>&1; then
   fi
 fi
 ok "Xcode Command Line Tools"
+command -v xcodebuild >/dev/null 2>&1 || die "Full Xcode is required for the native MLX helper."
 
 # Rust toolchain (cargo).
 if ! command -v cargo >/dev/null 2>&1; then
@@ -92,13 +93,13 @@ ok "cmake $(cmake --version | head -1 | awk '{print $3}')"
 
 # ── 2. models ────────────────────────────────────────────────────────────────
 echo
-bold "2/4  Models (Parakeet speech-to-text + Qwen 2.5 1.5B cleanup, ~1.7 GB)"
-PARAKEET="models/dictation/parakeet-tdt-v3-int8/encoder-model.int8.onnx"
-CLEANUP_MODEL="models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf"
-if [ -s "$PARAKEET" ] && [ -s "$CLEANUP_MODEL" ]; then
-  ok "models already downloaded"
+bold "2/4  Models (Cohere Transcribe Q4 MLX + S1-mini)"
+COHERE="models/dictation/cohere-mlx-q4/model.safetensors"
+S1="models/llm/s1-mini/s1-mini.gguf"
+if [ -s "$COHERE" ] && [ -s "$S1" ]; then
+  ok "fixed model stack already prepared"
 else
-  info "downloading (one time)…"
+  info "preparing local checkpoints (one time)…"
   ./scripts/download-models.sh
 fi
 
@@ -119,8 +120,6 @@ cat <<'EOT'
 
   Then you're set. How to use it:
     • Hold  Right Option , speak, release — text appears at your cursor.
-    • Hands-free: hold Right Option + tap Space, release both, keep talking,
-      tap Right Option again to stop.
     • Look for the 🎤 in your menu bar. It launches automatically at login.
 EOT
 echo

@@ -187,18 +187,18 @@ fn frontmost_is_conferencing() -> bool {
 #[cfg_attr(not(all(target_os = "macos", feature = "ax-inject")), allow(dead_code))]
 fn is_conferencing_bundle_id(bundle_id: &str) -> bool {
     const CALL_APPS: &[&str] = &[
-        "us.zoom.xos",                // Zoom
-        "com.microsoft.teams",        // Microsoft Teams (classic)
-        "com.microsoft.teams2",       // Microsoft Teams (new)
-        "com.cisco.webexmeetingsapp", // Webex Meetings
-        "Cisco-Systems.Spark",        // Webex / Cisco Spark
-        "com.apple.FaceTime",         // FaceTime
-        "com.hnc.Discord",            // Discord
-        "com.tinyspeck.slackmacgap",  // Slack (huddles)
-        "com.google.meet",            // Google Meet (standalone app)
-        "com.skype.skype",            // Skype
-        "com.ringcentral.glip",       // RingCentral
-        "com.bluejeansnet.app",       // BlueJeans
+        "us.zoom.xos",                 // Zoom
+        "com.microsoft.teams",         // Microsoft Teams (classic)
+        "com.microsoft.teams2",        // Microsoft Teams (new)
+        "com.cisco.webexmeetingsapp",  // Webex Meetings
+        "Cisco-Systems.Spark",         // Webex / Cisco Spark
+        "com.apple.FaceTime",          // FaceTime
+        "com.hnc.Discord",             // Discord
+        "com.tinyspeck.slackmacgap",   // Slack (huddles)
+        "com.google.meet",             // Google Meet (standalone app)
+        "com.skype.skype",             // Skype
+        "com.ringcentral.glip",        // RingCentral
+        "com.bluejeansnet.app",        // BlueJeans
         "com.gotomeeting.GoToMeeting", // GoToMeeting
     ];
     CALL_APPS.iter().any(|a| a.eq_ignore_ascii_case(bundle_id))

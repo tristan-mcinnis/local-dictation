@@ -1,16 +1,19 @@
 # local-dictation
 
-Fast, private, on-device dictation for Apple Silicon Macs. Hold a key, talk, release, and the text lands at your cursor in about 150 ms. Everything runs locally. Nothing leaves your Mac, no account, no subscription, no cloud.
+Fast, private, on-device dictation for one Apple Silicon Mac. Hold a key, talk,
+release, and the text lands at your cursor. Everything runs locally: Cohere
+Transcribe Q4 in native MLX, then S1-mini for guarded cleanup.
 
 Built for how people actually dictate now: into an AI chat, a Slack thread, a message box. The text drops in at the cursor, so you talk, press Enter, and it sends. The whole point is speed, so the cleanup model only runs when your speech is actually messy. Clear speech goes straight through.
 
-A free, open-source alternative to Superwhisper, Wispr Flow, MacWhisper, and built-in Apple Dictation.
+This branch is intentionally software-of-one. It has no model picker, cloud
+providers, account, subscription, or runtime telemetry.
 
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 ![On-device](https://img.shields.io/badge/network%20at%20runtime-none-success)
-![Latency ~150 ms](https://img.shields.io/badge/latency-~150ms%20clear%20speech-brightgreen)
+![Cohere hot fixture](https://img.shields.io/badge/Cohere%20Q4-~200ms%20hot-brightgreen)
 
 <p align="center">
   <img src="docs/demo.gif" alt="local-dictation demo: hold Right Option, speak, release, cleaned text lands at the cursor" width="420">
@@ -18,10 +21,13 @@ A free, open-source alternative to Superwhisper, Wispr Flow, MacWhisper, and bui
 
 ## Features, in order of impact
 
-1. **Lowest latency.** About 150 ms from key release to text on screen for clear speech (transcribe plus inject, no cloud round-trip). Parakeet TDT v3 runs on the Apple Neural Engine via CoreML. This is the reason the project exists.
+1. **Fast Cohere MLX.** The old ONNX/Core ML path fell back to CPU. The native
+   persistent MLX helper runs the 8.35-second fixture in about 198–220 ms hot.
 2. **Fully private and offline.** Audio and text never leave your Mac. No account, no telemetry, no network at runtime.
 3. **Lands at your cursor, in any app.** Dictate into any text field or chat box and press Enter to send. Works in native Cocoa apps directly, and falls back to clipboard paste for Electron apps (VS Code, Slack, browsers, Notion).
-4. **Cleanup only when needed.** Clear speech is passed through untouched and fast. The on-device LLM runs only when the text is genuinely messy (filler, stutters, run-ons). When it does run it removes filler and fixes punctuation without rewriting, dropping, or substituting your words.
+4. **Guarded S1-mini cleanup.** Clean speech skips generation. Messy speech is
+   offered to S1-mini; deterministic cleanup and content/runaway guards win if
+   the model truncates, repeats, or changes intent.
 5. **Personal dictionary.** Your names, brands, and tools (Todoist, Pencil, macOS) are kept as you mean them instead of being "corrected" to common words. Edit it from the menu bar.
 6. **Hands-free mode.** Hold the key and tap Space to latch, then talk with nothing held down. Tap the key once to stop. Good for long thoughts.
 7. **Voice commands.** End an utterance with "press enter", "new line", or "press tab" to emit the keystroke. Say "scratch that" to cancel, or "undo that" to revert the last dictation.
@@ -32,7 +38,8 @@ Also included: always-on pre-roll mic so the first word is never clipped, a live
 
 ## Install
 
-**Download the app.** Grab the `.dmg` from the [latest release](https://github.com/tristan-mcinnis/local-dictation/releases/latest) (about 12 MB), open it, and drag **Local Dictation.app** into `/Applications`. It is small because it downloads the two models (Parakeet plus Qwen 2.5 1.5B, about 1.7 GB) on first launch, so the first run needs internet.
+This personal build expects the locally installed Superwhisper Cohere Q4 and
+S1-mini checkpoints. Model bytes are never committed.
 
 Because the app is ad-hoc signed, clear the Gatekeeper quarantine once:
 
@@ -40,15 +47,8 @@ Because the app is ad-hoc signed, clear the Gatekeeper quarantine once:
 xattr -dr com.apple.quarantine "/Applications/Local Dictation.app"
 ```
 
-Launch it. You will see a "Downloading models" notification on the first run, then a prompt for Microphone and Accessibility in System Settings, Privacy and Security. The menu-bar mic icon means it is ready.
-
-**If huggingface.co is blocked or slow (for example in mainland China):** use a VPN for the first launch, or pre-download through a mirror with no VPN:
-
-```bash
-HF_ENDPOINT=https://hf-mirror.com "/Applications/Local Dictation.app/Contents/MacOS/local-dictation" fetch-models
-```
-
-`HF_ENDPOINT` also works with `./scripts/download-models.sh` and `./install.sh`.
+Launch it, then grant Microphone and Accessibility in System Settings → Privacy
+& Security. The menu-bar mic icon means it is ready.
 
 **Build from source.**
 
@@ -58,7 +58,8 @@ cd local-dictation
 ./install.sh
 ```
 
-`install.sh` checks prerequisites (offering to install Rust and cmake), downloads the models, builds the app, installs it to `/Applications`, sets it to launch at login, and starts it. It is safe to re-run. You still grant Microphone and Accessibility yourself on first launch.
+`install.sh` checks prerequisites, prepares the personal model links/conversion,
+builds the native MLX helper and Rust app, installs it, and starts it.
 
 The app is ad-hoc signed, so after a rebuild macOS may re-ask for those two permissions. A real Developer ID would make the grants stick.
 
@@ -82,10 +83,7 @@ cargo build --features full --release
 
 # Or build the .app bundle
 ./scripts/build-app.sh --install      # build, copy to /Applications, login item, launch
-./scripts/build-app.sh --slim --dmg   # tiny DMG, models fetched on first run (the shipped release)
-
-# Whisper build (no cleaner — whisper.cpp and llama.cpp both vendor ggml)
-BUILD_FEATURES=parakeet,cohere,moonshine,whisper,ax-inject ./scripts/build-app.sh --install
+./scripts/build-app.sh --bundle-models --dmg
 ```
 
 </details>
@@ -97,16 +95,13 @@ BUILD_FEATURES=parakeet,cohere,moonshine,whisper,ax-inject ./scripts/build-app.s
 Set up the "local-dictation" app on this Mac (Apple Silicon) from
 https://github.com/tristan-mcinnis/local-dictation:
 1. Clone the repo (or use it if we are already inside it).
-2. Run ./install.sh. It checks prerequisites, downloads the models, builds
+2. Run ./install.sh. It checks prerequisites, prepares the local model links, builds
    "Local Dictation.app", installs it to /Applications, and sets it to launch
    at login. Answer "yes" to prompts about installing Rust or cmake.
 Then stop and tell me the one thing you cannot do for me: on first launch macOS
 asks for Microphone and Accessibility permission, and I have to grant both in
 System Settings, Privacy and Security myself.
-Hotkeys: hold Right Option to dictate. For hands-free, hold Right Option and tap
-Space, let go of both, keep talking, then tap Right Option once to stop.
-If huggingface.co is blocked here (for example mainland China), run the download
-with HF_ENDPOINT=https://hf-mirror.com so it uses a mirror instead of a VPN.
+Hotkey: hold Right Option to dictate and release to transcribe.
 ```
 
 </details>
@@ -123,45 +118,30 @@ The menu-bar app holds the model, hotkey, output-format, and cleanup pickers, th
 
 ## Performance
 
-Measured on Apple Silicon, hot path after warm-up, end to end from key release to injected text.
+Measured on an Apple M5 after warm-up with `testdata/dictation_sample.wav`
+(8.35 seconds of speech):
 
-| Path | Latency |
-| --- | --- |
-| Clear speech (cleanup skipped) | about 150 ms |
-| Messy speech (cleanup model runs) | about 300 to 700 ms, scales with length |
+| Stage | Hot latency |
+| --- | ---: |
+| Cohere Transcribe Q4 through MLX | about 198–220 ms |
+| S1-mini attempt on the fixture | about 6–70 ms |
+| Combined inference fixture | about 207–270 ms |
 
-A 2 second clear utterance: transcribe about 90 ms (Parakeet TDT v3 INT8, CoreML), inject about 5 ms native or about 185 ms for Electron apps. When the cleanup model runs it adds roughly 140 to 250 ms (Qwen 2.5 1.5B Q4_K_M, Metal). The cleanup prompt is decoded once at boot and its KV-cache prefix is reused, so it does not re-prefill each time.
+Native AX insertion remains about 5 ms. Clipboard fallback is measured
+separately because Electron applications can add substantially more latency.
+Run `cargo run --release --features full -- bench testdata/dictation_sample.wav`
+for current-machine numbers.
 
 ## Models
 
-Both defaults run fully on-device. `./scripts/download-models.sh` fetches them.
-
 | Model | Size | Role |
-| --- | --- | --- |
-| Parakeet TDT v3 INT8 (ONNX) | 640 MB | Speech to text (default) |
-| Qwen 2.5 1.5B-IT Q4_K_M (GGUF) | 1.0 GB | Cleanup |
+| --- | ---: | --- |
+| Cohere Transcribe Q4 MLX | about 1.5 GB | Fixed speech-to-text model |
+| S1-mini Q4_K_M | about 462 MB | Fixed cleanup model |
 
-Qwen 2.5 1.5B won a bake-off of eight local models on 11 hard dictation cases ([`examples/model_bakeoff.rs`](./examples/model_bakeoff.rs)): 50 of 55 passes at 137 ms mean cleanup, beating Gemma 3 4B at a third of the size. Swap models from the menu bar or with `GEMMA_MODEL_PATH`.
-
-### Alternative ASR backends
-
-Parakeet is the default (lowest latency, single CTC/TDT pass). Two more ONNX backends share the same `ort` + CoreML stack (no new native deps), and Whisper uses whisper.cpp + Metal. All are selectable from the Speech Engine menu or `DICTATE_ASR_BACKEND`.
-
-| Backend | Model | Size | Latency (M5, 8.35 s audio) | Notes |
-| --- | --- | --- | --- | --- |
-| Parakeet (default) | TDT v3 INT8 | 640 MB | ~190 ms | Punctuated, multilingual |
-| Moonshine Base | v1 61M INT8 | 66 MB | ~320 ms | English-only, raw text (cleanup punctuates) |
-| Moonshine Tiny | v1 27M INT8 | 30 MB | ~230 ms | English-only, rougher accuracy |
-| Whisper | large-v3-turbo q5_0 | 547 MB | ~560 ms | Punctuated, multilingual, **no cleanup** (ggml clash) |
-
-Fetch optional backends:
-
-```bash
-./scripts/download-models.sh --moonshine base   # or tiny
-./scripts/download-models.sh --whisper          # large-v3-turbo q5_0
-```
-
-**Whisper trades cleanup for ASR.** whisper.cpp (`whisper-rs`) and llama.cpp (`llama-cpp-2`, the cleanup engine) both vendor ggml and cannot link into the same binary. Build with `--features whisper-stack` (Parakeet + Whisper + inject, no cleaner) to use Whisper — its output is already punctuated, so the missing cleanup is less critical. `build.rs` enforces the mutual exclusion with a clear error. Moonshine and Cohere have no such restriction (they use ONNX Runtime, not ggml).
+The Cohere setup script re-keys Safetensors metadata for the public
+`mlx-audio-swift` module; tensor bytes are unchanged. S1-mini is linked from the
+local installation and loaded by the persistent llama.cpp worker.
 
 ## Compared to the alternatives
 
@@ -185,13 +165,11 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 | Var | Effect |
 | --- | --- |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key. Default `0x3D` (Right Option) |
-| `DICTATE_ASR_BACKEND` | ASR engine: `parakeet` (default), `cohere`, `moonshine`, or `whisper` |
-| `GEMMA_MODEL_PATH` | Cleanup model path (name is historical) |
-| `PARAKEET_MODEL_DIR` | Parakeet ASR model directory |
-| `DICTATE_MOONSHINE_VARIANT` | Moonshine size: `tiny` or `base` (default) |
-| `DICTATE_WHISPER_MODEL_PATH` | Path to Whisper ggml `.bin` file |
+| `DICTATE_COHERE_MLX_MODEL_DIR` | Converted Cohere Q4 checkpoint directory |
+| `DICTATE_COHERE_MLX_BRIDGE` | Native helper path override |
+| `DICTATE_COHERE_LANG` | Decoder language hint (`en` by default) |
+| `S1_MODEL_PATH` | S1-mini GGUF path override |
 | `DICTATE_FORMAT` | Active output-format preset |
-| `HF_ENDPOINT` | Model download mirror (for example `https://hf-mirror.com`) |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_NO_MUTE` | Do not mute other audio during capture |
 
@@ -201,7 +179,7 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 | --- | --- |
 | `daemon` | The push-to-talk daemon, the real way to use this |
 | `toggle`, `start`, `stop`, `cancel` | Drive a running daemon over its control socket (Shortcuts, Raycast, a foot pedal) |
-| `fetch-models [dir]` | Download the default models (respects `HF_ENDPOINT`) |
+| `fetch-models [dir]` | Verify the fixed local model stack |
 | `bench [wav]` | Transcribe and clean a WAV, report timings |
 | `logs` | Open the daemon log |
 | `ax-check` | Surface the Accessibility permission prompt |
@@ -209,8 +187,8 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 
 ## Trade-offs
 
-* English-first. Parakeet is multilingual but the cleanup is tuned for English.
-* Whisper and cleanup cannot coexist: both vendor ggml. Build with `whisper-stack` (no cleaner) or `full` (no Whisper), not both.
+* Cohere is multilingual, but the personal prompt/eval corpus is English-first.
+* S1-mini is guarded; failed quality checks fall back to deterministic text.
 * Electron apps add about 185 ms (clipboard paste settle time). Native apps inject in about 5 ms.
 * Recording is bounded by key hold, not silence detection.
 * macOS and Apple Silicon only.
@@ -220,19 +198,25 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 ```bash
 cargo test                 # core unit and integration tests, no models needed
 cargo test --features full # adds the menubar, history, injector, and cleaner suites
-cargo build --features whisper-stack  # verify the Whisper (no-cleaner) stack compiles
+native/cohere-mlx/test.sh
+cargo run --release --features cleaner --example s1_mini_eval
 ```
 
 ## License
 
 Dual-licensed under MIT OR Apache-2.0, at your option. See [LICENSE-MIT](./LICENSE-MIT) and [LICENSE-APACHE](./LICENSE-APACHE).
 
-Models are not redistributed here. Parakeet TDT v3 is NVIDIA's under their license. Qwen 2.5 is Apache-2.0. Check each model's terms before commercial use.
+Models are not redistributed here. This personal build refers to locally
+installed model files; check their terms before broader distribution.
 
 ## Acknowledgements
 
-Standing on [NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), [Qwen 2.5](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct), [Moonshine](https://github.com/UsefulSensors/moonshine) by Useful Sensors, [OpenAI Whisper](https://github.com/openai/whisper) via [whisper.cpp](https://github.com/ggml-org/whisper.cpp), [transcribe-rs](https://github.com/cjpais/transcribe-rs), [parakeet-rs](https://github.com/cdpierse/parakeet-rs), [ONNX Runtime](https://github.com/microsoft/onnxruntime) via [`ort`](https://github.com/pykeio/ort), [llama.cpp](https://github.com/ggml-org/llama.cpp) via [`llama-cpp-2`](https://github.com/utilityai/llama-cpp-rs), [cpal](https://github.com/RustAudio/cpal), [objc2](https://github.com/madsmtm/objc2), and [arboard](https://github.com/1Password/arboard).
+Built with [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026),
+[mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift),
+[MLX Swift](https://github.com/ml-explore/mlx-swift),
+[llama.cpp](https://github.com/ggml-org/llama.cpp), `cpal`, `objc2`, and `rusqlite`.
 
 ---
 
-Keywords: macOS dictation, speech to text, voice to text, voice typing, on-device, offline, local, private, push to talk, Parakeet, Qwen, Whisper, Moonshine, local LLM, Apple Silicon, Superwhisper alternative, Wispr Flow alternative, MacWhisper alternative, Apple Dictation alternative, dictation for ChatGPT and Claude, low latency speech recognition, Rust.
+Keywords: macOS dictation, Cohere Transcribe, S1-mini, MLX, on-device,
+offline, private, push to talk, Apple Silicon, Rust.

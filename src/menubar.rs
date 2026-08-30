@@ -26,12 +26,10 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSButton, NSColor,
-    NSControlStateValueOff, NSControlStateValueOn, NSEvent, NSFont, NSImage, NSLineBreakMode,
-    NSMenu, NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSStatusBar, NSStatusItem,
-    NSTextAlignment,
-    NSTextField, NSTextView, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowLevel,
-    NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEvent,
+    NSFont, NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSScreen, NSScrollView, NSSearchField,
+    NSStatusBar, NSStatusItem, NSTextAlignment, NSTextField, NSTextView, NSView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
@@ -54,6 +52,7 @@ const LOG_PATH: &str = "/tmp/dictate-daemon.log";
 
 // Pill geometry — tuned to match Wispr Flow's compact pill.
 const PILL_W: f64 = 120.0;
+const PILL_EXPANDED_W: f64 = 272.0;
 const PILL_H: f64 = 44.0;
 const BAR_COUNT: usize = 14;
 const BAR_W: f64 = 3.0;
@@ -68,30 +67,56 @@ const BAR_MIN_H: f64 = 2.0;
 /// through the window builders.
 #[allow(dead_code)] // the full palette is documented once; not every tier is consumed yet
 mod theme {
-    use objc2_app_kit::NSColor;
     use objc2::rc::Retained;
+    use objc2_app_kit::NSColor;
 
     fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
         NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, b, a)
     }
 
     // Light surfaces (history / dictionary windows).
-    pub fn panel() -> Retained<NSColor> { rgba(0.969, 0.969, 0.973, 1.0) } // #F7F7F8
-    pub fn card() -> Retained<NSColor> { rgba(1.0, 1.0, 1.0, 1.0) }
-    pub fn border() -> Retained<NSColor> { rgba(0.851, 0.851, 0.871, 1.0) }
-    pub fn text_primary() -> Retained<NSColor> { rgba(0.067, 0.067, 0.078, 1.0) }
-    pub fn text_secondary() -> Retained<NSColor> { rgba(0.345, 0.345, 0.380, 1.0) }
-    pub fn text_tertiary() -> Retained<NSColor> { rgba(0.480, 0.480, 0.510, 1.0) }
+    pub fn panel() -> Retained<NSColor> {
+        rgba(0.969, 0.969, 0.973, 1.0)
+    } // #F7F7F8
+    pub fn card() -> Retained<NSColor> {
+        rgba(1.0, 1.0, 1.0, 1.0)
+    }
+    pub fn border() -> Retained<NSColor> {
+        rgba(0.851, 0.851, 0.871, 1.0)
+    }
+    pub fn text_primary() -> Retained<NSColor> {
+        rgba(0.067, 0.067, 0.078, 1.0)
+    }
+    pub fn text_secondary() -> Retained<NSColor> {
+        rgba(0.345, 0.345, 0.380, 1.0)
+    }
+    pub fn text_tertiary() -> Retained<NSColor> {
+        rgba(0.480, 0.480, 0.510, 1.0)
+    }
 
     // The floating recording pill stays a dark HUD (legible over any app), but in
     // the family's refined charcoal rather than the old near-black + grey ring.
-    pub fn pill_bg() -> Retained<NSColor> { rgba(0.071, 0.071, 0.078, 0.95) } // ~#121214
-    pub fn pill_border() -> Retained<NSColor> { rgba(1.0, 1.0, 1.0, 0.10) }   // hairline
+    pub fn pill_bg() -> Retained<NSColor> {
+        rgba(0.071, 0.071, 0.078, 0.95)
+    } // ~#121214
+    pub fn pill_border() -> Retained<NSColor> {
+        rgba(1.0, 1.0, 1.0, 0.10)
+    } // hairline
     /// Live-recording waveform: clean off-white.
-    pub fn bar_active() -> Retained<NSColor> { rgba(0.95, 0.95, 0.97, 1.0) }
+    pub fn bar_active() -> Retained<NSColor> {
+        rgba(0.95, 0.95, 0.97, 1.0)
+    }
     /// Processing ("thinking") waveform: the family's muted busy-grey, so the two
     /// states finally read differently without introducing a new colour.
-    pub fn bar_busy() -> Retained<NSColor> { rgba(0.55, 0.58, 0.62, 1.0) }
+    pub fn bar_busy() -> Retained<NSColor> {
+        rgba(0.55, 0.58, 0.62, 1.0)
+    }
+    pub fn bar_success() -> Retained<NSColor> {
+        rgba(0.43, 0.78, 0.56, 1.0)
+    }
+    pub fn bar_error() -> Retained<NSColor> {
+        rgba(0.95, 0.42, 0.40, 1.0)
+    }
 }
 
 /// Pin a window to the light "Aqua" appearance and the family panel background,
@@ -113,6 +138,14 @@ struct UiGlobals {
     status_item: Retained<NSStatusItem>,
     pill_window: Retained<NSWindow>,
     bars: Vec<Retained<NSView>>,
+    pill_content: Retained<NSView>,
+    pill_status: Retained<NSTextField>,
+    pill_cancel: Retained<NSButton>,
+    pill_settings: Retained<NSButton>,
+    /// 0 = compact, 1 = expanded. The timer eases this value so hover can be
+    /// interrupted without a second animation system or a bounce.
+    pill_expanded: Mutex<f64>,
+    reduced_motion: bool,
     last_state: AtomicU8,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
     /// slowly toward the new RMS sample — gives the snappy bouncing
@@ -286,6 +319,14 @@ define_class!(
         fn open_settings(&self, _sender: *mut AnyObject) {
             crate::settings_window::show_settings_window();
         }
+
+        /// The expanded pill's compact, keyboard-reachable escape hatch. It
+        /// uses the same local control channel as the CLI/Shortcuts path, so
+        /// cancelling never reaches into the audio worker from AppKit.
+        #[unsafe(method(cancelPill:))]
+        fn cancel_pill(&self, _sender: *mut AnyObject) {
+            let _ = crate::ipc::send(crate::ipc::Command::Cancel);
+        }
     }
 );
 
@@ -337,12 +378,18 @@ pub fn init_and_run() -> eyre::Result<()> {
 
     let actions = MenuActions::new();
     let built = build_status_item(mtm, &actions)?;
-    let (pill_window, bars) = build_pill_window(mtm)?;
+    let pill = build_pill_window(mtm, &actions)?;
 
     let globals = UiGlobals {
         status_item: built.status_item,
-        pill_window,
-        bars,
+        pill_window: pill.window,
+        bars: pill.bars,
+        pill_content: pill.content,
+        pill_status: pill.status,
+        pill_cancel: pill.cancel,
+        pill_settings: pill.settings,
+        pill_expanded: Mutex::new(0.0),
+        reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
         icon_idle: built.icon_idle,
@@ -427,8 +474,12 @@ pub(crate) fn write_and_open_commands_reference() {
     body.push_str("Local Dictation — Voice Commands & Settings\n");
     body.push_str("===========================================\n\n");
     body.push_str(&crate::voice_commands::reference_text());
-    body.push_str(&format!("\n\nPUSH-TO-TALK KEY: {hotkey} (hold, speak, release)\n"));
-    body.push_str("OUTPUT FORMATS (menu → Output format): default · numbered · bullets · email · code\n");
+    body.push_str(&format!(
+        "\n\nPUSH-TO-TALK KEY: {hotkey} (hold, speak, release)\n"
+    ));
+    body.push_str(
+        "OUTPUT FORMATS (menu → Output format): default · numbered · bullets · email · code\n",
+    );
 
     let Some(path) = crate::app_paths::config_file("voice-commands.txt") else {
         eprintln!("[menu] no config dir for commands reference");
@@ -520,8 +571,7 @@ fn build_status_item(
 
     // Simple editor for the personal dictionary (names/terms to keep spelled
     // verbatim). Counterpart to Dictation History — one clean native window.
-    let dictionary_item =
-        action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
+    let dictionary_item = action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
     menu.addItem(&dictionary_item);
 
     // Native Settings window (⌘,): all tunables in one place, batched apply.
@@ -530,35 +580,8 @@ fn build_status_item(
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
-    // ── ASR engine submenu (which model transcribes the audio) ──────────
-    // Parakeet (default, lowest latency) vs Cohere (more accurate, 14
-    // languages, but heavier). Picking one writes `asr_backend` + relaunches.
-    let asr_parent = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Speech engine"),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    asr_parent.setEnabled(true);
-    let asr_submenu = build_asr_submenu(mtm, actions, &settings);
-    asr_parent.setSubmenu(Some(&asr_submenu));
-    menu.addItem(&asr_parent);
-
-    // ── Cleanup model submenu ───────────────────────────────────────────
-    let model_parent = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Cleanup model"),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    model_parent.setEnabled(true);
-    let model_submenu = build_model_submenu(mtm, actions, &settings);
-    model_parent.setSubmenu(Some(&model_submenu));
-    menu.addItem(&model_parent);
+    // Model choices are intentionally absent: this personal build is one
+    // warmed Cohere MLX transcriber followed by S1-mini.
 
     // ── Hotkey submenu ──────────────────────────────────────────────────
     let hotkey_parent = unsafe {
@@ -575,13 +598,7 @@ fn build_status_item(
     menu.addItem(&hotkey_parent);
 
     // ── Cleanup on/off toggle ───────────────────────────────────────────
-    let cleanup_item = action_item(
-        mtm,
-        "Cleanup enabled",
-        sel!(toggleCleanup:),
-        "",
-        actions,
-    );
+    let cleanup_item = action_item(mtm, "Cleanup enabled", sel!(toggleCleanup:), "", actions);
     let cleanup_on = settings.cleanup_enabled.unwrap_or(true);
     {
         cleanup_item.setState(if cleanup_on {
@@ -647,7 +664,13 @@ fn build_status_item(
 
     // ── Logs + corrections ──────────────────────────────────────────────
     menu.addItem(&action_item(mtm, "Open Log", sel!(openLog:), "l", actions));
-    menu.addItem(&action_item(mtm, "Export Log to Downloads…", sel!(exportLog:), "", actions));
+    menu.addItem(&action_item(
+        mtm,
+        "Export Log to Downloads…",
+        sel!(exportLog:),
+        "",
+        actions,
+    ));
     menu.addItem(&action_item(
         mtm,
         "Open corrections folder",
@@ -687,194 +710,6 @@ fn build_status_item(
         icon_processing,
         last_item,
     })
-}
-
-/// Build the speech-engine (ASR backend) picker: Parakeet vs Cohere vs
-/// Moonshine. The active backend is checked; selecting one writes
-/// `asr_backend` + relaunches. `DICTATE_ASR_BACKEND` locks the choice
-/// (disabled items + note). When a backend is chosen but its model isn't
-/// downloaded, a disabled hint says how to get it.
-fn build_asr_submenu(
-    mtm: MainThreadMarker,
-    actions: &Retained<MenuActions>,
-    settings: &Settings,
-) -> Retained<NSMenu> {
-    use crate::transcriber::AsrBackend;
-
-    let submenu = NSMenu::new(mtm);
-    submenu.setAutoenablesItems(false);
-
-    let env_locked = std::env::var_os("DICTATE_ASR_BACKEND").is_some();
-    // The checkmark reflects the *file* setting (env lock is shown separately).
-    let active = settings
-        .asr_backend
-        .as_deref()
-        .and_then(AsrBackend::parse)
-        .unwrap_or_default();
-
-    // Are the opt-in model weights actually present? (resolve_asr applies env + default.)
-    let resolved = settings.resolve_asr();
-    let cohere_present = std::path::Path::new(&resolved.cohere_dir).is_dir();
-    let moonshine_present = std::path::Path::new(&resolved.moonshine_dir).is_dir();
-    let whisper_present = std::path::Path::new(&resolved.whisper_model_path).is_file();
-
-    for (backend, label) in [
-        (AsrBackend::Parakeet, "Parakeet — fast (default)"),
-        (AsrBackend::Cohere, "Cohere — accurate, 14 languages"),
-        (AsrBackend::Moonshine, "Moonshine — fast, English (ONNX)"),
-        (AsrBackend::Whisper, "Whisper — accurate, multilingual (no cleanup)"),
-    ] {
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(label),
-                Some(sel!(selectAsrBackend:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe {
-            item.setTarget(Some(actions));
-            item.setEnabled(!env_locked);
-            let rep_ns = NSString::from_str(backend.as_str());
-            let rep: &AnyObject = &rep_ns;
-            item.setRepresentedObject(Some(rep));
-            item.setState(if !env_locked && active == backend {
-                NSControlStateValueOn
-            } else {
-                NSControlStateValueOff
-            });
-        }
-        submenu.addItem(&item);
-    }
-
-    // Hint when an opt-in backend's weights aren't on disk.
-    let mut added_sep = false;
-    let mut add_hint = |submenu: &Retained<NSMenu>, text: &str| {
-        if !added_sep {
-            submenu.addItem(&*NSMenuItem::separatorItem(mtm));
-            added_sep = true;
-        }
-        let note = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(text),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        note.setEnabled(false);
-        submenu.addItem(&note);
-    };
-    if !cohere_present {
-        add_hint(&submenu, "Cohere: run  download-models.sh --cohere");
-    }
-    if !moonshine_present {
-        add_hint(&submenu, "Moonshine: run  download-models.sh --moonshine");
-    }
-    if !whisper_present {
-        add_hint(&submenu, "Whisper: run  download-models.sh --whisper");
-    }
-
-    if env_locked {
-        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
-        let note = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("(locked by DICTATE_ASR_BACKEND env var)"),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        note.setEnabled(false);
-        submenu.addItem(&note);
-    }
-
-    submenu
-}
-
-/// Build the model-picker submenu. Each discovered model gets a checkable
-/// item; the active one is checked. If `GEMMA_MODEL_PATH` is set in the
-/// environment it overrides everything, so we surface a disabled note and
-/// leave the items unchecked.
-fn build_model_submenu(
-    mtm: MainThreadMarker,
-    actions: &Retained<MenuActions>,
-    settings: &Settings,
-) -> Retained<NSMenu> {
-    let submenu = NSMenu::new(mtm);
-    submenu.setAutoenablesItems(false);
-
-    let env_locked = std::env::var_os("GEMMA_MODEL_PATH").is_some();
-    let models = settings::discover_llm_models();
-
-    if models.is_empty() {
-        let none = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("(no models found under models/llm/)"),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        none.setEnabled(false);
-        submenu.addItem(&none);
-        return submenu;
-    }
-
-    // Effective active path: settings choice, or the canonicalized default.
-    let default_gemma = crate::app_paths::gemma_default_path();
-    let effective = settings.gemma_model.clone().unwrap_or_else(|| {
-        std::fs::canonicalize(&default_gemma)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or(default_gemma)
-    });
-
-    for choice in &models {
-        // Annotate with the speed/accuracy hint so the trade-off is one glance,
-        // e.g. "gemma-3-1b-it — fast · recommended".
-        let title = match &choice.hint {
-            Some(h) => format!("{} — {h}", choice.label),
-            None => choice.label.clone(),
-        };
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str(&title),
-                Some(sel!(selectModel:)),
-                &NSString::from_str(""),
-            )
-        };
-        unsafe {
-            item.setTarget(Some(actions));
-            item.setEnabled(!env_locked);
-            // Stash the absolute path so the action knows what was picked.
-            let path_ns = NSString::from_str(&choice.path);
-            let rep: &AnyObject = &path_ns;
-            item.setRepresentedObject(Some(rep));
-            if !env_locked && choice.path == effective {
-                item.setState(NSControlStateValueOn);
-            } else {
-                item.setState(NSControlStateValueOff);
-            }
-        }
-        submenu.addItem(&item);
-    }
-
-    if env_locked {
-        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
-        let note = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("(locked by GEMMA_MODEL_PATH env var)"),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        note.setEnabled(false);
-        submenu.addItem(&note);
-    }
-
-    submenu
 }
 
 /// Build the output-format picker. A "Default (no preset)" row clears the
@@ -1178,7 +1013,10 @@ pub(crate) fn open_prompts_file() {
             esc(&prompts.transform),
         );
         if let Err(e) = std::fs::write(&path, seed) {
-            eprintln!("[menu] failed to seed prompts.json ({}): {e}", path.display());
+            eprintln!(
+                "[menu] failed to seed prompts.json ({}): {e}",
+                path.display()
+            );
             // Still try to open whatever exists / the folder below.
         }
     }
@@ -1235,8 +1073,7 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
 
     // Container content view: a hint label on top, the editable text area in the
     // middle, a Save button bottom-right.
-    let container: Retained<NSView> =
-        NSView::initWithFrame(NSView::alloc(mtm), frame);
+    let container: Retained<NSView> = NSView::initWithFrame(NSView::alloc(mtm), frame);
 
     // Instruction label (in-window, so it isn't truncated like a long subtitle).
     let label_y = win_h - margin - label_h;
@@ -1413,9 +1250,8 @@ fn build_dictionary_window(mtm: MainThreadMarker) -> DictionaryUi {
         container.addSubview(&save_button);
     }
 
-    let style = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Miniaturizable;
+    let style =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
@@ -1538,7 +1374,8 @@ fn add_dictionary_entry_from_fields() {
             format!("{base}\n{line}")
         };
         ui.text_view.setString(&NSString::from_str(&joined));
-        let _: () = msg_send![&*ui.text_view, scrollToEndOfDocument: std::ptr::null_mut::<AnyObject>()];
+        let _: () =
+            msg_send![&*ui.text_view, scrollToEndOfDocument: std::ptr::null_mut::<AnyObject>()];
 
         // Clear the fields and return focus to "Heard" for the next entry.
         ui.heard_field.setStringValue(&NSString::from_str(""));
@@ -1674,7 +1511,12 @@ fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         window.center();
     }
 
-    HistoryUi { window, search, scroll, doc }
+    HistoryUi {
+        window,
+        search,
+        scroll,
+        doc,
+    }
 }
 
 /// Re-query the history DB, rebuild the list, and bring the window forward.
@@ -1917,9 +1759,7 @@ fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]
 /// doesn't exist or we're on an older macOS without SF Symbols.
 fn sf_symbol(name: &str) -> Option<Retained<NSImage>> {
     let ns_name = NSString::from_str(name);
-    let img = {
-        NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None)
-    };
+    let img = { NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None) };
     if let Some(ref img) = img {
         // Template mode: the image adopts the menu-bar tint color
         // (dark or light depending on the user's theme).
@@ -1928,12 +1768,23 @@ fn sf_symbol(name: &str) -> Option<Retained<NSImage>> {
     img
 }
 
-/// Build the floating pill window and return (window, bar_views).
-/// The pill is a small rounded-rect with a subtle border, containing a
-/// row of vertical bars that we animate from audio RMS.
+struct PillBuild {
+    window: Retained<NSWindow>,
+    content: Retained<NSView>,
+    bars: Vec<Retained<NSView>>,
+    status: Retained<NSTextField>,
+    cancel: Retained<NSButton>,
+    settings: Retained<NSButton>,
+}
+
+/// Build the floating pill window. It starts as a compact waveform capsule;
+/// the same content view grows horizontally when the pointer rests over it,
+/// revealing status text plus two useful, >=32px controls. Keeping one window
+/// and one view tree makes hover expansion cheap and interruptible.
 fn build_pill_window(
     mtm: MainThreadMarker,
-) -> eyre::Result<(Retained<NSWindow>, Vec<Retained<NSView>>)> {
+    actions: &Retained<MenuActions>,
+) -> eyre::Result<PillBuild> {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PILL_W, PILL_H));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -1949,7 +1800,10 @@ fn build_pill_window(
         window.setOpaque(false);
         let clear = NSColor::clearColor();
         window.setBackgroundColor(Some(&clear));
-        window.setIgnoresMouseEvents(true);
+        // The pill is intentionally mouse-aware: the timer samples the
+        // pointer against the window frame and expands the shelf on hover.
+        // Controls remain outside the compact frame until expanded.
+        window.setIgnoresMouseEvents(false);
         window.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
                 | NSWindowCollectionBehavior::Stationary
@@ -1998,8 +1852,71 @@ fn build_pill_window(
         bars.push(bar);
     }
 
+    // Contextual shelf: hidden by clipping while compact, then revealed by
+    // the width animation. The labels are redundant status cues (not color
+    // alone), and the buttons have persistent tooltips/accessibility names.
+    let status = NSTextField::labelWithString(&NSString::from_str("Ready"), mtm);
+    status.setFrame(NSRect::new(
+        NSPoint::new(PILL_W + 14.0, 13.0),
+        NSSize::new(92.0, 18.0),
+    ));
+    status.setFont(Some(&NSFont::systemFontOfSize(12.0)));
+    unsafe {
+        let _: () = msg_send![&*status, setTextColor: &*NSColor::whiteColor()];
+        let _: () = msg_send![&*status, setAlphaValue: 0.0_f64];
+        let _: () =
+            msg_send![&*status, setAccessibilityLabel: &*NSString::from_str("Dictation status")];
+    }
+
+    let cancel: Retained<NSButton> = unsafe {
+        msg_send![
+            NSButton::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 76.0, 6.0), NSSize::new(32.0, 32.0))
+        ]
+    };
+    cancel.setTitle(&NSString::from_str("×"));
+    cancel.setBordered(false);
+    cancel.setToolTip(Some(&NSString::from_str("Cancel recording (Escape)")));
+    unsafe {
+        let _: () = msg_send![&*cancel, setTarget: &**actions];
+        let _: () = msg_send![&*cancel, setAction: sel!(cancelPill:)];
+        let _: () = msg_send![&*cancel, setKeyEquivalent: &*NSString::from_str("\u{1b}")];
+        let _: () = msg_send![&*cancel, setFont: &*NSFont::systemFontOfSize(21.0)];
+        let _: () =
+            msg_send![&*cancel, setAccessibilityLabel: &*NSString::from_str("Cancel recording")];
+        let _: () = msg_send![&*cancel, setAlphaValue: 0.0_f64];
+    }
+
+    let settings: Retained<NSButton> = unsafe {
+        msg_send![
+            NSButton::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 42.0, 6.0), NSSize::new(32.0, 32.0))
+        ]
+    };
+    settings.setTitle(&NSString::from_str("⚙"));
+    settings.setBordered(false);
+    settings.setToolTip(Some(&NSString::from_str("Open Dictation settings")));
+    unsafe {
+        let _: () = msg_send![&*settings, setTarget: &**actions];
+        let _: () = msg_send![&*settings, setAction: sel!(openSettings:)];
+        settings.setFont(Some(&NSFont::systemFontOfSize(16.0)));
+        let _: () = msg_send![&*settings, setAccessibilityLabel: &*NSString::from_str("Open Dictation settings")];
+        let _: () = msg_send![&*settings, setAlphaValue: 0.0_f64];
+    }
+
+    content_view.addSubview(&status);
+    content_view.addSubview(&cancel);
+    content_view.addSubview(&settings);
+
     window.setContentView(Some(&content_view));
-    Ok((window, bars))
+    Ok(PillBuild {
+        window,
+        content: content_view,
+        bars,
+        status,
+        cancel,
+        settings,
+    })
 }
 
 /// CFRunLoopTimer firing ~30 FPS. On every tick: update bar heights from
@@ -2021,8 +1938,17 @@ fn install_poll_timer() {
         // synthetic "thinking" wave instead of letting the bars sit frozen.
         match state {
             UiState::Recording => update_bars(globals),
-            UiState::Processing => animate_processing_bars(globals),
-            UiState::Idle => {}
+            UiState::Processing => {
+                if globals.reduced_motion {
+                    set_static_processing_bars(globals);
+                } else {
+                    animate_processing_bars(globals);
+                }
+            }
+            UiState::Success | UiState::Error | UiState::Idle => {}
+        }
+        if state != UiState::Idle {
+            update_pill_hover(globals);
         }
     }
 
@@ -2062,6 +1988,8 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         UiState::Idle => &globals.icon_idle,
         UiState::Recording => &globals.icon_recording,
         UiState::Processing => &globals.icon_processing,
+        UiState::Success => &globals.icon_recording,
+        UiState::Error => &globals.icon_processing,
     };
     if let Some(button) = globals.status_item.button(mtm) {
         if let Some(img) = icon {
@@ -2072,6 +2000,8 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 UiState::Idle => "◯",
                 UiState::Recording => "●",
                 UiState::Processing => "◌",
+                UiState::Success => "✓",
+                UiState::Error => "!",
             };
             button.setTitle(&NSString::from_str(fallback));
         }
@@ -2088,19 +2018,169 @@ fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             }
             ui_channel::reset_levels();
             collapse_bars(globals);
+            resize_pill(globals, 0.0);
             globals.pill_window.orderOut(None);
         }
         UiState::Recording => {
             set_bars_color(globals, &theme::bar_active());
+            globals
+                .pill_status
+                .setStringValue(&NSString::from_str("Recording · release to finish"));
+            set_pill_controls_visible(globals, false);
+            resize_pill(globals, 0.0);
             position_pill_at_cursor_screen(&globals.pill_window);
             globals.pill_window.orderFrontRegardless();
         }
         UiState::Processing => {
             set_bars_color(globals, &theme::bar_busy());
+            globals
+                .pill_status
+                .setStringValue(&NSString::from_str("Processing…"));
+            set_pill_controls_visible(globals, false);
+            resize_pill(globals, 0.0);
+            position_pill_at_cursor_screen(&globals.pill_window);
+            globals.pill_window.orderFrontRegardless();
+        }
+        UiState::Success => {
+            set_bars_color(globals, &theme::bar_success());
+            globals
+                .pill_status
+                .setStringValue(&NSString::from_str("Done"));
+            set_static_success_bars(globals);
+            set_pill_controls_visible(globals, false);
+            resize_pill(globals, 0.0);
+            position_pill_at_cursor_screen(&globals.pill_window);
+            globals.pill_window.orderFrontRegardless();
+        }
+        UiState::Error => {
+            set_bars_color(globals, &theme::bar_error());
+            globals
+                .pill_status
+                .setStringValue(&NSString::from_str("Couldn’t transcribe"));
+            set_static_error_bars(globals);
+            set_pill_controls_visible(globals, false);
+            resize_pill(globals, 0.0);
             position_pill_at_cursor_screen(&globals.pill_window);
             globals.pill_window.orderFrontRegardless();
         }
     }
+}
+
+/// Read the pointer directly instead of installing a global event monitor.
+/// This keeps the UI self-contained and avoids stealing events from the app
+/// where the user is dictating. The panel is mouse-aware only while visible.
+fn pointer_over_pill(window: &NSWindow) -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let p = NSEvent::mouseLocation();
+    let f = window.frame();
+    let _ = mtm; // retain the main-thread proof for AppKit's mouse query
+    p.x >= f.origin.x
+        && p.x <= f.origin.x + f.size.width
+        && p.y >= f.origin.y
+        && p.y <= f.origin.y + f.size.height
+}
+
+/// Interruptible, non-bouncy hover expansion. The compact capsule remains
+/// stable at the same screen centre while the shelf reveals itself to the
+/// right. Reduced motion snaps to the target and uses static status cues.
+fn update_pill_hover(globals: &UiGlobals) {
+    let target = if pointer_over_pill(&globals.pill_window) {
+        1.0
+    } else {
+        0.0
+    };
+    let Ok(mut progress) = globals.pill_expanded.lock() else {
+        return;
+    };
+    let next = if globals.reduced_motion {
+        target
+    } else {
+        *progress + (target - *progress) * 0.24
+    };
+    let next = if (next - target).abs() < 0.01 {
+        target
+    } else {
+        next
+    };
+    if (next - *progress).abs() < 0.004 {
+        return;
+    }
+    *progress = next;
+    drop(progress);
+    resize_pill(globals, next);
+    set_pill_controls_visible(globals, next > 0.08);
+}
+
+fn set_pill_controls_visible(globals: &UiGlobals, visible: bool) {
+    let alpha = if visible { 1.0 } else { 0.0 };
+    unsafe {
+        let _: () = msg_send![&*globals.pill_status, setAlphaValue: alpha];
+        let _: () = msg_send![&*globals.pill_cancel, setAlphaValue: alpha];
+        let _: () = msg_send![&*globals.pill_settings, setAlphaValue: alpha];
+    }
+}
+
+/// Resize the transparent borderless window around the same horizontal
+/// centre. `setFrame:display:animate:` is deliberately non-animated; the
+/// interpolation above is what makes the transition interruptible.
+fn resize_pill(globals: &UiGlobals, progress: f64) {
+    let width = PILL_W + (PILL_EXPANDED_W - PILL_W) * progress.clamp(0.0, 1.0);
+    let old = globals.pill_window.frame();
+    let cx = old.origin.x + old.size.width / 2.0;
+    let frame = NSRect::new(
+        NSPoint::new(cx - width / 2.0, old.origin.y),
+        NSSize::new(width, PILL_H),
+    );
+    unsafe {
+        let _: () =
+            msg_send![&*globals.pill_window, setFrame: frame, display: true, animate: false];
+    }
+    globals.pill_content.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width, PILL_H),
+    ));
+}
+
+fn set_static_processing_bars(globals: &UiGlobals) {
+    let h = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * 0.42;
+    for (i, bar) in globals.bars.iter().enumerate() {
+        set_bar_height(bar, i, h);
+    }
+}
+
+fn set_static_success_bars(globals: &UiGlobals) {
+    for (i, bar) in globals.bars.iter().enumerate() {
+        set_bar_height(bar, i, if i % 2 == 0 { 16.0 } else { 10.0 });
+    }
+}
+
+fn set_static_error_bars(globals: &UiGlobals) {
+    for (i, bar) in globals.bars.iter().enumerate() {
+        set_bar_height(
+            bar,
+            i,
+            if i == BAR_COUNT / 2 {
+                BAR_MAX_H
+            } else {
+                BAR_MIN_H
+            },
+        );
+    }
+}
+
+fn reduced_motion_enabled() -> bool {
+    if std::env::var_os("DICTATE_REDUCED_MOTION").is_some() {
+        return true;
+    }
+    // macOS exposes the preference through the global defaults domain. A
+    // failed read simply means the normal, restrained interpolation is used.
+    std::process::Command::new("defaults")
+        .args(["read", "-g", "reduceMotion"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "1")
+        .unwrap_or(false)
 }
 
 fn update_bars(globals: &UiGlobals) {
@@ -2165,8 +2245,8 @@ fn animate_processing_bars(globals: &UiGlobals) {
     let t = CFAbsoluteTimeGetCurrent();
     const SPEED: f64 = 5.5; // radians/sec — ~0.9 sweeps per second
     const SPACING: f64 = 0.55; // radians/bar — ~1.2 wavelengths across the row
-    // Calm amplitude (peaks ~60% of full) so it reads as "thinking", not a
-    // loud audio signal.
+                               // Calm amplitude (peaks ~60% of full) so it reads as "thinking", not a
+                               // loud audio signal.
     let amp = (BAR_MAX_H * 0.6 - BAR_MIN_H) / 2.0;
     let mid = BAR_MIN_H + amp;
 
@@ -2214,7 +2294,9 @@ fn collapse_bars(globals: &UiGlobals) {
 }
 
 fn position_pill_at_cursor_screen(window: &NSWindow) {
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     {
         let mouse_loc = NSEvent::mouseLocation();
         let screens = NSScreen::screens(mtm);
@@ -2257,8 +2339,14 @@ mod tests {
         // ordering and indices) without pinning exact times, since formatting
         // is locale/timezone dependent.
         let entries = vec![
-            Entry { text: "second day line".into(), created_at: 1_747_900_000 },
-            Entry { text: "first day line".into(), created_at: 1_747_900_000 - 90_000 },
+            Entry {
+                text: "second day line".into(),
+                created_at: 1_747_900_000,
+            },
+            Entry {
+                text: "first day line".into(),
+                created_at: 1_747_900_000 - 90_000,
+            },
         ];
         let rows = history_rows(&entries);
         eprintln!("\n----- history_rows -----\n{rows:#?}\n------------------------");

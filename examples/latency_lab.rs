@@ -31,7 +31,10 @@ async fn main() -> eyre::Result<()> {
     // Representative push-to-talk transcripts (short → mid). These are the kind
     // of raw Parakeet output the cleaner sees in production.
     let transcripts = [
-        ("short", "um so i think we should just ship the the thing today"),
+        (
+            "short",
+            "um so i think we should just ship the the thing today",
+        ),
         (
             "mid",
             "okay so basically what i wanna do is refactor the cleaner module \
@@ -48,16 +51,71 @@ async fn main() -> eyre::Result<()> {
     // Synthetic known-vocab terms (plausible proper nouns / domain casing), to
     // measure the token cost of the vocabulary suffix at two cap levels.
     let pool: Vec<String> = [
-        "Lumen", "Tristan McInnis", "Parakeet", "macOS", "ONNX", "GitHub", "CoreML",
-        "Anthropic", "Cupertino", "Soniox", "Browserbase", "Neon", "Postgres", "Gemma",
-        "llama.cpp", "Metal", "CGEventTap", "Accessibility", "Tencent", "Seoul",
-        "Kubernetes", "Terraform", "Datadog", "Grafana", "Prometheus", "Redis", "Kafka",
-        "Snowflake", "Databricks", "Cloudflare", "Vercel", "Netlify", "Supabase",
-        "Firebase", "DynamoDB", "ElastiCache", "Lambda", "Fargate", "CloudFront",
-        "Route53", "Wasabi", "Backblaze", "Tailscale", "WireGuard", "Caddy", "Traefik",
-        "Nginx", "Envoy", "Istio", "Linkerd", "Consul", "Vault", "Nomad", "Packer",
-        "Ansible", "Pulumi", "ArgoCD", "Tekton", "Buildkite", "CircleCI", "Drone",
-        "Gitea", "Forgejo", "Codeberg", "SourceHut",
+        "Lumen",
+        "Tristan McInnis",
+        "Parakeet",
+        "macOS",
+        "ONNX",
+        "GitHub",
+        "CoreML",
+        "Anthropic",
+        "Cupertino",
+        "Soniox",
+        "Browserbase",
+        "Neon",
+        "Postgres",
+        "Gemma",
+        "llama.cpp",
+        "Metal",
+        "CGEventTap",
+        "Accessibility",
+        "Tencent",
+        "Seoul",
+        "Kubernetes",
+        "Terraform",
+        "Datadog",
+        "Grafana",
+        "Prometheus",
+        "Redis",
+        "Kafka",
+        "Snowflake",
+        "Databricks",
+        "Cloudflare",
+        "Vercel",
+        "Netlify",
+        "Supabase",
+        "Firebase",
+        "DynamoDB",
+        "ElastiCache",
+        "Lambda",
+        "Fargate",
+        "CloudFront",
+        "Route53",
+        "Wasabi",
+        "Backblaze",
+        "Tailscale",
+        "WireGuard",
+        "Caddy",
+        "Traefik",
+        "Nginx",
+        "Envoy",
+        "Istio",
+        "Linkerd",
+        "Consul",
+        "Vault",
+        "Nomad",
+        "Packer",
+        "Ansible",
+        "Pulumi",
+        "ArgoCD",
+        "Tekton",
+        "Buildkite",
+        "CircleCI",
+        "Drone",
+        "Gitea",
+        "Forgejo",
+        "Codeberg",
+        "SourceHut",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -74,18 +132,23 @@ async fn main() -> eyre::Result<()> {
     // which is the ceiling a prompt-prefix cache could remove.
     let prompt_minimal = "Clean up this dictation. Output only the cleaned text.".to_string();
 
-    let variants: [(&str, &str); 4] = [
+    let _variants: [(&str, &str); 4] = [
         ("baseline (full instructions)", &prompt_baseline),
         ("baseline + 20 vocab terms", &prompt_vocab20),
         ("baseline + 64 vocab terms", &prompt_vocab64),
         ("minimal prompt (prefix-cache floor)", &prompt_minimal),
     ];
 
-    println!("prompt char lengths (≈ tokens/4): baseline={}, +20={}, +64={}, minimal={}",
-        prompt_baseline.len(), prompt_vocab20.len(), prompt_vocab64.len(), prompt_minimal.len());
+    println!(
+        "prompt char lengths (≈ tokens/4): baseline={}, +20={}, +64={}, minimal={}",
+        prompt_baseline.len(),
+        prompt_vocab20.len(),
+        prompt_vocab64.len(),
+        prompt_minimal.len()
+    );
 
-    let gemma = Settings::load()
-        .resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
+    let gemma =
+        Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
     eprintln!("[lat] model: {gemma}");
     let t = Instant::now();
     let engine = TextCleanupEngine::initialize(&gemma)?;
@@ -102,14 +165,36 @@ async fn main() -> eyre::Result<()> {
     for (tname, raw) in &transcripts {
         // Prime residency with a different transcript so `cached` exercises a
         // real partial-reuse, then compare.
-        let _ = engine.eval_cleanup(&prompt_baseline, "warm the cache with something else", false).await?;
+        let _ = engine
+            .eval_cleanup(
+                &prompt_baseline,
+                "warm the cache with something else",
+                false,
+            )
+            .await?;
         let cached = engine.eval_cleanup(&prompt_baseline, raw, false).await?;
-        let uncached = engine.eval_cleanup_uncached(&prompt_baseline, raw, false).await?;
+        let uncached = engine
+            .eval_cleanup_uncached(&prompt_baseline, raw, false)
+            .await?;
         let ok = cached == uncached;
         parity_ok &= ok;
-        println!("  {tname:<8} {}", if ok { "✅ identical".to_string() } else { format!("❌ DIFFER\n    cached:   {cached:?}\n    uncached: {uncached:?}") });
+        println!(
+            "  {tname:<8} {}",
+            if ok {
+                "✅ identical".to_string()
+            } else {
+                format!("❌ DIFFER\n    cached:   {cached:?}\n    uncached: {uncached:?}")
+            }
+        );
     }
-    println!("  → parity: {}", if parity_ok { "ALL MATCH" } else { "MISMATCH — prefix reuse is UNSAFE" });
+    println!(
+        "  → parity: {}",
+        if parity_ok {
+            "ALL MATCH"
+        } else {
+            "MISMATCH — prefix reuse is UNSAFE"
+        }
+    );
 
     // ---- LATENCY: realized cached win + vocab cost ----
     for (tname, raw) in &transcripts {
@@ -118,12 +203,18 @@ async fn main() -> eyre::Result<()> {
         // Cached vs uncached on the SAME baseline prompt = the realized win.
         for (label, no_reuse) in [("baseline CACHED", false), ("baseline UNCACHED", true)] {
             let _ = run_timed(&engine, &prompt_baseline, raw, no_reuse, 1).await?; // warm
-            let (mean, min, max, last) = run_timed(&engine, &prompt_baseline, raw, no_reuse, REPS).await?;
+            let (mean, min, max, last) =
+                run_timed(&engine, &prompt_baseline, raw, no_reuse, REPS).await?;
             println!("  {label:<38} mean {mean:7.1} ms  (min {min:6.1}, max {max:6.1})");
-            if no_reuse { println!("      → {last:?}"); }
+            if no_reuse {
+                println!("      → {last:?}");
+            }
         }
         // Vocab cost (cached path, as it'd run in production).
-        for (vname, prompt) in [("+ 20 vocab terms (cached)", &prompt_vocab20), ("+ 64 vocab terms (cached)", &prompt_vocab64)] {
+        for (vname, prompt) in [
+            ("+ 20 vocab terms (cached)", &prompt_vocab20),
+            ("+ 64 vocab terms (cached)", &prompt_vocab64),
+        ] {
             let _ = run_timed(&engine, prompt, raw, false, 1).await?;
             let (mean, min, max, _l) = run_timed(&engine, prompt, raw, false, REPS).await?;
             println!("  {vname:<38} mean {mean:7.1} ms  (min {min:6.1}, max {max:6.1})");

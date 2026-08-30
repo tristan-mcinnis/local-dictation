@@ -51,9 +51,9 @@ APP_SUPPORT="$HOME/Library/Application Support/$APP_NAME"
 
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 
-# Recommended (shipped) model stack — only these get bundled with --bundle-models.
-PARAKEET_REL="dictation/parakeet-tdt-v3-int8"
-LLM_REL="llm/qwen-2.5-1.5b-it"
+# Fixed software-of-one model stack.
+COHERE_REL="dictation/cohere-mlx-q4"
+LLM_REL="llm/s1-mini"
 
 BUNDLE_MODELS=0
 SLIM=0
@@ -83,11 +83,11 @@ fi
 
 echo "▶ Local Dictation.app  (v$VERSION)"
 
-# ── 1. compile the release binary ───────────────────────────────────────────
-# BUILD_FEATURES overrides the feature set (default: full = all backends +
-# cleaner + inject, no whisper). To include Whisper (which is mutually
-# exclusive with cleaner due to a ggml clash — see build.rs), build with:
-#   BUILD_FEATURES=parakeet,cohere,moonshine,whisper,ax-inject ./scripts/build-app.sh --install
+# ── 1. compile native MLX helper + Rust app ──────────────────────────────────
+echo "• building native Cohere MLX helper…"
+COHERE_HELPER="$($REPO_ROOT/native/cohere-mlx/build.sh | tail -1)"
+COHERE_PRODUCTS="$(dirname "$COHERE_HELPER")"
+
 BUILD_FEATURES="${BUILD_FEATURES:-full}"
 echo "• building release binary (cargo build --features $BUILD_FEATURES --release)…"
 cargo build --features "$BUILD_FEATURES" --release
@@ -99,6 +99,11 @@ rm -rf "$APP"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 cp "$BIN_SRC" "$MACOS_DIR/$EXEC_NAME"
 chmod +x "$MACOS_DIR/$EXEC_NAME"
+cp "$COHERE_HELPER" "$RES_DIR/cohere-mlx-bridge"
+chmod +x "$RES_DIR/cohere-mlx-bridge"
+# MLX searches for mlx.metallib beside its executable before bundle lookup.
+cp "$COHERE_PRODUCTS/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" \
+   "$RES_DIR/mlx.metallib"
 
 # ── 3. Info.plist ────────────────────────────────────────────────────────────
 cat > "$CONTENTS/Info.plist" <<PLIST
@@ -141,8 +146,8 @@ rm -rf "$ICONSET" "$ICON_PNG"
 if [ "$BUNDLE_MODELS" -eq 1 ]; then
   echo "• bundling model stack into the app (recommended stack only)…"
   mkdir -p "$RES_DIR/models/dictation" "$RES_DIR/models/llm"
-  cp -R "$REPO_ROOT/models/$PARAKEET_REL" "$RES_DIR/models/$PARAKEET_REL"
-  cp -R "$REPO_ROOT/models/$LLM_REL"      "$RES_DIR/models/$LLM_REL"
+  cp -R "$REPO_ROOT/models/$COHERE_REL" "$RES_DIR/models/$COHERE_REL"
+  cp -RL "$REPO_ROOT/models/$LLM_REL"   "$RES_DIR/models/$LLM_REL"
   echo "  bundled: $(du -sh "$RES_DIR/models" | cut -f1)"
 elif [ "$SLIM" -eq 1 ]; then
   # Ship NO models and NO dev symlink: on a clean machine the app resolves no

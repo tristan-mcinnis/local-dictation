@@ -1,12 +1,12 @@
+#[cfg(feature = "cohere-mlx")]
+use fast_dictate_backend::cues;
 use fast_dictate_backend::{
     audio::{AudioCaptureEngine, BUFFER_CAPACITY},
     injector::AccessibilityInjector,
     transcriber::LocalInferenceWorker,
 };
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
-use fast_dictate_backend::cues;
 
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
+#[cfg(feature = "cohere-mlx")]
 use std::time::Instant;
 
 // cpal::Stream is !Send on macOS — pin the runtime to one thread so the
@@ -88,9 +88,14 @@ async fn run_mock_loop() -> eyre::Result<()> {
     let is_recording = engine.start_mock_loop();
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     engine.stop_capture();
-    let transcription = worker.run_inference_pipeline(consumer, is_recording).await?;
+    let transcription = worker
+        .run_inference_pipeline(consumer, is_recording)
+        .await?;
     AccessibilityInjector::inject_text(&transcription)?;
-    println!("Pipeline finished. Transcript length: {}", transcription.len());
+    println!(
+        "Pipeline finished. Transcript length: {}",
+        transcription.len()
+    );
     Ok(())
 }
 
@@ -145,7 +150,7 @@ fn inject_with_optional_focus(text: &str) -> eyre::Result<()> {
 /// `bench` / `dictate` subcommands faithful to production instead of
 /// silently skipping corrections + commands. The CLI paths don't execute
 /// the trailing action (no key synthesis); we just note it.
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
+#[cfg(feature = "cohere-mlx")]
 fn refine_for_cli(cleaned: &str) -> String {
     use fast_dictate_backend::corrections::Corrections;
     use fast_dictate_backend::refiner::Refiner;
@@ -154,7 +159,10 @@ fn refine_for_cli(cleaned: &str) -> String {
     let corrections = Corrections::load_default().unwrap_or_else(|_| Corrections::empty());
     let refined = Refiner::new(corrections).refine(cleaned);
     if refined.action != TrailingAction::None {
-        println!("[refine] parsed trailing command {:?} (not executed in CLI mode)", refined.action);
+        println!(
+            "[refine] parsed trailing command {:?} (not executed in CLI mode)",
+            refined.action
+        );
     }
     refined.text
 }
@@ -189,9 +197,7 @@ fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
 fn run_logs() -> eyre::Result<()> {
     let log_path = "/tmp/dictate-daemon.log";
     if !std::path::Path::new(log_path).exists() {
-        eprintln!(
-            "[logs] {log_path} doesn't exist yet — start the daemon first with `daemon`."
-        );
+        eprintln!("[logs] {log_path} doesn't exist yet — start the daemon first with `daemon`.");
         return Ok(());
     }
     // `open -t` uses the default .txt editor (Console.app on most setups).
@@ -235,15 +241,24 @@ fn run_context_probe() -> eyre::Result<()> {
     match target.screen_text() {
         Some(text) => {
             let preview: String = text.chars().take(400).collect();
-            println!("[context-probe] harvested screen text ({} chars):\n  {preview:?}", text.len());
+            println!(
+                "[context-probe] harvested screen text ({} chars):\n  {preview:?}",
+                text.len()
+            );
         }
-        None => println!("[context-probe] no screen text exposed (AX-blind app, e.g. Electron/terminal)"),
+        None => println!(
+            "[context-probe] no screen text exposed (AX-blind app, e.g. Electron/terminal)"
+        ),
     }
     let terms = target.screen_terms(16);
     if terms.is_empty() {
         println!("[context-probe] extracted terms: <none>");
     } else {
-        println!("[context-probe] extracted terms ({}): {}", terms.len(), terms.join(", "));
+        println!(
+            "[context-probe] extracted terms ({}): {}",
+            terms.len(),
+            terms.join(", ")
+        );
     }
     Ok(())
 }
@@ -255,21 +270,21 @@ fn run_context_probe() -> eyre::Result<()> {
     ))
 }
 
-#[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper")))]
+#[cfg(not(feature = "cohere-mlx"))]
 async fn run_bench(_wav: &str) -> eyre::Result<()> {
     Err(eyre::eyre!(
         "`bench` requires an ASR backend feature (try --features full)"
     ))
 }
 
-#[cfg(not(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper")))]
+#[cfg(not(feature = "cohere-mlx"))]
 async fn run_dictate(_ms: u64) -> eyre::Result<()> {
     Err(eyre::eyre!(
         "`dictate` requires an ASR backend feature (try --features full)"
     ))
 }
 
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
+#[cfg(feature = "cohere-mlx")]
 async fn run_bench(wav_path: &str) -> eyre::Result<()> {
     use fast_dictate_backend::transcriber::load_wav_mono16k;
 
@@ -350,21 +365,15 @@ async fn run_bench(wav_path: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
+#[cfg(feature = "cohere-mlx")]
 async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
     let asr = asr_config();
     println!("[dictate] asr backend: {}", asr.describe());
-    println!(
-        "[dictate] recording for {} ms — speak now...",
-        duration_ms
-    );
+    println!("[dictate] recording for {} ms — speak now...", duration_ms);
 
     let t_load_model = Instant::now();
     let mut worker = LocalInferenceWorker::initialize(&asr)?;
-    println!(
-        "[dictate] asr loaded in {:?}",
-        t_load_model.elapsed()
-    );
+    println!("[dictate] asr loaded in {:?}", t_load_model.elapsed());
 
     #[cfg(feature = "cleaner")]
     let cleaner = {
@@ -394,10 +403,7 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
         .run_inference_pipeline(consumer, is_recording)
         .await?;
     let drain_and_transcribe = t_drain.elapsed();
-    println!(
-        "[dictate] drain+transcribe: {:?}",
-        drain_and_transcribe
-    );
+    println!("[dictate] drain+transcribe: {:?}", drain_and_transcribe);
     println!("[dictate] raw transcript: {transcript:?}");
 
     #[cfg(feature = "cleaner")]
@@ -430,12 +436,12 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
 /// settings/env/defaults. Single source of truth shared by bench, dictate,
 /// the daemon, and listen mode — see `settings::Settings::resolve_asr`. All of
 /// those entry points require an ASR backend feature, so gate it there.
-#[cfg(any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"))]
+#[cfg(feature = "cohere-mlx")]
 fn asr_config() -> fast_dictate_backend::transcriber::AsrConfig {
     fast_dictate_backend::settings::Settings::load().resolve_asr()
 }
 
-#[cfg(all(feature = "cleaner", any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper")))]
+#[cfg(all(feature = "cleaner", feature = "cohere-mlx"))]
 fn gemma_path() -> String {
     // Precedence: GEMMA_MODEL_PATH env > settings.json > bundle-aware default.
     use fast_dictate_backend::settings::Settings;
@@ -455,7 +461,8 @@ async fn run_transform(instruction: Option<String>, text: Option<String>) -> eyr
             "usage: transform \"<instruction>\" \"<text to transform>\""
         ));
     };
-    let gemma = Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
+    let gemma =
+        Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
     println!("[transform] gemma: {gemma}");
     let t = std::time::Instant::now();
     let cleaner = TextCleanupEngine::initialize(&gemma)?;
@@ -479,7 +486,7 @@ async fn run_transform(_i: Option<String>, _t: Option<String>) -> eyre::Result<(
 /// `eprintln!` output would vanish. Point stdout+stderr at the same log file
 /// the menu's relaunch path uses, so the structured per-utterance log works
 /// from the very first launch. No-op when not bundled (keep terminal output).
-#[cfg(all(target_os = "macos", any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"), feature = "ax-inject"))]
+#[cfg(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject"))]
 fn redirect_stdio_to_log_if_bundled() {
     use std::os::unix::io::AsRawFd;
     if !fast_dictate_backend::app_paths::running_in_bundle() {
@@ -501,13 +508,13 @@ fn redirect_stdio_to_log_if_bundled() {
 
 /// EXPERIMENTAL: run the hands-free wake-word listener instead of the
 /// push-to-talk daemon. Continuous mic + VAD + wake-word trigger → inject.
-#[cfg(all(target_os = "macos", any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"), feature = "ax-inject"))]
+#[cfg(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject"))]
 async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run_listen, DaemonConfig};
     fast_dictate_backend::model_fetch::ensure_models_on_first_run();
     #[cfg(feature = "cleaner")]
-    let no_cleanup = !fast_dictate_backend::settings::Settings::load()
-        .resolve_cleanup_enabled(no_cleanup);
+    let no_cleanup =
+        !fast_dictate_backend::settings::Settings::load().resolve_cleanup_enabled(no_cleanup);
     let config = DaemonConfig::from_env(
         asr_config(),
         #[cfg(feature = "cleaner")]
@@ -517,14 +524,14 @@ async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
     run_listen(config)
 }
 
-#[cfg(not(all(target_os = "macos", any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"), feature = "ax-inject")))]
+#[cfg(not(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject")))]
 async fn run_listen(_no_cleanup: bool) -> eyre::Result<()> {
     Err(eyre::eyre!(
         "`listen` requires --features full (parakeet + cleaner + ax-inject) on macOS"
     ))
 }
 
-#[cfg(all(target_os = "macos", any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"), feature = "ax-inject"))]
+#[cfg(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject"))]
 async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run, DaemonConfig};
     redirect_stdio_to_log_if_bundled();
@@ -539,8 +546,8 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     // The menu-bar cleanup toggle lives in settings.json; a CLI --no-cleanup
     // is a hard override that always wins.
     #[cfg(feature = "cleaner")]
-    let no_cleanup = !fast_dictate_backend::settings::Settings::load()
-        .resolve_cleanup_enabled(no_cleanup);
+    let no_cleanup =
+        !fast_dictate_backend::settings::Settings::load().resolve_cleanup_enabled(no_cleanup);
     let config = DaemonConfig::from_env(
         asr_config(),
         #[cfg(feature = "cleaner")]
@@ -550,7 +557,7 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     run(config)
 }
 
-#[cfg(not(all(target_os = "macos", any(feature = "parakeet", feature = "cohere", feature = "moonshine", feature = "whisper"), feature = "ax-inject")))]
+#[cfg(not(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject")))]
 async fn run_daemon(_no_cleanup: bool) -> eyre::Result<()> {
     Err(eyre::eyre!(
         "`daemon` requires --features full (parakeet + cleaner + ax-inject) on macOS"
@@ -586,5 +593,7 @@ fn run_synth_press(hold_ms: u64) -> eyre::Result<()> {
 
 #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
 fn run_synth_press(_hold_ms: u64) -> eyre::Result<()> {
-    Err(eyre::eyre!("synth-press requires --features ax-inject on macOS"))
+    Err(eyre::eyre!(
+        "synth-press requires --features ax-inject on macOS"
+    ))
 }

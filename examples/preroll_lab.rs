@@ -23,7 +23,9 @@ fn synth_utterance(total_ms: u32) -> Vec<f32> {
     let n = (SAMPLE_RATE as u64 * total_ms as u64 / 1000) as usize;
     // A simple tone the whole time — every sample is "speech" so any dropped
     // leading sample is unambiguously lost content.
-    (0..n).map(|i| if i % 2 == 0 { 0.3 } else { -0.3 }).collect()
+    (0..n)
+        .map(|i| if i % 2 == 0 { 0.3 } else { -0.3 })
+        .collect()
 }
 
 fn ms_of(samples: usize) -> f64 {
@@ -63,22 +65,37 @@ fn main() {
 
     println!("pre-roll capture proof  (SR = {SAMPLE_RATE} Hz)");
     println!("  scenario: speech starts at t=0, key pressed at +{press_ms} ms,");
-    println!("            cold stream-open latency {open_latency_ms} ms, pre-roll {preroll_ms} ms\n");
+    println!(
+        "            cold stream-open latency {open_latency_ms} ms, pre-roll {preroll_ms} ms\n"
+    );
 
     println!("  open-on-press (current default):");
-    println!("    captured {:>7.1} ms   lost {:>6.1} ms of leading speech",
-        ms_of(on_press_captured), ms_of(on_press_lost));
+    println!(
+        "    captured {:>7.1} ms   lost {:>6.1} ms of leading speech",
+        ms_of(on_press_captured),
+        ms_of(on_press_lost)
+    );
 
     println!("  always-on pre-roll:");
-    println!("    captured {:>7.1} ms   lost {:>6.1} ms of leading speech",
-        ms_of(always_on_captured.min(speech.len())), ms_of(always_on_lost));
+    println!(
+        "    captured {:>7.1} ms   lost {:>6.1} ms of leading speech",
+        ms_of(always_on_captured.min(speech.len())),
+        ms_of(always_on_lost)
+    );
 
     let recovered = ms_of(on_press_lost) - ms_of(always_on_lost);
-    println!("\n  → pre-roll recovers {recovered:.1} ms of leading speech that open-on-press drops.");
-    println!("    (lookback flushed on press: {:.1} ms; plus zero stream-open latency.)",
-        ms_of(lookback.len()));
+    println!(
+        "\n  → pre-roll recovers {recovered:.1} ms of leading speech that open-on-press drops."
+    );
+    println!(
+        "    (lookback flushed on press: {:.1} ms; plus zero stream-open latency.)",
+        ms_of(lookback.len())
+    );
 
     // Sanity: with preroll >= press_ms, no leading speech should be lost at all.
-    assert!(always_on_lost == 0, "pre-roll {preroll_ms}ms should cover {press_ms}ms press");
+    assert!(
+        always_on_lost == 0,
+        "pre-roll {preroll_ms}ms should cover {press_ms}ms press"
+    );
     println!("\n  assertion ok: with pre-roll ≥ finger-travel, leading words are never clipped.");
 }

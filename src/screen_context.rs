@@ -24,16 +24,14 @@ const MAX_SCAN_CHARS: usize = 8_000;
 /// pronouns, function words). They're never the proper nouns the ASR mangles,
 /// so they'd only waste slots in the capped vocabulary list.
 const STOPWORDS: &[&str] = &[
-    "the", "this", "that", "these", "those", "and", "but", "or", "for", "with",
-    "from", "into", "your", "you", "our", "their", "his", "her", "its", "we",
-    "they", "he", "she", "it", "a", "an", "of", "to", "in", "on", "at", "is",
-    "are", "was", "were", "be", "been", "being", "will", "would", "could",
-    "should", "can", "may", "might", "must", "what", "when", "where", "who",
-    "whom", "why", "how", "here", "there", "then", "now", "yes", "no", "ok",
-    "okay", "so", "well", "just", "like", "also", "if", "as", "by", "do",
-    "does", "did", "not", "all", "any", "some", "more", "most", "such", "than",
-    "too", "very", "i'm", "i'll", "i've", "i'd", "we're", "don't", "it's",
-    "let's", "that's", "there's", "hello", "hi", "thanks", "thank",
+    "the", "this", "that", "these", "those", "and", "but", "or", "for", "with", "from", "into",
+    "your", "you", "our", "their", "his", "her", "its", "we", "they", "he", "she", "it", "a", "an",
+    "of", "to", "in", "on", "at", "is", "are", "was", "were", "be", "been", "being", "will",
+    "would", "could", "should", "can", "may", "might", "must", "what", "when", "where", "who",
+    "whom", "why", "how", "here", "there", "then", "now", "yes", "no", "ok", "okay", "so", "well",
+    "just", "like", "also", "if", "as", "by", "do", "does", "did", "not", "all", "any", "some",
+    "more", "most", "such", "than", "too", "very", "i'm", "i'll", "i've", "i'd", "we're", "don't",
+    "it's", "let's", "that's", "there's", "hello", "hi", "thanks", "thank",
 ];
 
 /// Take a window of `±radius` characters centred on `caret` from `text`. This
@@ -52,7 +50,11 @@ pub fn window_around(text: &str, caret: usize, radius: usize) -> &str {
     let start_ci = caret.saturating_sub(radius);
     let end_ci = caret.saturating_add(radius).min(n);
     let start_b = chars[start_ci].0;
-    let end_b = if end_ci >= n { text.len() } else { chars[end_ci].0 };
+    let end_b = if end_ci >= n {
+        text.len()
+    } else {
+        chars[end_ci].0
+    };
     &text[start_b..end_b]
 }
 
@@ -70,7 +72,12 @@ pub fn extract_terms(text: &str, cap: usize) -> Vec<String> {
     // deterministic tie-break that keeps document order among equal-score terms.
     let mut scored: Vec<(i32, usize, String)> = Vec::new();
 
-    for raw in text.chars().take(MAX_SCAN_CHARS).collect::<String>().split_whitespace() {
+    for raw in text
+        .chars()
+        .take(MAX_SCAN_CHARS)
+        .collect::<String>()
+        .split_whitespace()
+    {
         let Some(tok) = trim_token(raw) else { continue };
         if !is_candidate(tok) {
             continue;
@@ -98,7 +105,10 @@ fn trim_token(raw: &str) -> Option<&str> {
         return None;
     }
     // Drop a trailing possessive so "Lumen's" contributes "Lumen".
-    let t = t.strip_suffix("'s").or_else(|| t.strip_suffix("'S")).unwrap_or(t);
+    let t = t
+        .strip_suffix("'s")
+        .or_else(|| t.strip_suffix("'S"))
+        .unwrap_or(t);
     if t.is_empty() {
         None
     } else {
@@ -178,7 +188,13 @@ mod tests {
     fn preserves_on_screen_casing_and_dedups() {
         let terms = extract_terms("macOS macOS macos MACOS", 16);
         // First-seen casing wins; case-insensitive dedup collapses the rest.
-        assert_eq!(terms.iter().filter(|t| t.eq_ignore_ascii_case("macos")).count(), 1);
+        assert_eq!(
+            terms
+                .iter()
+                .filter(|t| t.eq_ignore_ascii_case("macos"))
+                .count(),
+            1
+        );
         assert_eq!(terms[0], "macOS");
     }
 
@@ -217,7 +233,7 @@ mod tests {
     #[test]
     fn window_around_caret_clamps_and_centres() {
         let text = "0123456789ABCDEFGHIJ"; // 20 chars
-        // Around index 10, radius 3 → chars [7,13).
+                                           // Around index 10, radius 3 → chars [7,13).
         assert_eq!(window_around(text, 10, 3), "789ABC");
         // Caret at start clamps low edge.
         assert_eq!(window_around(text, 0, 3), "012");
@@ -237,6 +253,9 @@ mod tests {
         let terms = extract_terms(win, 16);
         assert!(terms.contains(&"Lumen".to_string()));
         assert!(terms.contains(&"Parakeet".to_string()));
-        assert!(!terms.contains(&"FarawayProject".to_string()), "got {terms:?}");
+        assert!(
+            !terms.contains(&"FarawayProject".to_string()),
+            "got {terms:?}"
+        );
     }
 }

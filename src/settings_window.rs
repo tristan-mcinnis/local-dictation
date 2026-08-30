@@ -255,7 +255,9 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
             frame,
-            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable,
+            NSWindowStyleMask::Titled
+                | NSWindowStyleMask::Closable
+                | NSWindowStyleMask::Miniaturizable,
             NSBackingStoreType::Buffered,
             false,
         )
@@ -266,8 +268,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     }
     menubar::apply_light_chrome(&window);
 
-    let content: Retained<NSView> =
-        NSView::initWithFrame(NSView::alloc(mtm), frame);
+    let content: Retained<NSView> = NSView::initWithFrame(NSView::alloc(mtm), frame);
 
     let scroll: Retained<NSScrollView> = unsafe {
         msg_send![
@@ -331,7 +332,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         popup_add_item(&hotkey_popup, label_str, Some(*code as isize), None);
     }
     select_popup_tag(&hotkey_popup, hotkey_active);
-    wire_popup(&hotkey_popup, &controller, sel!(changeHotkey:), hotkey_locked);
+    wire_popup(
+        &hotkey_popup,
+        &controller,
+        sel!(changeHotkey:),
+        hotkey_locked,
+    );
     y += ROW_H;
     if hotkey_locked {
         y = env_hint(mtm, &container, y, "DICTATE_HOTKEY_KEYCODE");
@@ -350,8 +356,17 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     // Always-on mic (pre-roll)
     let preroll_switch = switch_row(mtm, &container, y, "Always-on mic (pre-roll)");
     let preroll_on = loaded.resolve_preroll_ms() > 0;
-    preroll_switch.setState(if preroll_on { NSControlStateValueOn } else { NSControlStateValueOff });
-    wire_switch(&preroll_switch, &controller, sel!(changePreroll:), std::env::var_os("DICTATE_PREROLL_MS").is_some());
+    preroll_switch.setState(if preroll_on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    wire_switch(
+        &preroll_switch,
+        &controller,
+        sel!(changePreroll:),
+        std::env::var_os("DICTATE_PREROLL_MS").is_some(),
+    );
     y += ROW_H;
     if std::env::var_os("DICTATE_PREROLL_MS").is_some() {
         y = env_hint(mtm, &container, y, "DICTATE_PREROLL_MS");
@@ -368,7 +383,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         popup_add_item(&format_popup, name, None, Some(name));
     }
     select_popup_rep(&format_popup, &loaded.resolve_format().unwrap_or_default());
-    wire_popup(&format_popup, &controller, sel!(changeFormat:), format_locked);
+    wire_popup(
+        &format_popup,
+        &controller,
+        sel!(changeFormat:),
+        format_locked,
+    );
     y += ROW_H;
     if format_locked {
         y = env_hint(mtm, &container, y, "DICTATE_FORMAT");
@@ -379,17 +399,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     // ASR backend
     let backend_popup = popup(mtm, &container, y, "Speech engine");
     let backend_locked = std::env::var_os("DICTATE_ASR_BACKEND").is_some();
-    for (backend, label_str) in [
-        (AsrBackend::Parakeet, "Parakeet — fast (default)"),
-        (AsrBackend::Cohere, "Cohere — accurate, 14 languages"),
-        (AsrBackend::Moonshine, "Moonshine — fast, English (ONNX)"),
-        (AsrBackend::Whisper, "Whisper — multilingual (no cleanup)"),
-    ] {
+    for (backend, label_str) in [(AsrBackend::Cohere, "Cohere Transcribe — native MLX")] {
         popup_add_item(&backend_popup, label_str, None, Some(backend.as_str()));
     }
     let resolved_asr = loaded.resolve_asr();
     select_popup_rep(&backend_popup, resolved_asr.backend.as_str());
-    wire_popup(&backend_popup, &controller, sel!(changeBackend:), backend_locked);
+    wire_popup(&backend_popup, &controller, sel!(changeBackend:), true);
     y += ROW_H;
     if backend_locked {
         y = env_hint(mtm, &container, y, "DICTATE_ASR_BACKEND");
@@ -397,7 +412,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     // Cohere quant
     let cohere_quant_popup = popup(mtm, &container, y, "Cohere quality");
-    for (v, l) in [("int4", "int4 (default, smaller)"), ("int8", "int8 (more accurate)")] {
+    for (v, l) in [("int4", "Q4 — fixed personal checkpoint")] {
         popup_add_item(&cohere_quant_popup, l, None, Some(v));
     }
     select_popup_rep(&cohere_quant_popup, resolved_asr.cohere_quant.as_str());
@@ -405,7 +420,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         &cohere_quant_popup,
         &controller,
         sel!(changeCohereQuant:),
-        std::env::var_os("DICTATE_COHERE_QUANT").is_some(),
+        true,
     );
     y += ROW_H;
 
@@ -440,21 +455,14 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
     y += ROW_H;
 
-    // Moonshine variant
-    let moonshine_popup = popup(mtm, &container, y, "Moonshine model");
-    for (v, l) in [
-        ("tiny", "Tiny (27M, fastest)"),
-        ("base", "Base (61M, recommended)"),
-    ] {
+    // Native runtime is fixed; retain the control object only to keep the
+    // settings window's stable ownership layout.
+    let moonshine_popup = popup(mtm, &container, y, "Inference runtime");
+    for (v, l) in [("base", "MLX helper — persistent and warmed")] {
         popup_add_item(&moonshine_popup, l, None, Some(v));
     }
     select_popup_rep(&moonshine_popup, resolved_asr.moonshine_size.as_str());
-    wire_popup(
-        &moonshine_popup,
-        &controller,
-        sel!(changeMoonshine:),
-        std::env::var_os("DICTATE_MOONSHINE_VARIANT").is_some(),
-    );
+    wire_popup(&moonshine_popup, &controller, sel!(changeMoonshine:), true);
     y += ROW_H;
 
     // Cleanup model
@@ -462,7 +470,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let model_locked = std::env::var_os("GEMMA_MODEL_PATH").is_some();
     let models = settings::discover_llm_models();
     if models.is_empty() {
-        popup_add_item(&model_popup, "(no models found under models/llm/)", None, Some(""));
+        popup_add_item(
+            &model_popup,
+            "(no models found under models/llm/)",
+            None,
+            Some(""),
+        );
     } else {
         let default_gemma = crate::app_paths::gemma_default_path();
         let effective = loaded.gemma_model.clone().unwrap_or_else(|| {
@@ -503,7 +516,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         std::env::var_os("DICTATE_STREAMING_CLEANUP").is_some(),
     );
     y += ROW_H;
-    y = hint_line(mtm, &container, y, "Clean each sentence during the hold (VAD-segmented). Off = whole-buffer.");
+    y = hint_line(
+        mtm,
+        &container,
+        y,
+        "Clean each sentence during the hold (VAD-segmented). Off = whole-buffer.",
+    );
 
     // Listen mode
     let listen_switch = switch_row(mtm, &container, y, "Listen mode (wake word)");
@@ -519,7 +537,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         std::env::var_os("DICTATE_LISTEN_MODE").is_some(),
     );
     y += ROW_H;
-    y = hint_line(mtm, &container, y, "Hands-free: say the wake word to dictate. Needs always-on mic.");
+    y = hint_line(
+        mtm,
+        &container,
+        y,
+        "Hands-free: say the wake word to dictate. Needs always-on mic.",
+    );
 
     // Wake word
     let wake_field = text_row(mtm, &container, y, "Wake word", &loaded.resolve_wake_word());
@@ -532,18 +555,56 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     y += ROW_H;
 
     y = section(mtm, &container, y, "Files & Logs");
-    y = button_row(mtm, &container, y, "Edit cleanup prompts…", &controller, sel!(editPrompts:));
-    y = button_row(mtm, &container, y, "Open corrections folder", &controller, sel!(openCorrections:));
-    y = button_row(mtm, &container, y, "Voice Commands & Shortcuts…", &controller, sel!(openCommandsRef:));
+    y = button_row(
+        mtm,
+        &container,
+        y,
+        "Edit cleanup prompts…",
+        &controller,
+        sel!(editPrompts:),
+    );
+    y = button_row(
+        mtm,
+        &container,
+        y,
+        "Open corrections folder",
+        &controller,
+        sel!(openCorrections:),
+    );
+    y = button_row(
+        mtm,
+        &container,
+        y,
+        "Voice Commands & Shortcuts…",
+        &controller,
+        sel!(openCommandsRef:),
+    );
     y = button_row(mtm, &container, y, "Open Log", &controller, sel!(openLog:));
-    y = button_row(mtm, &container, y, "Export Log to Downloads…", &controller, sel!(exportLog:));
+    y = button_row(
+        mtm,
+        &container,
+        y,
+        "Export Log to Downloads…",
+        &controller,
+        sel!(exportLog:),
+    );
 
     y = section(mtm, &container, y, "About");
-    y = about_line(mtm, &container, y, &format!("Local Dictation {}", env!("CARGO_PKG_VERSION")));
+    y = about_line(
+        mtm,
+        &container,
+        y,
+        &format!("Local Dictation {}", env!("CARGO_PKG_VERSION")),
+    );
     if let Some(dir) = crate::app_paths::config_dir() {
         y = about_line(mtm, &container, y, &format!("Config: {}", dir.display()));
     }
-    y = about_line(mtm, &container, y, &format!("Models: {}", crate::app_paths::llm_models_dir().display()));
+    y = about_line(
+        mtm,
+        &container,
+        y,
+        &format!("Models: {}", crate::app_paths::llm_models_dir().display()),
+    );
 
     let total_h = y + PAD;
     container.setFrameSize(NSSize::new(WIN_W, total_h));
@@ -588,7 +649,8 @@ fn label(
     font: &NSFont,
     color: &NSColor,
 ) -> Retained<NSTextField> {
-    let l: Retained<NSTextField> = unsafe { msg_send![NSTextField::alloc(mtm), initWithFrame: frame] };
+    let l: Retained<NSTextField> =
+        unsafe { msg_send![NSTextField::alloc(mtm), initWithFrame: frame] };
     unsafe {
         l.setStringValue(&NSString::from_str(text));
         l.setBezeled(false);
@@ -631,7 +693,12 @@ fn hint_line(mtm: MainThreadMarker, container: &SettingsFlippedView, y: f64, tex
 
 /// "(locked by DICTATE_…)" footnote. Returns new y.
 fn env_hint(mtm: MainThreadMarker, container: &SettingsFlippedView, y: f64, varname: &str) -> f64 {
-    hint_line(mtm, container, y, &format!("Locked by the {varname} env var"))
+    hint_line(
+        mtm,
+        container,
+        y,
+        &format!("Locked by the {varname} env var"),
+    )
 }
 
 /// About-section line. Returns new y.
@@ -664,7 +731,10 @@ fn popup(
     container.addSubview(&l);
     let pop: Retained<NSPopUpButton> = NSPopUpButton::initWithFrame_pullsDown(
         NSPopUpButton::alloc(mtm),
-        NSRect::new(NSPoint::new(CONTROL_X, y + 4.0), NSSize::new(CONTROL_W, 24.0)),
+        NSRect::new(
+            NSPoint::new(CONTROL_X, y + 4.0),
+            NSSize::new(CONTROL_W, 24.0),
+        ),
         false,
     );
     container.addSubview(&pop);
@@ -714,7 +784,12 @@ fn select_popup_rep(pop: &NSPopUpButton, target: &str) {
     }
 }
 
-fn wire_popup(pop: &NSPopUpButton, controller: &Retained<SettingsController>, action: objc2::runtime::Sel, locked: bool) {
+fn wire_popup(
+    pop: &NSPopUpButton,
+    controller: &Retained<SettingsController>,
+    action: objc2::runtime::Sel,
+    locked: bool,
+) {
     unsafe {
         pop.setTarget(Some(controller));
         pop.setAction(Some(action));
@@ -745,7 +820,12 @@ fn switch_row(
     sw
 }
 
-fn wire_switch(sw: &NSSwitch, controller: &Retained<SettingsController>, action: objc2::runtime::Sel, locked: bool) {
+fn wire_switch(
+    sw: &NSSwitch,
+    controller: &Retained<SettingsController>,
+    action: objc2::runtime::Sel,
+    locked: bool,
+) {
     unsafe {
         sw.setTarget(Some(controller));
         sw.setAction(Some(action));
@@ -777,7 +857,9 @@ fn text_row(
     };
     field.setStringValue(&NSString::from_str(value));
     field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-    field.setPlaceholderString(Some(&NSString::from_str(crate::settings::DEFAULT_WAKE_WORD)));
+    field.setPlaceholderString(Some(&NSString::from_str(
+        crate::settings::DEFAULT_WAKE_WORD,
+    )));
     container.addSubview(&field);
     field
 }
@@ -865,9 +947,12 @@ fn refresh_backend_dependents(ui: &SettingsUi) {
     };
     let cohere = backend == AsrBackend::Cohere;
     let moonshine = backend == AsrBackend::Moonshine;
-    ui.cohere_quant_popup.setEnabled(cohere && std::env::var_os("DICTATE_COHERE_QUANT").is_none());
-    ui.cohere_lang_popup.setEnabled(cohere && std::env::var_os("DICTATE_COHERE_LANG").is_none());
-    ui.moonshine_popup.setEnabled(moonshine && std::env::var_os("DICTATE_MOONSHINE_VARIANT").is_none());
+    ui.cohere_quant_popup
+        .setEnabled(cohere && std::env::var_os("DICTATE_COHERE_QUANT").is_none());
+    ui.cohere_lang_popup
+        .setEnabled(cohere && std::env::var_os("DICTATE_COHERE_LANG").is_none());
+    ui.moonshine_popup
+        .setEnabled(moonshine && std::env::var_os("DICTATE_MOONSHINE_VARIANT").is_none());
 }
 
 fn apply_and_restart(ui: &SettingsUi) {

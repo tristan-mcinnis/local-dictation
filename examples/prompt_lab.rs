@@ -132,8 +132,18 @@ struct FormatCase {
 // "okay"/"ok" stay: for cleanup they catch a real failure (leading filler
 // "okay so ..." that should have been stripped).
 const PREAMBLE_TELLS: &[&str] = &[
-    "here's", "here is", "sure,", "sure!", "okay,", "okay ", "ok,",
-    "certainly", "of course", "below is", "the cleaned text", "the cleaned version",
+    "here's",
+    "here is",
+    "sure,",
+    "sure!",
+    "okay,",
+    "okay ",
+    "ok,",
+    "certainly",
+    "of course",
+    "below is",
+    "the cleaned text",
+    "the cleaned version",
 ];
 
 fn line_count(s: &str) -> usize {
@@ -190,8 +200,7 @@ fn evaluate(out: &str, input: &str, c: &Checks) -> Vec<String> {
             let ok = match kind.as_str() {
                 "numbered" => {
                     let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    !digits.is_empty()
-                        && t[digits.len()..].starts_with(['.', ')'])
+                    !digits.is_empty() && t[digits.len()..].starts_with(['.', ')'])
                 }
                 "bullet" => t.starts_with(['-', '*', '•']),
                 _ => true,
@@ -221,12 +230,11 @@ async fn main() -> eyre::Result<()> {
     let lab_path = root.join("prompts-lab/lab.json");
     let body = std::fs::read_to_string(&lab_path)
         .map_err(|e| eyre::eyre!("read {}: {e}", lab_path.display()))?;
-    let lab: Lab = serde_json::from_str(&body)
-        .map_err(|e| eyre::eyre!("parse lab.json: {e}"))?;
+    let lab: Lab = serde_json::from_str(&body).map_err(|e| eyre::eyre!("parse lab.json: {e}"))?;
     let reps = lab.reps.unwrap_or(2).max(1);
 
-    let gemma = Settings::load()
-        .resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
+    let gemma =
+        Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
     eprintln!("[lab] model: {gemma}");
     let t = std::time::Instant::now();
     let engine = TextCleanupEngine::initialize(&gemma)?;
@@ -239,7 +247,10 @@ async fn main() -> eyre::Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let _ = writeln!(md, "# Prompt-lab results — `{model_name}`\n");
-    let _ = writeln!(md, "Reps per case: {reps} (fixed seed → near-deterministic; reps surface platform jitter).\n");
+    let _ = writeln!(
+        md,
+        "Reps per case: {reps} (fixed seed → near-deterministic; reps surface platform jitter).\n"
+    );
 
     let mut total = 0usize;
     let mut clean_passes = 0usize;
@@ -254,7 +265,10 @@ async fn main() -> eyre::Result<()> {
         };
         for name in names {
             let Some(prompt) = lab.cleanup_candidates.get(&name) else {
-                eprintln!("[lab] cleanup case {} references unknown candidate {name:?}", case.id);
+                eprintln!(
+                    "[lab] cleanup case {} references unknown candidate {name:?}",
+                    case.id
+                );
                 continue;
             };
             let preserve = case
@@ -268,10 +282,21 @@ async fn main() -> eyre::Result<()> {
             }
             total += 1;
             let pass = report_case(
-                &mut md, &mut jsonl, "cleanup", &case.id, &case.category, &name,
-                Some(&case.input), None, &case.input, &outs, case.checks.as_ref(),
+                &mut md,
+                &mut jsonl,
+                "cleanup",
+                &case.id,
+                &case.category,
+                &name,
+                Some(&case.input),
+                None,
+                &case.input,
+                &outs,
+                case.checks.as_ref(),
             );
-            if pass { clean_passes += 1; }
+            if pass {
+                clean_passes += 1;
+            }
         }
     }
 
@@ -285,19 +310,37 @@ async fn main() -> eyre::Result<()> {
         };
         for name in names {
             let Some(prompt) = lab.transform_candidates.get(&name) else {
-                eprintln!("[lab] transform case {} references unknown candidate {name:?}", case.id);
+                eprintln!(
+                    "[lab] transform case {} references unknown candidate {name:?}",
+                    case.id
+                );
                 continue;
             };
             let mut outs = Vec::new();
             for _ in 0..reps {
-                outs.push(engine.eval_transform(prompt, &case.instruction, &case.input).await?);
+                outs.push(
+                    engine
+                        .eval_transform(prompt, &case.instruction, &case.input)
+                        .await?,
+                );
             }
             total += 1;
             let pass = report_case(
-                &mut md, &mut jsonl, "transform", &case.id, &case.category, &name,
-                Some(&case.input), Some(&case.instruction), &case.input, &outs, case.checks.as_ref(),
+                &mut md,
+                &mut jsonl,
+                "transform",
+                &case.id,
+                &case.category,
+                &name,
+                Some(&case.input),
+                Some(&case.instruction),
+                &case.input,
+                &outs,
+                case.checks.as_ref(),
             );
-            if pass { clean_passes += 1; }
+            if pass {
+                clean_passes += 1;
+            }
         }
     }
 
@@ -305,7 +348,10 @@ async fn main() -> eyre::Result<()> {
     let _ = writeln!(md, "\n## Formats\n");
     for case in &lab.format_cases {
         let Some(prompt) = lab.format_candidates.get(&case.format) else {
-            eprintln!("[lab] format case {} references unknown format {:?}", case.id, case.format);
+            eprintln!(
+                "[lab] format case {} references unknown format {:?}",
+                case.id, case.format
+            );
             continue;
         };
         let mut outs = Vec::new();
@@ -314,13 +360,27 @@ async fn main() -> eyre::Result<()> {
         }
         total += 1;
         let pass = report_case(
-            &mut md, &mut jsonl, "format", &case.id, &case.format, &case.format,
-            Some(&case.input), None, &case.input, &outs, case.checks.as_ref(),
+            &mut md,
+            &mut jsonl,
+            "format",
+            &case.id,
+            &case.format,
+            &case.format,
+            Some(&case.input),
+            None,
+            &case.input,
+            &outs,
+            case.checks.as_ref(),
         );
-        if pass { clean_passes += 1; }
+        if pass {
+            clean_passes += 1;
+        }
     }
 
-    let _ = writeln!(md, "\n---\n**Total: {clean_passes}/{total} configurations passed all checks.**");
+    let _ = writeln!(
+        md,
+        "\n---\n**Total: {clean_passes}/{total} configurations passed all checks.**"
+    );
     eprintln!("[lab] {clean_passes}/{total} configurations passed all checks");
 
     let results = root.join("prompts-lab/results");
@@ -352,20 +412,29 @@ fn report_case(
 ) -> bool {
     let mut all_pass = true;
     let stable = outs.iter().all(|o| o == &outs[0]);
-    let _ = writeln!(md, "### `{kind}` · {id} · _{category}_ · candidate `{candidate}`");
+    let _ = writeln!(
+        md,
+        "### `{kind}` · {id} · _{category}_ · candidate `{candidate}`"
+    );
     if let Some(instr) = instruction {
         let _ = writeln!(md, "- **instruction:** {instr}");
     }
     let _ = writeln!(md, "- **input:** `{}`", one_line(input));
     for (i, out) in outs.iter().enumerate() {
         let fails = checks.map(|c| evaluate(out, input, c)).unwrap_or_default();
-        if !fails.is_empty() { all_pass = false; }
+        if !fails.is_empty() {
+            all_pass = false;
+        }
         let verdict = if fails.is_empty() { "✅" } else { "❌" };
         let _ = writeln!(md, "- **out[{i}]** {verdict}:\n```\n{out}\n```");
         if !fails.is_empty() {
             let _ = writeln!(md, "  - fails: {}", fails.join("; "));
         }
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let esc = |s: &str| {
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        };
         let _ = writeln!(
             jsonl,
             "{{\"kind\":\"{kind}\",\"id\":\"{id}\",\"candidate\":\"{candidate}\",\"rep\":{i},\"pass\":{},\"out\":\"{}\"}}",

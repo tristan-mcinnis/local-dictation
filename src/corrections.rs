@@ -65,7 +65,10 @@ impl Corrections {
     /// tests and for callers that source corrections from somewhere other
     /// than the JSON file.
     pub fn from_map(map: HashMap<String, String>) -> Self {
-        let map = map.into_iter().map(|(k, v)| (k.to_lowercase(), v)).collect();
+        let map = map
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect();
         Self::build(map)
     }
 
@@ -182,7 +185,8 @@ impl Corrections {
 
     /// Save to the default corrections path (or `DICTATE_CORRECTIONS_PATH`).
     pub fn save(&self) -> eyre::Result<()> {
-        let path = Self::config_path().ok_or_else(|| eyre::eyre!("no config dir for corrections.json"))?;
+        let path =
+            Self::config_path().ok_or_else(|| eyre::eyre!("no config dir for corrections.json"))?;
         self.save_to(&path)
     }
 
@@ -398,7 +402,10 @@ mod tests {
     #[test]
     fn basic_word_replacement() {
         let c = dict(&[("lings", "Lumen")]);
-        assert_eq!(c.apply("Hello lings how are you"), "Hello Lumen how are you");
+        assert_eq!(
+            c.apply("Hello lings how are you"),
+            "Hello Lumen how are you"
+        );
     }
 
     #[test]
@@ -444,7 +451,10 @@ mod tests {
     fn matches_multi_word_phrase() {
         // The whole point of the rewrite: multi-word keys actually fire now.
         let c = dict(&[("to twist", "Todoist")]);
-        assert_eq!(c.apply("send articles to twist now"), "send articles Todoist now");
+        assert_eq!(
+            c.apply("send articles to twist now"),
+            "send articles Todoist now"
+        );
         // Case-insensitive across the whole phrase; surrounding spacing kept.
         assert_eq!(c.apply("To Twist"), "Todoist");
     }
@@ -486,13 +496,23 @@ mod tests {
         // post-cleanup correction pass must resolve both spellings (hyphen and
         // space) to the brand — a 3-token and a 2-token phrase, mid-sentence.
         let c = dict(&[("to do list", "Todoist"), ("do list", "Todoist")]);
-        assert_eq!(c.apply("Double check the to-do list."), "Double check the Todoist.");
-        assert_eq!(c.apply("Double check the do list."), "Double check the Todoist.");
+        assert_eq!(
+            c.apply("Double check the to-do list."),
+            "Double check the Todoist."
+        );
+        assert_eq!(
+            c.apply("Double check the do list."),
+            "Double check the Todoist."
+        );
     }
 
     #[test]
     fn editor_lines_render_fixes_and_bare_words() {
-        let c = dict(&[("lings", "Lumen"), ("github", "GitHub"), ("parakeet", "Parakeet")]);
+        let c = dict(&[
+            ("lings", "Lumen"),
+            ("github", "GitHub"),
+            ("parakeet", "Parakeet"),
+        ]);
         let lines = c.to_editor_lines();
         // Casing-only fixes are identical ignoring case → clean bare words.
         assert!(lines.contains(&"Parakeet".to_string()), "{lines:?}");
@@ -503,9 +523,7 @@ mod tests {
 
     #[test]
     fn from_editor_text_parses_arrows_and_bare_words() {
-        let c = Corrections::from_editor_text(
-            "_a comment\nfoo -> Bar\nBaz\nmacos → macOS\n  \n",
-        );
+        let c = Corrections::from_editor_text("_a comment\nfoo -> Bar\nBaz\nmacos → macOS\n  \n");
         assert_eq!(c.apply("foo"), "Bar"); // -> arrow
         assert_eq!(c.apply("macos"), "macOS"); // → arrow
         assert_eq!(c.apply("baz"), "Baz"); // bare word = identity, keeps casing
@@ -515,15 +533,24 @@ mod tests {
     #[test]
     fn quick_add_line_formats_like_editor_lines() {
         // A real mishearing fix → arrow line, keyed on what was heard.
-        assert_eq!(quick_add_line("Julian", "Julien"), Some("Julian → Julien".to_string()));
+        assert_eq!(
+            quick_add_line("Julian", "Julien"),
+            Some("Julian → Julien".to_string())
+        );
         // Blank "heard" → a bare keep-this-spelling word.
         assert_eq!(quick_add_line("", "GitHub"), Some("GitHub".to_string()));
         // Same word, different case → identity/keep, rendered bare (no arrow).
-        assert_eq!(quick_add_line("github", "GitHub"), Some("GitHub".to_string()));
+        assert_eq!(
+            quick_add_line("github", "GitHub"),
+            Some("GitHub".to_string())
+        );
         // No target spelling → nothing to add.
         assert_eq!(quick_add_line("Julian", "   "), None);
         // Inputs are trimmed.
-        assert_eq!(quick_add_line("  lings ", " Lumen "), Some("lings → Lumen".to_string()));
+        assert_eq!(
+            quick_add_line("  lings ", " Lumen "),
+            Some("lings → Lumen".to_string())
+        );
     }
 
     #[test]

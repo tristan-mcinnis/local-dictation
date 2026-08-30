@@ -1,0 +1,117 @@
+[
+  {
+    "id": "basic-punctuation",
+    "category": "punctuation",
+    "input": "i think we should ship this today",
+    "must_contain": ["ship this today"],
+    "must_not_contain": [],
+    "preserve_exact": [],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "fillers-and-repeat",
+    "category": "filler-cleanup",
+    "input": "um so i think we should uh ship the the thing today you know",
+    "must_contain": ["ship", "thing today"],
+    "must_not_contain": ["um ", " uh ", "the the", "you know", "so i think"],
+    "preserve_exact": [],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "colloquial-expansion",
+    "category": "filler-cleanup",
+    "input": "we're gonna test it and then we'll merge it",
+    "must_contain": ["test it", "merge it"],
+    "must_not_contain": ["gonna"],
+    "preserve_exact": [],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "domain-casing",
+    "category": "dictionary",
+    "input": "we tested the rust build on macos with onnx and github",
+    "must_contain": ["tested", "build"],
+    "must_not_contain": [],
+    "preserve_exact": ["Rust", "macOS", "ONNX", "GitHub"],
+    "known_vocabulary": ["Rust", "macOS", "ONNX", "GitHub"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "proper-names",
+    "category": "dictionary",
+    "input": "i talked to saoirse kavanagh about the nimbari project with eilish",
+    "must_contain": ["talked", "project"],
+    "must_not_contain": [],
+    "preserve_exact": ["Saoirse Kavanagh", "Nimbari", "Eilish"],
+    "known_vocabulary": ["Saoirse Kavanagh", "Nimbari", "Eilish"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "unusual-word-protection",
+    "category": "no-hallucination",
+    "input": "please open pencil and leave the document there",
+    "must_contain": ["open pencil", "document"],
+    "must_not_contain": ["open source", "open a pencil"],
+    "preserve_exact": ["open pencil"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "all-clauses-preserved",
+    "category": "content-preservation",
+    "input": "send the draft to Lumen and block thirty minutes tomorrow morning",
+    "must_contain": ["send the draft", "block", "tomorrow morning"],
+    "must_not_contain": [],
+    "preserve_exact": ["Lumen"],
+    "known_vocabulary": ["Lumen"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "question-not-answered",
+    "category": "no-answer",
+    "input": "what time does the train leave from penn station",
+    "must_contain": ["train leave", "Penn Station"],
+    "must_not_contain": ["The train leaves", "It leaves", "I don't know", "I cannot"],
+    "preserve_exact": ["Penn Station"],
+    "known_vocabulary": ["Penn Station"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "unfinished-fragment",
+    "category": "no-hallucination",
+    "input": "the user's name was",
+    "must_contain": ["user's name"],
+    "must_not_contain": ["John", "Sarah", "Sally", "Tristan"],
+    "preserve_exact": [],
+    "max_expansion_ratio": 2.5,
+    "require_terminal_punctuation": false
+  },
+  {
+    "id": "standalone-pronoun",
+    "category": "punctuation",
+    "input": "i sent it because i thought it was ready",
+    "must_contain": ["sent it", "thought it was ready"],
+    "must_not_contain": [],
+    "preserve_exact": ["I"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "technical-identifiers",
+    "category": "dictionary",
+    "input": "the cohere and s1 mini models run through llama cpp on apple silicon",
+    "must_contain": ["Cohere", "S1-mini", "llama.cpp", "Apple Silicon"],
+    "must_not_contain": [],
+    "preserve_exact": ["Cohere", "S1-mini", "llama.cpp", "Apple Silicon"],
+    "known_vocabulary": ["Cohere", "S1-mini", "llama.cpp", "Apple Silicon"],
+    "require_terminal_punctuation": true
+  },
+  {
+    "id": "short-greeting",
+    "category": "content-preservation",
+    "input": "hey Lumen thanks for your help",
+    "must_contain": ["thanks", "help"],
+    "must_not_contain": [],
+    "preserve_exact": ["Lumen"],
+    "known_vocabulary": ["Lumen"],
+    "require_terminal_punctuation": true
+  }
+]

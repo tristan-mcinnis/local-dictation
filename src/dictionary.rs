@@ -86,8 +86,14 @@ pub fn load_from(path: &Path) -> Vec<String> {
         return Vec::new();
     };
     let terms = parse(&body);
-    if terms.is_empty() && !body.trim().is_empty() && serde_json::from_str::<Vec<String>>(&body).is_err() {
-        eprintln!("[warn] dictionary parse failed ({}): expected a JSON array of strings", path.display());
+    if terms.is_empty()
+        && !body.trim().is_empty()
+        && serde_json::from_str::<Vec<String>>(&body).is_err()
+    {
+        eprintln!(
+            "[warn] dictionary parse failed ({}): expected a JSON array of strings",
+            path.display()
+        );
     }
     terms
 }
@@ -101,7 +107,11 @@ mod tests {
         let body = r#"["_ a comment", "Parakeet", "  Lumen  ", "", "  ", "CGEventTap"]"#;
         assert_eq!(
             parse(body),
-            vec!["Parakeet".to_string(), "Lumen".to_string(), "CGEventTap".to_string()]
+            vec![
+                "Parakeet".to_string(),
+                "Lumen".to_string(),
+                "CGEventTap".to_string()
+            ]
         );
     }
 
@@ -122,12 +132,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dict-test-{}", std::process::id()));
         let path = dir.join("dictionary.json");
         // Blanks and _-comments are dropped on save.
-        save_to(&path, &[
-            "Parakeet".into(),
-            "  Lumen  ".into(),
-            "".into(),
-            "_ignore".into(),
-        ])
+        save_to(
+            &path,
+            &[
+                "Parakeet".into(),
+                "  Lumen  ".into(),
+                "".into(),
+                "_ignore".into(),
+            ],
+        )
         .unwrap();
         let loaded = load_from(&path);
         assert_eq!(loaded, vec!["Parakeet".to_string(), "Lumen".to_string()]);

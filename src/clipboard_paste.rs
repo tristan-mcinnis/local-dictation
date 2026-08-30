@@ -69,8 +69,7 @@ fn pasteboard_change_count() -> Option<isize> {
 }
 
 pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
-    let mut cb = Clipboard::new()
-        .map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
+    let mut cb = Clipboard::new().map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
 
     // Save current plain text (if any). We deliberately ignore errors here —
     // an empty / non-text clipboard is fine, we just won't restore anything.

@@ -280,7 +280,10 @@ mod tests {
         let rms = (buf.iter().map(|x| x * x).sum::<f32>() / buf.len() as f32).sqrt();
         // Boosted close to the target (capped by ASR_MAX_GAIN here: 0.01*16 = 0.16).
         assert!(rms > 0.10, "boosted RMS too low: {rms}");
-        assert!(buf.iter().all(|x| x.abs() <= ASR_PEAK_CEILING), "must not clip");
+        assert!(
+            buf.iter().all(|x| x.abs() <= ASR_PEAK_CEILING),
+            "must not clip"
+        );
     }
 
     #[test]
@@ -291,7 +294,10 @@ mod tests {
             .collect();
         let gain = normalize_for_asr(&mut buf);
         assert!(gain < 1.0, "loud input should be attenuated, got {gain}");
-        assert!(buf.iter().all(|x| x.abs() <= ASR_PEAK_CEILING), "must not clip");
+        assert!(
+            buf.iter().all(|x| x.abs() <= ASR_PEAK_CEILING),
+            "must not clip"
+        );
     }
 
     #[test]
@@ -399,7 +405,10 @@ pub struct PrerollRing {
 
 impl PrerollRing {
     pub fn new(cap: usize) -> Self {
-        Self { cap, buf: VecDeque::with_capacity(cap + 1) }
+        Self {
+            cap,
+            buf: VecDeque::with_capacity(cap + 1),
+        }
     }
 
     /// Append samples, evicting the oldest so length never exceeds `cap`.
@@ -581,12 +590,9 @@ impl AlwaysOnCapture {
         }
 
         let stream = match sample_format {
-            SampleFormat::F32 => device.build_input_stream(
-                &config,
-                make_cb!(f32, |s: &f32| *s),
-                err_fn,
-                None,
-            ),
+            SampleFormat::F32 => {
+                device.build_input_stream(&config, make_cb!(f32, |s: &f32| *s), err_fn, None)
+            }
             SampleFormat::I16 => device.build_input_stream(
                 &config,
                 make_cb!(i16, |s: &i16| *s as f32 / 32_768.0),
@@ -603,7 +609,9 @@ impl AlwaysOnCapture {
         }
         .map_err(|e| eyre::eyre!("build_input_stream failed: {e}"))?;
 
-        stream.play().map_err(|e| eyre::eyre!("stream.play failed: {e}"))?;
+        stream
+            .play()
+            .map_err(|e| eyre::eyre!("stream.play failed: {e}"))?;
         self.stream = Some(stream);
         Ok(())
     }

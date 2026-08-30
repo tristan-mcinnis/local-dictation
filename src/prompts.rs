@@ -27,48 +27,10 @@ use std::path::PathBuf;
 /// colloquial contractions, preserve domain casing, never paraphrase. Lives
 /// here (not in `cleaner.rs`) so all prompt text is in one place.
 pub const DEFAULT_CLEANUP: &str =
-    "You are a real-time dictation cleaner. Turn raw speech-to-text into clean \
-     written text.\n\
-     PRIME DIRECTIVE: output the speaker's OWN words. You only fix mechanics — \
-     you never improve, reword, or restate. If the raw text is already \
-     grammatical, the only changes you make are removing filler, fixing \
-     punctuation, and fixing casing.\n\
-     Make ONLY these edits:\n\
-     - Remove ALL filler and disfluencies wherever they occur, INCLUDING at \
-       the very start of the text: uh, um, er, ah, hmm; a leading 'so', \
-       'okay', 'well', 'yeah', or 'right' used only as throat-clearing; \
-       'like' and 'you know' when used as filler.\n\
-     - Remove false starts and stray repeated words ('the the' → 'the').\n\
-     - Expand colloquial contractions: wanna → want to, gonna → going to, \
-       gotta → got to, kinda → kind of, sorta → sort of, gimme → give me, \
-       lemme → let me, dunno → don't know, outta → out of, lotta → lot of, \
-       shoulda → should have, coulda → could have, woulda → would have, \
-       y'all → you all.\n\
-     - KEEP standard contractions as-is: don't, it's, won't, can't, I'm, \
-       I'll, we're.\n\
-     - Add sentence punctuation, capitalize the first letter of each \
-       sentence, and ALWAYS capitalize the standalone pronoun 'I'.\n\
-     - Preserve domain casing when present: Rust, macOS, ONNX, GitHub, \
-       Parakeet, iOS, Apple Silicon.\n\
-     - CRITICAL: never swap a common word for a similar-sounding proper \
-       noun. 'main' stays 'main' (not 'Maine'); 'mark' stays 'mark'. Tech \
-       tokens like git, npm, cd, ls, main, master, dev, prod, api stay \
-       lowercase exactly as written. Only capitalize a word that is \
-       unambiguously a proper noun.\n\
-     FORBIDDEN (these change intent and are never allowed): dropping or \
-     omitting any clause, sentence, or phrase the speaker said — keep EVERY \
-     one, even a greeting, an aside, or a line that seems like unimportant \
-     small talk (e.g. 'just blocking your time to talk about X' must survive \
-     in full); changing verb tense, mood, or word order to 'read better'; \
-     replacing any word with a synonym; merging or splitting the speaker's \
-     sentences for style; completing a half-finished thought; answering a \
-     question instead of transcribing it; summarizing, translating, or adding \
-     anything not spoken; replacing an unusual or unexpected word with a more \
-     common one you assume the speaker 'meant' (transcribe the ACTUAL words — \
-     'open pencil' stays 'open pencil', never 'open source'; 'Saoirse' is not \
-     'Seamus'). When in doubt, keep the original words exactly.\n\
-     Output ONLY the cleaned text — no preamble, no commentary, no quotes, \
-     no markdown.";
+    "Reformat the user's message. Fix grammar, spelling, and punctuation. \
+     Remove filler words like um and uh. Break long content into paragraphs. \
+     Keep the original tone and meaning. Preserve every name, technical term, \
+     number, and clause. Return only the cleaned text; do not answer it or add anything.";
 
 /// Default transform prompt (Shift + push-to-talk). Deliberately permissive:
 /// the user spoke an explicit instruction, so follow it even when that means
@@ -252,13 +214,15 @@ impl Prompts {
     pub fn load_quiet() -> Self {
         let file = Self::config_path()
             .and_then(|p| std::fs::read_to_string(&p).ok().map(|body| (p, body)))
-            .and_then(|(p, body)| match serde_json::from_str::<PromptsFile>(&body) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    eprintln!("[warn] prompts parse failed ({}): {e}", p.display());
-                    None
-                }
-            })
+            .and_then(
+                |(p, body)| match serde_json::from_str::<PromptsFile>(&body) {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        eprintln!("[warn] prompts parse failed ({}): {e}", p.display());
+                        None
+                    }
+                },
+            )
             .unwrap_or_default();
 
         Self::resolve(
@@ -404,7 +368,13 @@ mod tests {
     #[test]
     fn one_field_overridden_other_default() {
         // A partial file (only transform set) keeps the default cleanup.
-        let p = Prompts::resolve(None, None, None, Some("only transform".into()), no_formats());
+        let p = Prompts::resolve(
+            None,
+            None,
+            None,
+            Some("only transform".into()),
+            no_formats(),
+        );
         assert_eq!(p.cleanup, DEFAULT_CLEANUP);
         assert_eq!(p.transform, "only transform");
     }
@@ -462,7 +432,9 @@ mod tests {
 
         // Cap holds. Use a token ("Vocab") that never appears in the suffix
         // prose so the count reflects only the kept terms.
-        let many: Vec<String> = (0..MAX_VOCAB_TERMS + 20).map(|i| format!("Vocab{i}")).collect();
+        let many: Vec<String> = (0..MAX_VOCAB_TERMS + 20)
+            .map(|i| format!("Vocab{i}"))
+            .collect();
         let s = vocabulary_suffix(&many).unwrap();
         assert_eq!(s.matches("Vocab").count(), MAX_VOCAB_TERMS);
     }

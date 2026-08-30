@@ -245,8 +245,8 @@ mod tests {
         use std::sync::mpsc;
         // Pin the socket to a unique per-process temp path so this test is
         // hermetic and doesn't collide with a real daemon's socket.
-        let sock = std::env::temp_dir()
-            .join(format!("dictate-control-test-{}.sock", std::process::id()));
+        let sock =
+            std::env::temp_dir().join(format!("dictate-control-test-{}.sock", std::process::id()));
         std::env::set_var("DICTATE_CONTROL_SOCK", &sock);
 
         let (tx, rx) = mpsc::channel();

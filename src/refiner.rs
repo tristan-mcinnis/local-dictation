@@ -91,7 +91,10 @@ pub enum DictationOutcome {
     /// No body, just a keystroke to synthesize ("press enter" on its own).
     BareAction(TrailingAction),
     /// Inject `text`, then run `action` afterwards (`action` may be `None`).
-    Inject { text: String, action: TrailingAction },
+    Inject {
+        text: String,
+        action: TrailingAction,
+    },
     /// Nothing left to do — empty body with no action.
     Skip,
 }
@@ -235,7 +238,10 @@ mod tests {
     #[test]
     fn outcome_cancel_is_discard() {
         let r = refiner(&[]);
-        assert_eq!(r.refine("scratch that").outcome(), DictationOutcome::Discard);
+        assert_eq!(
+            r.refine("scratch that").outcome(),
+            DictationOutcome::Discard
+        );
     }
 
     #[test]

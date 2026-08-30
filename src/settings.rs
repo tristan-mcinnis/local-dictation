@@ -30,8 +30,7 @@ use std::path::{Path, PathBuf};
 /// the CLI resolver and the menu so "default" means the same thing in both.
 /// Qwen 2.5 1.5B is the recommended cleanup model (best quality-per-ms in the
 /// `examples/model_bakeoff.rs` lineup); the `GEMMA_*` names are historical.
-pub const DEFAULT_GEMMA_REL: &str =
-    "models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+pub const DEFAULT_GEMMA_REL: &str = "models/llm/s1-mini/s1-mini.gguf";
 
 /// Push-to-talk hotkey options offered in the menu, as (label, keycode).
 /// Each must be a modifier key handled by `keycode_to_modifier_flag` in the
@@ -163,10 +162,15 @@ impl Settings {
     /// Resolve the cleanup model path: `GEMMA_MODEL_PATH` env > settings >
     /// `default`.
     pub fn resolve_gemma<'a>(&'a self, default: &'a str) -> String {
+        if let Ok(v) = std::env::var("S1_MODEL_PATH") {
+            return v;
+        }
         if let Ok(v) = std::env::var("GEMMA_MODEL_PATH") {
             return v;
         }
-        self.gemma_model.clone().unwrap_or_else(|| default.to_string())
+        self.gemma_model
+            .clone()
+            .unwrap_or_else(|| default.to_string())
     }
 
     /// Resolve the full ASR selection (backend + each model's directory) with
@@ -182,11 +186,9 @@ impl Settings {
     pub fn resolve_asr(&self) -> crate::transcriber::AsrConfig {
         use crate::transcriber::{AsrBackend, AsrConfig, CohereQuant, MoonshineSize};
 
-        let backend = std::env::var("DICTATE_ASR_BACKEND")
-            .ok()
-            .and_then(|v| AsrBackend::parse(&v))
-            .or_else(|| self.asr_backend.as_deref().and_then(AsrBackend::parse))
-            .unwrap_or_default();
+        // Existing backend settings are deliberately ignored: this is now a
+        // fixed Cohere MLX appliance. Keep decoding old fields for migration.
+        let backend = AsrBackend::Cohere;
 
         let cohere_quant = std::env::var("DICTATE_COHERE_QUANT")
             .ok()
@@ -207,7 +209,11 @@ impl Settings {
         let moonshine_size = std::env::var("DICTATE_MOONSHINE_VARIANT")
             .ok()
             .and_then(|v| MoonshineSize::parse(&v))
-            .or_else(|| self.moonshine_variant.as_deref().and_then(MoonshineSize::parse))
+            .or_else(|| {
+                self.moonshine_variant
+                    .as_deref()
+                    .and_then(MoonshineSize::parse)
+            })
             .unwrap_or_default();
 
         let parakeet_dir = std::env::var("PARAKEET_MODEL_DIR")
@@ -224,6 +230,10 @@ impl Settings {
 
         AsrConfig {
             backend,
+            helper_path: crate::app_paths::cohere_mlx_helper_path(),
+            model_dir: crate::app_paths::cohere_mlx_default_dir(),
+            language: cohere_language.clone(),
+            max_tokens: 256,
             parakeet_dir,
             cohere_dir,
             cohere_quant,
@@ -451,9 +461,18 @@ mod tests {
 
     #[test]
     fn model_hints_bucket_by_size() {
-        assert_eq!(model_hint("smollm2-360m-it").as_deref(), Some("fastest · roughest cleanup"));
-        assert_eq!(model_hint("gemma-3-1b-it").as_deref(), Some("fast · recommended"));
-        assert_eq!(model_hint("gemma-3-4b-it").as_deref(), Some("most accurate · ~2.5× slower"));
+        assert_eq!(
+            model_hint("smollm2-360m-it").as_deref(),
+            Some("fastest · roughest cleanup")
+        );
+        assert_eq!(
+            model_hint("gemma-3-1b-it").as_deref(),
+            Some("fast · recommended")
+        );
+        assert_eq!(
+            model_hint("gemma-3-4b-it").as_deref(),
+            Some("most accurate · ~2.5× slower")
+        );
         assert_eq!(model_hint("mystery-model").as_deref(), None);
     }
 
@@ -583,10 +602,8 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "fd-settings-roundtrip-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("fd-settings-roundtrip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.json");
 
@@ -611,10 +628,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_defaults() {
-        let path = std::env::temp_dir().join(format!(
-            "fd-settings-missing-{}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("fd-settings-missing-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let s = Settings::load_from(&path);
         assert_eq!(s, Settings::default());
@@ -622,10 +636,7 @@ mod tests {
 
     #[test]
     fn load_corrupt_file_returns_defaults() {
-        let dir = std::env::temp_dir().join(format!(
-            "fd-settings-corrupt-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("fd-settings-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.json");
         std::fs::create_dir_all(&dir).unwrap();
