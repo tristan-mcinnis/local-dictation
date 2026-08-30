@@ -69,6 +69,15 @@ struct SettingsUi {
     tail_capture_switch: Retained<NSSwitch>,
     listen_switch: Retained<NSSwitch>,
     wake_field: Retained<NSTextField>,
+    // Push-to-talk chord + behavior
+    custom_hotkey_field: Retained<NSTextField>,
+    custom_hotkey_hint: Retained<NSTextField>,
+    whisper_switch: Retained<NSSwitch>,
+    // Translate
+    translate_targets_field: Retained<NSTextField>,
+    active_translate_popup: Retained<NSPopUpButton>,
+    // History
+    retention_popup: Retained<NSPopUpButton>,
     /// In-memory edits, not yet written. Updated by every control action;
     /// flushed by `Apply & Restart`.
     pending: Mutex<Settings>,
@@ -112,7 +121,12 @@ define_class!(
         #[unsafe(method(changeHotkey:))]
         fn change_hotkey(&self, sender: *mut AnyObject) {
             let code = popup_selected_tag(sender);
-            with_pending(|p| p.hotkey_keycode = Some(code as i64));
+            // The popup only offers bare modifier keys, so selecting one clears
+            // any chord modifiers the custom-hotkey field may have set.
+            with_pending(|p| {
+                p.hotkey_keycode = Some(code as i64);
+                p.hotkey_modifiers = Some(0);
+            });
         }
 
         #[unsafe(method(changeCleanup:))]
@@ -227,6 +241,57 @@ define_class!(
         #[unsafe(method(exportLog:))]
         fn export_log(&self, _sender: *mut AnyObject) {
             menubar::export_log_to_downloads();
+        }
+
+        #[unsafe(method(changeWhisper:))]
+        fn change_whisper(&self, sender: *mut AnyObject) {
+            let on = switch_on(sender);
+            with_pending(|p| p.whisper_mode = Some(on));
+        }
+
+        #[unsafe(method(changeRetention:))]
+        fn change_retention(&self, sender: *mut AnyObject) {
+            let rep = popup_selected_rep(sender);
+            with_pending(|p| p.history_retention = if rep.is_empty() { None } else { Some(rep) });
+        }
+
+        #[unsafe(method(changeTranslateTargets:))]
+        fn change_translate_targets(&self, sender: *mut AnyObject) {
+            let s = field_string(sender);
+            let list: Vec<String> = s
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect();
+            with_pending(|p| p.translation_targets = if list.is_empty() { None } else { Some(list) });
+        }
+
+        #[unsafe(method(changeActiveTranslateTarget:))]
+        fn change_active_translate_target(&self, sender: *mut AnyObject) {
+            let rep = popup_selected_rep(sender);
+            with_pending(|p| {
+                p.active_translation_target = if rep.is_empty() { None } else { Some(rep) };
+            });
+        }
+
+        #[unsafe(method(changeCustomHotkey:))]
+        fn change_custom_hotkey(&self, sender: *mut AnyObject) {
+            let s = field_string(sender);
+            let (hint, applied) = parse_custom_hotkey(&s);
+            with_pending(|p| match applied {
+                Some((keycode, modifiers)) => {
+                    p.hotkey_keycode = Some(keycode);
+                    p.hotkey_modifiers = Some(modifiers);
+                }
+                None => {
+                    p.hotkey_keycode = None;
+                    p.hotkey_modifiers = None;
+                }
+            });
+            if let Some(ui) = SETTINGS_UI.get() {
+                ui.custom_hotkey_hint
+                    .setStringValue(&NSString::from_str(&hint));
+            }
         }
     }
 );
@@ -350,6 +415,34 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         y = env_hint(mtm, &container, y, "DICTATE_HOTKEY_KEYCODE");
     }
 
+    // Custom hotkey (chord) — an arbitrary modifiers + key combo, e.g.
+    // cmd+shift+d. The popup above only offers bare modifier keys; this field
+    // is where a chord is declared. A live hint below reports the parsed
+    // result plus any system-wide conflict.
+    let (initial_custom_hotkey, initial_hotkey_hint) = initial_custom_hotkey();
+    let custom_hotkey_field =
+        text_row(mtm, &container, y, "Custom hotkey", &initial_custom_hotkey);
+    custom_hotkey_field
+        .setPlaceholderString(Some(&NSString::from_str("e.g. cmd+shift+d or f5")));
+    unsafe {
+        custom_hotkey_field.setTarget(Some(&controller));
+        custom_hotkey_field.setAction(Some(sel!(changeCustomHotkey:)));
+        custom_hotkey_field.setEnabled(!hotkey_locked);
+    }
+    y += ROW_H;
+    let custom_hotkey_hint = label(
+        mtm,
+        &initial_hotkey_hint,
+        NSRect::new(
+            NSPoint::new(PAD, y),
+            NSSize::new(WIN_W - 2.0 * PAD, 14.0),
+        ),
+        &NSFont::systemFontOfSize(11.0),
+        &NSColor::secondaryLabelColor(),
+    );
+    container.addSubview(&custom_hotkey_hint);
+    y += 14.0;
+
     // Cleanup enabled
     let cleanup_switch = switch_row(mtm, &container, y, "Enable cleanup");
     cleanup_switch.setState(if loaded.cleanup_enabled.unwrap_or(true) {
@@ -377,6 +470,95 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     y += ROW_H;
     if std::env::var_os("DICTATE_PREROLL_MS").is_some() {
         y = env_hint(mtm, &container, y, "DICTATE_PREROLL_MS");
+    }
+
+    // Whisper mode — lower the speech-detection threshold so quiet dictation
+    // is captured.
+    let whisper_switch = switch_row(mtm, &container, y, "Whisper mode");
+    whisper_switch.setState(if loaded.resolve_whisper_mode() {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    wire_switch(
+        &whisper_switch,
+        &controller,
+        sel!(changeWhisper:),
+        std::env::var_os("DICTATE_WHISPER_MODE").is_some(),
+    );
+    y += ROW_H;
+    if std::env::var_os("DICTATE_WHISPER_MODE").is_some() {
+        y = env_hint(mtm, &container, y, "DICTATE_WHISPER_MODE");
+    }
+
+    // History retention — how long to keep dictation history.
+    let retention_popup = popup(mtm, &container, y, "History retention");
+    let retention_locked = std::env::var_os("DICTATE_HISTORY_RETENTION").is_some();
+    for (label_str, rep) in [
+        ("Forever", "forever"),
+        ("1 year", "1year"),
+        ("1 month", "1month"),
+        ("1 week", "1week"),
+        ("24 hours", "24hours"),
+        ("Never", "never"),
+    ] {
+        popup_add_item(&retention_popup, label_str, None, Some(rep));
+    }
+    select_popup_rep(&retention_popup, &loaded.resolve_history_retention());
+    wire_popup(
+        &retention_popup,
+        &controller,
+        sel!(changeRetention:),
+        retention_locked,
+    );
+    y += ROW_H;
+    if retention_locked {
+        y = env_hint(mtm, &container, y, "DICTATE_HISTORY_RETENTION");
+    }
+
+    y = section(mtm, &container, y, "Translate to");
+
+    // Translate targets — comma-separated list of target languages.
+    let loaded_targets = loaded.resolve_translation_targets();
+    let targets_value = loaded_targets.join(", ");
+    let translate_targets_field =
+        text_row(mtm, &container, y, "Translate targets", &targets_value);
+    translate_targets_field
+        .setPlaceholderString(Some(&NSString::from_str("Spanish, Chinese, French")));
+    let targets_locked = std::env::var_os("DICTATE_TRANSLATION_TARGETS").is_some();
+    unsafe {
+        translate_targets_field.setTarget(Some(&controller));
+        translate_targets_field.setAction(Some(sel!(changeTranslateTargets:)));
+        translate_targets_field.setEnabled(!targets_locked);
+    }
+    y += ROW_H;
+    if targets_locked {
+        y = env_hint(mtm, &container, y, "DICTATE_TRANSLATION_TARGETS");
+    }
+
+    // Active translate target — picks which of the targets is used. Kept a
+    // static list from the loaded settings for v1.
+    let active_translate_popup = popup(mtm, &container, y, "Active target");
+    let active_target_locked = std::env::var_os("DICTATE_ACTIVE_TRANSLATION_TARGET").is_some();
+    if loaded_targets.is_empty() {
+        popup_add_item(&active_translate_popup, "(none)", None, Some(""));
+    } else {
+        for t in &loaded_targets {
+            popup_add_item(&active_translate_popup, t, None, Some(t));
+        }
+        if let Some(active) = loaded.resolve_active_translation_target(&loaded_targets) {
+            select_popup_rep(&active_translate_popup, &active);
+        }
+    }
+    wire_popup(
+        &active_translate_popup,
+        &controller,
+        sel!(changeActiveTranslateTarget:),
+        active_target_locked,
+    );
+    y += ROW_H;
+    if active_target_locked {
+        y = env_hint(mtm, &container, y, "DICTATE_ACTIVE_TRANSLATION_TARGET");
     }
 
     y = section(mtm, &container, y, "Output");
@@ -672,6 +854,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         tail_capture_switch,
         listen_switch,
         wake_field,
+        custom_hotkey_field,
+        custom_hotkey_hint,
+        whisper_switch,
+        translate_targets_field,
+        active_translate_popup,
+        retention_popup,
         pending: Mutex::new(loaded.clone()),
         original: loaded,
         _controller: controller,
@@ -966,6 +1154,88 @@ fn popup_selected_rep(sender: *mut AnyObject) -> String {
 }
 
 // ─── State plumbing ──────────────────────────────────────────────────────
+
+/// Render a keycode as a parseable key name ("d", "f5", "space", …) so a
+/// configured chord can be round-tripped back through `Hotkey::parse`.
+fn key_name_from_keycode(code: i64) -> String {
+    match code {
+        0x31 => "space".into(),
+        0x24 => "return".into(),
+        0x30 => "tab".into(),
+        0x35 => "escape".into(),
+        0x7B => "left".into(),
+        0x7C => "right".into(),
+        0x7D => "down".into(),
+        0x7E => "up".into(),
+        _ => {
+            if (0x7A..=0x8D).contains(&code) {
+                format!("f{}", code - 0x7A + 1)
+            } else if (0x00..=0x19).contains(&code) {
+                ((b'a' + code as u8) as char).to_string()
+            } else if (0x1D..=0x26).contains(&code) {
+                ((b'0' + (code - 0x1D) as u8) as char).to_string()
+            } else {
+                format!("key 0x{code:x}")
+            }
+        }
+    }
+}
+
+/// Render a `Hotkey` as a parseable shorthand ("cmd+shift+d", "f5", …).
+fn hotkey_to_parseable(h: &crate::hotkeys::Hotkey) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if h.modifiers & crate::hotkeys::COMMAND != 0 {
+        parts.push("cmd".into());
+    }
+    if h.modifiers & crate::hotkeys::SHIFT != 0 {
+        parts.push("shift".into());
+    }
+    if h.modifiers & crate::hotkeys::CONTROL != 0 {
+        parts.push("ctrl".into());
+    }
+    if h.modifiers & crate::hotkeys::OPTION != 0 {
+        parts.push("option".into());
+    }
+    parts.push(key_name_from_keycode(h.keycode));
+    parts.join("+")
+}
+
+/// Parse a custom-hotkey field string. Returns the hint line to display and,
+/// on a valid parse, the `(keycode, modifiers)` to write into `pending`.
+fn parse_custom_hotkey(s: &str) -> (String, Option<(i64, u64)>) {
+    match crate::hotkeys::Hotkey::parse(s) {
+        Some(hk) => {
+            let hint = match crate::hotkeys::detect_conflict(&hk) {
+                Some(msg) => format!("{} — {msg}", hk.display()),
+                None => format!("{} — no conflict detected", hk.display()),
+            };
+            (hint, Some((hk.keycode, hk.modifiers)))
+        }
+        None => ("unrecognized hotkey".to_string(), None),
+    }
+}
+
+/// The initial (field value, hint) for the custom-hotkey field, derived from
+/// the loaded hotkey. A bare modifier (the historical default, Right Option)
+/// is owned by the popup above; any real key renders as a parseable chord.
+fn initial_custom_hotkey() -> (String, String) {
+    let hk = crate::hotkeys::Hotkey::from_settings();
+    if hk.is_modifier_only() {
+        (
+            String::new(),
+            "The key is a bare modifier — set it in the popup above, or type a \
+             chord like cmd+shift+d here."
+                .to_string(),
+        )
+    } else {
+        let text = hotkey_to_parseable(&hk);
+        let hint = match crate::hotkeys::detect_conflict(&hk) {
+            Some(msg) => format!("{} — {msg}", hk.display()),
+            None => format!("{} — no conflict detected", hk.display()),
+        };
+        (text, hint)
+    }
+}
 
 fn with_pending<F: FnOnce(&mut Settings)>(f: F) {
     if let Some(ui) = SETTINGS_UI.get() {

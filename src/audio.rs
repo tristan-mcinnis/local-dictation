@@ -597,7 +597,7 @@ mod tests {
 
         // stream_audio holds the OLDER drained samples; the ring the NEWER ones.
         // ring_occupied=5 < 16 → from_stream = 11 → 11 newest stream_audio + 5 ring.
-        let (mut prod, mut cons) = HeapRb::<f32>::new(64).split();
+        let (mut prod, cons) = HeapRb::<f32>::new(64).split();
         let stream_audio = vec![1.0_f32; 40];
         for &v in &[10.0_f32, 20.0, 30.0, 40.0, 50.0] {
             let _ = prod.try_push(v);
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(&tail[11..], &[10.0, 20.0, 30.0, 40.0, 50.0]);
 
         // Ring alone covers the whole window → stream_audio contributes nothing.
-        let (mut prod2, mut cons2) = HeapRb::<f32>::new(64).split();
+        let (mut prod2, cons2) = HeapRb::<f32>::new(64).split();
         for &v in &[
             1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
             16.0,

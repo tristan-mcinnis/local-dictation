@@ -330,6 +330,68 @@ define_class!(
         fn cancel_pill(&self, _sender: *mut AnyObject) {
             let _ = crate::ipc::send(crate::ipc::Command::Cancel);
         }
+
+        // Re-run the pipeline on the last utterance's audio at the current
+        // cursor. No-op when nothing has been dictated this session.
+        #[unsafe(method(retryLast:))]
+        fn retry_last(&self, _sender: *mut AnyObject) {
+            if let Err(e) = crate::ipc::send(crate::ipc::Command::Retry) {
+                eprintln!("[menu] retry last dictation failed: {e}");
+            }
+        }
+
+        // Pick the active Translate-mode target. representedObject holds the
+        // target name; the translate path reads settings per utterance, so a
+        // save (no relaunch) is enough for the change to take effect.
+        #[unsafe(method(selectTranslateTarget:))]
+        fn select_translate_target(&self, sender: *mut AnyObject) {
+            let target = unsafe {
+                let obj: *mut AnyObject = msg_send![sender, representedObject];
+                if obj.is_null() {
+                    return;
+                }
+                let s: &NSString = &*(obj as *const NSString);
+                s.to_string()
+            };
+            if target.is_empty() {
+                return;
+            }
+            let mut s = Settings::load();
+            s.active_translation_target = Some(target);
+            if let Err(e) = s.save() {
+                eprintln!("[menu] failed to save translate target: {e}");
+            }
+        }
+
+        // Pick the history-retention window. representedObject holds the
+        // canonical string ("forever" / "1year" / …); history reads retention
+        // per record, so a save (no relaunch) is enough.
+        #[unsafe(method(selectRetention:))]
+        fn select_retention(&self, sender: *mut AnyObject) {
+            let rep = unsafe {
+                let obj: *mut AnyObject = msg_send![sender, representedObject];
+                if obj.is_null() {
+                    return;
+                }
+                let s: &NSString = &*(obj as *const NSString);
+                s.to_string()
+            };
+            if rep.is_empty() {
+                return;
+            }
+            let mut s = Settings::load();
+            s.history_retention = Some(rep);
+            if let Err(e) = s.save() {
+                eprintln!("[menu] failed to save history retention: {e}");
+            }
+        }
+
+        // Import a .csv of vocabulary entries into corrections.json and refresh
+        // the dictionary window. Backs the "Import Dictionary CSV…" menu item.
+        #[unsafe(method(importCsv:))]
+        fn import_csv(&self, _sender: *mut AnyObject) {
+            import_dictionary_csv();
+        }
     }
 );
 
@@ -573,10 +635,50 @@ fn build_status_item(
     let history_item = action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions);
     menu.addItem(&history_item);
 
+    // Re-run the last utterance: the pipeline replays the stored audio and
+    // injects the fresh transcript at the current cursor. Cheap and useful
+    // when the first pass was mistranscribed or landed in the wrong spot.
+    let retry_item = action_item(mtm, "Retry last dictation", sel!(retryLast:), "r", actions);
+    menu.addItem(&retry_item);
+
+    // Pick the active Translate-mode target (only meaningful when targets are
+    // configured; reads settings per utterance, so no relaunch).
+    let translate_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Translate to"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    translate_parent.setEnabled(true);
+    let translate_submenu = build_translate_submenu(mtm, actions, &settings);
+    translate_parent.setSubmenu(Some(&translate_submenu));
+    menu.addItem(&translate_parent);
+
+    // How long to keep dictation history (read per record, so no relaunch).
+    let retention_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("History retention"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    retention_parent.setEnabled(true);
+    let retention_submenu = build_retention_submenu(mtm, actions, &settings);
+    retention_parent.setSubmenu(Some(&retention_submenu));
+    menu.addItem(&retention_parent);
+
     // Simple editor for the personal dictionary (names/terms to keep spelled
     // verbatim). Counterpart to Dictation History — one clean native window.
     let dictionary_item = action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
     menu.addItem(&dictionary_item);
+
+    // Import a .csv of vocabulary entries into the personal dictionary.
+    let import_csv_item =
+        action_item(mtm, "Import Dictionary CSV…", sel!(importCsv:), "", actions);
+    menu.addItem(&import_csv_item);
 
     // Native Settings window (⌘,): all tunables in one place, batched apply.
     let settings_item = action_item(mtm, "Settings…", sel!(openSettings:), ",", actions);
@@ -797,6 +899,113 @@ fn build_format_submenu(
     submenu
 }
 
+/// Build the Translate-to picker. Each configured target is a checkable row
+/// (the active one checked); clicking saves the active target without a
+/// relaunch (the translate path reads settings per utterance). When no targets
+/// are configured, the submenu carries a single disabled note pointing at the
+/// Settings window.
+fn build_translate_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+) -> Retained<NSMenu> {
+    let submenu = NSMenu::new(mtm);
+    submenu.setAutoenablesItems(false);
+
+    let targets = settings.resolve_translation_targets();
+    if targets.is_empty() {
+        let note = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("(add targets in Settings → Translate to)"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        note.setEnabled(false);
+        submenu.addItem(&note);
+        return submenu;
+    }
+
+    let active = settings.resolve_active_translation_target(&targets);
+    for target in &targets {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(target),
+                Some(sel!(selectTranslateTarget:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(actions));
+            item.setEnabled(true);
+            let rep_ns = NSString::from_str(target);
+            let rep: &AnyObject = &rep_ns;
+            item.setRepresentedObject(Some(rep));
+            let is_active = active
+                .as_deref()
+                .map(|a| a.eq_ignore_ascii_case(target))
+                .unwrap_or(false);
+            item.setState(if is_active {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+        }
+        submenu.addItem(&item);
+    }
+
+    submenu
+}
+
+/// Build the history-retention picker. Each window is a checkable row (the
+/// active one checked); clicking saves the window without a relaunch (history
+/// reads retention per record).
+fn build_retention_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+) -> Retained<NSMenu> {
+    let submenu = NSMenu::new(mtm);
+    submenu.setAutoenablesItems(false);
+
+    let active = settings.resolve_history_retention();
+    const CHOICES: &[(&str, &str)] = &[
+        ("Forever", "forever"),
+        ("1 year", "1year"),
+        ("1 month", "1month"),
+        ("1 week", "1week"),
+        ("24 hours", "24hours"),
+        ("Never", "never"),
+    ];
+    for (label, rep) in CHOICES {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(label),
+                Some(sel!(selectRetention:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            item.setTarget(Some(actions));
+            item.setEnabled(true);
+            let rep_ns = NSString::from_str(rep);
+            let rep_obj: &AnyObject = &rep_ns;
+            item.setRepresentedObject(Some(rep_obj));
+            item.setState(if active.eq_ignore_ascii_case(rep) {
+                NSControlStateValueOn
+            } else {
+                NSControlStateValueOff
+            });
+        }
+        submenu.addItem(&item);
+    }
+
+    submenu
+}
+
 /// Build the push-to-talk key submenu from `settings::HOTKEY_CHOICES`.
 fn build_hotkey_submenu(
     mtm: MainThreadMarker,
@@ -972,6 +1181,85 @@ pub(crate) fn open_corrections_folder() {
     } else {
         let _ = std::process::Command::new("open").arg(&dir).status();
     }
+}
+
+/// Import entries from a user-picked CSV file into the personal vocabulary
+/// (corrections.json), then refresh the dictionary window's editor text and
+/// confirm via the window subtitle.
+///
+/// The native file dialog is driven through AppleScript's `choose file` (which
+/// presents the same macOS open panel) because `NSOpenPanel` isn't compiled
+/// into this build — its `objc2-app-kit` cargo feature is not enabled, and
+/// adding it would mean editing Cargo.toml, which is out of scope for this UI
+/// change. A CSV is matched by its standard UTI (`public.comma-separated-
+/// values-text`) with a `public.text` fallback for pickers that don't register
+/// the specific type.
+fn import_dictionary_csv() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "POSIX path of (choose file of type {\"public.comma-separated-values-text\", \"public.text\"} with prompt \"Choose a dictionary CSV to import\")",
+        ])
+        .output();
+    let Ok(out) = out else {
+        eprintln!("[menu] import CSV: osascript failed to launch");
+        return;
+    };
+    if !out.status.success() {
+        // User dismissed the dialog (AppleScript returns -128 on cancel) or
+        // the script errored. Nothing was chosen, so there's nothing to do.
+        eprintln!("[menu] import CSV cancelled or failed (osascript exit {:?})", out.status.code());
+        return;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() {
+        return;
+    }
+    let path = PathBuf::from(path);
+
+    let mut corrections = match crate::corrections::Corrections::load_default() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[menu] import CSV: failed to load corrections: {e}");
+            return;
+        }
+    };
+    let added = match corrections.import_csv_path(&path) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[menu] import CSV: failed to read {}: {e}", path.display());
+            return;
+        }
+    };
+    if let Err(e) = corrections.save() {
+        eprintln!("[menu] import CSV: failed to save corrections: {e}");
+        return;
+    }
+    eprintln!("[menu] imported {added} term(s) from {}", path.display());
+
+    // Refresh the dictionary window's editor text from the merged vocabulary so
+    // the imported entries appear inline, and bring it forward. (We reuse the
+    // build-once window; corrections are read fresh from disk here.
+    let ui = dictionary_ui(mtm);
+    let joined = crate::corrections::Corrections::load_default()
+        .map(|c| c.to_editor_lines())
+        .unwrap_or_default()
+        .join("\n");
+    ui.text_view.setString(&NSString::from_str(&joined));
+    unsafe {
+        let msg = NSString::from_str(&format!("Imported {added} term(s)"));
+        let _: () = msg_send![&*ui.window, setSubtitle: &*msg];
+    }
+    ui.window.makeKeyAndOrderFront(None);
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    {
+        app.activateIgnoringOtherApps(true)
+    };
 }
 
 /// Open the user's `prompts.json` (cleanup + transform system prompts) in a
