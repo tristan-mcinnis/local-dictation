@@ -270,6 +270,13 @@ impl TextCleanupEngine {
     /// Apply the model's chat template. S1-mini's merged Qwen3 template emits
     /// EOG immediately when given a separate system role, so its instruction
     /// and transcript deliberately share one user turn (matching Superwhisper).
+    ///
+    /// The assistant turn is prefilled with an EMPTY `<think></think>` block —
+    /// Qwen3's canonical non-thinking form. Without it S1-mini sometimes opens a
+    /// real reasoning block and burns the entire generation budget (sized ~1.3×
+    /// the transcript) inside it; the think-strip in `polish` then leaves nothing
+    /// and the runaway guard falls back to raw. The prefill makes generation
+    /// start at the answer: deterministic, faster, and no dead LLM calls.
     fn template_messages(
         model: &LlamaModel,
         chat_template: &LlamaChatTemplate,
@@ -279,9 +286,11 @@ impl TextCleanupEngine {
         let combined = format!("{system_msg}\n\n{user_msg}");
         let messages = vec![LlamaChatMessage::new("user".into(), combined)
             .map_err(|e| eyre::eyre!("invalid user message: {e:?}"))?];
-        model
+        let mut prompt = model
             .apply_chat_template(chat_template, &messages, true)
-            .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))
+            .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))?;
+        prompt.push_str("<think>\n\n</think>\n\n");
+        Ok(prompt)
     }
 
     /// Clean a raw dictation transcript for readability. Runs on the persistent

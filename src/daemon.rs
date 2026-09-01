@@ -1572,8 +1572,13 @@ fn worker_loop(
                                     crate::text_polish::fix_speech_mechanics(&pre_corrected);
                                 let word_count = pre_corrected.split_whitespace().count();
 
-                                if !format_active
-                                    && !crate::text_polish::needs_llm_cleanup(&pre_corrected)
+                                // Below 3 words there is nothing for the LLM to
+                                // clean, tone, or format — even an active preset
+                                // gains nothing reshaping "Yes." — so tiny
+                                // utterances always take the deterministic path.
+                                if word_count < 3
+                                    || (!format_active
+                                        && !crate::text_polish::needs_llm_cleanup(&pre_corrected))
                                 {
                                     // (1) Clean dictation skips the generative LLM
                                     // entirely. Measured: ~87% of utterances pass
