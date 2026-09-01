@@ -315,7 +315,7 @@ stack:
 | `S1_MODEL_PATH` | S1-mini GGUF path (also `GEMMA_MODEL_PATH`, a compat alias) |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `0x3D` Right Option; decimal or `0x` hex) |
 | `DICTATE_FORMAT` | Active output-format preset |
-| `DICTATE_STREAMING_ASR` | Incremental streaming ASR: transcribe each VAD-paused sentence during the hold for a live preview (default on; `0`/`false`/`off` disables). Whole-utterance cleanup still runs at release. Off while pre-roll is active |
+| `DICTATE_STREAMING_ASR` | Incremental streaming ASR: transcribe each VAD-paused sentence during the hold so only the final segment is outstanding at release (default on; `0`/`false`/`off` disables). Whole-utterance cleanup still runs at release. Off while pre-roll is active |
 | `DICTATE_PREROLL_MS` | Always-on mic lookback ms (default 0 = off; e.g. 400) |
 | `DICTATE_TAIL_CAPTURE` | Release tail-capture: keep the mic open briefly after release so the last word isn't clipped (default on; `0`/`false`/`off` disables). Off while pre-roll is active |
 | `DICTATE_TAIL_CAPTURE_CAP_MS` | Hard cap on the tail-capture grace loop (default 1500) |

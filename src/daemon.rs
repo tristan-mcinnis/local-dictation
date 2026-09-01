@@ -930,7 +930,6 @@ fn worker_loop(
                 stream_segs.clear();
                 stream_audio.clear();
                 stream_poisoned = false;
-                ui_channel::clear_live_transcript();
                 cues::play_cancel();
                 ui_channel::set_state(UiState::Idle);
                 eprintln!("⌫ cancelled · discarded");
@@ -983,7 +982,6 @@ fn worker_loop(
                                 stream_poisoned = false;
                             }
                             noise_floor.clear();
-                            ui_channel::clear_live_transcript();
                             pending_target = Some(spawn_focus_capture());
                             continue;
                         }
@@ -1207,7 +1205,6 @@ fn worker_loop(
                         crate::audio_duck::mute();
                         ui_channel::set_state(UiState::Recording);
                         crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
-                        ui_channel::clear_live_transcript();
                         eprintln!("  ↻    re-press during tail-capture · reused warm stream");
                         pending_target = Some(spawn_focus_capture());
                         continue 'evloop;
@@ -1221,7 +1218,6 @@ fn worker_loop(
                         stream_segs.clear();
                         stream_audio.clear();
                         stream_poisoned = false;
-                        ui_channel::clear_live_transcript();
                         cues::play_cancel();
                         ui_channel::set_state(UiState::Idle);
                         let _unmute = crate::audio_duck::RestoreOnDrop;
@@ -1259,7 +1255,6 @@ fn worker_loop(
                 }
                 cues::play_stop();
                 ui_channel::set_state(UiState::Processing);
-                ui_channel::clear_live_transcript();
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 let held = press_to_release.unwrap_or_default();
                 eprintln!("⏹ stopped · held {}", secs(held));
@@ -1347,7 +1342,10 @@ fn worker_loop(
                         };
                         segs_cached = stream_segs.len();
                         timing_final_seg_ms = final_seg_ms;
-                        let joined = stream_segs.join(" ");
+                        // Boundary-repairing join: a pause before the last word
+                        // makes the ASR emit "…instant." + "connection." — see
+                        // `join_stream_segments` for the lowercase-start repair.
+                        let joined = crate::text_polish::join_stream_segments(&stream_segs);
                         let fallback = stream_poisoned || transform || stream_segs.is_empty();
                         // Take the backup buffer so the fallback transcribes exactly
                         // what was captured (and frees it for the next utterance).
@@ -1922,10 +1920,6 @@ fn stream_process_asr(
             eprintln!("  ⟫ seg · {raw:?}");
         }
         segs_acc.push(corrected);
-        // Live preview: surface the joined cached text in the pill while recording.
-        if !final_flush {
-            ui_channel::set_live_transcript(&segs_acc.join(" "));
-        }
     }
     last_seg_ms
 }
@@ -2015,7 +2009,6 @@ fn begin_open_capture(
         stream_audio.clear();
         *stream_poisoned = false;
     }
-    ui_channel::clear_live_transcript();
     eprintln!("▶ recording");
     true
 }

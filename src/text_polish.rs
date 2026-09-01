@@ -562,6 +562,36 @@ pub fn flatten_to_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Join streamed ASR segments into one utterance, repairing the boundary
+/// artifact the segmenter creates: the VAD closes a segment at every pause and
+/// the ASR punctuates each segment independently, so a pause before the final
+/// word yields "…it's like instant." + "connection." — a spurious period that
+/// `fix_speech_mechanics` then sentence-capitalizes into "instant. Connection."
+/// The ASR capitalizes genuine sentence starts, so a segment that BEGINS
+/// lowercase is its own signal that it heard a mid-sentence continuation: drop
+/// the previous segment's single trailing period and keep the sentence flowing.
+/// A "..." trail-off, '!'/'?', and capitalized starts are left untouched.
+pub fn join_stream_segments(segs: &[String]) -> String {
+    let mut out = String::new();
+    for seg in segs {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str(seg);
+            continue;
+        }
+        let starts_lower = seg.chars().next().is_some_and(|c| c.is_lowercase());
+        if starts_lower && out.ends_with('.') && !out.ends_with("..") {
+            out.pop();
+        }
+        out.push(' ');
+        out.push_str(seg);
+    }
+    out
+}
+
 /// Trailing acknowledgement fillers a speaker tacks on while thinking — kept as
 /// its own clause, e.g. "…we can use. Yeah." Only stripped when it's a STANDALONE
 /// trailing clause (after a sentence/comma boundary), so "I told him yeah" and a
@@ -1375,6 +1405,34 @@ fn add_terminal_period(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn join_stream_segments_repairs_mid_sentence_boundaries() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The reported bug: a pause before the last word → spurious period.
+        assert_eq!(
+            join_stream_segments(&s(&["it's like instant.", "connection."])),
+            "it's like instant connection."
+        );
+        // Capitalized start = a genuine new sentence — period stays.
+        assert_eq!(
+            join_stream_segments(&s(&["The...", "They can be paired."])),
+            "The... They can be paired."
+        );
+        // Trail-off ellipsis is deliberate — never popped.
+        assert_eq!(
+            join_stream_segments(&s(&["I was thinking...", "maybe later."])),
+            "I was thinking... maybe later."
+        );
+        // '!'/'?' are real terminals — untouched even before a lowercase start.
+        assert_eq!(
+            join_stream_segments(&s(&["Ready?", "yes."])),
+            "Ready? yes."
+        );
+        // Empty / whitespace segments are dropped; single segment passes through.
+        assert_eq!(join_stream_segments(&s(&["", "  ", "Hello."])), "Hello.");
+        assert_eq!(join_stream_segments(&s(&["Hello."])), "Hello.");
+    }
 
     #[test]
     fn strips_chat_template_artefacts() {

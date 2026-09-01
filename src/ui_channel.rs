@@ -10,15 +10,11 @@
 //!     which drives the status-item icon and shows/hides the floating pill.
 //!   * **last dictation** — the most recent injected text, for the menu's
 //!     "Copy last dictation" item and "Last: …" preview.
-//!   * **live transcript** — the running text of the in-progress dictation,
-//!     updated as streaming ASR completes each VAD-bounded sentence during the
-//!     hold, so the pill can preview it live. Cleared when recording ends.
 //!
-//! Keeping all four behind one module means the worker↔UI contract is
+//! Keeping all three behind one module means the worker↔UI contract is
 //! defined in a single place: the worker side (`set_state`, `set_last_dictation`,
-//! `push_level`, `set_live_transcript`) and the reader side (`state`,
-//! `last_dictation`, `recent_levels`, `live_transcript`) are the whole interface.
-//! `clear_live_transcript` is the worker-side reset when recording ends. `audio.rs`
+//! `push_level`) and the reader side (`state`, `last_dictation`,
+//! `recent_levels`) are the whole interface. `audio.rs`
 //! stays a pure capture module that just calls `push_level`; `menubar.rs` reads through here rather
 //! than owning the statics itself.
 //!
@@ -73,10 +69,6 @@ static LAST_DICTATION: Mutex<String> = Mutex::new(String::new());
 /// Written from the cpal audio thread, read from the menu-bar UI timer.
 static AUDIO_LEVELS: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::new());
 
-/// The running text of the in-progress dictation, surfaced in the recording
-/// pill as streaming ASR completes segments. Empty while not recording.
-static LIVE_TRANSCRIPT: Mutex<String> = Mutex::new(String::new());
-
 // ─── Writer side (worker / audio threads) ───────────────────────────────
 
 /// Broadcast a new UI state.
@@ -117,22 +109,6 @@ pub fn push_level(rms: f32) {
     }
 }
 
-/// Record the running live transcript (joined cached segments) so the pill can
-/// preview it while recording. Called by the streaming-ASR path after each
-/// completed segment. Intended to be short-ish; the reader truncates for display.
-pub fn set_live_transcript(text: &str) {
-    if let Ok(mut g) = LIVE_TRANSCRIPT.lock() {
-        *g = text.to_string();
-    }
-}
-
-/// Clear the live transcript (called when recording ends or is cancelled).
-pub fn clear_live_transcript() {
-    if let Ok(mut g) = LIVE_TRANSCRIPT.lock() {
-        g.clear();
-    }
-}
-
 // ─── Reader side (main / UI thread) ──────────────────────────────────────
 
 /// Current UI state.
@@ -151,11 +127,6 @@ pub fn recent_levels() -> Vec<f32> {
         .lock()
         .map(|q| q.iter().copied().collect())
         .unwrap_or_default()
-}
-
-/// The current live transcript (empty string when not recording).
-pub fn live_transcript() -> String {
-    LIVE_TRANSCRIPT.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
 /// Clear the waveform ring (called when the pill hides on return to idle).
