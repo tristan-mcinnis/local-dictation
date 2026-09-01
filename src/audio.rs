@@ -580,12 +580,36 @@ mod tests {
         tail_quiet.extend(std::iter::repeat(0.0).take(10));
         let (thresh, engage) =
             tail_capture_engage(&tail_quiet, 1, noise_floor(&[0.004, 0.005], 0.10), 300, 30);
-        assert!(thresh >= TAIL_ABS_FLOOR, "threshold keeps the absolute floor");
+        assert!(
+            thresh >= TAIL_SOFT_ABS_FLOOR,
+            "threshold keeps the (soft) absolute floor"
+        );
         assert!(!engage, "900-ms quiet tail should skip the grace");
 
-        // Threshold math is unchanged: floor*3, clamped to the absolute floor.
+        // A SOFT trailing word: level between the soft threshold and the old ×3
+        // threshold. Under the old math this read as "released in a pause" and
+        // the word clipped; the soft tail threshold must engage the grace.
+        let floor = 0.004_f32;
+        let soft = tail_speech_threshold(floor, false) + 0.0005; // just above soft
+        assert!(
+            soft < speech_threshold(floor),
+            "test level must sit under the plain speech threshold"
+        );
+        let tail_soft = vec![floor, floor, soft, soft];
+        let (_, engage) = tail_capture_engage(&tail_soft, 1, floor, 300, 30);
+        assert!(engage, "a soft trailing word must engage the grace");
+
+        // Plain-speech threshold math is unchanged: floor*3, clamped to the
+        // absolute floor. The tail path is more sensitive; whisper mode wins.
         assert_eq!(speech_threshold(0.10), 0.30);
         assert_eq!(speech_threshold(0.0), TAIL_ABS_FLOOR);
+        assert_eq!(tail_speech_threshold(0.10, false), 0.20);
+        assert_eq!(tail_speech_threshold(0.0, false), TAIL_SOFT_ABS_FLOOR);
+        assert_eq!(
+            tail_speech_threshold(0.002, true),
+            speech_threshold_with_mode(0.002, true),
+            "whisper mode keeps its own (lower) thresholds"
+        );
     }
 
     #[test]
@@ -1083,6 +1107,16 @@ pub const WHISPER_ABS_FLOOR: f32 = 0.005;
 /// Absolute floor on the speech threshold, so an ultra-quiet room can never push
 /// the threshold to zero (and thus never treat pure silence as "speech").
 pub const TAIL_ABS_FLOOR: f32 = 0.01;
+/// Tail-capture sensitivity: the release-tail engage decision and the grace
+/// loop's quiet check use a LOWER threshold than plain speech detection.
+/// Voices naturally fall in level at the end of a sentence, so a trailing word
+/// spoken softly sat just under the ×3 threshold, read as "released in a
+/// pause", skipped the grace, and got clipped — the one drop path tail-capture
+/// left open. ×2 with a lower absolute floor keeps that word visible while a
+/// genuinely quiet pause (ambient ≈ floor) still skips for zero added latency.
+pub const TAIL_SOFT_FLOOR_FACTOR: f32 = 2.0;
+/// Absolute floor paired with [`TAIL_SOFT_FLOOR_FACTOR`] (see there).
+pub const TAIL_SOFT_ABS_FLOOR: f32 = 0.006;
 /// Low percentile of the per-frame RMS distribution used as the noise-floor proxy.
 pub const TAIL_NOISE_PERCENTILE: f32 = 0.10;
 
@@ -1210,6 +1244,18 @@ pub fn speech_threshold_with_mode(floor: f32, whisper: bool) -> f32 {
     (floor * factor).max(abs_floor)
 }
 
+/// Speech threshold for the TAIL-CAPTURE path only (engage decision + grace
+/// quiet check): more sensitive than [`speech_threshold_with_mode`] so a soft
+/// trailing word still reads as speech — see [`TAIL_SOFT_FLOOR_FACTOR`].
+/// Whisper mode is lower still and unchanged.
+pub fn tail_speech_threshold(floor: f32, whisper: bool) -> f32 {
+    if whisper {
+        speech_threshold_with_mode(floor, true)
+    } else {
+        (floor * TAIL_SOFT_FLOOR_FACTOR).max(TAIL_SOFT_ABS_FLOOR)
+    }
+}
+
 /// True if the last `n` frames (`rms_frames`) are all below `threshold` — i.e.
 /// the release happens during a pause. Used both for the grace-engagement check
 /// (last ~300 ms) and as a building block. Fewer than `n` frames returns true
@@ -1275,7 +1321,7 @@ pub fn tail_capture_engage_with_mode(
     frame_ms: u32,
     whisper: bool,
 ) -> (f32, bool) {
-    let threshold = speech_threshold_with_mode(floor, whisper);
+    let threshold = tail_speech_threshold(floor, whisper);
     let frames = frame_rms(tail, frame_len);
     let engage_frames = quiet_frame_count(engage_ms, frame_ms);
     let engage = !frames_quiet(&frames, threshold, engage_frames);

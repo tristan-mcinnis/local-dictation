@@ -218,8 +218,10 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
 the mic immediately, clipping a word still being spoken. Instead it now enters a short grace loop
 (polling the live level every ~40 ms) that keeps the engine open and stops once the level has stayed
 below an *adaptive* speech threshold for ~250 ms continuously, or a `DICTATE_TAIL_CAPTURE_CAP_MS`
-cap (default 1500) hits. The threshold is `max(noise_floor × 3, 0.01)`, where the floor is the low
-percentile of per-frame RMS across the utterance, so it adapts to the room. It only engages when
+cap (default 1500) hits. The threshold is `max(noise_floor × 2, 0.006)` (deliberately *softer* than
+the plain ×3 speech threshold, so a trailing word spoken quietly — voices fall at sentence ends —
+still reads as speech instead of "released in a pause"; whisper mode is lower still), where the
+floor is the low percentile of per-frame RMS across the utterance, so it adapts to the room. It only engages when
 the release plausibly happened mid-speech — a release in a pause (last ~300 ms quiet) skips it
 entirely for zero added latency. The recovered audio accumulates in the ring and is drained by the
 release pipeline (so the streaming final-segment flush includes it). Skipped entirely under always-on
