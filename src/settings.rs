@@ -144,6 +144,14 @@ pub struct Settings {
     /// captured. `None`/false ⇒ off. Override: `DICTATE_WHISPER_MODE`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub whisper_mode: Option<bool>,
+
+    /// Double-tap the hotkey to enter hands-free (latched) recording — an
+    /// alternative to the Space chord for remotes with no Spacebar (e.g. a
+    /// pocket gadget that only emits Right Option). A quick tap released and
+    /// re-pressed within the double-tap window latches the mic. `None`/true ⇒
+    /// enabled. Override: `DICTATE_DOUBLE_TAP_LATCH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub double_tap_latch: Option<bool>,
 }
 
 /// Default wake word for listen mode. Two distinct syllables, uncommon as a
@@ -433,6 +441,16 @@ impl Settings {
         self.whisper_mode.unwrap_or(false)
     }
 
+    /// Resolve double-tap-to-latch (hands-free from a hotkey double-tap):
+    /// `DICTATE_DOUBLE_TAP_LATCH` env > settings > enabled.
+    pub fn resolve_double_tap_latch(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_DOUBLE_TAP_LATCH") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.double_tap_latch.unwrap_or(true)
+    }
+
     /// Resolve the active formatting preset: `DICTATE_FORMAT` env > settings >
     /// none. Blank/whitespace is treated as unset. The returned name is matched
     /// (case-insensitively) against `prompts.json`'s `formats` keys by the
@@ -702,6 +720,16 @@ mod tests {
             let mut s = Settings::default();
             s.whisper_mode = Some(true);
             assert!(s.resolve_whisper_mode());
+        }
+    }
+
+    #[test]
+    fn double_tap_latch_on_by_default() {
+        if std::env::var_os("DICTATE_DOUBLE_TAP_LATCH").is_none() {
+            assert!(Settings::default().resolve_double_tap_latch());
+            let mut s = Settings::default();
+            s.double_tap_latch = Some(false);
+            assert!(!s.resolve_double_tap_latch());
         }
     }
 

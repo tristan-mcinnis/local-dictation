@@ -31,7 +31,7 @@ use core_graphics::event::{
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Round a Duration to integer milliseconds for log output.
@@ -86,6 +86,13 @@ const SCREEN_VOCAB_CAP: usize = 16;
 // Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
 const SPACE_KEYCODE: i64 = 0x31;
 
+// Double-tap-to-latch gesture timing. A quick tap (press+release within
+// TAP_MAX_HOLD) followed by a second press within DOUBLE_TAP_WINDOW of that
+// release arms hands-free — the no-Spacebar route into latch. Detected in the
+// event-tap callback (it needs real press/release timing), not the machine.
+const TAP_MAX_HOLD: Duration = Duration::from_millis(300);
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(350);
+
 // Hands-free latch state machine, shared with the event-tap callback:
 //
 //   ST_IDLE ─PTT press─▶ ST_HOLDING ─release─▶ ST_IDLE              (normal PTT)
@@ -110,7 +117,9 @@ const ST_STOPPING_TAP: u8 = 4;
 enum PttInput {
     /// The PTT modifier transitioned to held. `shift` = Shift co-held (the
     /// transform-selection gesture), read only when starting a fresh utterance.
-    HotkeyPress { shift: bool },
+    /// `double_tap` = this is the second press of a quick double-tap (set by the
+    /// event-tap callback; only meaningful from IDLE, where it latches).
+    HotkeyPress { shift: bool, double_tap: bool },
     /// The PTT modifier transitioned to released.
     HotkeyRelease,
     /// Space went down (only meaningful while the PTT key is held).
@@ -123,6 +132,11 @@ enum PttDecision {
     Nothing,
     /// Begin capture. `transform` carries the Shift-at-press gesture.
     Start {
+        transform: bool,
+    },
+    /// Double-tap from idle: begin hands-free capture AND cue latched (Start +
+    /// ArmLatch shrunk into one decision; the no-Spacebar route into ST_LATCHED).
+    StartLatched {
         transform: bool,
     },
     /// End capture and run the pipeline.
@@ -138,7 +152,12 @@ enum PttDecision {
 /// this free of any CG / channel types makes the whole gesture unit-testable.
 fn ptt_transition(state: u8, input: PttInput) -> (u8, PttDecision) {
     match (state, input) {
-        (ST_IDLE, PttInput::HotkeyPress { shift }) => {
+        // Double-tap from idle: go straight to latched so the release of the
+        // second press can't stop the session (see ST_LATCHED release arm).
+        (ST_IDLE, PttInput::HotkeyPress { double_tap: true, .. }) => {
+            (ST_LATCHED, PttDecision::StartLatched { transform: false })
+        }
+        (ST_IDLE, PttInput::HotkeyPress { shift, double_tap: false }) => {
             (ST_HOLDING, PttDecision::Start { transform: shift })
         }
         (ST_HOLDING, PttInput::SpaceDown) => (ST_HOLDING_ARMED, PttDecision::ArmLatch),
@@ -152,6 +171,36 @@ fn ptt_transition(state: u8, input: PttInput) -> (u8, PttDecision) {
         // Any other combination is a no-op (e.g. stray Space when not holding,
         // re-press while already holding, release in IDLE).
         (s, _) => (s, PttDecision::Nothing),
+    }
+}
+
+/// Detects a quick double-tap of the PTT key from its press/release spacing,
+/// so a remote with no Spacebar can reach hands-free mode. Lives in the
+/// event-tap callback (needs real timing); the state machine stays pure.
+#[derive(Default)]
+struct DoubleTapDetector {
+    last_press: Option<Instant>,
+    last_release: Option<Instant>,
+}
+
+impl DoubleTapDetector {
+    /// Record a press; true if this is the *second* press of a double-tap (the
+    /// first tap was held < TAP_MAX_HOLD and released < DOUBLE_TAP_WINDOW ago).
+    /// Retains `last_press` so a third tap can chain a detection.
+    fn on_press(&mut self, now: Instant) -> bool {
+        let is_double = matches!(
+            (self.last_press, self.last_release),
+            (Some(p), Some(r))
+                if now.saturating_duration_since(r) <= DOUBLE_TAP_WINDOW
+                    && r.saturating_duration_since(p) <= TAP_MAX_HOLD
+        );
+        self.last_press = Some(now);
+        is_double
+    }
+
+    /// Record a release.
+    fn on_release(&mut self, now: Instant) {
+        self.last_release = Some(now);
     }
 }
 
@@ -297,6 +346,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let hotkey_down = Arc::new(AtomicBool::new(false));
     let hotkey_down_cb = hotkey_down.clone();
 
+    // Double-tap-to-latch: the callback records press/release timing to
+    // recognise a hotkey double-tap (the no-Spacebar route into hands-free).
+    let double_tap_latch = crate::settings::Settings::load().resolve_double_tap_latch();
+    let detector_cb = Arc::new(Mutex::new(DoubleTapDetector::default()));
+
     // Drive the latch state machine once, forwarding any Start/Stop decision to
     // the worker. Shared by the modifier-only and chord hotkey detection paths.
     let drive = {
@@ -308,6 +362,12 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             match decision {
                 PttDecision::Start { transform } => {
                     let _ = tx.send(DaemonEvent::StartRecording { transform });
+                }
+                // Double-tap from idle: begin recording AND cue latched,
+                // mirroring the Space-chord Start + LatchArmed sequence.
+                PttDecision::StartLatched { transform } => {
+                    let _ = tx.send(DaemonEvent::StartRecording { transform });
+                    let _ = tx.send(DaemonEvent::LatchArmed);
                 }
                 PttDecision::Stop => {
                     let _ = tx.send(DaemonEvent::StopRecording);
@@ -358,10 +418,15 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         if flags.contains(hf) {
                             // Shift co-held at press → transform mode (rewrite the
                             // selection). The user holds Shift *before* the PTT key.
+                            let press = Instant::now();
+                            let double_tap = double_tap_latch
+                                && detector_cb.lock().unwrap().on_press(press);
                             PttInput::HotkeyPress {
                                 shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                                double_tap,
                             }
                         } else {
+                            detector_cb.lock().unwrap().on_release(Instant::now());
                             PttInput::HotkeyRelease
                         }
                     } else {
@@ -380,7 +445,10 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         if flags.contains(required_mask) {
                             let shift = flags.contains(CGEventFlags::CGEventFlagShift)
                                 && !required_mask.contains(CGEventFlags::CGEventFlagShift);
-                            drive(PttInput::HotkeyPress { shift });
+                            let press = Instant::now();
+                            let double_tap = double_tap_latch
+                                && detector_cb.lock().unwrap().on_press(press);
+                            drive(PttInput::HotkeyPress { shift, double_tap });
                             hotkey_down_cb.store(true, Ordering::SeqCst);
                             return CallbackResult::Drop;
                         }
@@ -411,6 +479,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     if !modifier_only && keycode == hotkey_keycode {
                         // Chord hotkey release: swallow the matching key-up.
                         if hotkey_down_cb.swap(false, Ordering::SeqCst) {
+                            detector_cb.lock().unwrap().on_release(Instant::now());
                             drive(PttInput::HotkeyRelease);
                             return CallbackResult::Drop;
                         }
@@ -2306,7 +2375,7 @@ mod tests {
     fn normal_ptt_press_and_release() {
         // Hold then release: start on press, stop on release, back to idle.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::HotkeyRelease,
         ]);
         assert_eq!(
@@ -2318,7 +2387,7 @@ mod tests {
 
     #[test]
     fn shift_press_starts_transform() {
-        let (decisions, _) = run(&[PttInput::HotkeyPress { shift: true }]);
+        let (decisions, _) = run(&[PttInput::HotkeyPress { shift: true, double_tap: false }]);
         assert_eq!(decisions, vec![PttDecision::Start { transform: true }]);
     }
 
@@ -2326,10 +2395,10 @@ mod tests {
     fn hands_free_full_gesture() {
         // Hold PTT, chord Space, release both, then tap PTT to stop.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false }, // Start
+            PttInput::HotkeyPress { shift: false, double_tap: false }, // Start
             PttInput::SpaceDown,                    // ArmLatch (cue + swallow)
             PttInput::HotkeyRelease,                // → Latched, keep recording
-            PttInput::HotkeyPress { shift: false }, // tap → Stop
+            PttInput::HotkeyPress { shift: false, double_tap: false }, // tap → Stop
             PttInput::HotkeyRelease,                // → Idle, no-op
         ]);
         assert_eq!(
@@ -2350,7 +2419,7 @@ mod tests {
         // Arming only needs the Space chord while holding; releasing the PTT
         // afterwards latches regardless of when Space physically came up.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::SpaceDown,
             PttInput::HotkeyRelease,
         ]);
@@ -2363,7 +2432,7 @@ mod tests {
         // A second Space during the same hold must still be swallowed, but
         // emits SwallowSpace (no fresh cue) rather than ArmLatch.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::SpaceDown,
             PttInput::SpaceDown,
         ]);
@@ -2392,7 +2461,7 @@ mod tests {
         // Once hands-free, the keys are up; a Space is a real keystroke and
         // must not be swallowed or change state.
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::SpaceDown,
             PttInput::HotkeyRelease, // Latched
             PttInput::SpaceDown,     // real space
@@ -2406,8 +2475,8 @@ mod tests {
         // A spurious second press event while already holding does nothing
         // (and never starts a second recording).
         let (decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false },
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
         ]);
         assert_eq!(
             decisions,
@@ -2424,13 +2493,115 @@ mod tests {
         // A plain hold/release, then a hands-free session — state returns to
         // idle cleanly between them.
         let (_decisions, end) = run(&[
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::HotkeyRelease, // Stop → Idle
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::SpaceDown,
             PttInput::HotkeyRelease, // Latched
-            PttInput::HotkeyPress { shift: false },
+            PttInput::HotkeyPress { shift: false, double_tap: false },
             PttInput::HotkeyRelease, // Stop → Idle
+        ]);
+        assert_eq!(end, ST_IDLE);
+    }
+
+    // Double-tap to latch. The first press is a normal quick tap (Start, then
+    // Stop on release); it's the *second* press (double_tap=true) that latches.
+
+    #[test]
+    fn double_tap_from_idle_latches() {
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false, double_tap: false }, // tap 1
+            PttInput::HotkeyRelease,
+            PttInput::HotkeyPress { shift: false, double_tap: true }, // tap 2 → latch
+            PttInput::HotkeyRelease, // keys up, stays recording
+        ]);
+        assert_eq!(
+            decisions,
+            vec![
+                PttDecision::Start { transform: false },
+                PttDecision::Stop,
+                PttDecision::StartLatched { transform: false },
+                PttDecision::Nothing,
+            ]
+        );
+        assert_eq!(end, ST_LATCHED);
+    }
+
+    #[test]
+    fn double_tap_then_single_tap_stops() {
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+            PttInput::HotkeyRelease,
+            PttInput::HotkeyPress { shift: false, double_tap: true }, // latch
+            PttInput::HotkeyRelease,
+            PttInput::HotkeyPress { shift: false, double_tap: false }, // stop tap
+            PttInput::HotkeyRelease,
+        ]);
+        assert_eq!(
+            decisions,
+            vec![
+                PttDecision::Start { transform: false },
+                PttDecision::Stop,
+                PttDecision::StartLatched { transform: false },
+                PttDecision::Nothing,
+                PttDecision::Stop,
+                PttDecision::Nothing,
+            ]
+        );
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn single_quick_tap_does_not_latch() {
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+            PttInput::HotkeyRelease,
+        ]);
+        assert_eq!(
+            decisions,
+            vec![PttDecision::Start { transform: false }, PttDecision::Stop]
+        );
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn hold_then_release_does_not_latch() {
+        // A single long hold (double_tap is never set, since there's no second
+        // press) is just a normal PTT utterance — never hands-free.
+        let (_decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+            PttInput::HotkeyRelease,
+        ]);
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn double_tap_while_latched_stops() {
+        // A press while already hands-free ends the session; the double-tap flag
+        // is ignored once latched (ST_LATCHED → Stop on the first press, the
+        // rest is a no-op).
+        let (decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+            PttInput::SpaceDown,
+            PttInput::HotkeyRelease, // latched via Space chord
+            PttInput::HotkeyPress { shift: false, double_tap: true },
+            PttInput::HotkeyRelease,
+        ]);
+        assert!(decisions.contains(&PttDecision::Stop));
+        assert_eq!(end, ST_IDLE);
+    }
+
+    #[test]
+    fn triple_tap_latches_then_stops() {
+        // Three quick taps: the first is a normal utterance, the second latches
+        // hands-free, the third stops it — net return to idle.
+        let (_decisions, end) = run(&[
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+            PttInput::HotkeyRelease,
+            PttInput::HotkeyPress { shift: false, double_tap: true }, // latch
+            PttInput::HotkeyRelease,
+            PttInput::HotkeyPress { shift: false, double_tap: true }, // stop tap
+            PttInput::HotkeyRelease,
         ]);
         assert_eq!(end, ST_IDLE);
     }

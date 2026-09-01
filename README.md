@@ -29,7 +29,7 @@ providers, account, subscription, or runtime telemetry.
    offered to S1-mini; deterministic cleanup and content/runaway guards win if
    the model truncates, repeats, or changes intent.
 5. **Personal dictionary.** Your names, brands, and tools (Todoist, Pencil, macOS) are kept as you mean them instead of being "corrected" to common words. Edit it from the menu bar.
-6. **Hands-free mode.** Hold the key and tap Space to latch, then talk with nothing held down. Tap the key once to stop. Good for long thoughts.
+6. **Hands-free mode.** Hold the key and tap Space to latch, then talk with nothing held down. Tap the key once to stop. Good for long thoughts. No Spacebar? Double-tap the key to latch instead.
 7. **Voice commands.** End an utterance with "press enter", "new line", or "press tab" to emit the keystroke. Say "scratch that" to cancel, or "undo that" to revert the last dictation.
 8. **Transform selected text by voice.** Select a passage, hold Shift plus the key, speak an instruction ("make this concise", "translate to Spanish"), and it rewrites in place.
 9. **Output formats.** Numbered, bullets, email, and code presets reshape a dictation when you want structure. Off by default, picked from the menu bar.
