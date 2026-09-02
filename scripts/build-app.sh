@@ -166,13 +166,18 @@ else
   fi
 fi
 
-# ── 6. ad-hoc code signature ─────────────────────────────────────────────────
-# Ad-hoc ('-') is enough to run on Apple Silicon. Note: rebuilding changes the
-# signature hash, so macOS may re-ask for Accessibility/Microphone after a
-# rebuild. A real Developer ID would make those grants stick across rebuilds.
-echo "• ad-hoc code-signing…"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || \
-  codesign --force --deep --sign - "$APP"
+# ── 6. code signature ────────────────────────────────────────────────────────
+# A stable signing identity keeps the Accessibility/Microphone grants across
+# rebuilds (TCC keys them to the signature). Default: the first "Apple
+# Development" identity in the login keychain; SIGN_IDENTITY=- forces ad-hoc.
+if [ -z "${SIGN_IDENTITY:-}" ]; then
+  SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep -o '"Apple Development: [^"]*"' | head -1 | tr -d '"')
+  SIGN_IDENTITY=${SIGN_IDENTITY:--}
+fi
+echo "• code-signing with: $SIGN_IDENTITY"
+codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" >/dev/null 2>&1 || \
+  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
 codesign --verify --deep --strict "$APP" && echo "  signature OK"
 
 echo "✓ built: $APP"

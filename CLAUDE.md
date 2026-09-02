@@ -27,8 +27,10 @@ native/cohere-mlx/test.sh                      # Swift bridge protocol tests
 ./scripts/reload-daemon.sh                     # relaunch to pick up config edits
 ```
 
-Run `cargo test` after every source change. A rebuild re-signs ad-hoc, so
-macOS may re-ask for Microphone + Accessibility; only the user can grant it.
+Run `cargo test` after every source change. `scripts/build-app.sh` signs with
+the first Apple Development identity in the keychain so Microphone +
+Accessibility grants survive rebuilds; `SIGN_IDENTITY=-` forces ad-hoc, which
+makes macOS re-ask. Only the user can grant the permission.
 
 ## Boundaries (do not widen without a design)
 
