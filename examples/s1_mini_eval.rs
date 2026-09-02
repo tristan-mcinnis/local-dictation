@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! cargo run --release --features cleaner --example s1_mini_eval
-//! S1_MODEL_PATH=/path/to/s1-mini.gguf cargo run --release --features cleaner --example s1_mini_eval -- --reps 3
+//! DICTATE_LLM_MODEL_PATH=/path/to/s1-mini.gguf cargo run --release --features cleaner --example s1_mini_eval -- --reps 3
 //! ```
 //!
 //! The runner does not modify user settings or dictionary files. Vocabulary
@@ -24,7 +24,7 @@ fn main() {
 
 #[cfg(feature = "cleaner")]
 mod enabled {
-    use fast_dictate_backend::app_paths::gemma_default_path;
+    use fast_dictate_backend::app_paths::llm_default_path;
     use fast_dictate_backend::cleaner::TextCleanupEngine;
     use fast_dictate_backend::prompts::{vocabulary_suffix, DEFAULT_CLEANUP};
     use serde::Deserialize;
@@ -127,10 +127,9 @@ mod enabled {
                 return PathBuf::from(path);
             }
         }
-        std::env::var_os("S1_MODEL_PATH")
-            .or_else(|| std::env::var_os("GEMMA_MODEL_PATH"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(gemma_default_path()))
+        fast_dictate_backend::settings::llm_model_env()
+            .map(|(_, v)| PathBuf::from(v))
+            .unwrap_or_else(|| PathBuf::from(llm_default_path()))
     }
 
     fn reps(args: &[String]) -> usize {
@@ -162,7 +161,7 @@ mod enabled {
         let path = model_path(&args);
         if !path.exists() {
             return Err(eyre::eyre!(
-                "S1-mini model not found at {} (set S1_MODEL_PATH or pass --model PATH)",
+                "S1-mini model not found at {} (set DICTATE_LLM_MODEL_PATH or pass --model PATH)",
                 path.display()
             ));
         }

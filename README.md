@@ -170,7 +170,7 @@ User config lives in `~/.config/local-dictation/`. The menu bar writes `settings
 | `DICTATE_COHERE_MLX_MODEL_DIR` | Converted Cohere Q4 checkpoint directory |
 | `DICTATE_COHERE_MLX_BRIDGE` | Native helper path override |
 | `DICTATE_COHERE_LANG` | Decoder language hint (`en` by default) |
-| `S1_MODEL_PATH` | S1-mini GGUF path override |
+| `DICTATE_LLM_MODEL_PATH` | Cleanup-LLM GGUF path override (`S1_MODEL_PATH` alias, `GEMMA_MODEL_PATH` deprecated) |
 | `DICTATE_FORMAT` | Active output-format preset |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_NO_MUTE` | Do not mute other audio during capture |

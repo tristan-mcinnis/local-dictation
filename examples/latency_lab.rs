@@ -148,7 +148,7 @@ async fn main() -> eyre::Result<()> {
     );
 
     let gemma =
-        Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
+        Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path());
     eprintln!("[lat] model: {gemma}");
     let t = Instant::now();
     let engine = TextCleanupEngine::initialize(&gemma)?;

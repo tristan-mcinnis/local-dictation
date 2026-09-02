@@ -155,7 +155,7 @@ define_class!(
         #[unsafe(method(changeModel:))]
         fn change_model(&self, sender: *mut AnyObject) {
             let path = popup_selected_rep(sender);
-            with_pending(|p| p.gemma_model = if path.is_empty() { None } else { Some(path) });
+            with_pending(|p| p.llm_model = if path.is_empty() { None } else { Some(path) });
         }
 
         #[unsafe(method(changeStreaming:))]
@@ -602,7 +602,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     // Cleanup model
     let model_popup = popup(mtm, &container, y, "Cleanup model");
-    let model_locked = std::env::var_os("GEMMA_MODEL_PATH").is_some();
+    let model_env = settings::llm_model_env();
+    let model_locked = model_env.is_some();
     let models = settings::discover_llm_models();
     if models.is_empty() {
         popup_add_item(
@@ -612,11 +613,11 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
             Some(""),
         );
     } else {
-        let default_gemma = crate::app_paths::gemma_default_path();
-        let effective = loaded.gemma_model.clone().unwrap_or_else(|| {
-            std::fs::canonicalize(&default_gemma)
+        let default_llm = crate::app_paths::llm_default_path();
+        let effective = loaded.llm_model.clone().unwrap_or_else(|| {
+            std::fs::canonicalize(&default_llm)
                 .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(default_gemma)
+                .unwrap_or(default_llm)
         });
         for choice in &models {
             let title = match &choice.hint {
@@ -631,8 +632,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     }
     wire_popup(&model_popup, &controller, sel!(changeModel:), model_locked);
     y += ROW_H;
-    if model_locked {
-        y = env_hint(mtm, &container, y, "GEMMA_MODEL_PATH");
+    if let Some((name, _)) = model_env {
+        y = env_hint(mtm, &container, y, name);
     }
 
     y = section(mtm, &container, y, "Experimental");

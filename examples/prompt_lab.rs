@@ -6,7 +6,7 @@
 //! ```bash
 //! cargo run --release --features cleaner --example prompt_lab
 //! # or point at a different model to compare:
-//! GEMMA_MODEL_PATH=models/llm/gemma-3-4b-it/gemma-3-4b-it-Q4_K_M.gguf \
+//! DICTATE_LLM_MODEL_PATH=models/llm/other-model/other-model.gguf \
 //!   cargo run --release --features cleaner --example prompt_lab
 //! ```
 //!
@@ -234,7 +234,7 @@ async fn main() -> eyre::Result<()> {
     let reps = lab.reps.unwrap_or(2).max(1);
 
     let gemma =
-        Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
+        Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path());
     eprintln!("[lab] model: {gemma}");
     let t = std::time::Instant::now();
     let engine = TextCleanupEngine::initialize(&gemma)?;

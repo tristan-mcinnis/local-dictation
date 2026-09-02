@@ -60,6 +60,17 @@ macOS may re-ask for Microphone + Accessibility; only the user can grant it.
   shell interpolation.
 - User data on disk (`~/.config/local-dictation/*.json`, `history.db`) keeps
   its format. Unknown keys are ignored by serde; never break an old file.
+  Renaming a key means a migration: read the old key when the new one is
+  missing, write the new key, keep the old read for one release. Current
+  one: `gemma_model` → `llm_model` (env `GEMMA_MODEL_PATH` →
+  `DICTATE_LLM_MODEL_PATH`, `S1_MODEL_PATH` stays an alias), 2026-09.
+- Names are model-neutral: the cleanup LLM is `llm_*` in code, keys, and
+  env vars, never the name of whichever model is loaded today.
+
+## Repo hygiene
+
+- `.memory/` is agent session notes (project context only, no secrets) and
+  is tracked in git on purpose; the owner can untrack it at any time.
 
 ## Privacy
 

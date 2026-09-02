@@ -100,8 +100,9 @@ Developer ID would make grants stick. When bundled, the daemon redirects stdout/
 - **Cohere Q4 checkpoint** (`cohere_mlx_default_dir`): `DICTATE_COHERE_MLX_MODEL_DIR` env >
   `<base>/dictation/cohere-mlx-q4`. Converted by `scripts/models/convert_superwhisper_cohere.py`
   from the locally installed Superwhisper checkpoint.
-- **S1-mini GGUF** (`gemma_default_path`, name is a retained compatibility alias): `S1_MODEL_PATH`
-  env > `GEMMA_MODEL_PATH` env > `settings.json` `gemma_model` > `<base>/llm/s1-mini/s1-mini.gguf`.
+- **S1-mini GGUF** (`llm_default_path`, resolved by `Settings::resolve_llm_model`):
+  `DICTATE_LLM_MODEL_PATH` env > `S1_MODEL_PATH` env (alias) > `GEMMA_MODEL_PATH` env (deprecated,
+  warns once) > `settings.json` `llm_model` > `<base>/llm/s1-mini/s1-mini.gguf`.
 - **Native helper** (`cohere_mlx_helper_path`): `DICTATE_COHERE_MLX_BRIDGE` env >
   `<bundle>/Resources/cohere-mlx-bridge` > `native/cohere-mlx/.build/xcode/Build/Products/Release/cohere-mlx-bridge`.
 
@@ -234,15 +235,18 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 (`app_paths::config_dir` / `config_file`), so every consumer (`settings.rs`, `prompts.rs`,
 `corrections.rs`, `history.rs`, `dictionary.rs`, the menu bar) shares the same location rather than
 re-joining the path:
-- `settings.json` (`settings.rs`) — written by the menu bar. Keys: `gemma_model`, `hotkey_keycode`,
+- `settings.json` (`settings.rs`) — written by the menu bar. Keys: `llm_model`, `hotkey_keycode`,
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
   `double_tap_latch`.
   `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
   `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
-  silently ignored by serde — an old settings file still parses. (`gemma_model` holds whatever
-  cleanup model is selected; the name is historical.)
+  silently ignored by serde — an old settings file still parses.
+  **`gemma_model` → `llm_model` migration (2026-09):** the cleanup-model key was renamed. `load`
+  still reads `gemma_model` when `llm_model` is absent (`llm_model` wins if both exist), folds it
+  into `llm_model`, and rewrites the file once with the new key; `save` never writes `gemma_model`.
+  The fallback read is kept for one release, then the legacy field is removed.
 - `prompts.json` (`prompts.rs`) — hand-edited `cleanup` + `transform` system prompts, plus a
   `formats` map of named output-shape presets. Four presets ship built-in
   (`numbered`/`bullets`/`email`/`code` in `DEFAULT_FORMATS`); a user's `formats` overlays them (same
@@ -272,7 +276,7 @@ stack:
 | `DICTATE_COHERE_MLX_MODEL_DIR` | Cohere Q4 MLX checkpoint directory |
 | `DICTATE_COHERE_MLX_BRIDGE` | Native MLX helper binary path |
 | `DICTATE_COHERE_LANG` | Decoder language hint (default `en`) |
-| `S1_MODEL_PATH` | S1-mini GGUF path (also `GEMMA_MODEL_PATH`, a compat alias) |
+| `DICTATE_LLM_MODEL_PATH` | Cleanup-LLM GGUF path. `S1_MODEL_PATH` is an accepted alias; `GEMMA_MODEL_PATH` is deprecated (still honoured, warns once). New name wins when several are set |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `hotkeys::DEFAULT_KEYCODE` = `0x3D` Right Option; decimal or `0x` hex) |
 | `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key) |
 | `DICTATE_DOUBLE_TAP_LATCH` | Double-tap the hotkey to latch hands-free (`0`/`false`/`off` disables) |

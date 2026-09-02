@@ -329,14 +329,14 @@ async fn run_bench(wav_path: &str) -> eyre::Result<()> {
     #[cfg(feature = "cleaner")]
     let final_text = {
         use fast_dictate_backend::cleaner::TextCleanupEngine;
-        let gemma_path = gemma_path();
+        let llm_path = llm_model_path();
         println!();
-        println!("[bench] gemma model: {gemma_path}");
+        println!("[bench] llm model: {llm_path}");
 
         let t_g_load = Instant::now();
-        let cleaner = TextCleanupEngine::initialize(&gemma_path)?;
+        let cleaner = TextCleanupEngine::initialize(&llm_path)?;
         println!(
-            "[bench] gemma loaded in {:?} (one-time cost)",
+            "[bench] llm loaded in {:?} (one-time cost)",
             t_g_load.elapsed()
         );
 
@@ -379,10 +379,10 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
     #[cfg(feature = "cleaner")]
     let cleaner = {
         use fast_dictate_backend::cleaner::TextCleanupEngine;
-        let gemma_path = gemma_path();
+        let llm_path = llm_model_path();
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&gemma_path)?;
-        println!("[dictate] gemma   loaded in {:?}", t.elapsed());
+        let c = TextCleanupEngine::initialize(&llm_path)?;
+        println!("[dictate] llm     loaded in {:?}", t.elapsed());
         c
     };
 
@@ -443,10 +443,10 @@ fn asr_config() -> fast_dictate_backend::transcriber::AsrConfig {
 }
 
 #[cfg(all(feature = "cleaner", feature = "cohere-mlx"))]
-fn gemma_path() -> String {
-    // Precedence: GEMMA_MODEL_PATH env > settings.json > bundle-aware default.
+fn llm_model_path() -> String {
+    // Precedence: DICTATE_LLM_MODEL_PATH env (or alias) > settings.json > bundle-aware default.
     use fast_dictate_backend::settings::Settings;
-    Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path())
+    Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path())
 }
 
 /// `transform "<instruction>" "<text>"` — run the warm-Gemma transform path on
@@ -462,11 +462,11 @@ async fn run_transform(instruction: Option<String>, text: Option<String>) -> eyr
             "usage: transform \"<instruction>\" \"<text to transform>\""
         ));
     };
-    let gemma =
-        Settings::load().resolve_gemma(&fast_dictate_backend::app_paths::gemma_default_path());
-    println!("[transform] gemma: {gemma}");
+    let llm =
+        Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path());
+    println!("[transform] llm: {llm}");
     let t = std::time::Instant::now();
-    let cleaner = TextCleanupEngine::initialize(&gemma)?;
+    let cleaner = TextCleanupEngine::initialize(&llm)?;
     println!("[transform] loaded in {:?}", t.elapsed());
 
     let t = std::time::Instant::now();
@@ -519,7 +519,7 @@ async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
     let config = DaemonConfig::from_env(
         asr_config(),
         #[cfg(feature = "cleaner")]
-        gemma_path(),
+        llm_model_path(),
         no_cleanup,
     );
     run_listen(config)
@@ -552,7 +552,7 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     let config = DaemonConfig::from_env(
         asr_config(),
         #[cfg(feature = "cleaner")]
-        gemma_path(),
+        llm_model_path(),
         no_cleanup,
     );
     run(config)

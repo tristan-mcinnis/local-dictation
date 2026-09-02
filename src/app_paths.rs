@@ -122,9 +122,9 @@ pub fn cohere_mlx_helper_path() -> String {
         .into_owned()
 }
 
-/// Default S1-mini cleanup model path.
-/// `gemma_*` is retained temporarily as a source-compatibility name.
-pub fn gemma_default_path() -> String {
+/// Default cleanup-LLM path (S1-mini GGUF). Overrides are resolved in
+/// `settings::Settings::resolve_llm_model`.
+pub fn llm_default_path() -> String {
     models_base_dir()
         .join("llm/s1-mini/s1-mini.gguf")
         .to_string_lossy()

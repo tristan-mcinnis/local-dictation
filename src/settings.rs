@@ -6,7 +6,7 @@
 //! script or exporting env vars.
 //!
 //! Precedence at resolve time is always **env var > settings file > built-in
-//! default**. That keeps the documented env knobs (`GEMMA_MODEL_PATH`,
+//! default**. That keeps the documented env knobs (`DICTATE_LLM_MODEL_PATH`,
 //! `DICTATE_HOTKEY_KEYCODE`) authoritative for power users / scripted
 //! launches: if one of those is set, the matching menu item is ignored.
 //!
@@ -42,10 +42,47 @@ pub fn hotkey_name(keycode: i64) -> String {
     crate::hotkeys::modifier_keycode_name(keycode)
 }
 
+/// Env var that pins the cleanup model path (wins over `settings.json`).
+pub const LLM_MODEL_PATH_ENV: &str = "DICTATE_LLM_MODEL_PATH";
+/// Still-accepted spellings of `LLM_MODEL_PATH_ENV`, checked in order after
+/// it. `S1_MODEL_PATH` is a documented alias (the model is S1-mini);
+/// `GEMMA_MODEL_PATH` is the pre-rename name and logs a one-time deprecation
+/// warning. Drop `GEMMA_MODEL_PATH` after one release.
+pub const LLM_MODEL_PATH_ENV_ALIASES: &[&str] = &["S1_MODEL_PATH", "GEMMA_MODEL_PATH"];
+
+/// The cleanup-model env override, if any: `(var name, value)`. New name wins;
+/// aliases are accepted; the deprecated `GEMMA_MODEL_PATH` warns once.
+pub fn llm_model_env() -> Option<(&'static str, String)> {
+    if let Ok(v) = std::env::var(LLM_MODEL_PATH_ENV) {
+        return Some((LLM_MODEL_PATH_ENV, v));
+    }
+    for &name in LLM_MODEL_PATH_ENV_ALIASES {
+        if let Ok(v) = std::env::var(name) {
+            if name == "GEMMA_MODEL_PATH" {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "[warn] GEMMA_MODEL_PATH is deprecated; set {LLM_MODEL_PATH_ENV} instead"
+                    )
+                });
+            }
+            return Some((name, v));
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     /// Absolute path to the cleanup model `.gguf`. `None` ⇒ use the default.
+    /// On-disk key `llm_model` (since 2026-09). The pre-rename key
+    /// `gemma_model` is still read as a fallback for one release and moved
+    /// here on load (see `migrate_legacy_keys`); it is never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_model: Option<String>,
+    /// Legacy spelling of `llm_model`. Read-only: `load_from` folds it into
+    /// `llm_model` and `save` drops it. Remove after one release.
+    #[serde(default, skip_serializing)]
     pub gemma_model: Option<String>,
     /// CGEvent keycode watched for push-to-talk. `None` ⇒ use the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -162,19 +199,49 @@ impl Settings {
         let Some(path) = Self::config_path() else {
             return Self::default();
         };
-        Self::load_from(&path)
+        let (settings, migrated) = Self::load_from_migrating(&path);
+        if migrated {
+            // One-time rewrite so the file carries the new key from now on.
+            match settings.save_to(&path) {
+                Ok(()) => eprintln!("[settings] migrated gemma_model -> llm_model in {}", path.display()),
+                Err(e) => eprintln!("[warn] settings migration not written ({}): {e}", path.display()),
+            }
+        }
+        settings
     }
 
     /// Load settings from an explicit path. Missing or corrupt files degrade to
-    /// defaults; this is the test entry point.
+    /// defaults; this is the test entry point. Legacy keys are folded into
+    /// their current names in memory (the file is not rewritten here).
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
+        Self::load_from_migrating(path).0
+    }
+
+    /// `load_from` plus a flag saying whether a legacy key was migrated (so the
+    /// caller can decide to rewrite the file).
+    fn load_from_migrating(path: &Path) -> (Self, bool) {
+        let mut settings: Self = match std::fs::read_to_string(path) {
             Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
                 eprintln!("[warn] settings parse failed ({}): {e}", path.display());
                 Self::default()
             }),
             Err(_) => Self::default(), // missing file is the common case
+        };
+        let migrated = settings.migrate_legacy_keys();
+        (settings, migrated)
+    }
+
+    /// Fold renamed keys into their current fields. Returns true when
+    /// something moved. Rule: the new key wins when both are present.
+    fn migrate_legacy_keys(&mut self) -> bool {
+        let mut migrated = false;
+        if let Some(legacy) = self.gemma_model.take() {
+            if self.llm_model.is_none() {
+                self.llm_model = Some(legacy);
+            }
+            migrated = true;
         }
+        migrated
     }
 
     /// Write settings to the config path, creating the parent directory.
@@ -195,16 +262,13 @@ impl Settings {
         Ok(())
     }
 
-    /// Resolve the cleanup model path: `GEMMA_MODEL_PATH` env > settings >
-    /// `default`.
-    pub fn resolve_gemma<'a>(&'a self, default: &'a str) -> String {
-        if let Ok(v) = std::env::var("S1_MODEL_PATH") {
+    /// Resolve the cleanup model path: env (`llm_model_env`) > settings
+    /// `llm_model` > `default`.
+    pub fn resolve_llm_model<'a>(&'a self, default: &'a str) -> String {
+        if let Some((_, v)) = llm_model_env() {
             return v;
         }
-        if let Ok(v) = std::env::var("GEMMA_MODEL_PATH") {
-            return v;
-        }
-        self.gemma_model
+        self.llm_model
             .clone()
             .unwrap_or_else(|| default.to_string())
     }
@@ -752,13 +816,13 @@ mod tests {
     }
 
     #[test]
-    fn gemma_falls_back_to_default_when_unset() {
-        if std::env::var_os("GEMMA_MODEL_PATH").is_none() {
+    fn llm_model_falls_back_to_default_when_unset() {
+        if llm_model_env().is_none() {
             let s = Settings::default();
-            assert_eq!(s.resolve_gemma("default.gguf"), "default.gguf");
+            assert_eq!(s.resolve_llm_model("default.gguf"), "default.gguf");
             let mut s2 = Settings::default();
-            s2.gemma_model = Some("chosen.gguf".to_string());
-            assert_eq!(s2.resolve_gemma("default.gguf"), "chosen.gguf");
+            s2.llm_model = Some("chosen.gguf".to_string());
+            assert_eq!(s2.resolve_llm_model("default.gguf"), "chosen.gguf");
         }
     }
 
@@ -885,11 +949,36 @@ mod tests {
         .unwrap();
 
         let mut expected = Settings::default();
-        expected.gemma_model = Some("/tmp/legacy.gguf".into());
+        // `gemma_model` is folded into `llm_model` on load.
+        expected.llm_model = Some("/tmp/legacy.gguf".into());
         expected.cohere_language = Some("ja".into());
         // Legacy-only keys are dropped (not preserved as noise); live fields
         // survive. Equality against `expected` proves this.
-        assert_eq!(Settings::load_from(&path), expected);
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded, expected);
+        assert!(loaded.gemma_model.is_none());
+        // A save writes the new key only.
+        loaded.save_to(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("\"llm_model\""), "{body}");
+        assert!(!body.contains("gemma_model"), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_model_key_wins_over_legacy_gemma_model() {
+        let dir = std::env::temp_dir().join(format!("fd-settings-llmwins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "llm_model": "/tmp/new.gguf", "gemma_model": "/tmp/old.gguf" }"#,
+        )
+        .unwrap();
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.llm_model.as_deref(), Some("/tmp/new.gguf"));
+        assert!(loaded.gemma_model.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

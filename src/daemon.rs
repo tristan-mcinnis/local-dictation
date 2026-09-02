@@ -213,7 +213,7 @@ pub struct DaemonConfig {
     /// Resolved fixed Cohere MLX ASR configuration.
     pub asr: crate::transcriber::AsrConfig,
     #[cfg(feature = "cleaner")]
-    pub gemma_path: String,
+    pub llm_model_path: String,
     /// If true, inject the raw ASR transcript without Gemma cleanup.
     /// Saves ~860 ms per utterance.
     pub no_cleanup: bool,
@@ -224,7 +224,7 @@ pub struct DaemonConfig {
 impl DaemonConfig {
     pub fn from_env(
         asr: crate::transcriber::AsrConfig,
-        #[cfg(feature = "cleaner")] gemma_path: String,
+        #[cfg(feature = "cleaner")] llm_model_path: String,
         no_cleanup: bool,
     ) -> Self {
         let hotkey_keycode =
@@ -232,7 +232,7 @@ impl DaemonConfig {
         Self {
             asr,
             #[cfg(feature = "cleaner")]
-            gemma_path,
+            llm_model_path,
             no_cleanup,
             hotkey_keycode,
         }
@@ -616,12 +616,12 @@ fn worker_loop(
 
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
-        let pretty = std::path::Path::new(&config.gemma_path)
+        let pretty = std::path::Path::new(&config.llm_model_path)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(&config.gemma_path);
+            .unwrap_or(&config.llm_model_path);
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&config.gemma_path)?;
+        let c = TextCleanupEngine::initialize(&config.llm_model_path)?;
         eprintln!(
             "[boot] cleaner     loaded in {:>4} ms · {pretty}",
             ms(t.elapsed())
@@ -1687,7 +1687,7 @@ fn worker_loop(
                 // is self-describing when comparing models.
                 #[cfg(feature = "cleaner")]
                 if cleaner.is_some() {
-                    let m = std::path::Path::new(&config.gemma_path)
+                    let m = std::path::Path::new(&config.llm_model_path)
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("?");
@@ -2093,7 +2093,7 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&config.gemma_path)?;
+        let c = TextCleanupEngine::initialize(&config.llm_model_path)?;
         eprintln!("[boot] cleaner     loaded in {:>4} ms", ms(t.elapsed()));
         Some(c)
     } else {

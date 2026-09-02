@@ -254,7 +254,7 @@ define_class!(
                 let s: &NSString = &*(obj as *const NSString);
                 s.to_string()
             };
-            write_settings_and_relaunch(move |set| set.gemma_model = Some(path));
+            write_settings_and_relaunch(move |set| set.llm_model = Some(path));
         }
 
         #[unsafe(method(selectHotkey:))]
