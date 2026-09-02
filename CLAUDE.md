@@ -54,6 +54,9 @@ macOS may re-ask for Microphone + Accessibility; only the user can grant it.
 - Constants: default hotkey is `hotkeys::DEFAULT_KEYCODE`; keycode names come
   from `hotkeys::modifier_keycode_name`. No scattered `0x3D`.
 - Process lookups by PID go through `injector::process_command_path`.
+- `daemon/` and `menubar/` are module directories (`mod.rs` + one file per
+  concern). Child files start with `use super::*;` and expose cross-file items
+  as `pub(super)`; only `mod.rs` re-exports the crate-public API.
 - Logging is `eprintln!` with a `[tag]` prefix to the daemon log. No logging
   crate.
 - Child processes use `std::process::Command` with argument arrays. No

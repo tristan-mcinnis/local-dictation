@@ -122,7 +122,7 @@ there are two very different loops, and only one needs a rebuild:
 2. **Changing code or built-in defaults** (`src/**`, the `DEFAULT_*` consts in `prompts.rs`).
    Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. Because the bundle is
    *ad-hoc* signed, a rebuild changes the signature hash and **macOS may revoke + re-prompt for
-   Accessibility/Microphone** — the daemon will exit at boot (`daemon.rs` permission check) until
+   Accessibility/Microphone** — the daemon will exit at boot (`daemon/mod.rs` permission check) until
    you re-grant it in System Settings → Privacy & Security. An agent cannot grant this; it requires
    the user. (A real Developer ID signature would make the grant stick across rebuilds.)
 
@@ -145,7 +145,7 @@ the real app. **Only three features exist** (plus `full`):
   The `transform` subcommand and Shift+PTT transform mode also live here.
 - **`ax-inject`** (`accessibility-sys`, `core-foundation`, `core-graphics`, `arboard`, `objc2*`) —
   real macOS Accessibility text injection, clipboard fallback, menu-bar status item, floating
-  wave pill, settings window. Gates `injector.rs`, `clipboard_paste.rs`, `menubar.rs`,
+  wave pill, settings window. Gates `injector.rs`, `clipboard_paste.rs`, `menubar/`,
   `settings_window.rs`, and the daemon.
 - **`full`** = `cohere-mlx` + `cleaner` + `ax-inject` — the one-user production stack. It is always
   what the shipped app builds with (`BUILD_FEATURES=${BUILD_FEATURES:-full}` in `build-app.sh`).
@@ -156,7 +156,7 @@ When adding code, gate it behind the right feature and keep the default (feature
 
 ## Pipeline data flow (the daemon path)
 
-`daemon.rs` owns a `CGEventTap` watching the hotkey modifier + a worker thread. On key release it
+`daemon/` owns a `CGEventTap` watching the hotkey modifier + a worker thread (`mod.rs` boot + event tap, `ptt.rs` the pure hold/latch state machine, `worker.rs` the capture → ASR → cleanup → inject thread, `listen.rs` the wake-word mode). On key release it
 drains audio and runs the pipeline:
 
 ```
@@ -218,7 +218,7 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
   (dropped a clause), the faithful deterministic result wins.
 
 `ui_channel.rs` carries worker→UI state (recording/processing, last dictation, audio levels) to
-`menubar.rs` (status item, waveform pill, history window, settings window). `history.rs` writes
+`menubar/` (`mod.rs` status item + menu actions, `pill.rs` waveform pill, `history.rs` history window, `dictionary.rs` dictionary editor) plus `settings_window.rs`. `history.rs` writes
 every injected dictation to SQLite at `~/.config/local-dictation/history.db`. `screen_context.rs`
 harvests proper nouns from the focused window and feeds them to
 `cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings.
