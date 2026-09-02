@@ -211,9 +211,7 @@ mod macos {
     }
 
     fn cache_directory() -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join("Library/Caches/Local Dictation/Sounds"))
+        crate::app_paths::cache_dir("Sounds")
     }
 
     fn matches_bytes(path: &Path, expected: &[u8]) -> bool {

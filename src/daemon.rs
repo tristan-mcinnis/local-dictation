@@ -47,11 +47,7 @@ fn secs(d: Duration) -> String {
 /// Look up an app name from a PID via `ps`. Falls back to the bare PID
 /// if the lookup fails. Used purely for log readability.
 fn app_name(pid: i32) -> String {
-    std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+    crate::injector::process_command_path(pid)
         .map(|s| {
             // `/path/to/Visual Studio Code.app/Contents/MacOS/Code` →
             // `Visual Studio Code`
@@ -71,10 +67,6 @@ fn app_name(pid: i32) -> String {
 
 #[cfg(feature = "cleaner")]
 use crate::cleaner::TextCleanupEngine;
-
-// Right Option key — kVK_RightOption from Carbon Events.h.
-// Default. Override at startup by setting DICTATE_HOTKEY_KEYCODE.
-const DEFAULT_HOTKEY_KEYCODE: i64 = 0x3D;
 
 /// How many screen-harvested proper nouns to feed the cleanup prompt. Kept small
 /// on purpose: measurement (examples/latency_lab) showed the accuracy win is
@@ -236,7 +228,7 @@ impl DaemonConfig {
         no_cleanup: bool,
     ) -> Self {
         let hotkey_keycode =
-            crate::settings::Settings::load().resolve_hotkey(DEFAULT_HOTKEY_KEYCODE);
+            crate::settings::Settings::load().resolve_hotkey(crate::hotkeys::DEFAULT_KEYCODE);
         Self {
             asr,
             #[cfg(feature = "cleaner")]

@@ -196,7 +196,7 @@ fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
 /// Open the daemon log in the user's default text editor / Console.app.
 /// Same path the menu-bar "Open Log" item uses.
 fn run_logs() -> eyre::Result<()> {
-    let log_path = "/tmp/dictate-daemon.log";
+    let log_path = fast_dictate_backend::app_paths::DAEMON_LOG_PATH;
     if !std::path::Path::new(log_path).exists() {
         eprintln!("[logs] {log_path} doesn't exist yet — start the daemon first with `daemon`.");
         return Ok(());
@@ -496,7 +496,7 @@ fn redirect_stdio_to_log_if_bundled() {
     if let Ok(f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/dictate-daemon.log")
+        .open(fast_dictate_backend::app_paths::DAEMON_LOG_PATH)
     {
         unsafe {
             libc::dup2(f.as_raw_fd(), 1);

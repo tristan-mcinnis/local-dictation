@@ -61,7 +61,7 @@ pub const DEFAULT_TRANSFORM: &str =
 /// "Output format" submenu). When one is active it REPLACES the cleanup prompt
 /// for normal dictation. A user's `prompts.json` `formats` map is overlaid on
 /// top of these (same key overrides; new keys add), so these are sensible
-/// defaults rather than a locked set. Tuned against Gemma 3 1B in
+/// defaults rather than a locked set. Tuned in
 /// `prompts-lab/` — see that directory's README for the methodology.
 pub const DEFAULT_FORMATS: &[(&str, &str)] = &[
     (

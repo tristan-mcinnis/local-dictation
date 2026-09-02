@@ -48,7 +48,7 @@ use std::sync::{Mutex, OnceLock};
 use crate::settings::{self, Settings};
 use crate::ui_channel::{self, UiState};
 
-const LOG_PATH: &str = "/tmp/dictate-daemon.log";
+use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
 // Pill geometry — deliberately smaller and lower-profile than the
 // Wispr Flow / Superwhisper pills the layout was originally modelled on.
@@ -517,7 +517,7 @@ struct StatusItemBuild {
 /// it never drifts. Backs the menu's "Voice Commands & Shortcuts…" item.
 pub(crate) fn write_and_open_commands_reference() {
     let s = Settings::load();
-    let hotkey = settings::hotkey_name(s.hotkey_keycode.unwrap_or(0x3D));
+    let hotkey = settings::hotkey_name(s.hotkey_keycode.unwrap_or(crate::hotkeys::DEFAULT_KEYCODE));
 
     let mut body = String::new();
     body.push_str("Local Dictation — Voice Commands & Settings\n");
@@ -999,7 +999,7 @@ fn build_hotkey_submenu(
     submenu.setAutoenablesItems(false);
 
     let env_locked = std::env::var_os("DICTATE_HOTKEY_KEYCODE").is_some();
-    let active = settings.hotkey_keycode.unwrap_or(0x3D); // default Right Option
+    let active = settings.hotkey_keycode.unwrap_or(crate::hotkeys::DEFAULT_KEYCODE);
 
     for (label, code) in settings::HOTKEY_CHOICES {
         let item = unsafe {
@@ -1128,7 +1128,7 @@ fn copy_to_clipboard(text: &str) {
 }
 
 pub(crate) fn export_log_to_downloads() {
-    let Some(home) = std::env::var_os("HOME") else {
+    let Some(home) = crate::app_paths::home_dir() else {
         return;
     };
     if !std::path::Path::new(LOG_PATH).exists() {
@@ -1138,7 +1138,7 @@ pub(crate) fn export_log_to_downloads() {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let dest = PathBuf::from(home)
+    let dest = home
         .join("Downloads")
         .join(format!("dictate-log-{ts}.txt"));
     if std::fs::copy(LOG_PATH, &dest).is_ok() {

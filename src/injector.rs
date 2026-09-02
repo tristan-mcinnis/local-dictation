@@ -73,6 +73,17 @@ fn is_ax_blind(pid: i32) -> bool {
 ///      err=0 on set_selected_text yet nothing renders.
 static CLIPBOARD_ONLY_CACHE: Mutex<Vec<(i32, bool, bool)>> = Mutex::new(Vec::new());
 
+/// Executable path of a running process (`ps -o comm=`), untrimmed. `None`
+/// when `ps` fails or the PID is gone. Shared by the injector's app
+/// classifier and the daemon's log labelling so there is one spawn site.
+pub fn process_command_path(pid: i32) -> Option<String> {
+    std::process::Command::new("ps")
+        .args(["-o", "comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
 /// Classify a PID by its executable name into `(is_electron, is_terminal)`.
 /// Both flags route to clipboard paste; `is_terminal` additionally lets the
 /// daemon skip prose cleanup (you almost never want Gemma rewriting a shell
@@ -85,11 +96,8 @@ fn classify_pid(pid: i32) -> (bool, bool) {
             }
         }
     }
-    let comm = std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+    let comm = process_command_path(pid)
+        .map(|s| s.to_lowercase())
         .unwrap_or_default();
     let is_electron = comm.contains("/electron")
         || comm.contains("visual studio code")

@@ -36,12 +36,16 @@ pub fn modifier_names() -> &'static [(&'static str, u64)] {
     ]
 }
 
+/// The built-in push-to-talk key: Right Option (`kVK_RightOption`). Every
+/// consumer that needs "the default hotkey" reads this one constant.
+pub const DEFAULT_KEYCODE: i64 = 0x3D;
+
 /// The keycodes that are themselves a modifier key (any side). A hotkey built
 /// on one of these is detected by the daemon via `FlagsChanged`, not `KeyDown`.
 /// Right-side codes first, then their left counterparts.
 const MODIFIER_KEYCODES: [i64; 8] = [
-    0x3D, // Right Option
-    0x36, // Right Command
+    DEFAULT_KEYCODE, // Right Option
+    0x36,            // Right Command
     0x3E, // Right Control
     0x3C, // Right Shift
     0x3A, // Option
@@ -72,7 +76,7 @@ impl Hotkey {
     pub fn from_settings() -> Hotkey {
         let settings = crate::settings::Settings::load();
         Hotkey {
-            keycode: settings.resolve_hotkey(0x3D),
+            keycode: settings.resolve_hotkey(DEFAULT_KEYCODE),
             modifiers: settings.resolve_hotkey_modifiers(),
         }
     }
@@ -159,7 +163,7 @@ impl Hotkey {
 
 /// Map a modifier keycode to its human name (used for `display` of a
 /// modifier-only hotkey). Unknown codes fall back to `key 0x{keycode:x}`.
-fn modifier_keycode_name(keycode: i64) -> String {
+pub fn modifier_keycode_name(keycode: i64) -> String {
     match keycode {
         0x3D => "Right Option".into(),
         0x36 => "Right Command".into(),

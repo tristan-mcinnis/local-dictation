@@ -34,10 +34,25 @@ pub fn running_in_bundle() -> bool {
     bundle_resources_dir().is_some()
 }
 
+/// The daemon's structured log. A bundled app redirects stdout/stderr here
+/// (no terminal to print to); the menu bar, the settings window and the
+/// `logs` subcommand all open this same file.
+pub const DAEMON_LOG_PATH: &str = "/tmp/dictate-daemon.log";
+
+/// `$HOME` as a path (None when unset). Every per-user location below is
+/// derived from this one accessor rather than re-reading the env var.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
 /// `~/Library/Application Support/Local Dictation` (None if `$HOME` is unset).
 pub fn app_support_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/Local Dictation"))
+    Some(home_dir()?.join("Library/Application Support/Local Dictation"))
+}
+
+/// `~/Library/Caches/Local Dictation/<sub>` (None if `$HOME` is unset).
+pub fn cache_dir(sub: &str) -> Option<PathBuf> {
+    Some(home_dir()?.join("Library/Caches/Local Dictation").join(sub))
 }
 
 /// `~/.config/local-dictation` — the single user-config directory shared by
@@ -46,8 +61,7 @@ pub fn app_support_dir() -> Option<PathBuf> {
 /// location is defined; every module resolves through it rather than
 /// re-joining the path itself (see CLAUDE.md "Config & precedence").
 pub fn config_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".config").join("local-dictation"))
+    Some(home_dir()?.join(".config").join("local-dictation"))
 }
 
 /// A named file inside [`config_dir`], e.g. `config_file("settings.json")`.

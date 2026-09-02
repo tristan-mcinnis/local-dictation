@@ -31,7 +31,7 @@ use crate::settings::{self, Settings};
 
 use std::sync::{Mutex, OnceLock};
 
-const LOG_PATH: &str = "/tmp/dictate-daemon.log";
+use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
 // Window + layout geometry. The window is fixed-size (manual layout); the form
 // scrolls if a section grows past the visible height.

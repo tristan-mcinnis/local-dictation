@@ -6,8 +6,9 @@ Transcribe Q4 in native MLX, then S1-mini for guarded cleanup.
 
 Built for how people actually dictate now: into an AI chat, a Slack thread, a message box. The text drops in at the cursor, so you talk, press Enter, and it sends. The whole point is speed, so the cleanup model only runs when your speech is actually messy. Clear speech goes straight through.
 
-This branch is intentionally software-of-one. It has no model picker, cloud
-providers, account, subscription, or runtime telemetry.
+This branch is intentionally software-of-one. The speech model is fixed (only
+the cleanup model is selectable), and there are no cloud providers, account,
+subscription, or runtime telemetry.
 
 ![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)
 ![Platform: macOS · Apple Silicon](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Apple%20Silicon-black)
@@ -34,7 +35,7 @@ providers, account, subscription, or runtime telemetry.
 8. **Transform selected text by voice.** Select a passage, hold Shift plus the key, speak an instruction ("make this concise", "translate to Spanish"), and it rewrites in place.
 9. **Output formats.** Numbered, bullets, email, and code presets reshape a dictation when you want structure. Off by default, picked from the menu bar.
 
-Also included: always-on pre-roll mic so the first word is never clipped, a live waveform pill at the cursor, a menu-bar app with searchable history, a control socket so Shortcuts / Raycast / a foot pedal can trigger it, and editable system prompts in plain JSON.
+Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first word is never clipped, release tail-capture and a warm mic window on by default, a live waveform pill at the cursor, a menu-bar app with searchable history, a control socket so Shortcuts / Raycast / a foot pedal can trigger it, and editable system prompts in plain JSON.
 
 ## Install
 
@@ -114,7 +115,7 @@ For hands-free, hold Right Option and tap **Space** (a short pop confirms), let 
 
 To edit existing text, select it, hold **Shift plus Right Option**, speak an instruction, and release.
 
-The menu-bar app holds the model, hotkey, output-format, and cleanup pickers, the personal dictionary, dictation history, and prompt and log tools.
+The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, the personal dictionary, dictation history, and prompt and log tools.
 
 ## Performance
 
@@ -160,7 +161,8 @@ If you want zero setup and a maintained app, the others win. If you want the low
 
 ## Configuration
 
-User config lives in `~/.config/local-dictation/`. The menu bar writes `settings.json` (model, hotkey, cleanup, output format). Hand-edit `prompts.json` for the cleanup and transform prompts, and `corrections.json` for the dictionary. Env vars win over files. Common ones:
+User config lives in `~/.config/local-dictation/`. The menu bar writes `settings.json` (model, hotkey, cleanup, output format). Hand-edit `prompts.json` for the cleanup and transform prompts, and `corrections.json` for the dictionary. Env vars win over files. Common ones
+(the full list is in `docs/architecture.md`):
 
 | Var | Effect |
 | --- | --- |

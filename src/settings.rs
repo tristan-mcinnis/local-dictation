@@ -26,12 +26,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Built-in default cleanup model, relative to the project tree. Shared by
-/// the CLI resolver and the menu so "default" means the same thing in both.
-/// Qwen 2.5 1.5B is the recommended cleanup model (best quality-per-ms in the
-/// `examples/model_bakeoff.rs` lineup); the `GEMMA_*` names are historical.
-pub const DEFAULT_GEMMA_REL: &str = "models/llm/s1-mini/s1-mini.gguf";
-
 /// Push-to-talk hotkey options offered in the menu, as (label, keycode).
 /// Each must be a modifier key handled by `keycode_to_modifier_flag` in the
 /// daemon, so the press/release edge is detected correctly.
@@ -43,12 +37,9 @@ pub const HOTKEY_CHOICES: &[(&str, i64)] = &[
 ];
 
 /// Human-readable name for a hotkey keycode (falls back to the hex code).
+/// One naming table lives in `hotkeys`; this is a thin alias for menu code.
 pub fn hotkey_name(keycode: i64) -> String {
-    HOTKEY_CHOICES
-        .iter()
-        .find(|(_, code)| *code == keycode)
-        .map(|(name, _)| name.to_string())
-        .unwrap_or_else(|| format!("key 0x{keycode:x}"))
+    crate::hotkeys::modifier_keycode_name(keycode)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
