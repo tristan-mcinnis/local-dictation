@@ -87,7 +87,7 @@ executable before bundle lookup).
 The bundle is `dist/Local Dictation.app` — `LSUIElement` menu-bar agent (no Dock icon), ad-hoc
 signed, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
 (`com.tristanmcinnis.local-dictation`). Icon is rendered from an SF Symbol by
-`scripts/make-icon.swift`. Because it's a stable signed bundle, macOS attributes Microphone +
+`resources/AppIcon.icns` (rendered by design-system/icons/make-icon.py --glyph waveform). Because it's a stable signed bundle, macOS attributes Microphone +
 Accessibility to the app itself (granted once), instead of to whatever terminal launched it.
 Ad-hoc signing means a *rebuild* changes the signature hash and macOS may re-ask — a real
 Developer ID would make grants stick. When bundled, the daemon redirects stdout/stderr to

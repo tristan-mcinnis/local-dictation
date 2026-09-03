@@ -68,62 +68,59 @@ const BAR_GAP: f64 = 2.0;
 const BAR_MAX_H: f64 = 18.0;
 const BAR_MIN_H: f64 = 2.0;
 
-/// Shared monochrome palette — the same design language as the other personal
-/// menu-bar apps (sync-pill, rti). Strict greyscale; the only colour anywhere is
-/// a single muted status accent, used sparingly (sync-pill's "the only colour is
-/// the status dot" rule). Defined once here instead of scattering RGBA literals
-/// through the window builders.
+/// House palette (design-system/tokens.json via the generated `house_theme.rs`).
+/// The history / dictionary windows are pinned light, so they read `LIGHT`;
+/// the floating pill is a dark HUD, so it reads the `hud_*` tokens and the dark
+/// status colours. No RGBA literal lives outside the generated file.
+#[path = "house_theme.rs"]
+mod house_theme;
+
 #[allow(dead_code)] // the full palette is documented once; not every tier is consumed yet
 mod theme {
+    use super::house_theme::{DARK, LIGHT};
     use objc2::rc::Retained;
     use objc2_app_kit::NSColor;
 
-    fn rgba(r: f64, g: f64, b: f64, a: f64) -> Retained<NSColor> {
-        NSColor::colorWithCalibratedRed_green_blue_alpha(r, g, b, a)
-    }
-
     // Light surfaces (history / dictionary windows).
     pub fn panel() -> Retained<NSColor> {
-        rgba(0.969, 0.969, 0.973, 1.0)
-    } // #F7F7F8
+        LIGHT.surface.ns_color()
+    }
     pub fn card() -> Retained<NSColor> {
-        rgba(1.0, 1.0, 1.0, 1.0)
+        LIGHT.surface_raised.ns_color()
     }
     pub fn border() -> Retained<NSColor> {
-        rgba(0.851, 0.851, 0.871, 1.0)
+        LIGHT.stroke.ns_color()
     }
     pub fn text_primary() -> Retained<NSColor> {
-        rgba(0.067, 0.067, 0.078, 1.0)
+        LIGHT.text_primary.ns_color()
     }
     pub fn text_secondary() -> Retained<NSColor> {
-        rgba(0.345, 0.345, 0.380, 1.0)
+        LIGHT.text_secondary.ns_color()
     }
     pub fn text_tertiary() -> Retained<NSColor> {
-        rgba(0.480, 0.480, 0.510, 1.0)
+        LIGHT.text_tertiary.ns_color()
     }
 
-    // The floating recording pill stays a dark HUD (legible over any app), but in
-    // the family's refined charcoal rather than the old near-black + grey ring.
+    // The floating recording pill is a dark HUD, legible over any app.
     pub fn pill_bg() -> Retained<NSColor> {
-        rgba(0.071, 0.071, 0.078, 0.95)
-    } // ~#121214
-    pub fn pill_border() -> Retained<NSColor> {
-        rgba(1.0, 1.0, 1.0, 0.10)
-    } // hairline
-    /// Live-recording waveform: clean off-white.
-    pub fn bar_active() -> Retained<NSColor> {
-        rgba(0.95, 0.95, 0.97, 1.0)
+        LIGHT.hud_fill.ns_color()
     }
-    /// Processing ("thinking") waveform: the family's muted busy-grey, so the two
-    /// states finally read differently without introducing a new colour.
+    pub fn pill_border() -> Retained<NSColor> {
+        LIGHT.hud_stroke.ns_color()
+    }
+    /// Live-recording waveform: HUD ink.
+    pub fn bar_active() -> Retained<NSColor> {
+        LIGHT.hud_text.ns_color()
+    }
+    /// Processing ("thinking") waveform: muted, so the two states read differently.
     pub fn bar_busy() -> Retained<NSColor> {
-        rgba(0.55, 0.58, 0.62, 1.0)
+        LIGHT.hud_muted.ns_color()
     }
     pub fn bar_success() -> Retained<NSColor> {
-        rgba(0.43, 0.78, 0.56, 1.0)
+        DARK.success.ns_color()
     }
     pub fn bar_error() -> Retained<NSColor> {
-        rgba(0.95, 0.42, 0.40, 1.0)
+        DARK.danger.ns_color()
     }
 }
 

@@ -98,7 +98,7 @@ references it.
 | `tests/verification.rs` | **KEEP / update** | Preserve integration checks for config, capture/injection, corrections, and the fixed model pipeline; remove alternate backend cases. |
 | `scripts/build-app.sh` | **KEEP / rewrite** | Keep packaging, icon, signing, install, and login item. Replace `BUILD_FEATURES=full` and old model bundle constants with Cohere MLX + S1-mini. |
 | `scripts/reload-daemon.sh` | **KEEP** | Fast config/prompt/corrections iteration; update comments if settings become hot-reloadable or fixed-stack. |
-| `scripts/make-icon.swift` | **KEEP** | Packaging-only. |
+| `scripts/make-icon.swift` | **REMOVED 2026-09-03** | Replaced by `resources/AppIcon.icns` from the design-system repo. |
 | `scripts/download-models.sh` | **REWRITE** | Current default is Parakeet + Qwen (`lines 5–11`). Make it an explicit Cohere/S1 setup script or remove it if models are already installed locally. |
 | `scripts/gen-streaming-corpus.sh`, `scripts/gen-vad-corpus.sh` | **DEFER / remove after experiments** | Keep only while the corresponding latency/segmentation decision is open. They are not product dependencies. |
 | `install.sh` | **KEEP / update** | Keep one-shot installation, but remove stale default model download assumptions. |

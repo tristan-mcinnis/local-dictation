@@ -130,17 +130,8 @@ cat > "$CONTENTS/Info.plist" <<PLIST
 PLIST
 
 # ── 4. icon ──────────────────────────────────────────────────────────────────
-echo "• rendering icon…"
-ICON_PNG="$(mktemp -t ld-icon).png"
-swift "$REPO_ROOT/scripts/make-icon.swift" "$ICON_PNG" >/dev/null
-ICONSET="$(mktemp -d -t ld-iconset).iconset"
-mkdir -p "$ICONSET"
-for size in 16 32 128 256 512; do
-  sips -z "$size" "$size"               "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}.png"      >/dev/null
-  sips -z "$((size*2))" "$((size*2))"   "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}@2x.png"   >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$RES_DIR/Icon.icns"
-rm -rf "$ICONSET" "$ICON_PNG"
+# Rendered by design-system/icons/make-icon.py --glyph waveform (house icon rule).
+cp "$REPO_ROOT/resources/AppIcon.icns" "$RES_DIR/Icon.icns"
 
 # ── 5. models ────────────────────────────────────────────────────────────────
 if [ "$BUNDLE_MODELS" -eq 1 ]; then
