@@ -468,13 +468,15 @@ fn modifiers_from_mask(mask: u64) -> CGEventFlags {
     f
 }
 
-/// The VAD config for the push-to-talk path: whisper mode uses a lower speech
-/// threshold so quiet dictation is captured.
+/// The VAD config for the push-to-talk streaming path: whisper mode uses a
+/// lower speech threshold so quiet dictation is captured, and every mode uses
+/// the longer streaming pause so hesitations inside a clause do not become
+/// separate, separately-punctuated ASR requests.
 fn vad_config(whisper: bool) -> crate::vad::VadConfig {
     if whisper {
-        crate::vad::VadConfig::whisper()
+        crate::vad::VadConfig::whisper().streaming()
     } else {
-        crate::vad::VadConfig::default()
+        crate::vad::VadConfig::default().streaming()
     }
 }
 

@@ -48,6 +48,24 @@ impl VadConfig {
             ..Self::default()
         }
     }
+
+    /// Pause length that closes a segment on the streaming path, where every
+    /// segment becomes its own ASR request. The ASR punctuates each request as
+    /// a standalone utterance, so a boundary inside a clause surfaces as a
+    /// spurious ". Capital" in the injected text. 400 ms (the batch default,
+    /// tuned on synthetic audio) is shorter than an ordinary mid-sentence
+    /// breath or think pause; live dictations on 2026-09-03 split at "at the
+    /// bottom of | Of RTI" and "in 2020 | Six". 900 ms only delays when a
+    /// chunk is transcribed — it never changes what is heard.
+    pub const STREAMING_MIN_PAUSE_MS: f32 = 900.0;
+
+    /// The same thresholds, with the streaming pause length.
+    pub fn streaming(self) -> Self {
+        Self {
+            min_pause_ms: Self::STREAMING_MIN_PAUSE_MS,
+            ..self
+        }
+    }
 }
 
 /// Split `audio` (mono f32 at `sr` Hz) into speech segments as inclusive-start /
@@ -245,6 +263,21 @@ mod tests {
         assert_eq!(w.frame_ms, d.frame_ms);
         assert_eq!(w.min_pause_ms, d.min_pause_ms);
         assert_eq!(w.pad_ms, d.pad_ms);
+    }
+
+    #[test]
+    fn streaming_config_lengthens_only_the_pause() {
+        let d = VadConfig::default();
+        let s = VadConfig::default().streaming();
+        assert!(s.min_pause_ms > d.min_pause_ms);
+        assert_eq!(s.min_pause_ms, VadConfig::STREAMING_MIN_PAUSE_MS);
+        assert_eq!(s.frame_ms, d.frame_ms);
+        assert_eq!(s.peak_frac, d.peak_frac);
+        assert_eq!(s.pad_ms, d.pad_ms);
+        // Whisper keeps its lower threshold through the streaming override.
+        let w = VadConfig::whisper().streaming();
+        assert_eq!(w.peak_frac, VadConfig::whisper().peak_frac);
+        assert_eq!(w.min_pause_ms, VadConfig::STREAMING_MIN_PAUSE_MS);
     }
 
     #[test]
