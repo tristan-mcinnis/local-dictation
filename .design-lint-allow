@@ -1,0 +1,6 @@
+# design-lint exceptions for Local Dictation. Currently none.
+#
+# src/menubar/slate.rs is the drawing factory: it calls systemFontOfSize_weight,
+# setCornerRadius and the colour constructors with values read from
+# house_theme.rs, never with literals, so the lint passes it as written. If a
+# literal ever appears there it is drift, not an exception. Keep this file.
