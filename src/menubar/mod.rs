@@ -24,26 +24,34 @@
 mod dictionary;
 mod history;
 mod pill;
+mod render_ui;
+pub(crate) mod slate;
 use dictionary::*;
 use history::*;
 use pill::*;
+pub use render_ui::render_ui;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSApplication, NSApplicationActivationPolicy,
-    NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSEvent,
-    NSFont, NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSScreen, NSScrollView, NSSearchField,
-    NSStatusBar, NSStatusItem, NSTextAlignment, NSTextField, NSTextView, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath,
+    NSBitmapImageFileType, NSBitmapImageRep, NSButton, NSColor, NSControl, NSControlStateValueOff,
+    NSControlStateValueOn, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+    NSGraphicsContext, NSImage, NSImageSymbolConfiguration, NSImageView, NSKernAttributeName, NSLineBreakMode, NSMenu,
+    NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSShadow, NSStatusBar, NSStatusItem,
+    NSTextAlignment, NSTextField, NSTextView, NSTrackingArea, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
+    NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::{
     kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
     CFRunLoopTimerContext,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSObject, NSPoint, NSRect, NSSize, NSString,
+    MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSMutableAttributedString, NSNumber,
+    NSObject, NSPoint, NSRange, NSRect, NSSize, NSString,
 };
 
 use crate::history::Entry;
@@ -57,83 +65,126 @@ use crate::ui_channel::{self, UiState};
 
 use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
-// Pill geometry — deliberately smaller and lower-profile than the
-// Wispr Flow / Superwhisper pills the layout was originally modelled on.
-const PILL_W: f64 = 96.0;
-const PILL_EXPANDED_W: f64 = 256.0;
-const PILL_H: f64 = 34.0;
+// ─── Slate geometry ──────────────────────────────────────────────────────
+//
+// Every number here is either a house token or a value derived from one. The
+// pill is `CONTROL_PILL` high at `RADIUS_PILL`, and its waveform sits in a
+// sunken well; the bar block width falls out of the bar count, width and gap.
+
+/// House palette (design-system/tokens.json via the generated `house_theme.rs`).
+/// Both appearances live in the file; `slate::palette()` picks one per draw and
+/// `theme::*` hands out dynamic colours for the parts AppKit draws itself. No
+/// RGBA literal lives outside the generated file.
+#[path = "house_theme.rs"]
+pub(crate) mod house_theme;
+
+use house_theme::{
+    CONTROL_CHIP, CONTROL_FOOTER, CONTROL_INPUT, CONTROL_KEYCAP, CONTROL_PILL, CONTROL_ROW, CONTROL_TILE, HAIRLINE, LAYOUT_PANEL_WIDTH, MOTION_HOVER, RADIUS_LG, RADIUS_MD, RADIUS_PILL,
+    RADIUS_ROW, RADIUS_SM, RADIUS_TILE, RADIUS_XL, RADIUS_XS, SHADOW_SELECTION, SPACE_LG, SPACE_MD,
+    SPACE_SM, SPACE_XS, SPACE_XXL, SPACE_XXS, TRACKING_SECTION, TYPE_BODY_SMALL, TYPE_CAPTION, TYPE_INPUT,
+    TYPE_KEY_CAP, TYPE_META, TYPE_SECTION, WEIGHT_MEDIUM, WEIGHT_REGULAR,
+    WEIGHT_SEMIBOLD,
+};
+
+/// The pill is `CONTROL_PILL` tall at `RADIUS_PILL`.
+const PILL_H: f64 = CONTROL_PILL;
+/// Horizontal padding between the pill's edge and the waveform well.
+const PILL_PAD: f64 = SPACE_XXS + 2.0;
+/// Padding between the pill edge and a text/dot run (the status states).
+const PILL_TEXT_PAD: f64 = SPACE_SM + 2.0;
+/// Gap between items on the hover shelf and in the status states.
+const PILL_GAP: f64 = SPACE_XS + 2.0;
+/// The sunken well the waveform sits in.
+const WELL_H: f64 = CONTROL_TILE - 2.0;
+const WELL_PAD: f64 = SPACE_XS + 2.0;
+const WELL_RADIUS: f64 = RADIUS_LG;
+
 const BAR_COUNT: usize = 14;
 const BAR_W: f64 = 3.0;
 const BAR_GAP: f64 = 2.0;
-const BAR_MAX_H: f64 = 18.0;
+/// Tallest bar. The well is `WELL_H` high, so the peak sits just inside it.
+const BAR_MAX_H: f64 = 14.0;
 const BAR_MIN_H: f64 = 2.0;
 
-/// House palette (design-system/tokens.json via the generated `house_theme.rs`).
-/// The history / dictionary windows are pinned light, so they read `LIGHT`;
-/// the floating pill is a dark HUD, so it reads the `hud_*` tokens and the dark
-/// status colours. No RGBA literal lives outside the generated file.
-#[path = "house_theme.rs"]
-mod house_theme;
+/// Compact pill width: two paddings, the well, and the bar block inside it.
+const PILL_W: f64 = 2.0 * PILL_PAD + 2.0 * WELL_PAD + BAR_BLOCK_W;
+const BAR_BLOCK_W: f64 = BAR_COUNT as f64 * BAR_W + (BAR_COUNT as f64 - 1.0) * BAR_GAP;
 
-#[allow(dead_code)] // the full palette is documented once; not every tier is consumed yet
-mod theme {
+/// Dynamic colours for the parts AppKit paints for us (text fields, popup
+/// titles, placeholders). Each one re-resolves per appearance, so a window
+/// never has to be rebuilt when the user switches light/dark.
+#[allow(dead_code)] // the full palette is named once; not every tier is consumed yet
+pub(crate) mod theme {
     use super::house_theme::{DARK, LIGHT};
+    use super::slate::dyn_color;
     use objc2::rc::Retained;
     use objc2_app_kit::NSColor;
 
-    // Light surfaces (history / dictionary windows).
-    pub fn panel() -> Retained<NSColor> {
-        LIGHT.surface.ns_color()
-    }
-    pub fn card() -> Retained<NSColor> {
-        LIGHT.surface_raised.ns_color()
-    }
-    pub fn border() -> Retained<NSColor> {
-        LIGHT.stroke.ns_color()
-    }
-    pub fn text_primary() -> Retained<NSColor> {
-        LIGHT.text_primary.ns_color()
-    }
-    pub fn text_secondary() -> Retained<NSColor> {
-        LIGHT.text_secondary.ns_color()
-    }
-    pub fn text_tertiary() -> Retained<NSColor> {
-        LIGHT.text_tertiary.ns_color()
+    macro_rules! token {
+        ($($fn_name:ident),* $(,)?) => {
+            $(
+                pub fn $fn_name() -> Retained<NSColor> {
+                    dyn_color(
+                        concat!("ld.", stringify!($fn_name)),
+                        LIGHT.$fn_name,
+                        DARK.$fn_name,
+                    )
+                }
+            )*
+        };
     }
 
-    // The floating recording pill is a dark HUD, legible over any app.
-    pub fn pill_bg() -> Retained<NSColor> {
-        LIGHT.hud_fill.ns_color()
-    }
-    pub fn pill_border() -> Retained<NSColor> {
-        LIGHT.hud_stroke.ns_color()
-    }
-    /// Live-recording waveform: HUD ink.
-    pub fn bar_active() -> Retained<NSColor> {
-        LIGHT.hud_text.ns_color()
-    }
-    /// Processing ("thinking") waveform: muted, so the two states read differently.
-    pub fn bar_busy() -> Retained<NSColor> {
-        LIGHT.hud_muted.ns_color()
-    }
-    pub fn bar_success() -> Retained<NSColor> {
-        DARK.success.ns_color()
-    }
-    pub fn bar_error() -> Retained<NSColor> {
-        DARK.danger.ns_color()
-    }
+    token!(
+        surface,
+        surface_raised,
+        surface_sunken,
+        surface_tint,
+        well,
+        tile_fill,
+        tile_stroke,
+        chip_fill,
+        text_primary,
+        text_secondary,
+        text_tertiary,
+        text_inverse,
+        accent,
+        accent_soft,
+        success,
+        warning,
+        danger,
+        stroke,
+        stroke_strong,
+        divider,
+        highlight_top,
+        selection_fill,
+        selection_ring,
+        hover_fill,
+        key_cap_fill,
+        key_cap_stroke,
+        panel_tint,
+    );
 }
 
-/// Pin a window to the light "Aqua" appearance and the family panel background,
-/// so the history / dictionary windows read as the same light monochrome surface
-/// as sync-pill regardless of the system's light/dark setting (the system
-/// semantic text colours then resolve to their dark-on-light variants).
-pub(crate) fn apply_light_chrome(window: &NSWindow) {
-    let name = NSString::from_str("NSAppearanceNameAqua");
-    if let Some(aqua) = NSAppearance::appearanceNamed(&name) {
-        window.setAppearance(Some(&aqua));
+// ─── Appearance ──────────────────────────────────────────────────────────
+
+/// Apply the user's Appearance setting to the whole application. Every window
+/// inherits it, so nothing is pinned to Aqua any more and Dark is the default.
+pub(crate) fn apply_app_appearance(mtm: MainThreadMarker, choice: &str) {
+    let app = NSApplication::sharedApplication(mtm);
+    let name = match choice {
+        "light" => Some(unsafe { NSAppearanceNameAqua }),
+        "dark" => Some(unsafe { NSAppearanceNameDarkAqua }),
+        // "system" — clear the override and follow the system setting.
+        _ => None,
+    };
+    match name {
+        Some(n) => {
+            if let Some(a) = NSAppearance::appearanceNamed(n) {
+                app.setAppearance(Some(&a));
+            }
+        }
+        None => app.setAppearance(None),
     }
-    window.setBackgroundColor(Some(&theme::panel()));
 }
 
 // The worker→UI state (current `UiState`, last dictation, audio levels) lives
@@ -142,11 +193,7 @@ pub(crate) fn apply_light_chrome(window: &NSWindow) {
 struct UiGlobals {
     status_item: Retained<NSStatusItem>,
     pill_window: Retained<NSWindow>,
-    bars: Vec<Retained<NSView>>,
-    pill_content: Retained<NSView>,
-    pill_status: Retained<NSTextField>,
-    pill_cancel: Retained<NSButton>,
-    pill_settings: Retained<NSButton>,
+    pill: PillBuild,
     /// 0 = compact, 1 = expanded. The timer eases this value so hover can be
     /// interrupted without a second animation system or a bounce.
     pill_expanded: Mutex<f64>,
@@ -156,8 +203,10 @@ struct UiGlobals {
     /// slowly toward the new RMS sample — gives the snappy bouncing
     /// feel of real audio meters.
     displayed_heights: Mutex<Vec<f64>>,
-    /// Pre-built SF Symbol images for the three states. Swapped onto the
-    /// status item's button when the state changes.
+    /// The waveform glyph, in the three menu-bar treatments the rule allows:
+    /// template ink when idle, `danger`-tinted while recording, and the same
+    /// template at 40 % while the pipeline works. One glyph family, so the
+    /// status item and the app icon read as one app.
     icon_idle: Option<Retained<NSImage>>,
     icon_recording: Option<Retained<NSImage>>,
     icon_processing: Option<Retained<NSImage>>,
@@ -429,18 +478,17 @@ pub fn init_and_run() -> eyre::Result<()> {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
     install_main_menu(mtm, &app);
 
+    // Dark is the default; the setting can pin Light or follow the system.
+    apply_app_appearance(mtm, &Settings::load().resolve_appearance());
+
     let actions = MenuActions::new();
     let built = build_status_item(mtm, &actions)?;
     let pill = build_pill_window(mtm, &actions)?;
 
     let globals = UiGlobals {
         status_item: built.status_item,
-        pill_window: pill.window,
-        bars: pill.bars,
-        pill_content: pill.content,
-        pill_status: pill.status,
-        pill_cancel: pill.cancel,
-        pill_settings: pill.settings,
+        pill_window: pill.window.clone(),
+        pill,
         pill_expanded: Mutex::new(0.0),
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
@@ -577,11 +625,13 @@ fn build_status_item(
         .button(mtm)
         .ok_or_else(|| eyre::eyre!("status item has no button"))?;
 
-    // Pre-build three SF Symbol images. setTemplate(true) makes them
-    // monochrome and follow the menu-bar tint (white on dark, black on
-    // light), matching every native macOS app.
-    let icon_idle = sf_symbol("mic");
-    let icon_recording = sf_symbol("mic.fill");
+    // One glyph family — the waveform, matching the app icon, so the icon and
+    // the status item read as one app. Idle and processing are the template
+    // image (it adopts the menu-bar tint); recording is the same shape drawn
+    // once in `danger`, the only chroma the rule allows on chrome.
+    let icon_idle = sf_symbol("waveform");
+    let icon_recording =
+        sf_symbol_tinted("waveform", &theme::danger()).or_else(|| sf_symbol("waveform"));
     let icon_processing = sf_symbol("waveform");
     if let Some(img) = &icon_idle {
         button.setImage(Some(img));

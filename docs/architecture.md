@@ -154,6 +154,41 @@ the real app. **Only three features exist** (plus `full`):
 When adding code, gate it behind the right feature and keep the default (featureless) build green so
 `cargo test` stays fast and dependency-free.
 
+## The house design (Slate)
+
+Every surface the app draws — the pill, the history panel, the dictionary editor, the settings
+shell — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
+`tokens.json`). The generated token file is vendored at `src/menubar/house_theme.rs`; it is
+generated, never hand-edited, and `make check` in `design-system` flags a stale copy. Nothing in
+the UI types a colour, a radius, a font size or a control height: `src/menubar/slate.rs` is the
+one drawing layer, and it reads only tokens. It gives the rest of the code a single painted
+`NSView` subclass (`SlateView`, which paints a panel, card, well, tile, chip, key cap, row,
+divider or status dot from its `Paint`), the ink waveform, the ink toggle (`NSSwitch` paints
+itself in the system accent and cannot be tinted, and the rule forbids chrome colour), and the
+composite builders — key caps, chips, icon tiles, section labels. `menubar::theme` exposes each
+token as a *dynamic* `NSColor` for the parts AppKit paints itself (text fields, popup titles),
+while `slate`'s `drawRect:` code resolves the palette from
+`NSAppearance::currentDrawingAppearance`. Between them, one view tree renders correctly in both
+appearances with no rebuild.
+
+Dark is the default and light is first-class. The old `apply_light_chrome`, which pinned the
+history and settings windows to `NSAppearanceNameAqua`, is gone; every window now follows the
+application appearance, which `menubar::apply_app_appearance` sets at boot from the new
+`appearance` setting (`system` / `light` / `dark`, default `dark`, env `DICTATE_APPEARANCE`) and
+again the moment the Settings popup changes — the one setting that applies live rather than on
+restart, because a look you cannot see until a restart is not a choice. The menu-bar glyph is the
+waveform in all three states, matching the app icon: template ink when idle, the same symbol
+tinted `danger` while recording, and the template at 40 % while the pipeline works.
+
+`fast-dictate-backend render-ui <dir>` snapshots the whole design offscreen. It builds the pill in
+each of its five layouts, the history panel with sample rows, the dictionary editor and the
+settings shell, draws each straight into a bitmap with `cacheDisplay(in:to:)` under both
+`NSAppearanceNameDarkAqua` and `NSAppearanceNameAqua`, writes PNGs and exits. No window is ever
+ordered on screen and the activation policy is `Prohibited`, so it never steals focus. A blur
+material renders nothing useful in a window that was never ordered in, so while the snapshot runs
+`slate::set_opaque_materials(true)` swaps the `NSVisualEffectView` for a plain container and
+paints `panel_tint` at full alpha instead; everything else draws exactly as it does on screen.
+
 ## Pipeline data flow (the daemon path)
 
 `daemon/` owns a `CGEventTap` watching the hotkey modifier + a worker thread (`mod.rs` boot + event tap, `ptt.rs` the pure hold/latch state machine, `worker.rs` the capture → ASR → cleanup → inject thread, `listen.rs` the wake-word mode). On key release it
@@ -239,7 +274,7 @@ re-joining the path:
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
-  `double_tap_latch`.
+  `double_tap_latch`, `appearance`.
   `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
   `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
   silently ignored by serde — an old settings file still parses.

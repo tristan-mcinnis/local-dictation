@@ -387,6 +387,7 @@ dependencies = [
  "accessibility-sys",
  "arboard",
  "base64",
+ "block2",
  "core-foundation",
  "core-graphics",
  "cpal",

@@ -180,7 +180,25 @@ pub struct Settings {
     /// enabled. Override: `DICTATE_DOUBLE_TAP_LATCH`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub double_tap_latch: Option<bool>,
+
+    /// Window appearance: `"system"`, `"light"`, or `"dark"`. `None` ⇒
+    /// [`DEFAULT_APPEARANCE`] (dark — the house design's default). Applied with
+    /// `NSApplication.setAppearance`, so every window follows it; nothing is
+    /// pinned to Aqua any more. Override: `DICTATE_APPEARANCE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appearance: Option<String>,
 }
+
+/// Appearance choices offered in the menu and the Settings window, as
+/// `(on-disk value, label)`.
+pub const APPEARANCE_CHOICES: &[(&str, &str)] = &[
+    ("dark", "Dark"),
+    ("light", "Light"),
+    ("system", "System"),
+];
+
+/// The house design is dark-first; light is first-class but not the default.
+pub const DEFAULT_APPEARANCE: &str = "dark";
 
 /// Default wake word for listen mode. Two distinct syllables, uncommon as a
 /// sentence opener, so false triggers in normal speech are rare.
@@ -485,6 +503,28 @@ impl Settings {
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "forever".to_string())
+    }
+
+    /// Resolve the window appearance: `DICTATE_APPEARANCE` env > settings >
+    /// [`DEFAULT_APPEARANCE`]. Anything unrecognised falls back to the default
+    /// rather than leaving the app in an undefined appearance.
+    pub fn resolve_appearance(&self) -> String {
+        let raw = std::env::var("DICTATE_APPEARANCE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                self.appearance
+                    .as_ref()
+                    .map(|v| v.trim().to_ascii_lowercase())
+                    .filter(|v| !v.is_empty())
+            });
+        match raw.as_deref() {
+            Some("light") => "light".to_string(),
+            Some("dark") => "dark".to_string(),
+            Some("system") | Some("auto") => "system".to_string(),
+            _ => DEFAULT_APPEARANCE.to_string(),
+        }
     }
 
     /// Resolve whisper mode: `DICTATE_WHISPER_MODE` env > settings > false.

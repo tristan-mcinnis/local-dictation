@@ -57,11 +57,14 @@ async fn main() -> eyre::Result<()> {
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
         "logs" => run_logs(),
+        // Offscreen design snapshot: build every window, draw it straight into
+        // a bitmap, write PNGs, exit. Nothing is ever ordered on screen.
+        "render-ui" => run_render_ui(args.get(2).cloned()),
         "transform" => {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
         )),
     }
 }
@@ -81,6 +84,29 @@ fn run_control(cmd: fast_dictate_backend::ipc::Command) -> eyre::Result<()> {
              Start it with `daemon` (or launch Local Dictation.app)."
         )),
     }
+}
+
+/// Snapshot every UI surface offscreen, in both appearances, for design review.
+/// Hidden from the user-facing help beyond the usage string: it exists so the
+/// design can be checked without putting a window in front of anyone.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+fn run_render_ui(out_dir: Option<String>) -> eyre::Result<()> {
+    let dir = out_dir
+        .or_else(|| std::env::var("DICTATE_RENDER_UI").ok())
+        .unwrap_or_else(|| "target/ui-render".to_string());
+    let written = fast_dictate_backend::menubar::render_ui(&dir)?;
+    for path in &written {
+        println!("[render-ui] {}", path.display());
+    }
+    println!("[render-ui] wrote {} files to {dir}", written.len());
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+fn run_render_ui(_out_dir: Option<String>) -> eyre::Result<()> {
+    Err(eyre::eyre!(
+        "render-ui needs the `ax-inject` feature on macOS"
+    ))
 }
 
 async fn run_mock_loop() -> eyre::Result<()> {

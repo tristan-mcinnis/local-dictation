@@ -1,11 +1,16 @@
-//! Native AppKit Settings window.
+//! Native AppKit Settings window — the house settings shell.
 //!
-//! A single scrollable window with grouped sections (Dictation, Output, Speech,
-//! Experimental, Files & Logs, About) built from the same AppKit primitives the
-//! Dictionary/History windows use — `NSScrollView` + a flipped `NSView`
-//! document, manual frame layout, system fonts/colours. No SwiftUI, no second
-//! binary: this is the "idiomatic AppKit in Rust" route (option C), giving the
-//! System-Settings feel using the exact frameworks SwiftUI wraps.
+//! `LAYOUT_SETTINGS_WIDTH` × `LAYOUT_SETTINGS_HEIGHT` (760 × 540): a
+//! `LAYOUT_SETTINGS_RAIL` (220) rail on `surface_sunken` carrying the app mark
+//! and six `CONTROL_RAILROW` rows, each with a 26 px icon tile; the selected
+//! row is a raised tile. The pane on the right has a `title` heading with a
+//! `meta` subtitle, groups as cards at `Radius.lg` with an uppercase `section`
+//! label and `CONTROL_ROW` rows, and a `CONTROL_FOOTER` well carrying the
+//! restart hint on the left and the primary key on the right.
+//!
+//! Controls follow the rule rather than the system: popups are chips, toggles
+//! are ink (`NSSwitch` paints itself in the system accent and offers no tint,
+//! so the house toggle is `slate::InkToggle`), and nothing is blue.
 //!
 //! Edit model: controls edit an in-memory `pending` copy of `Settings`; nothing
 //! is written until the user clicks **Apply & Restart**, which saves once and
@@ -15,60 +20,113 @@
 //! Closing without applying keeps the edits in-memory for the window's life but
 //! never writes them. Env-var locks (`DICTATE_*`) disable the matching control
 //! and show a footnote, mirroring the menu's "(locked by … env var)" notes.
+//!
+//! Appearance is the one setting that also applies live, because a preview you
+//! cannot see is not a preview.
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSControlStateValueOff,
-    NSControlStateValueOn, NSFont, NSPopUpButton, NSScrollView, NSSwitch, NSTextField, NSView,
-    NSWindow, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSImageView, NSMenuItem,
+    NSPopUpButton, NSScrollView, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{
+    MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString,
+};
 
-use crate::menubar;
+use crate::menubar::{self, slate, theme};
 use crate::settings::{self, Settings};
 
 use std::sync::{Mutex, OnceLock};
 
 use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
-// Window + layout geometry. The window is fixed-size (manual layout); the form
-// scrolls if a section grows past the visible height.
-const WIN_W: f64 = 480.0;
-const WIN_H: f64 = 560.0;
-const BOTTOM_BAR_H: f64 = 44.0;
-const PAD: f64 = 20.0;
-const LABEL_W: f64 = 196.0;
-const CONTROL_X: f64 = PAD + LABEL_W + 8.0;
-const CONTROL_W: f64 = WIN_W - CONTROL_X - PAD;
-const ROW_H: f64 = 30.0;
+use crate::menubar::house_theme::{
+    CONTROL_CHIP, CONTROL_FOOTER, CONTROL_RAILROW, CONTROL_ROW, CONTROL_TILE, HAIRLINE,
+    LAYOUT_SETTINGS_HEIGHT, LAYOUT_SETTINGS_RAIL, LAYOUT_SETTINGS_WIDTH, RADIUS_LG, RADIUS_MD,
+    RADIUS_SM, RADIUS_TILE, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TYPE_BODY_SMALL,
+    TYPE_CAPTION, TYPE_LABEL, TYPE_META, TYPE_TITLE, WEIGHT_MEDIUM, WEIGHT_REGULAR,
+    WEIGHT_SEMIBOLD,
+};
+
+// ─── Shell geometry, all derived from tokens ─────────────────────────────
+const WIN_W: f64 = LAYOUT_SETTINGS_WIDTH;
+const WIN_H: f64 = LAYOUT_SETTINGS_HEIGHT;
+const RAIL_W: f64 = LAYOUT_SETTINGS_RAIL;
+/// Room for the traffic lights on a full-size-content window.
+const TITLEBAR_H: f64 = 28.0;
+/// The pane's heading band: `title` over a `meta` subtitle.
+const HEADER_H: f64 = 60.0;
+const PANE_X: f64 = RAIL_W;
+const PANE_W: f64 = WIN_W - RAIL_W;
+/// Gutter between the pane edge and a card.
+const PANE_PAD: f64 = 22.0;
+const CARD_W: f64 = PANE_W - 2.0 * PANE_PAD;
+/// Horizontal padding inside a card, and the 4 px band above/below its rows.
+const CARD_PAD_X: f64 = 14.0;
+const CARD_PAD_Y: f64 = 4.0;
+/// The uppercase section label band at the top of a card.
+const CARD_LABEL_H: f64 = 28.0;
+/// Widest a popup chip may grow before its title truncates.
+const POPUP_MAX_W: f64 = 220.0;
+
+/// The rail's six sections, in order: label, SF Symbol, subtitle.
+const PANES: &[(&str, &str, &str)] = &[
+    (
+        "Dictation",
+        "mic",
+        "Key, cleanup, and what happens after release.",
+    ),
+    (
+        "Translate",
+        "character.book.closed",
+        "Speak in one language, land in another.",
+    ),
+    ("Output", "text.alignleft", "Formatting and appearance."),
+    (
+        "Speech engine",
+        "cpu",
+        "The transcriber and the cleanup model.",
+    ),
+    (
+        "Experimental",
+        "flask",
+        "Rough edges. Off unless you want them.",
+    ),
+    ("About", "info.circle", "Files, logs, and where things live."),
+];
 
 // Control fields are held for ownership/future refresh even when not read after
 // build (the view hierarchy already retains them); suppress the dead-code lint.
 #[allow(dead_code)]
-struct SettingsUi {
-    window: Retained<NSWindow>,
+pub struct SettingsUi {
+    pub(crate) window: Retained<NSWindow>,
     _scroll: Retained<NSScrollView>,
-    #[allow(dead_code)]
-    container: Retained<SettingsFlippedView>,
+    /// One flipped document view per rail section; the scroll view swaps
+    /// between them so a pane change is one assignment, not a rebuild.
+    panes: Vec<Retained<SettingsFlippedView>>,
+    rail_rows: Vec<Retained<slate::SlateView>>,
+    pane_title: Retained<NSTextField>,
+    pane_subtitle: Retained<NSTextField>,
     // General
     hotkey_popup: Retained<NSPopUpButton>,
-    cleanup_switch: Retained<NSSwitch>,
-    preroll_switch: Retained<NSSwitch>,
+    cleanup_switch: Retained<slate::InkToggle>,
+    preroll_switch: Retained<slate::InkToggle>,
     format_popup: Retained<NSPopUpButton>,
+    appearance_popup: Retained<NSPopUpButton>,
     // Speech
     cohere_lang_popup: Retained<NSPopUpButton>,
     model_popup: Retained<NSPopUpButton>,
     // Advanced
-    streaming_switch: Retained<NSSwitch>,
-    tail_capture_switch: Retained<NSSwitch>,
-    listen_switch: Retained<NSSwitch>,
+    streaming_switch: Retained<slate::InkToggle>,
+    tail_capture_switch: Retained<slate::InkToggle>,
+    listen_switch: Retained<slate::InkToggle>,
     wake_field: Retained<NSTextField>,
     // Push-to-talk chord + behavior
     custom_hotkey_field: Retained<NSTextField>,
     custom_hotkey_hint: Retained<NSTextField>,
-    whisper_switch: Retained<NSSwitch>,
+    whisper_switch: Retained<slate::InkToggle>,
     // Translate
     translate_targets_field: Retained<NSTextField>,
     active_translate_popup: Retained<NSPopUpButton>,
@@ -92,7 +150,7 @@ static SETTINGS_UI: OnceLock<SettingsUi> = OnceLock::new();
 define_class!(
     #[unsafe(super(NSView))]
     #[name = "FDSettingsFlippedView"]
-    struct SettingsFlippedView;
+    pub struct SettingsFlippedView;
 
     impl SettingsFlippedView {
         #[unsafe(method(isFlipped))]
@@ -113,6 +171,14 @@ define_class!(
     pub struct SettingsController;
 
     impl SettingsController {
+        #[unsafe(method(selectPane:))]
+        fn select_pane(&self, sender: *mut AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if let Some(ui) = SETTINGS_UI.get() {
+                show_pane(ui, tag as usize);
+            }
+        }
+
         #[unsafe(method(changeHotkey:))]
         fn change_hotkey(&self, sender: *mut AnyObject) {
             let code = popup_selected_tag(sender);
@@ -144,6 +210,17 @@ define_class!(
             with_pending(|p| {
                 p.active_format = if name.is_empty() { None } else { Some(name) };
             });
+        }
+
+        #[unsafe(method(changeAppearance:))]
+        fn change_appearance(&self, sender: *mut AnyObject) {
+            let v = popup_selected_rep(sender);
+            // Appearance is the one setting that also applies immediately —
+            // picking a look you cannot see until a restart is no choice at all.
+            if let Some(mtm) = MainThreadMarker::new() {
+                menubar::apply_app_appearance(mtm, &v);
+            }
+            with_pending(|p| p.appearance = if v.is_empty() { None } else { Some(v) });
         }
 
         #[unsafe(method(changeCohereLang:))]
@@ -291,11 +368,44 @@ pub fn show_settings_window() {
     };
 }
 
+/// Build the window without registering it as the process-wide singleton and
+/// without ever ordering it in. Used by `render-ui` to snapshot the shell.
+pub fn build_for_render(mtm: MainThreadMarker) -> SettingsUi {
+    build_settings_window(mtm)
+}
+
+/// Scroll the visible pane to its bottom so a snapshot shows the cards that sit
+/// below the fold.
+pub fn scroll_to_bottom_for_render(ui: &SettingsUi) {
+    scroll_render(ui, true);
+}
+
+pub fn scroll_to_top_for_render(ui: &SettingsUi) {
+    scroll_render(ui, false);
+}
+
+fn scroll_render(ui: &SettingsUi, bottom: bool) {
+    let Some(doc) = ui._scroll.documentView() else {
+        return;
+    };
+    let doc_h = doc.frame().size.height;
+    let clip_h = ui._scroll.contentSize().height;
+    let y = if bottom {
+        (doc_h - clip_h).max(0.0)
+    } else {
+        0.0
+    };
+    // Flipped document: scrolling "down" means a larger y.
+    doc.scrollPoint(NSPoint::new(0.0, y));
+    ui._scroll.setNeedsDisplay(true);
+    ui._scroll.displayIfNeeded();
+}
+
 fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let controller = SettingsController::new();
     let loaded = Settings::load();
 
-    // ── Shell: window + scroll view + bottom bar ────────────────────────
+    // ── Shell: window + rail + pane + footer well ───────────────────────
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W, WIN_H));
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -303,7 +413,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
             frame,
             NSWindowStyleMask::Titled
                 | NSWindowStyleMask::Closable
-                | NSWindowStyleMask::Miniaturizable,
+                | NSWindowStyleMask::Miniaturizable
+                | NSWindowStyleMask::FullSizeContentView,
             NSBackingStoreType::Buffered,
             false,
         )
@@ -312,81 +423,243 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         window.setTitle(&NSString::from_str("Local Dictation Settings"));
         window.setReleasedWhenClosed(false);
     }
-    menubar::apply_light_chrome(&window);
 
-    let content: Retained<NSView> = NSView::initWithFrame(NSView::alloc(mtm), frame);
+    let panel = slate::SlateView::new(mtm, frame, slate::Paint::Surface, 0.0);
 
+    // ── Rail ────────────────────────────────────────────────────────────
+    let rail = slate::SlateView::new(
+        mtm,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(RAIL_W, WIN_H)),
+        slate::Paint::Sunken,
+        0.0,
+    );
+    panel.addSubview(&rail);
+    let rail_divider = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(RAIL_W - HAIRLINE, 0.0),
+            NSSize::new(HAIRLINE, WIN_H),
+        ),
+        slate::Paint::Divider,
+        0.0,
+    );
+    panel.addSubview(&rail_divider);
+
+    // App mark: a 28 px tile, the product name, and the SETTINGS section label.
+    let mark_y = WIN_H - TITLEBAR_H - SPACE_SM - CONTROL_CHIP;
+    let mark_tile = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(SPACE_MD, mark_y),
+            NSSize::new(CONTROL_CHIP, CONTROL_CHIP),
+        ),
+        slate::Paint::Tile,
+        RADIUS_MD,
+    );
+    if let Some(img) = slate::template_symbol("waveform") {
+        let iv = NSImageView::new(mtm);
+        iv.setImage(Some(&img));
+        unsafe {
+            let _: () = msg_send![&*iv, setContentTintColor: &*theme::text_secondary()];
+        }
+        iv.setFrame(NSRect::new(
+            NSPoint::new(
+                ((CONTROL_CHIP - slate::GLYPH) / 2.0).round(),
+                ((CONTROL_CHIP - slate::GLYPH) / 2.0).round(),
+            ),
+            NSSize::new(slate::GLYPH, slate::GLYPH),
+        ));
+        mark_tile.addSubview(&iv);
+    }
+    rail.addSubview(&mark_tile);
+
+    let mark_name = slate::label(
+        mtm,
+        "Local Dictation",
+        TYPE_BODY_SMALL,
+        WEIGHT_SEMIBOLD,
+        theme::text_primary(),
+    );
+    slate::place_left(
+        &mark_name,
+        SPACE_MD + CONTROL_CHIP + SPACE_SM,
+        mark_y + CONTROL_CHIP - 8.0,
+    );
+    rail.addSubview(&mark_name);
+    let mark_kind = slate::section_label(mtm, "Settings");
+    slate::place_left(
+        &mark_kind,
+        SPACE_MD + CONTROL_CHIP + SPACE_SM,
+        mark_y + 6.0,
+    );
+    rail.addSubview(&mark_kind);
+
+    let mut rail_rows = Vec::new();
+    let mut row_y = mark_y - SPACE_MD - CONTROL_RAILROW;
+    for (i, (title, symbol, _)) in PANES.iter().enumerate() {
+        let row = slate::SlateView::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(SPACE_SM, row_y),
+                NSSize::new(RAIL_W - 2.0 * SPACE_SM, CONTROL_RAILROW),
+            ),
+            slate::Paint::Row,
+            RADIUS_MD,
+        );
+        row.set_selected(i == 0);
+        row.enable_hover();
+        let mid = CONTROL_RAILROW / 2.0;
+        let tile = slate::icon_tile(mtm, symbol, SPACE_XS, mid);
+        row.addSubview(&tile);
+        let l = slate::label(
+            mtm,
+            title,
+            TYPE_BODY_SMALL,
+            WEIGHT_MEDIUM,
+            theme::text_primary(),
+        );
+        slate::place_left(&l, SPACE_XS + CONTROL_TILE + SPACE_SM, mid);
+        row.addSubview(&l);
+        let btn = slate::click_overlay(
+            mtm,
+            NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(RAIL_W - 2.0 * SPACE_SM, CONTROL_RAILROW),
+            ),
+            &controller,
+            sel!(selectPane:),
+            i as isize,
+        );
+        row.addSubview(&btn);
+        rail.addSubview(&row);
+        rail_rows.push(row);
+        row_y -= CONTROL_RAILROW + SPACE_XXS;
+    }
+
+    // ── Pane heading ────────────────────────────────────────────────────
+    let header_y = WIN_H - TITLEBAR_H - HEADER_H;
+    let pane_title = slate::label(
+        mtm,
+        PANES[0].0,
+        TYPE_TITLE,
+        WEIGHT_SEMIBOLD,
+        theme::text_primary(),
+    );
+    pane_title.setFrame(NSRect::new(
+        NSPoint::new(PANE_X + PANE_PAD, header_y + HEADER_H / 2.0 - 2.0),
+        NSSize::new(PANE_W - 2.0 * PANE_PAD, TYPE_TITLE + SPACE_XS),
+    ));
+    panel.addSubview(&pane_title);
+    let pane_subtitle = slate::label(
+        mtm,
+        PANES[0].2,
+        TYPE_META,
+        WEIGHT_REGULAR,
+        theme::text_secondary(),
+    );
+    pane_subtitle.setFrame(NSRect::new(
+        NSPoint::new(PANE_X + PANE_PAD, header_y + SPACE_XS),
+        NSSize::new(PANE_W - 2.0 * PANE_PAD, TYPE_META + SPACE_XXS),
+    ));
+    panel.addSubview(&pane_subtitle);
+
+    // ── Footer well ─────────────────────────────────────────────────────
+    let footer = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(PANE_X, 0.0),
+            NSSize::new(PANE_W, CONTROL_FOOTER),
+        ),
+        slate::Paint::Well,
+        0.0,
+    );
+    let fmid = CONTROL_FOOTER / 2.0;
+    let footer_hint = slate::label(
+        mtm,
+        "Restart needed for engine changes",
+        TYPE_META,
+        WEIGHT_REGULAR,
+        theme::text_secondary(),
+    );
+    slate::place_left(&footer_hint, SPACE_MD, fmid);
+    footer.addSubview(&footer_hint);
+    let (apply_views, apply_w) = slate::key_hint(mtm, "Apply & Restart", &["⌘", "↩"], 0.0, fmid);
+    let apply_x = PANE_W - SPACE_SM - apply_w;
+    for v in &apply_views {
+        let f = v.frame();
+        v.setFrameOrigin(NSPoint::new(f.origin.x + apply_x, f.origin.y));
+        footer.addSubview(v);
+    }
+    let apply_btn = slate::click_overlay(
+        mtm,
+        NSRect::new(
+            NSPoint::new(apply_x - SPACE_XS, 0.0),
+            NSSize::new(apply_w + 2.0 * SPACE_XS, CONTROL_FOOTER),
+        ),
+        &controller,
+        sel!(applyAndRestart:),
+        0,
+    );
+    unsafe {
+        let _: () = msg_send![&*apply_btn, setKeyEquivalent: &*NSString::from_str("\r")];
+        let _: () = msg_send![&*apply_btn, setAccessibilityLabel: &*NSString::from_str("Apply and restart")];
+    }
+    footer.addSubview(&apply_btn);
+    panel.addSubview(&footer);
+    let footer_divider = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(PANE_X, CONTROL_FOOTER),
+            NSSize::new(PANE_W, HAIRLINE),
+        ),
+        slate::Paint::Divider,
+        0.0,
+    );
+    panel.addSubview(&footer_divider);
+
+    // ── Scroll area holding one document view per pane ──────────────────
+    let scroll_y = CONTROL_FOOTER + HAIRLINE;
+    let scroll_h = header_y - scroll_y;
     let scroll: Retained<NSScrollView> = unsafe {
         msg_send![
             NSScrollView::alloc(mtm),
             initWithFrame: NSRect::new(
-                NSPoint::new(0.0, BOTTOM_BAR_H),
-                NSSize::new(WIN_W, WIN_H - BOTTOM_BAR_H),
+                NSPoint::new(PANE_X, scroll_y),
+                NSSize::new(PANE_W, scroll_h),
             )
         ]
     };
     scroll.setHasVerticalScroller(true);
     scroll.setAutohidesScrollers(true);
     scroll.setDrawsBackground(false);
+    panel.addSubview(&scroll);
 
-    let container: Retained<SettingsFlippedView> = unsafe {
-        msg_send![
-            SettingsFlippedView::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W, 1000.0))
-        ]
+    let new_pane = || -> Retained<SettingsFlippedView> {
+        unsafe {
+            msg_send![
+                SettingsFlippedView::alloc(mtm),
+                initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANE_W, scroll_h))
+            ]
+        }
     };
 
-    // Bottom bar: hint (left) + Apply & Restart (right).
-    let apply_w = 130.0;
-    let apply_h = 28.0;
-    let apply_btn: Retained<NSButton> = unsafe {
-        msg_send![
-            NSButton::alloc(mtm),
-            initWithFrame: NSRect::new(
-                NSPoint::new(WIN_W - PAD - apply_w, (BOTTOM_BAR_H - apply_h) / 2.0),
-                NSSize::new(apply_w, apply_h),
-            )
-        ]
-    };
-    unsafe {
-        apply_btn.setTitle(&NSString::from_str("Apply & Restart"));
-        let _: () = msg_send![&*apply_btn, setBezelStyle: 1usize]; // rounded
-        apply_btn.setTarget(Some(&controller));
-        apply_btn.setAction(Some(sel!(applyAndRestart:)));
-    }
-    let hint = label(
-        mtm,
-        "Changes take effect after restart",
-        NSRect::new(
-            NSPoint::new(PAD, (BOTTOM_BAR_H - 16.0) / 2.0 + 2.0),
-            NSSize::new(WIN_W - 2.0 * PAD - apply_w - 12.0, 16.0),
-        ),
-        &NSFont::systemFontOfSize(11.0),
-        &NSColor::secondaryLabelColor(),
-    );
+    // ═══ Pane 0 — Dictation ═════════════════════════════════════════════
+    let dictation = new_pane();
+    let mut y = SPACE_MD;
 
-    // ── Rows ────────────────────────────────────────────────────────────
-    let mut y = 0.0_f64;
+    let mut card = card_begin(mtm, &dictation, y, "Input");
 
-    y = section(mtm, &container, y, "Dictation");
-
-    // Push-to-talk key
-    let hotkey_popup = popup(mtm, &container, y, "Push-to-talk key");
     let hotkey_locked = std::env::var_os("DICTATE_HOTKEY_KEYCODE").is_some();
     let hotkey_active = loaded.resolve_hotkey(0x3D);
+    let hotkey_popup = popup_row(mtm, &mut card, "Push-to-talk key");
     for (label_str, code) in settings::HOTKEY_CHOICES {
         popup_add_item(&hotkey_popup, label_str, Some(*code as isize), None);
     }
     select_popup_tag(&hotkey_popup, hotkey_active);
-    wire_popup(
-        &hotkey_popup,
-        &controller,
-        sel!(changeHotkey:),
-        hotkey_locked,
-    );
-    y += ROW_H;
+    finish_popup(&hotkey_popup);
+    wire_popup(&hotkey_popup, &controller, sel!(changeHotkey:), hotkey_locked);
     if hotkey_locked {
-        y = env_hint(mtm, &container, y, "DICTATE_HOTKEY_KEYCODE");
+        env_hint(mtm, &mut card, "DICTATE_HOTKEY_KEYCODE");
     }
 
     // Custom hotkey (chord) — an arbitrary modifiers + key combo, e.g.
@@ -394,80 +667,17 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     // is where a chord is declared. A live hint below reports the parsed
     // result plus any system-wide conflict.
     let (initial_custom_hotkey, initial_hotkey_hint) = initial_custom_hotkey();
-    let custom_hotkey_field =
-        text_row(mtm, &container, y, "Custom hotkey", &initial_custom_hotkey);
-    custom_hotkey_field
-        .setPlaceholderString(Some(&NSString::from_str("e.g. cmd+shift+d or f5")));
+    let custom_hotkey_field = text_row(mtm, &mut card, "Custom hotkey", &initial_custom_hotkey);
+    custom_hotkey_field.setPlaceholderString(Some(&NSString::from_str("e.g. cmd+shift+d or f5")));
     unsafe {
         custom_hotkey_field.setTarget(Some(&controller));
         custom_hotkey_field.setAction(Some(sel!(changeCustomHotkey:)));
         custom_hotkey_field.setEnabled(!hotkey_locked);
     }
-    y += ROW_H;
-    let custom_hotkey_hint = label(
-        mtm,
-        &initial_hotkey_hint,
-        NSRect::new(
-            NSPoint::new(PAD, y),
-            NSSize::new(WIN_W - 2.0 * PAD, 14.0),
-        ),
-        &NSFont::systemFontOfSize(11.0),
-        &NSColor::secondaryLabelColor(),
-    );
-    container.addSubview(&custom_hotkey_hint);
-    y += 14.0;
+    let custom_hotkey_hint = hint_line(mtm, &mut card, &initial_hotkey_hint);
 
-    // Cleanup enabled
-    let cleanup_switch = switch_row(mtm, &container, y, "Enable cleanup");
-    cleanup_switch.setState(if loaded.cleanup_enabled.unwrap_or(true) {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    wire_switch(&cleanup_switch, &controller, sel!(changeCleanup:), false);
-    y += ROW_H;
-
-    // Always-on mic (pre-roll)
-    let preroll_switch = switch_row(mtm, &container, y, "Always-on mic (pre-roll)");
-    let preroll_on = loaded.resolve_preroll_ms() > 0;
-    preroll_switch.setState(if preroll_on {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    wire_switch(
-        &preroll_switch,
-        &controller,
-        sel!(changePreroll:),
-        std::env::var_os("DICTATE_PREROLL_MS").is_some(),
-    );
-    y += ROW_H;
-    if std::env::var_os("DICTATE_PREROLL_MS").is_some() {
-        y = env_hint(mtm, &container, y, "DICTATE_PREROLL_MS");
-    }
-
-    // Whisper mode — lower the speech-detection threshold so quiet dictation
-    // is captured.
-    let whisper_switch = switch_row(mtm, &container, y, "Whisper mode");
-    whisper_switch.setState(if loaded.resolve_whisper_mode() {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    wire_switch(
-        &whisper_switch,
-        &controller,
-        sel!(changeWhisper:),
-        std::env::var_os("DICTATE_WHISPER_MODE").is_some(),
-    );
-    y += ROW_H;
-    if std::env::var_os("DICTATE_WHISPER_MODE").is_some() {
-        y = env_hint(mtm, &container, y, "DICTATE_WHISPER_MODE");
-    }
-
-    // History retention — how long to keep dictation history.
-    let retention_popup = popup(mtm, &container, y, "History retention");
     let retention_locked = std::env::var_os("DICTATE_HISTORY_RETENTION").is_some();
+    let retention_popup = popup_row(mtm, &mut card, "History retention");
     for (label_str, rep) in [
         ("Forever", "forever"),
         ("1 year", "1year"),
@@ -479,24 +689,84 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         popup_add_item(&retention_popup, label_str, None, Some(rep));
     }
     select_popup_rep(&retention_popup, &loaded.resolve_history_retention());
+    finish_popup(&retention_popup);
     wire_popup(
         &retention_popup,
         &controller,
         sel!(changeRetention:),
         retention_locked,
     );
-    y += ROW_H;
     if retention_locked {
-        y = env_hint(mtm, &container, y, "DICTATE_HISTORY_RETENTION");
+        env_hint(mtm, &mut card, "DICTATE_HISTORY_RETENTION");
+    }
+    y = card_end(&card);
+
+    let mut card = card_begin(mtm, &dictation, y, "Cleanup");
+    let cleanup_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Enable cleanup",
+        "Only runs when speech is messy",
+    );
+    cleanup_switch.set_on(loaded.cleanup_enabled.unwrap_or(true));
+    wire_switch(&cleanup_switch, &controller, sel!(changeCleanup:), false);
+
+    let whisper_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Whisper mode",
+        "Lower gate for quiet speech",
+    );
+    whisper_switch.set_on(loaded.resolve_whisper_mode());
+    wire_switch(
+        &whisper_switch,
+        &controller,
+        sel!(changeWhisper:),
+        std::env::var_os("DICTATE_WHISPER_MODE").is_some(),
+    );
+    if std::env::var_os("DICTATE_WHISPER_MODE").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_WHISPER_MODE");
     }
 
-    y = section(mtm, &container, y, "Translate to");
+    let preroll_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Always-on mic",
+        "Pre-roll so the first words aren't clipped",
+    );
+    preroll_switch.set_on(loaded.resolve_preroll_ms() > 0);
+    wire_switch(
+        &preroll_switch,
+        &controller,
+        sel!(changePreroll:),
+        std::env::var_os("DICTATE_PREROLL_MS").is_some(),
+    );
+    if std::env::var_os("DICTATE_PREROLL_MS").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_PREROLL_MS");
+    }
 
-    // Translate targets — comma-separated list of target languages.
+    let tail_capture_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Tail-capture",
+        "Keep listening ~250 ms after release",
+    );
+    tail_capture_switch.set_on(loaded.resolve_tail_capture());
+    wire_switch(
+        &tail_capture_switch,
+        &controller,
+        sel!(changeTailCapture:),
+        std::env::var_os("DICTATE_TAIL_CAPTURE").is_some(),
+    );
+    let _ = card_end(&card);
+    finish_pane(&dictation, &card);
+
+    // ═══ Pane 1 — Translate ═════════════════════════════════════════════
+    let translate = new_pane();
+    let mut card = card_begin(mtm, &translate, SPACE_MD, "Targets");
     let loaded_targets = loaded.resolve_translation_targets();
     let targets_value = loaded_targets.join(", ");
-    let translate_targets_field =
-        text_row(mtm, &container, y, "Translate targets", &targets_value);
+    let translate_targets_field = text_row(mtm, &mut card, "Translate targets", &targets_value);
     translate_targets_field
         .setPlaceholderString(Some(&NSString::from_str("Spanish, Chinese, French")));
     let targets_locked = std::env::var_os("DICTATE_TRANSLATION_TARGETS").is_some();
@@ -505,15 +775,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         translate_targets_field.setAction(Some(sel!(changeTranslateTargets:)));
         translate_targets_field.setEnabled(!targets_locked);
     }
-    y += ROW_H;
     if targets_locked {
-        y = env_hint(mtm, &container, y, "DICTATE_TRANSLATION_TARGETS");
+        env_hint(mtm, &mut card, "DICTATE_TRANSLATION_TARGETS");
     }
 
-    // Active translate target — picks which of the targets is used. Kept a
-    // static list from the loaded settings for v1.
-    let active_translate_popup = popup(mtm, &container, y, "Active target");
     let active_target_locked = std::env::var_os("DICTATE_ACTIVE_TRANSLATION_TARGET").is_some();
+    let active_translate_popup = popup_row(mtm, &mut card, "Active target");
     if loaded_targets.is_empty() {
         popup_add_item(&active_translate_popup, "(none)", None, Some(""));
     } else {
@@ -524,21 +791,23 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
             select_popup_rep(&active_translate_popup, &active);
         }
     }
+    finish_popup(&active_translate_popup);
     wire_popup(
         &active_translate_popup,
         &controller,
         sel!(changeActiveTranslateTarget:),
         active_target_locked,
     );
-    y += ROW_H;
     if active_target_locked {
-        y = env_hint(mtm, &container, y, "DICTATE_ACTIVE_TRANSLATION_TARGET");
+        env_hint(mtm, &mut card, "DICTATE_ACTIVE_TRANSLATION_TARGET");
     }
+    let _ = card_end(&card);
+    finish_pane(&translate, &card);
 
-    y = section(mtm, &container, y, "Output");
-
-    // Output format
-    let format_popup = popup(mtm, &container, y, "Output format");
+    // ═══ Pane 2 — Output ════════════════════════════════════════════════
+    let output = new_pane();
+    let mut card = card_begin(mtm, &output, SPACE_MD, "Format");
+    let format_popup = popup_row(mtm, &mut card, "Output format");
     let format_names = crate::prompts::Prompts::load_quiet().format_names();
     let format_locked = std::env::var_os("DICTATE_FORMAT").is_some();
     popup_add_item(&format_popup, "Default (no preset)", None, Some(""));
@@ -546,31 +815,44 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         popup_add_item(&format_popup, name, None, Some(name));
     }
     select_popup_rep(&format_popup, &loaded.resolve_format().unwrap_or_default());
-    wire_popup(
-        &format_popup,
-        &controller,
-        sel!(changeFormat:),
-        format_locked,
-    );
-    y += ROW_H;
+    finish_popup(&format_popup);
+    wire_popup(&format_popup, &controller, sel!(changeFormat:), format_locked);
     if format_locked {
-        y = env_hint(mtm, &container, y, "DICTATE_FORMAT");
+        env_hint(mtm, &mut card, "DICTATE_FORMAT");
     }
+    let y = card_end(&card);
 
-    y = section(mtm, &container, y, "Speech engine");
-
-    // The speech engine is fixed to Cohere Transcribe via the native MLX helper
-    // (Q4 checkpoint); the only live ASR setting is the decoder language.
-    let resolved_asr = loaded.resolve_asr();
-    y = hint_line(
+    let mut card = card_begin(mtm, &output, y, "Interface");
+    let appearance_popup = popup_row(mtm, &mut card, "Appearance");
+    for (rep, label_str) in settings::APPEARANCE_CHOICES {
+        popup_add_item(&appearance_popup, label_str, None, Some(rep));
+    }
+    select_popup_rep(&appearance_popup, &loaded.resolve_appearance());
+    finish_popup(&appearance_popup);
+    wire_popup(
+        &appearance_popup,
+        &controller,
+        sel!(changeAppearance:),
+        std::env::var_os("DICTATE_APPEARANCE").is_some(),
+    );
+    hint_line(
         mtm,
-        &container,
-        y,
+        &mut card,
+        "Dark is the default. Every window follows this — nothing is pinned to light.",
+    );
+    let _ = card_end(&card);
+    finish_pane(&output, &card);
+
+    // ═══ Pane 3 — Speech engine ═════════════════════════════════════════
+    let speech = new_pane();
+    let mut card = card_begin(mtm, &speech, SPACE_MD, "Engine");
+    let resolved_asr = loaded.resolve_asr();
+    hint_line(
+        mtm,
+        &mut card,
         "Fixed engine: Cohere Transcribe — native MLX (Q4)",
     );
-
-    // Cohere language
-    let cohere_lang_popup = popup(mtm, &container, y, "Cohere language");
+    let cohere_lang_popup = popup_row(mtm, &mut card, "Cohere language");
     const LANGS: &[(&str, &str)] = &[
         ("en", "English (en)"),
         ("de", "German (de)"),
@@ -592,16 +874,15 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         popup_add_item(&cohere_lang_popup, l, None, Some(code));
     }
     select_popup_rep(&cohere_lang_popup, &resolved_asr.language);
+    finish_popup(&cohere_lang_popup);
     wire_popup(
         &cohere_lang_popup,
         &controller,
         sel!(changeCohereLang:),
         std::env::var_os("DICTATE_COHERE_LANG").is_some(),
     );
-    y += ROW_H;
 
-    // Cleanup model
-    let model_popup = popup(mtm, &container, y, "Cleanup model");
+    let model_popup = popup_row(mtm, &mut card, "Cleanup model");
     let model_env = settings::llm_model_env();
     let model_locked = model_env.is_some();
     let models = settings::discover_llm_models();
@@ -630,168 +911,105 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
             }
         }
     }
+    finish_popup(&model_popup);
     wire_popup(&model_popup, &controller, sel!(changeModel:), model_locked);
-    y += ROW_H;
     if let Some((name, _)) = model_env {
-        y = env_hint(mtm, &container, y, name);
+        env_hint(mtm, &mut card, name);
     }
+    let _ = card_end(&card);
+    finish_pane(&speech, &card);
 
-    y = section(mtm, &container, y, "Experimental");
-
-    // Streaming ASR — inert (forced off) while always-on pre-roll is active,
-    // so the switch is disabled with a hint rather than looking live.
-    let streaming_switch = switch_row(mtm, &container, y, "Streaming ASR");
-    streaming_switch.setState(if loaded.resolve_streaming_asr() {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    let streaming_locked = std::env::var_os("DICTATE_STREAMING_ASR").is_some()
-        || loaded.resolve_preroll_ms() > 0;
+    // ═══ Pane 4 — Experimental ══════════════════════════════════════════
+    let experimental = new_pane();
+    let mut card = card_begin(mtm, &experimental, SPACE_MD, "Experimental");
+    let streaming_switch = toggle_row(mtm, &mut card, "Streaming ASR", "Live preview during the hold");
+    streaming_switch.set_on(loaded.resolve_streaming_asr());
+    let streaming_locked =
+        std::env::var_os("DICTATE_STREAMING_ASR").is_some() || loaded.resolve_preroll_ms() > 0;
     wire_switch(
         &streaming_switch,
         &controller,
         sel!(changeStreaming:),
         streaming_locked,
     );
-    y += ROW_H;
     if loaded.resolve_preroll_ms() > 0 {
-        y = hint_line(
+        hint_line(
             mtm,
-            &container,
-            y,
+            &mut card,
             "Off while always-on pre-roll is on (they drain the ring differently).",
         );
     }
-    y = hint_line(
-        mtm,
-        &container,
-        y,
-        "Transcribe sentences during the hold for a live preview (VAD-segmented). Off = whole-buffer at release.",
-    );
 
-    // Tail-capture (release grace)
-    let tail_capture_switch = switch_row(mtm, &container, y, "Tail-capture (release grace)");
-    tail_capture_switch.setState(if loaded.resolve_tail_capture() {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    wire_switch(
-        &tail_capture_switch,
-        &controller,
-        sel!(changeTailCapture:),
-        std::env::var_os("DICTATE_TAIL_CAPTURE").is_some(),
-    );
-    y += ROW_H;
-    y = hint_line(
-        mtm,
-        &container,
-        y,
-        "Keep listening ~250 ms after release so the last word isn't clipped.",
-    );
-
-    // Listen mode
-    let listen_switch = switch_row(mtm, &container, y, "Listen mode (wake word)");
-    listen_switch.setState(if loaded.resolve_listen_mode() {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
+    let listen_switch = toggle_row(mtm, &mut card, "Listen mode", "Hands-free, triggered by a wake word");
+    listen_switch.set_on(loaded.resolve_listen_mode());
     wire_switch(
         &listen_switch,
         &controller,
         sel!(changeListen:),
         std::env::var_os("DICTATE_LISTEN_MODE").is_some(),
     );
-    y += ROW_H;
-    y = hint_line(
-        mtm,
-        &container,
-        y,
-        "Hands-free: say the wake word to dictate. Needs always-on mic.",
-    );
+    hint_line(mtm, &mut card, "Needs always-on mic.");
 
-    // Wake word
-    let wake_field = text_row(mtm, &container, y, "Wake word", &loaded.resolve_wake_word());
+    let wake_field = text_row(mtm, &mut card, "Wake word", &loaded.resolve_wake_word());
     let wake_locked = std::env::var_os("DICTATE_WAKE_WORD").is_some();
     unsafe {
         wake_field.setTarget(Some(&controller));
         wake_field.setAction(Some(sel!(changeWakeWord:)));
         wake_field.setEnabled(!wake_locked);
     }
-    y += ROW_H;
+    let _ = card_end(&card);
+    finish_pane(&experimental, &card);
 
-    y = section(mtm, &container, y, "Files & Logs");
-    y = button_row(
-        mtm,
-        &container,
-        y,
-        "Edit cleanup prompts…",
-        &controller,
-        sel!(editPrompts:),
-    );
-    y = button_row(
-        mtm,
-        &container,
-        y,
-        "Open corrections folder",
-        &controller,
-        sel!(openCorrections:),
-    );
-    y = button_row(
-        mtm,
-        &container,
-        y,
-        "Voice Commands & Shortcuts…",
-        &controller,
-        sel!(openCommandsRef:),
-    );
-    y = button_row(mtm, &container, y, "Open Log", &controller, sel!(openLog:));
-    y = button_row(
-        mtm,
-        &container,
-        y,
-        "Export Log to Downloads…",
-        &controller,
-        sel!(exportLog:),
-    );
+    // ═══ Pane 5 — About ═════════════════════════════════════════════════
+    let about = new_pane();
+    let mut card = card_begin(mtm, &about, SPACE_MD, "Files & logs");
+    for (title, action) in [
+        ("Cleanup prompts", sel!(editPrompts:)),
+        ("Corrections folder", sel!(openCorrections:)),
+        ("Voice commands & shortcuts", sel!(openCommandsRef:)),
+        ("Log", sel!(openLog:)),
+        ("Export log to Downloads", sel!(exportLog:)),
+    ] {
+        button_row(mtm, &mut card, title, &controller, action);
+    }
+    let y = card_end(&card);
 
-    y = section(mtm, &container, y, "About");
-    y = about_line(
+    let mut card = card_begin(mtm, &about, y, "About");
+    hint_line(
         mtm,
-        &container,
-        y,
+        &mut card,
         &format!("Local Dictation {}", env!("CARGO_PKG_VERSION")),
     );
     if let Some(dir) = crate::app_paths::config_dir() {
-        y = about_line(mtm, &container, y, &format!("Config: {}", dir.display()));
+        hint_line(mtm, &mut card, &format!("Config: {}", dir.display()));
     }
-    y = about_line(
+    hint_line(
         mtm,
-        &container,
-        y,
+        &mut card,
         &format!("Models: {}", crate::app_paths::llm_models_dir().display()),
     );
+    let _ = card_end(&card);
+    finish_pane(&about, &card);
 
-    let total_h = y + PAD;
-    container.setFrameSize(NSSize::new(WIN_W, total_h));
+    let panes = vec![dictation, translate, output, speech, experimental, about];
+    scroll.setDocumentView(Some(&*panes[0]));
 
-    scroll.setDocumentView(Some(&*container));
-    content.addSubview(&scroll);
-    content.addSubview(&apply_btn);
-    content.addSubview(&hint);
-    window.setContentView(Some(&*content));
+    window.setContentView(Some(&*panel));
+    slate::apply_panel_chrome(&window);
     window.center();
 
-    let ui = SettingsUi {
+    SettingsUi {
         window,
         _scroll: scroll,
-        container,
+        panes,
+        rail_rows,
+        pane_title,
+        pane_subtitle,
         hotkey_popup,
         cleanup_switch,
         preroll_switch,
         format_popup,
+        appearance_popup,
         cohere_lang_popup,
         model_popup,
         streaming_switch,
@@ -807,109 +1025,192 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         pending: Mutex::new(loaded.clone()),
         original: loaded,
         _controller: controller,
-    };
-    ui
-}
-
-// ─── Layout helpers ──────────────────────────────────────────────────────
-
-fn label(
-    mtm: MainThreadMarker,
-    text: &str,
-    frame: NSRect,
-    font: &NSFont,
-    color: &NSColor,
-) -> Retained<NSTextField> {
-    let l: Retained<NSTextField> =
-        unsafe { msg_send![NSTextField::alloc(mtm), initWithFrame: frame] };
-    unsafe {
-        l.setStringValue(&NSString::from_str(text));
-        l.setBezeled(false);
-        l.setDrawsBackground(false);
-        l.setEditable(false);
-        l.setSelectable(false);
-        l.setFont(Some(font));
-        let _: () = msg_send![&*l, setTextColor: &*color];
     }
-    l
 }
 
-/// Section header (bold, secondary colour) with top spacing. Returns new y.
-fn section(mtm: MainThreadMarker, container: &SettingsFlippedView, y: f64, title: &str) -> f64 {
-    let top = y + 18.0;
-    let h = 18.0;
-    let l = label(
-        mtm,
-        title,
-        NSRect::new(NSPoint::new(PAD, top), NSSize::new(WIN_W - 2.0 * PAD, h)),
-        &NSFont::boldSystemFontOfSize(12.0),
-        &NSColor::secondaryLabelColor(),
-    );
-    container.addSubview(&l);
-    top + h + 2.0
+/// Swap the visible pane and move the rail's selection fill.
+fn show_pane(ui: &SettingsUi, index: usize) {
+    let Some(pane) = ui.panes.get(index) else {
+        return;
+    };
+    ui._scroll.setDocumentView(Some(&**pane));
+    pane.scrollPoint(NSPoint::new(0.0, 0.0));
+    for (i, row) in ui.rail_rows.iter().enumerate() {
+        row.set_selected(i == index);
+    }
+    if let Some((title, _, subtitle)) = PANES.get(index) {
+        ui.pane_title.setStringValue(&NSString::from_str(title));
+        ui.pane_subtitle.setStringValue(&NSString::from_str(subtitle));
+    }
 }
 
-/// A small grey hint line under a control. Returns new y.
-fn hint_line(mtm: MainThreadMarker, container: &SettingsFlippedView, y: f64, text: &str) -> f64 {
-    let l = label(
-        mtm,
-        text,
-        NSRect::new(NSPoint::new(PAD, y), NSSize::new(WIN_W - 2.0 * PAD, 14.0)),
-        &NSFont::systemFontOfSize(11.0),
-        &NSColor::secondaryLabelColor(),
-    );
-    container.addSubview(&l);
-    y + 14.0
-}
+// ─── Card builder ────────────────────────────────────────────────────────
 
-/// "(locked by DICTATE_…)" footnote. Returns new y.
-fn env_hint(mtm: MainThreadMarker, container: &SettingsFlippedView, y: f64, varname: &str) -> f64 {
-    hint_line(
-        mtm,
-        container,
-        y,
-        &format!("Locked by the {varname} env var"),
-    )
-}
-
-/// About-section line. Returns new y.
-fn about_line(mtm: MainThreadMarker, container: &SettingsFlippedView, y: f64, text: &str) -> f64 {
-    let l = label(
-        mtm,
-        text,
-        NSRect::new(NSPoint::new(PAD, y), NSSize::new(WIN_W - 2.0 * PAD, 16.0)),
-        &NSFont::systemFontOfSize(11.0),
-        &NSColor::secondaryLabelColor(),
-    );
-    container.addSubview(&l);
-    y + 16.0
-}
-
-/// A row label (left column) + a popup control. Returns the popup.
-fn popup(
-    mtm: MainThreadMarker,
-    container: &SettingsFlippedView,
+/// A group of rows drawn as one raised card. Rows are added top-down inside the
+/// card, each with a `divider` above it, and the card is sized to fit at the end.
+struct Card {
+    view: Retained<slate::SlateView>,
+    /// Next free y inside the card.
     y: f64,
+    /// Where the card sits in its pane.
+    origin_y: f64,
+}
+
+fn card_begin(
+    mtm: MainThreadMarker,
+    pane: &SettingsFlippedView,
+    y: f64,
+    label_text: &str,
+) -> Card {
+    let view = slate::SlateView::flipped(
+        mtm,
+        NSRect::new(
+            NSPoint::new(PANE_PAD, y),
+            NSSize::new(CARD_W, CARD_LABEL_H),
+        ),
+        slate::Paint::Card,
+        RADIUS_LG,
+    );
+    let l = slate::section_label(mtm, label_text);
+    l.sizeToFit();
+    let lh = l.frame().size.height;
+    l.setFrame(NSRect::new(
+        NSPoint::new(CARD_PAD_X, (CARD_PAD_Y + (CARD_LABEL_H - lh) / 2.0).round()),
+        NSSize::new(CARD_W - 2.0 * CARD_PAD_X, lh),
+    ));
+    view.addSubview(&l);
+    pane.addSubview(&view);
+    Card {
+        view,
+        y: CARD_PAD_Y + CARD_LABEL_H,
+        origin_y: y,
+    }
+}
+
+/// Reserve a row of `height` inside the card, drawing the `divider` above it.
+/// Returns the row's origin y inside the card.
+fn card_row(card: &mut Card, height: f64) -> f64 {
+    let mtm = MainThreadMarker::new().expect("card_row on the main thread");
+    let line = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(CARD_PAD_X, card.y),
+            NSSize::new(CARD_W - 2.0 * CARD_PAD_X, HAIRLINE),
+        ),
+        slate::Paint::Divider,
+        0.0,
+    );
+    card.view.addSubview(&line);
+    let y = card.y + HAIRLINE;
+    card.y = y + height;
+    y
+}
+
+/// Size the card to its rows and return the pane's next free y.
+fn card_end(card: &Card) -> f64 {
+    let h = card.y + CARD_PAD_Y;
+    card.view.setFrameSize(NSSize::new(CARD_W, h));
+    card.origin_y + h + SPACE_SM
+}
+
+/// Size the pane's document view to the cards it holds, so the scroll view
+/// knows how far it can travel.
+fn finish_pane(pane: &SettingsFlippedView, last: &Card) {
+    let h = last.origin_y + last.view.frame().size.height + SPACE_LG;
+    let current = pane.frame().size.height;
+    pane.setFrameSize(NSSize::new(PANE_W, h.max(current)));
+}
+
+// ─── Row builders ────────────────────────────────────────────────────────
+
+fn row_label(
+    mtm: MainThreadMarker,
+    card: &Card,
+    y: f64,
+    height: f64,
     title: &str,
-) -> Retained<NSPopUpButton> {
-    let l = label(
+    detail: Option<&str>,
+) -> f64 {
+    let mid = y + height / 2.0;
+    let l = slate::label(
         mtm,
         title,
-        NSRect::new(NSPoint::new(PAD, y + 6.0), NSSize::new(LABEL_W, 18.0)),
-        &NSFont::systemFontOfSize(13.0),
-        &NSColor::labelColor(),
+        TYPE_LABEL,
+        WEIGHT_MEDIUM,
+        theme::text_primary(),
     );
-    container.addSubview(&l);
+    let w = place_left_flipped(&l, CARD_PAD_X, mid);
+    card.view.addSubview(&l);
+    let mut used = CARD_PAD_X + w;
+    if let Some(d) = detail {
+        let dl = slate::label(mtm, d, TYPE_CAPTION, WEIGHT_REGULAR, theme::text_tertiary());
+        let dw = place_left_flipped(&dl, used + SPACE_XS, mid);
+        card.view.addSubview(&dl);
+        used += SPACE_XS + dw;
+    }
+    used
+}
+
+/// `slate::place_left` measures against a bottom-up midline; inside a flipped
+/// card the same maths applies, because AppKit flips the frame for us.
+fn place_left_flipped(field: &NSTextField, x: f64, mid_y: f64) -> f64 {
+    field.sizeToFit();
+    let f = field.frame();
+    field.setFrame(NSRect::new(
+        NSPoint::new(x, (mid_y - f.size.height / 2.0).round()),
+        f.size,
+    ));
+    f.size.width
+}
+
+/// A label on the left and a popup, drawn as a chip, on the right.
+fn popup_row(mtm: MainThreadMarker, card: &mut Card, title: &str) -> Retained<NSPopUpButton> {
+    let y = card_row(card, CONTROL_ROW);
+    row_label(mtm, card, y, CONTROL_ROW, title, None);
+    let mid = y + CONTROL_ROW / 2.0;
+    let shell = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(CARD_W - CARD_PAD_X - POPUP_MAX_W, (mid - CONTROL_TILE / 2.0).round()),
+            NSSize::new(POPUP_MAX_W, CONTROL_TILE),
+        ),
+        slate::Paint::Chip,
+        RADIUS_TILE,
+    );
     let pop: Retained<NSPopUpButton> = NSPopUpButton::initWithFrame_pullsDown(
         NSPopUpButton::alloc(mtm),
         NSRect::new(
-            NSPoint::new(CONTROL_X, y + 4.0),
-            NSSize::new(CONTROL_W, 24.0),
+            NSPoint::new(SPACE_XXS, 0.0),
+            NSSize::new(POPUP_MAX_W - 2.0 * SPACE_XXS, CONTROL_TILE),
         ),
         false,
     );
-    container.addSubview(&pop);
+    {
+        pop.setBordered(false);
+        pop.setFont(Some(&slate::font(TYPE_META, WEIGHT_REGULAR)));
+    }
+    shell.addSubview(&pop);
+    card.view.addSubview(&shell);
     pop
+}
+
+/// Shrink the popup chip to the width its widest title needs, then right-align
+/// it. Called once the items are in.
+fn finish_popup(pop: &NSPopUpButton) {
+    pop.sizeToFit();
+    let natural = pop.frame().size.width.min(POPUP_MAX_W);
+    let w = (natural + 2.0 * SPACE_XXS).min(POPUP_MAX_W);
+    pop.setFrame(NSRect::new(
+        NSPoint::new(SPACE_XXS, 0.0),
+        NSSize::new(w - 2.0 * SPACE_XXS, CONTROL_TILE),
+    ));
+    if let Some(shell) = unsafe { pop.superview() } {
+        let f = shell.frame();
+        shell.setFrame(NSRect::new(
+            NSPoint::new(CARD_W - CARD_PAD_X - w, f.origin.y),
+            NSSize::new(w, CONTROL_TILE),
+        ));
+    }
 }
 
 fn popup_add_item(pop: &NSPopUpButton, title: &str, tag: Option<isize>, rep: Option<&str>) {
@@ -917,6 +1218,7 @@ fn popup_add_item(pop: &NSPopUpButton, title: &str, tag: Option<isize>, rep: Opt
     let idx = pop.numberOfItems() - 1;
     if let Some(item) = pop.itemAtIndex(idx) {
         unsafe {
+            style_menu_item(&item, title);
             if let Some(t) = tag {
                 item.setTag(t);
             }
@@ -927,6 +1229,26 @@ fn popup_add_item(pop: &NSPopUpButton, title: &str, tag: Option<isize>, rep: Opt
             }
         }
     }
+}
+
+/// Render a popup item in the house type scale and ink, so the chip's title is
+/// `meta` in `text_primary` rather than the system label colour.
+unsafe fn style_menu_item(item: &NSMenuItem, title: &str) {
+    use objc2_app_kit::{NSFontAttributeName, NSForegroundColorAttributeName};
+    use objc2_foundation::{NSMutableAttributedString, NSRange};
+    let attrs = NSMutableAttributedString::from_nsstring(&NSString::from_str(title));
+    let range = NSRange::new(0, attrs.length());
+    attrs.addAttribute_value_range(
+        NSFontAttributeName,
+        &*slate::font(TYPE_META, WEIGHT_REGULAR),
+        range,
+    );
+    attrs.addAttribute_value_range(
+        NSForegroundColorAttributeName,
+        &*theme::text_primary(),
+        range,
+    );
+    item.setAttributedTitle(Some(&attrs));
 }
 
 fn select_popup_tag(pop: &NSPopUpButton, tag: i64) {
@@ -968,103 +1290,143 @@ fn wire_popup(
     }
 }
 
-/// A row label (left) + a switch (right). Returns the switch.
-fn switch_row(
+/// A label + optional detail on the left, an ink toggle on the right.
+fn toggle_row(
     mtm: MainThreadMarker,
-    container: &SettingsFlippedView,
-    y: f64,
+    card: &mut Card,
     title: &str,
-) -> Retained<NSSwitch> {
-    let l = label(
+    detail: &str,
+) -> Retained<slate::InkToggle> {
+    let y = card_row(card, CONTROL_ROW);
+    row_label(mtm, card, y, CONTROL_ROW, title, Some(detail));
+    let mid = y + CONTROL_ROW / 2.0;
+    let sw = slate::InkToggle::new(
         mtm,
-        title,
-        NSRect::new(NSPoint::new(PAD, y + 6.0), NSSize::new(LABEL_W, 18.0)),
-        &NSFont::systemFontOfSize(13.0),
-        &NSColor::labelColor(),
+        NSRect::new(
+            NSPoint::new(
+                CARD_W - CARD_PAD_X - slate::TOGGLE_W,
+                (mid - slate::TOGGLE_H / 2.0).round(),
+            ),
+            NSSize::new(slate::TOGGLE_W, slate::TOGGLE_H),
+        ),
     );
-    container.addSubview(&l);
-    let sw = NSSwitch::initWithFrame(
-        NSSwitch::alloc(mtm),
-        NSRect::new(NSPoint::new(CONTROL_X, y + 4.0), NSSize::new(40.0, 22.0)),
-    );
-    container.addSubview(&sw);
+    card.view.addSubview(&sw);
     sw
 }
 
 fn wire_switch(
-    sw: &NSSwitch,
+    sw: &slate::InkToggle,
     controller: &Retained<SettingsController>,
     action: objc2::runtime::Sel,
     locked: bool,
 ) {
     unsafe {
-        sw.setTarget(Some(controller));
-        sw.setAction(Some(action));
-        sw.setEnabled(!locked);
+        let _: () = msg_send![sw, setTarget: &**controller];
+        let _: () = msg_send![sw, setAction: action];
     }
+    sw.set_active(!locked);
 }
 
-/// A row label (left) + a text field (right). Returns the field.
+/// A label on the left and a house text field on the right.
 fn text_row(
     mtm: MainThreadMarker,
-    container: &SettingsFlippedView,
-    y: f64,
+    card: &mut Card,
     title: &str,
     value: &str,
 ) -> Retained<NSTextField> {
-    let l = label(
+    let y = card_row(card, CONTROL_ROW);
+    let used = row_label(mtm, card, y, CONTROL_ROW, title, None);
+    let mid = y + CONTROL_ROW / 2.0;
+    let left = (used + SPACE_MD).max(CARD_W / 2.0);
+    let width = CARD_W - CARD_PAD_X - left;
+    let shell = slate::SlateView::new(
         mtm,
-        title,
-        NSRect::new(NSPoint::new(PAD, y + 6.0), NSSize::new(LABEL_W, 18.0)),
-        &NSFont::systemFontOfSize(13.0),
-        &NSColor::labelColor(),
+        NSRect::new(
+            NSPoint::new(left, (mid - CONTROL_CHIP / 2.0).round()),
+            NSSize::new(width, CONTROL_CHIP),
+        ),
+        slate::Paint::Chip,
+        RADIUS_SM,
     );
-    container.addSubview(&l);
     let field: Retained<NSTextField> = unsafe {
         msg_send![
             NSTextField::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(CONTROL_X, y + 4.0), NSSize::new(CONTROL_W, 22.0))
-        ]
-    };
-    field.setStringValue(&NSString::from_str(value));
-    field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-    field.setPlaceholderString(Some(&NSString::from_str(
-        crate::settings::DEFAULT_WAKE_WORD,
-    )));
-    container.addSubview(&field);
-    field
-}
-
-/// A full-width push button row. Returns new y.
-fn button_row(
-    mtm: MainThreadMarker,
-    container: &SettingsFlippedView,
-    y: f64,
-    title: &str,
-    controller: &Retained<SettingsController>,
-    action: objc2::runtime::Sel,
-) -> f64 {
-    let btn: Retained<NSButton> = unsafe {
-        msg_send![
-            NSButton::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(CONTROL_X, y + 2.0), NSSize::new(CONTROL_W, 26.0))
+            initWithFrame: NSRect::new(
+                NSPoint::new(SPACE_XS, ((CONTROL_CHIP - FIELD_TEXT_H) / 2.0).round()),
+                NSSize::new(width - 2.0 * SPACE_XS, FIELD_TEXT_H),
+            )
         ]
     };
     unsafe {
-        btn.setTitle(&NSString::from_str(title));
-        let _: () = msg_send![&*btn, setBezelStyle: 1usize]; // rounded
-        btn.setTarget(Some(controller));
-        btn.setAction(Some(action));
+        field.setBezeled(false);
+        field.setDrawsBackground(false);
+        field.setAlignment(NSTextAlignment::Right);
+        field.setFont(Some(&slate::font(TYPE_META, WEIGHT_REGULAR)));
+        let _: () = msg_send![&*field, setTextColor: &*theme::text_primary()];
+        let _: () = msg_send![&*field, setFocusRingType: 1usize]; // None
     }
-    container.addSubview(&btn);
-    y + ROW_H
+    field.setStringValue(&NSString::from_str(value));
+    shell.addSubview(&field);
+    card.view.addSubview(&shell);
+    field
+}
+
+const FIELD_TEXT_H: f64 = 18.0;
+
+/// A row whose "control" is an action: a label on the left and an outlined
+/// "Open" chip on the right.
+fn button_row(
+    mtm: MainThreadMarker,
+    card: &mut Card,
+    title: &str,
+    controller: &Retained<SettingsController>,
+    action: objc2::runtime::Sel,
+) {
+    let y = card_row(card, CONTROL_ROW);
+    row_label(mtm, card, y, CONTROL_ROW, title, None);
+    let mid = y + CONTROL_ROW / 2.0;
+    let chip = slate::chip(mtm, "Open", Some("arrow.up.forward"), CARD_W - CARD_PAD_X, mid);
+    // A flipped parent flips the chip's y, so re-centre it in card space.
+    let f = chip.frame();
+    chip.setFrame(NSRect::new(
+        NSPoint::new(f.origin.x, (mid - CONTROL_CHIP / 2.0).round()),
+        f.size,
+    ));
+    card.view.addSubview(&chip);
+    let btn = slate::click_overlay(mtm, chip.frame(), controller, action, 0);
+    unsafe {
+        let _: () = msg_send![&*btn, setToolTip: &*NSString::from_str(title)];
+        let _: () = msg_send![&*btn, setAccessibilityLabel: &*NSString::from_str(title)];
+    }
+    card.view.addSubview(&btn);
+}
+
+/// A full-width `caption` line inside a card: hints, env-var locks, and the
+/// About facts.
+fn hint_line(mtm: MainThreadMarker, card: &mut Card, text: &str) -> Retained<NSTextField> {
+    let y = card_row(card, HINT_H);
+    let l = slate::label(mtm, text, TYPE_CAPTION, WEIGHT_REGULAR, theme::text_tertiary());
+    l.setFrame(NSRect::new(
+        NSPoint::new(CARD_PAD_X, (y + (HINT_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round()),
+        NSSize::new(CARD_W - 2.0 * CARD_PAD_X, TYPE_CAPTION + SPACE_XXS),
+    ));
+    card.view.addSubview(&l);
+    l
+}
+
+const HINT_H: f64 = 22.0;
+
+/// "(locked by DICTATE_…)" footnote.
+fn env_hint(mtm: MainThreadMarker, card: &mut Card, varname: &str) {
+    hint_line(mtm, card, &format!("Locked by the {varname} env var"));
 }
 
 // ─── Sender readers (called from the controller's objc methods) ──────────
 
+/// Works for the house ink toggle and for any `NSControl` with a `state`.
 fn switch_on(sender: *mut AnyObject) -> bool {
-    let sw: &NSSwitch = unsafe { &*(sender as *const NSSwitch) };
-    sw.state() == NSControlStateValueOn
+    let state: isize = unsafe { msg_send![sender, state] };
+    state != 0
 }
 
 fn field_string(sender: *mut AnyObject) -> String {

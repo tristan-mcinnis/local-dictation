@@ -35,6 +35,7 @@ ax-inject = [
     "dep:objc2-foundation",
     "dep:objc2-app-kit",
     "dep:objc2-core-foundation",
+    "dep:block2",
 ]
 # The one-user production stack: Cohere MLX + S1-mini + native Mac UI/output.
 full = ["cohere-mlx", "cleaner", "ax-inject"]
@@ -61,7 +62,7 @@ libc = "0.2"
 # Menu-bar status item. Pulled in only with the ax-inject feature (the daemon
 # path) — the lib build doesn't need it.
 objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSRunLoop", "NSThread", "NSDate", "NSDateFormatter"] }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSRunLoop", "NSThread", "NSDate", "NSDateFormatter", "NSAttributedString", "NSDictionary", "NSValue", "NSGeometry", "NSEnumerator"] }
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication",
     "NSStatusBar",
@@ -81,6 +82,7 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSGraphics",
     "NSGraphicsContext",
     "NSImage",
+    "NSImageView",
     # Plain native "Dictation History" window: a read-only NSTextView in a
     # scroll view. No WebView / HTML.
     "NSText",
@@ -97,7 +99,27 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     # Native Settings window controls: popups for pickers, switches for toggles.
     "NSPopUpButton",
     "NSSwitch",
+    # ── House design (Slate) ────────────────────────────────────────────
+    # Appearance-aware dynamic colours (NSColor colorWithName:dynamicProvider:),
+    # the glass material behind the pill / panels, vector drawing for the
+    # Slate primitives, and the bitmap path the offscreen `render-ui`
+    # subcommand uses to snapshot every window without showing it.
+    "NSAppearance",
+    "NSColorList",
+    "block2",
+    "NSVisualEffectView",
+    "NSSearchField",
+    "NSBezierPath",
+    "NSShadow",
+    "NSAttributedString",
+    "NSParagraphStyle",
+    "NSStringDrawing",
+    "NSImageRep",
+    "NSBitmapImageRep",
+    "NSTrackingArea",
+    "NSClipView",
 ] }
+block2 = { version = "0.6", optional = true }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
 
 [dev-dependencies]

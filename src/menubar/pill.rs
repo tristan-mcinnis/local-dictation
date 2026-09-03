@@ -1,32 +1,89 @@
-//! Floating waveform pill window and its state animation.
+//! The floating dictation pill — Slate.
+//!
+//! The pill is the same glass as a floating panel: an `NSVisualEffectView`
+//! tinted with `panel_tint`, a `stroke` hairline, a 1 px `highlight_top` inside
+//! the top edge, and the window's own layered shadow. It is
+//! `CONTROL_PILL` (36) high at `RADIUS_PILL` (18).
+//!
+//! Five layouts share one view tree, so a state change is a re-layout rather
+//! than a rebuild:
+//!
+//! | state      | content                                                     |
+//! | ---------- | ----------------------------------------------------------- |
+//! | recording  | ink waveform in a sunken `well`                              |
+//! | processing | the same bars at 40 % ink                                    |
+//! | hover      | well + "Release to finish `esc` · Latch `space`"             |
+//! | success    | `success` dot + "Landed · N words" + "Undo" `⌘` `Z`          |
+//! | error      | `danger` dot + "Couldn't transcribe" + "Retry" `↩`           |
+//!
+//! Success and error no longer recolour the bars: the pill collapses to a
+//! status line, which is the one place the rule allows chroma (a status dot,
+//! always paired with a word).
+
 use super::*;
 
-/// Build an NSImage from an SF Symbol name. Returns None if the symbol
-/// doesn't exist or we're on an older macOS without SF Symbols.
+/// Build an NSImage from an SF Symbol name, as a template image (it adopts the
+/// menu-bar tint). Returns None if the symbol doesn't exist.
 pub(super) fn sf_symbol(name: &str) -> Option<Retained<NSImage>> {
     let ns_name = NSString::from_str(name);
     let img = { NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None) };
     if let Some(ref img) = img {
-        // Template mode: the image adopts the menu-bar tint color
-        // (dark or light depending on the user's theme).
         img.setTemplate(true);
     }
     img
 }
 
-pub(super) struct PillBuild {
-    pub(super) window: Retained<NSWindow>,
-    pub(super) content: Retained<NSView>,
-    pub(super) bars: Vec<Retained<NSView>>,
-    pub(super) status: Retained<NSTextField>,
-    pub(super) cancel: Retained<NSButton>,
-    pub(super) settings: Retained<NSButton>,
+/// The same glyph, rendered once into `danger` so the recording state reads as
+/// recording without relying on animation. Template images adopt the menu-bar
+/// tint, so the tinted copy must be a real (non-template) bitmap.
+pub(super) fn sf_symbol_tinted(name: &str, color: &NSColor) -> Option<Retained<NSImage>> {
+    let ns_name = NSString::from_str(name);
+    let base = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None)?;
+    // A hierarchical symbol configuration is the native way to colour an SF
+    // Symbol; a template image would ignore it and adopt the menu-bar tint.
+    let cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(color);
+    let tinted = base.imageWithSymbolConfiguration(&cfg)?;
+    tinted.setTemplate(false);
+    Some(tinted)
 }
 
-/// Build the floating pill window. It starts as a compact waveform capsule;
-/// the same content view grows horizontally when the pointer rests over it,
-/// revealing status text plus two useful, >=32px controls. Keeping one window
-/// and one view tree makes hover expansion cheap and interruptible.
+/// Every view the pill can show. All are built once; `layout_pill` positions
+/// the ones this state needs and hides the rest.
+pub(super) struct PillBuild {
+    pub(super) window: Retained<NSWindow>,
+    /// The blur material; also the pill's content container.
+    pub(super) glass: Retained<NSView>,
+    /// The tint / stroke / highlight painted over the material.
+    pub(super) tint: Retained<slate::SlateView>,
+    /// The sunken track the bars sit in.
+    pub(super) well: Retained<slate::SlateView>,
+    pub(super) waveform: Retained<slate::WaveformView>,
+    /// Status dot for the success / error lines.
+    pub(super) dot: Retained<slate::SlateView>,
+    /// "Release to finish" / "Landed · 38 words" / "Couldn't transcribe".
+    pub(super) status: Retained<NSTextField>,
+    /// "Latch" / "Undo" / "Retry" — the secondary word before a key cap.
+    pub(super) hint: Retained<NSTextField>,
+    /// Up to three key caps: `esc`, `space`; `⌘`, `Z`; `↩`.
+    pub(super) caps: Vec<Retained<slate::SlateView>>,
+    /// Invisible hit targets over the shelf's caps so Escape-to-cancel and
+    /// Undo stay clickable, exactly as the old × / ⚙ buttons were.
+    pub(super) cancel: Retained<NSButton>,
+    pub(super) undo: Retained<NSButton>,
+}
+unsafe impl Send for PillBuild {}
+unsafe impl Sync for PillBuild {}
+
+/// Which layout the pill is showing. Derived from `UiState` plus hover.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum PillLayout {
+    Compact,
+    Shelf,
+    Success,
+    Error,
+}
+
+/// Build the floating pill window.
 pub(super) fn build_pill_window(
     mtm: MainThreadMarker,
     actions: &Retained<MenuActions>,
@@ -48,121 +105,245 @@ pub(super) fn build_pill_window(
         window.setBackgroundColor(Some(&clear));
         // The pill is intentionally mouse-aware: the timer samples the
         // pointer against the window frame and expands the shelf on hover.
-        // Controls remain outside the compact frame until expanded.
         window.setIgnoresMouseEvents(false);
         window.setCollectionBehavior(
             NSWindowCollectionBehavior::CanJoinAllSpaces
                 | NSWindowCollectionBehavior::Stationary
                 | NSWindowCollectionBehavior::IgnoresCycle,
         );
+        // The two panel shadows (`SHADOW_PANEL_NEAR` + `SHADOW_PANEL_FAR`) are
+        // what AppKit draws for a floating borderless window; asking for both
+        // by hand would double them.
         window.setHasShadow(true);
     }
 
-    // Content view: dark rounded pill with a subtle gray border.
-    let content_view = NSView::initWithFrame(NSView::alloc(mtm), frame);
-    unsafe {
-        content_view.setWantsLayer(true);
-        let layer: *mut objc2::runtime::AnyObject = msg_send![&*content_view, layer];
-        let _: () = msg_send![layer, setCornerRadius: PILL_H / 2.0];
-        let _: () = msg_send![layer, setMasksToBounds: true];
-        // Background: refined charcoal HUD (family palette).
-        let bg = theme::pill_bg();
-        let bg_cg: *mut objc2::runtime::AnyObject = msg_send![&*bg, CGColor];
-        let _: () = msg_send![layer, setBackgroundColor: bg_cg];
-        // Border: a hairline light ring, subtler than the old grey.
-        let border = theme::pill_border();
-        let border_cg: *mut objc2::runtime::AnyObject = msg_send![&*border, CGColor];
-        let _: () = msg_send![layer, setBorderColor: border_cg];
-        let _: () = msg_send![layer, setBorderWidth: 1.0_f64];
-    }
+    // ── Glass: material + panel tint / stroke / top highlight ──────────
+    let (glass, tint) = slate::glass(mtm, frame, RADIUS_PILL);
 
-    // Build N bar views centered horizontally + vertically. Each bar is an
-    // NSView with a white layer background. We mutate frame on every UI tick.
-    let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
-    let bar_block_x = (PILL_W - bar_block_w) / 2.0;
-    let mut bars = Vec::with_capacity(BAR_COUNT);
-    for i in 0..BAR_COUNT {
-        let x = bar_block_x + i as f64 * (BAR_W + BAR_GAP);
-        let y = (PILL_H - BAR_MIN_H) / 2.0;
-        let bar_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, BAR_MIN_H));
-        let bar = NSView::initWithFrame(NSView::alloc(mtm), bar_frame);
-        unsafe {
-            bar.setWantsLayer(true);
-            let layer: *mut objc2::runtime::AnyObject = msg_send![&*bar, layer];
-            let _: () = msg_send![layer, setCornerRadius: (BAR_W / 2.0)];
-            let active = theme::bar_active();
-            let active_cg: *mut objc2::runtime::AnyObject = msg_send![&*active, CGColor];
-            let _: () = msg_send![layer, setBackgroundColor: active_cg];
-        }
-        content_view.addSubview(&bar);
-        bars.push(bar);
-    }
+    // ── The waveform, in its sunken well ───────────────────────────────
+    let well = slate::SlateView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(PILL_PAD, ((PILL_H - WELL_H) / 2.0).round()),
+            NSSize::new(2.0 * WELL_PAD + BAR_BLOCK_W, WELL_H),
+        ),
+        slate::Paint::Well,
+        WELL_RADIUS,
+    );
+    let waveform = slate::WaveformView::new(
+        mtm,
+        NSRect::new(
+            NSPoint::new(WELL_PAD, 0.0),
+            NSSize::new(BAR_BLOCK_W, WELL_H),
+        ),
+    );
+    well.addSubview(&waveform);
+    glass.addSubview(&well);
 
-    // Contextual shelf: hidden by clipping while compact, then revealed by
-    // the width animation. The labels are redundant status cues (not color
-    // alone), and the buttons have persistent tooltips/accessibility names.
-    let status = NSTextField::labelWithString(&NSString::from_str("Ready"), mtm);
-    status.setFrame(NSRect::new(
-        NSPoint::new(PILL_W + 14.0, 8.0),
-        NSSize::new(68.0, 18.0),
-    ));
-    status.setFont(Some(&NSFont::systemFontOfSize(11.0)));
+    // ── Status line pieces ─────────────────────────────────────────────
+    let dot = slate::status_dot(mtm, true, PILL_TEXT_PAD, PILL_H / 2.0);
+    dot.setHidden(true);
+    glass.addSubview(&dot);
+
+    let status = slate::label(
+        mtm,
+        "Release to finish",
+        TYPE_META,
+        WEIGHT_REGULAR,
+        theme::text_secondary(),
+    );
     unsafe {
-        let _: () = msg_send![&*status, setTextColor: &*NSColor::whiteColor()];
-        let _: () = msg_send![&*status, setAlphaValue: 0.0_f64];
         let _: () =
             msg_send![&*status, setAccessibilityLabel: &*NSString::from_str("Dictation status")];
     }
+    status.setHidden(true);
+    glass.addSubview(&status);
 
+    let hint = slate::label(
+        mtm,
+        "Latch",
+        TYPE_META,
+        WEIGHT_REGULAR,
+        theme::text_tertiary(),
+    );
+    hint.setHidden(true);
+    glass.addSubview(&hint);
+
+    // Three caps cover every layout: two on the shelf, two for ⌘Z, one for ↩.
+    let mut caps = Vec::new();
+    for _ in 0..3 {
+        let cap = slate::key_cap(mtm, "esc", 0.0, PILL_H / 2.0);
+        cap.setHidden(true);
+        glass.addSubview(&cap);
+        caps.push(cap);
+    }
+
+    // Invisible hit targets: the shelf's `esc` cap cancels, the success line's
+    // ⌘Z pair undoes. The caps stay the visual affordance; these carry the
+    // click, so the pill keeps every action it had.
     let cancel: Retained<NSButton> = unsafe {
         msg_send![
             NSButton::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 66.0, 4.0), NSSize::new(26.0, 26.0))
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
         ]
     };
-    cancel.setTitle(&NSString::from_str("×"));
+    cancel.setTitle(&NSString::from_str(""));
     cancel.setBordered(false);
     cancel.setToolTip(Some(&NSString::from_str("Cancel recording (Escape)")));
     unsafe {
+        let _: () = msg_send![&*cancel, setTransparent: true];
         let _: () = msg_send![&*cancel, setTarget: &**actions];
         let _: () = msg_send![&*cancel, setAction: sel!(cancelPill:)];
-        let _: () = msg_send![&*cancel, setKeyEquivalent: &*NSString::from_str("\u{1b}")];
-        let _: () = msg_send![&*cancel, setFont: &*NSFont::systemFontOfSize(17.0)];
+        let _: () = msg_send![&*cancel, setKeyEquivalent: &*NSString::from_str("\\u{1b}")];
         let _: () =
             msg_send![&*cancel, setAccessibilityLabel: &*NSString::from_str("Cancel recording")];
-        let _: () = msg_send![&*cancel, setAlphaValue: 0.0_f64];
     }
+    cancel.setHidden(true);
+    glass.addSubview(&cancel);
 
-    let settings: Retained<NSButton> = unsafe {
+    let undo: Retained<NSButton> = unsafe {
         msg_send![
             NSButton::alloc(mtm),
-            initWithFrame: NSRect::new(NSPoint::new(PILL_EXPANDED_W - 36.0, 4.0), NSSize::new(26.0, 26.0))
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
         ]
     };
-    settings.setTitle(&NSString::from_str("⚙"));
-    settings.setBordered(false);
-    settings.setToolTip(Some(&NSString::from_str("Open Dictation settings")));
+    undo.setTitle(&NSString::from_str(""));
+    undo.setBordered(false);
+    undo.setToolTip(Some(&NSString::from_str("Undo the last dictation (⌘Z)")));
     unsafe {
-        let _: () = msg_send![&*settings, setTarget: &**actions];
-        let _: () = msg_send![&*settings, setAction: sel!(openSettings:)];
-        settings.setFont(Some(&NSFont::systemFontOfSize(13.0)));
-        let _: () = msg_send![&*settings, setAccessibilityLabel: &*NSString::from_str("Open Dictation settings")];
-        let _: () = msg_send![&*settings, setAlphaValue: 0.0_f64];
+        let _: () = msg_send![&*undo, setTransparent: true];
+        let _: () = msg_send![&*undo, setTarget: &**actions];
+        let _: () = msg_send![&*undo, setAction: sel!(cancelPill:)];
+        let _: () = msg_send![&*undo, setAccessibilityLabel: &*NSString::from_str("Undo dictation")];
     }
+    undo.setHidden(true);
+    glass.addSubview(&undo);
 
-    content_view.addSubview(&status);
-    content_view.addSubview(&cancel);
-    content_view.addSubview(&settings);
+    window.setContentView(Some(&*glass));
 
-    window.setContentView(Some(&content_view));
     Ok(PillBuild {
         window,
-        content: content_view,
-        bars,
+        glass,
+        tint,
+        well,
+        waveform,
+        dot,
         status,
+        hint,
+        caps,
         cancel,
-        settings,
+        undo,
     })
+}
+
+// ─── Layout ──────────────────────────────────────────────────────────────
+
+/// Lay the pill out for `layout` and return the width the window needs.
+/// Everything is measured, so a longer word never clips.
+pub(super) fn layout_pill(pill: &PillBuild, layout: PillLayout) -> f64 {
+    let mid = PILL_H / 2.0;
+    let well_w = 2.0 * WELL_PAD + BAR_BLOCK_W;
+    for cap in &pill.caps {
+        cap.setHidden(true);
+    }
+    pill.cancel.setHidden(true);
+    pill.undo.setHidden(true);
+
+    let width = match layout {
+        PillLayout::Compact => {
+            pill.well.setHidden(false);
+            pill.dot.setHidden(true);
+            pill.status.setHidden(true);
+            pill.hint.setHidden(true);
+            pill.well.setFrameOrigin(NSPoint::new(PILL_PAD, ((PILL_H - WELL_H) / 2.0).round()));
+            2.0 * PILL_PAD + well_w
+        }
+        PillLayout::Shelf => {
+            pill.well.setHidden(false);
+            pill.dot.setHidden(true);
+            pill.status.setHidden(false);
+            pill.hint.setHidden(false);
+            pill.well
+                .setFrameOrigin(NSPoint::new(PILL_PAD, ((PILL_H - WELL_H) / 2.0).round()));
+            let mut x = PILL_PAD + well_w + PILL_GAP;
+            x += slate::place_left(&pill.status, x, mid) + PILL_GAP;
+            x += place_cap(&pill.caps[0], "esc", x, mid) + PILL_GAP;
+            // The visible cap is the affordance; this invisible button is what
+            // AppKit clicks and what carries the Escape key equivalent.
+            pill.cancel.setFrame(pill.caps[0].frame());
+            pill.cancel.setHidden(false);
+            x += slate::place_left(&pill.hint, x, mid) + PILL_GAP;
+            x += place_cap(&pill.caps[1], "space", x, mid);
+            x + PILL_TEXT_PAD
+        }
+        PillLayout::Success => {
+            pill.well.setHidden(true);
+            pill.dot.setHidden(false);
+            pill.status.setHidden(false);
+            pill.hint.setHidden(false);
+            pill.dot.set_paint(slate::Paint::DotSuccess);
+            pill.dot
+                .setFrameOrigin(NSPoint::new(PILL_TEXT_PAD, (mid - slate::DOT / 2.0).round()));
+            let mut x = PILL_TEXT_PAD + slate::DOT + PILL_GAP;
+            x += slate::place_left(&pill.status, x, mid) + PILL_GAP;
+            x += slate::place_left(&pill.hint, x, mid) + PILL_GAP;
+            let c0 = place_cap(&pill.caps[0], "⌘", x, mid);
+            x += c0 + SPACE_XXS;
+            x += place_cap(&pill.caps[1], "Z", x, mid);
+            pill.undo.setFrame(NSRect::new(
+                NSPoint::new(x - c0 - SPACE_XXS - pill.hint.frame().size.width - PILL_GAP, 0.0),
+                NSSize::new(
+                    c0 + SPACE_XXS + pill.caps[1].frame().size.width
+                        + pill.hint.frame().size.width
+                        + PILL_GAP,
+                    PILL_H,
+                ),
+            ));
+            pill.undo.setHidden(false);
+            x + PILL_GAP + 2.0
+        }
+        PillLayout::Error => {
+            pill.well.setHidden(true);
+            pill.dot.setHidden(false);
+            pill.status.setHidden(false);
+            pill.hint.setHidden(false);
+            pill.dot.set_paint(slate::Paint::DotDanger);
+            pill.dot
+                .setFrameOrigin(NSPoint::new(PILL_TEXT_PAD, (mid - slate::DOT / 2.0).round()));
+            let mut x = PILL_TEXT_PAD + slate::DOT + PILL_GAP;
+            x += slate::place_left(&pill.status, x, mid) + PILL_GAP;
+            x += slate::place_left(&pill.hint, x, mid) + PILL_GAP;
+            x += place_cap(&pill.caps[2], "↩", x, mid);
+            x + PILL_TEXT_PAD
+        }
+    };
+    // The error pill is the one surface that takes a `danger` hairline, so the
+    // failure reads at a glance without recolouring anything else.
+    pill.tint.set_danger_stroke(layout == PillLayout::Error);
+    width.round()
+}
+
+/// Retitle a key cap in place and position it. Returns its width.
+fn place_cap(cap: &slate::SlateView, text: &str, x: f64, mid_y: f64) -> f64 {
+    let subs = cap.subviews();
+    if let Some(first) = subs.iter().next() {
+        let field: &NSTextField = unsafe { &*(&*first as *const NSView as *const NSTextField) };
+        field.setStringValue(&NSString::from_str(text));
+        field.sizeToFit();
+        let tw = field.frame().size.width;
+        let w = (tw + 2.0 * 5.0).max(CONTROL_KEYCAP).round();
+        cap.setFrame(NSRect::new(
+            NSPoint::new(x.round(), (mid_y - CONTROL_KEYCAP / 2.0).round()),
+            NSSize::new(w, CONTROL_KEYCAP),
+        ));
+        let th = field.frame().size.height;
+        field.setFrame(NSRect::new(
+            NSPoint::new(((w - tw) / 2.0).round(), ((CONTROL_KEYCAP - th) / 2.0).round()),
+            NSSize::new(tw, th),
+        ));
+    }
+    cap.setHidden(false);
+    cap.frame().size.width
 }
 
 /// CFRunLoopTimer firing ~30 FPS. On every tick: update bar heights from
@@ -230,14 +411,13 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         None => return,
     };
 
-    // Pick the SF Symbol for this state. mic / mic.fill / waveform make
-    // a clean visual progression: outline → filled → animated wave.
+    // One glyph family — the waveform, matching the app icon. Idle is the
+    // template ink; recording is the same shape tinted `danger`; processing is
+    // the template at 40 %, which is the rule's "busy" treatment.
     let icon = match state {
-        UiState::Idle => &globals.icon_idle,
+        UiState::Idle | UiState::Success => &globals.icon_idle,
         UiState::Recording => &globals.icon_recording,
-        UiState::Processing => &globals.icon_processing,
-        UiState::Success => &globals.icon_recording,
-        UiState::Error => &globals.icon_processing,
+        UiState::Processing | UiState::Error => &globals.icon_processing,
     };
     if let Some(button) = globals.status_item.button(mtm) {
         if let Some(img) = icon {
@@ -253,6 +433,11 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             };
             button.setTitle(&NSString::from_str(fallback));
         }
+        button.setAlphaValue(if state == UiState::Processing {
+            PROCESSING_ALPHA
+        } else {
+            1.0
+        });
     }
 
     match state {
@@ -266,52 +451,61 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             }
             ui_channel::reset_levels();
             collapse_bars(globals);
-            resize_pill(globals, 0.0);
+            if let Ok(mut p) = globals.pill_expanded.lock() {
+                *p = 0.0;
+            }
+            set_pill_layout(globals, PillLayout::Compact);
             globals.pill_window.orderOut(None);
         }
         UiState::Recording => {
-            set_bars_color(globals, &theme::bar_active());
+            globals.pill.waveform.set_muted(false);
             globals
-                .pill_status
-                .setStringValue(&NSString::from_str("Recording · release to finish"));
-            set_pill_controls_visible(globals, false);
-            resize_pill(globals, 0.0);
-            position_pill_at_cursor_screen(&globals.pill_window);
-            globals.pill_window.orderFrontRegardless();
+                .pill
+                .status
+                .setStringValue(&NSString::from_str("Release to finish"));
+            globals.pill.hint.setStringValue(&NSString::from_str("Latch"));
+            set_pill_layout(globals, PillLayout::Compact);
+            show_pill(globals);
         }
         UiState::Processing => {
-            set_bars_color(globals, &theme::bar_busy());
+            globals.pill.waveform.set_muted(true);
             globals
-                .pill_status
-                .setStringValue(&NSString::from_str("Processing…"));
-            set_pill_controls_visible(globals, false);
-            resize_pill(globals, 0.0);
-            position_pill_at_cursor_screen(&globals.pill_window);
-            globals.pill_window.orderFrontRegardless();
+                .pill
+                .status
+                .setStringValue(&NSString::from_str("Working…"));
+            set_pill_layout(globals, PillLayout::Compact);
+            show_pill(globals);
         }
         UiState::Success => {
-            set_bars_color(globals, &theme::bar_success());
-            globals
-                .pill_status
-                .setStringValue(&NSString::from_str("Done"));
-            set_static_success_bars(globals);
-            set_pill_controls_visible(globals, false);
-            resize_pill(globals, 0.0);
-            position_pill_at_cursor_screen(&globals.pill_window);
-            globals.pill_window.orderFrontRegardless();
+            let words = ui_channel::last_dictation().split_whitespace().count();
+            let text = if words == 1 {
+                "Landed · 1 word".to_string()
+            } else {
+                format!("Landed · {words} words")
+            };
+            globals.pill.status.setStringValue(&NSString::from_str(&text));
+            globals.pill.hint.setStringValue(&NSString::from_str("Undo"));
+            set_pill_layout(globals, PillLayout::Success);
+            show_pill(globals);
         }
         UiState::Error => {
-            set_bars_color(globals, &theme::bar_error());
             globals
-                .pill_status
+                .pill
+                .status
                 .setStringValue(&NSString::from_str("Couldn’t transcribe"));
-            set_static_error_bars(globals);
-            set_pill_controls_visible(globals, false);
-            resize_pill(globals, 0.0);
-            position_pill_at_cursor_screen(&globals.pill_window);
-            globals.pill_window.orderFrontRegardless();
+            globals.pill.hint.setStringValue(&NSString::from_str("Retry"));
+            set_pill_layout(globals, PillLayout::Error);
+            show_pill(globals);
         }
     }
+}
+
+/// The menu-bar glyph's alpha while the pipeline works.
+const PROCESSING_ALPHA: f64 = 0.4;
+
+fn show_pill(globals: &UiGlobals) {
+    position_pill_at_cursor_screen(&globals.pill_window);
+    globals.pill_window.orderFrontRegardless();
 }
 
 /// Read the pointer directly instead of installing a global event monitor.
@@ -334,6 +528,12 @@ pub(super) fn pointer_over_pill(window: &NSWindow) -> bool {
 /// stable at the same screen centre while the shelf reveals itself to the
 /// right. Reduced motion snaps to the target and uses static status cues.
 pub(super) fn update_pill_hover(globals: &UiGlobals) {
+    // Only the waveform states carry a hover shelf; the success and error
+    // lines already say what they are.
+    let state = ui_channel::state();
+    if !matches!(state, UiState::Recording | UiState::Processing) {
+        return;
+    }
     let target = if pointer_over_pill(&globals.pill_window) {
         1.0
     } else {
@@ -345,7 +545,7 @@ pub(super) fn update_pill_hover(globals: &UiGlobals) {
     let next = if globals.reduced_motion {
         target
     } else {
-        *progress + (target - *progress) * 0.24
+        *progress + (target - *progress) * HOVER_EASE
     };
     let next = if (next - target).abs() < 0.01 {
         target
@@ -355,67 +555,66 @@ pub(super) fn update_pill_hover(globals: &UiGlobals) {
     if (next - *progress).abs() < 0.004 {
         return;
     }
+    let crossed = (*progress > 0.5) != (next > 0.5);
     *progress = next;
     drop(progress);
-    resize_pill(globals, next);
-    set_pill_controls_visible(globals, next > 0.08);
-}
-
-pub(super) fn set_pill_controls_visible(globals: &UiGlobals, visible: bool) {
-    let alpha = if visible { 1.0 } else { 0.0 };
-    unsafe {
-        let _: () = msg_send![&*globals.pill_status, setAlphaValue: alpha];
-        let _: () = msg_send![&*globals.pill_cancel, setAlphaValue: alpha];
-        let _: () = msg_send![&*globals.pill_settings, setAlphaValue: alpha];
+    if crossed || next == 0.0 || next == 1.0 {
+        set_pill_layout(
+            globals,
+            if next > 0.5 {
+                PillLayout::Shelf
+            } else {
+                PillLayout::Compact
+            },
+        );
+    } else {
+        resize_pill(globals, next);
     }
 }
 
-/// Resize the transparent borderless window around the same horizontal
-/// centre. `setFrame:display:animate:` is deliberately non-animated; the
-/// interpolation above is what makes the transition interruptible.
+/// How fast the shelf eases open per 33 ms tick. `MOTION_HOVER` is 0.10 s, so
+/// roughly a quarter of the remaining distance each frame.
+const HOVER_EASE: f64 = 0.033 / MOTION_HOVER * 0.8;
+
+/// Lay the pill out for `layout` and size the window to the result.
+pub(super) fn set_pill_layout(globals: &UiGlobals, layout: PillLayout) {
+    let width = layout_pill(&globals.pill, layout);
+    set_pill_width(globals, width);
+}
+
+/// Interpolate the window width while the shelf eases open.
 pub(super) fn resize_pill(globals: &UiGlobals, progress: f64) {
-    let width = PILL_W + (PILL_EXPANDED_W - PILL_W) * progress.clamp(0.0, 1.0);
+    let compact = 2.0 * PILL_PAD + 2.0 * WELL_PAD + BAR_BLOCK_W;
+    let expanded = globals.pill.glass.frame().size.width.max(compact);
+    let width = compact + (expanded - compact) * progress.clamp(0.0, 1.0);
+    set_pill_width(globals, width);
+}
+
+fn set_pill_width(globals: &UiGlobals, width: f64) {
     let old = globals.pill_window.frame();
     let cx = old.origin.x + old.size.width / 2.0;
     let frame = NSRect::new(
-        NSPoint::new(cx - width / 2.0, old.origin.y),
+        NSPoint::new((cx - width / 2.0).round(), old.origin.y),
         NSSize::new(width, PILL_H),
     );
     unsafe {
         let _: () =
             msg_send![&*globals.pill_window, setFrame: frame, display: true, animate: false];
     }
-    globals.pill_content.setFrame(NSRect::new(
+    globals.pill.glass.setFrame(NSRect::new(
         NSPoint::new(0.0, 0.0),
         NSSize::new(width, PILL_H),
     ));
+    globals.pill.tint.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width, PILL_H),
+    ));
+    globals.pill.tint.setNeedsDisplay(true);
 }
 
 pub(super) fn set_static_processing_bars(globals: &UiGlobals) {
     let h = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * 0.42;
-    for (i, bar) in globals.bars.iter().enumerate() {
-        set_bar_height(bar, i, h);
-    }
-}
-
-pub(super) fn set_static_success_bars(globals: &UiGlobals) {
-    for (i, bar) in globals.bars.iter().enumerate() {
-        set_bar_height(bar, i, if i % 2 == 0 { 12.0 } else { 8.0 });
-    }
-}
-
-pub(super) fn set_static_error_bars(globals: &UiGlobals) {
-    for (i, bar) in globals.bars.iter().enumerate() {
-        set_bar_height(
-            bar,
-            i,
-            if i == BAR_COUNT / 2 {
-                BAR_MAX_H
-            } else {
-                BAR_MIN_H
-            },
-        );
-    }
+    globals.pill.waveform.set_heights([h; BAR_COUNT]);
 }
 
 pub(super) fn reduced_motion_enabled() -> bool {
@@ -437,8 +636,9 @@ pub(super) fn update_bars(globals: &UiGlobals) {
         Ok(g) => g,
         Err(_) => return,
     };
+    let mut heights = [BAR_MIN_H; BAR_COUNT];
 
-    for (i, bar) in globals.bars.iter().enumerate() {
+    for (i, slot) in heights.iter_mut().enumerate() {
         // Right-align: bar[BAR_COUNT-1] = newest level. As new samples
         // arrive the entire history scrolls left by one bar.
         let level = if levels.is_empty() {
@@ -473,15 +673,15 @@ pub(super) fn update_bars(globals: &UiGlobals) {
             current * 0.78 + target * 0.22
         };
         displayed[i] = new_h;
-        set_bar_height(bar, i, new_h);
+        *slot = new_h;
     }
+    globals.pill.waveform.set_heights(heights);
 }
 
 /// Synthetic "thinking" waveform shown while the pipeline transcribes / cleans
 /// up. No mic samples arrive during Processing, so without this the bars decay
-/// to a flat line and the pill looks frozen. We drive the same white bars with
-/// a sine wave that travels left→right across them — still a waveform, no new
-/// colors, but unmistakably animated so the user sees work is happening.
+/// to a flat line and the pill looks frozen. Same ink bars at 40 % — no new
+/// colour, but unmistakably animated so the user sees work is happening.
 pub(super) fn animate_processing_bars(globals: &UiGlobals) {
     let mut displayed = match globals.displayed_heights.lock() {
         Ok(g) => g,
@@ -498,36 +698,17 @@ pub(super) fn animate_processing_bars(globals: &UiGlobals) {
     let amp = (BAR_MAX_H * 0.6 - BAR_MIN_H) / 2.0;
     let mid = BAR_MIN_H + amp;
 
-    for (i, bar) in globals.bars.iter().enumerate() {
+    let mut heights = [BAR_MIN_H; BAR_COUNT];
+    for (i, slot) in heights.iter_mut().enumerate() {
         let wave = (t * SPEED - i as f64 * SPACING).sin();
         let target = mid + amp * wave;
         // Ease toward the target so the hand-off from the live recording
         // waveform glides in rather than snapping.
         let new_h = displayed[i] * 0.6 + target * 0.4;
         displayed[i] = new_h;
-        set_bar_height(bar, i, new_h);
+        *slot = new_h;
     }
-}
-
-/// Recolour every waveform bar (called on state change): off-white while
-/// recording, muted grey while "thinking", so the two states are distinct.
-pub(super) fn set_bars_color(globals: &UiGlobals, color: &NSColor) {
-    for bar in globals.bars.iter() {
-        unsafe {
-            let layer: *mut objc2::runtime::AnyObject = msg_send![&**bar, layer];
-            let cg: *mut objc2::runtime::AnyObject = msg_send![color, CGColor];
-            let _: () = msg_send![layer, setBackgroundColor: cg];
-        }
-    }
-}
-
-/// Position bar `i` at height `h`, vertically centered within the pill.
-pub(super) fn set_bar_height(bar: &NSView, i: usize, h: f64) {
-    let bar_block_w = BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP;
-    let x = (PILL_W - bar_block_w) / 2.0 + i as f64 * (BAR_W + BAR_GAP);
-    let y = (PILL_H - h) / 2.0;
-    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_W, h));
-    bar.setFrame(frame);
+    globals.pill.waveform.set_heights(heights);
 }
 
 pub(super) fn collapse_bars(globals: &UiGlobals) {
@@ -536,9 +717,7 @@ pub(super) fn collapse_bars(globals: &UiGlobals) {
             *v = BAR_MIN_H;
         }
     }
-    for (i, bar) in globals.bars.iter().enumerate() {
-        set_bar_height(bar, i, BAR_MIN_H);
-    }
+    globals.pill.waveform.set_heights([BAR_MIN_H; BAR_COUNT]);
 }
 
 pub(super) fn position_pill_at_cursor_screen(window: &NSWindow) {
@@ -568,8 +747,7 @@ pub(super) fn position_pill_at_cursor_screen(window: &NSWindow) {
         let win_frame = window.frame();
         let x = chosen.origin.x + (chosen.size.width - win_frame.size.width) / 2.0;
         // Sit close to the bottom edge so the pill stays out of the way.
-        let y = chosen.origin.y + 32.0;
+        let y = chosen.origin.y + SPACE_XXL;
         window.setFrameOrigin(NSPoint::new(x, y));
     }
 }
-
