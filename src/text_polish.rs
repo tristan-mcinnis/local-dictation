@@ -312,16 +312,16 @@ pub fn fix_speech_mechanics(s: &str) -> String {
     let dots_handled = normalize_spoken_dots(&at_handled);
     let joined = normalize_spoken_joins(&dots_handled);
     let terminated = add_terminal_period(&joined);
-    // Mid-sentence self-correction and spoken-list formatting run LAST, after
-    // all casing/punctuation mechanics, so their word-boundary surgery sees the
-    // final text. Both are conservative (never drop or reorder a content word).
-    let corrected = apply_self_correction(&terminated);
-    format_spoken_list(&corrected)
+    // Mid-sentence self-correction runs LAST, after all casing/punctuation
+    // mechanics, so its word-boundary surgery sees the final text. Structural
+    // formatting is never inferred here: lists require an explicit output-format
+    // preset, because ordinal words also occur naturally in faithful prose.
+    apply_self_correction(&terminated)
 }
 
-/// Byte spans of every alphanumeric run in `s` — the shared primitive for the
-/// deterministic self-correction and list-formatting passes, which need to
-/// locate words in the original-cased string.
+/// Byte spans of every alphanumeric run in `s` — the primitive used by the
+/// deterministic self-correction pass to locate words in the original-cased
+/// string.
 fn word_spans(s: &str) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut start = None;
@@ -338,87 +338,6 @@ fn word_spans(s: &str) -> Vec<(usize, usize)> {
         spans.push((si, s.len()));
     }
     spans
-}
-
-/// Ordinal words that mark a spoken list, mapped to their 1-based number.
-/// (Deterministic: `numbers::spoken_to_numerals` deliberately leaves ordinals
-/// alone, so these survive the earlier mechanics untouched.)
-const ORDINAL_WORDS: &[(&str, usize)] = &[
-    ("first", 1),
-    ("second", 2),
-    ("third", 3),
-    ("fourth", 4),
-    ("fifth", 5),
-    ("sixth", 6),
-    ("seventh", 7),
-    ("eighth", 8),
-    ("ninth", 9),
-    ("tenth", 10),
-];
-
-fn ordinal_number(word: &str) -> Option<usize> {
-    ORDINAL_WORDS
-        .iter()
-        .find(|(w, _)| *w == word)
-        .map(|(_, n)| *n)
-}
-
-/// Deterministic spoken-list formatting: when the utterance enumerates items
-/// with ordinal markers ("first … second … finally …"), split it into a
-/// numbered list, one item per line. Requires ≥2 ordinal markers (so prose that
-/// merely mentions "first" or "second" is left alone) and preserves the
-/// speaker's wording — items are only split, never rewritten. "finally"/"lastly"
-/// closes the list with the next number.
-pub fn format_spoken_list(s: &str) -> String {
-    let spans = word_spans(s);
-    if spans.len() < 4 {
-        return s.to_string();
-    }
-    let words: Vec<String> = spans.iter().map(|&(a, b)| s[a..b].to_lowercase()).collect();
-    let mut markers: Vec<(usize, usize)> = Vec::new(); // (word index, number)
-    let mut finally: Option<usize> = None;
-    for (idx, w) in words.iter().enumerate() {
-        if let Some(num) = ordinal_number(w) {
-            markers.push((idx, num));
-        } else if w == "finally" || w == "lastly" {
-            finally = Some(idx);
-        }
-    }
-    if markers.len() < 2 {
-        return s.to_string();
-    }
-    if let Some(fi) = finally {
-        markers.push((fi, markers.len() + 1));
-    }
-    markers.sort_by_key(|m| m.0);
-
-    let mut items: Vec<String> = Vec::new();
-    for (mi, &(idx, num)) in markers.iter().enumerate() {
-        let item_start = idx + 1;
-        let item_end = markers.get(mi + 1).map(|m| m.0).unwrap_or(spans.len());
-        if item_start >= item_end {
-            continue;
-        }
-        let a = spans[item_start].0;
-        // Extend to the next marker (or end of string) so a trailing period or
-        // comma that belongs to this item is kept, not dropped.
-        let b = markers
-            .get(mi + 1)
-            .map(|m| spans[m.0].0)
-            .unwrap_or(s.len());
-        let mut text = s[a..b].trim().trim_start_matches(',').trim().to_string();
-        if let Some(first) = text.chars().next() {
-            if first.is_ascii_lowercase() {
-                let cap = first.to_ascii_uppercase();
-                text = format!("{cap}{}", &text[first.len_utf8()..]);
-            }
-        }
-        items.push(format!("{num}. {text}"));
-    }
-    if items.len() < 2 {
-        return s.to_string();
-    }
-    items.join("\n")
 }
 
 /// Words that restart a self-corrected utterance, immediately before "i mean" /
@@ -1962,25 +1881,12 @@ mod tests {
     }
 
     #[test]
-    fn spoken_list_formats_ordinals_into_numbered_lines() {
+    fn clean_email_with_enumerated_priorities_stays_faithful_prose() {
+        let raw = "Okay, this is me dictating an email to Alex, hoping that they have a good day at work tomorrow. There are three things I want to focus on. The first one is signing a new deal, the second one is improving relations, and the third is planning a trip again in the fall. And those are the key priorities. So, thanks so much. Best, Sam.";
+
         assert_eq!(
-            format_spoken_list("First, check the logs. Second, run the tests. Finally, commit it."),
-            "1. Check the logs.\n2. Run the tests.\n3. Commit it."
-        );
-        // Two ordinals, no "finally".
-        assert_eq!(
-            format_spoken_list("First do A. Second do B."),
-            "1. Do A.\n2. Do B."
-        );
-        // A single "first" is prose → unchanged.
-        assert_eq!(
-            format_spoken_list("This is the first time we tried it"),
-            "This is the first time we tried it"
-        );
-        // Non-list text with no ordinals → unchanged.
-        assert_eq!(
-            format_spoken_list("Just a normal sentence about nothing"),
-            "Just a normal sentence about nothing"
+            fix_speech_mechanics(raw),
+            "This is me dictating an email to Alex, hoping that they have a good day at work tomorrow. There are 3 things I want to focus on. The first one is signing a new deal, the second one is improving relations, and the third is planning a trip again in the fall. And those are the key priorities. So, thanks so much. Best, Sam."
         );
     }
 

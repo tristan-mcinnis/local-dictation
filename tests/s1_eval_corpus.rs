@@ -17,6 +17,8 @@ struct Case {
     #[serde(default)]
     known_vocabulary: Vec<String>,
     #[serde(default)]
+    min_char_retention_ratio: Option<f64>,
+    #[serde(default)]
     max_expansion_ratio: Option<f64>,
 }
 
@@ -34,6 +36,8 @@ fn s1_corpus_is_nonempty_unique_and_well_formed() {
         assert!(case.must_not_contain.iter().all(|s| !s.trim().is_empty()));
         assert!(case.preserve_exact.iter().all(|s| !s.trim().is_empty()));
         assert!(case.known_vocabulary.iter().all(|s| !s.trim().is_empty()));
+        let min_char_retention = case.min_char_retention_ratio.unwrap_or(0.0);
+        assert!((0.0..=1.0).contains(&min_char_retention));
         assert!(case.max_expansion_ratio.unwrap_or(4.0) > 1.0);
     }
 }

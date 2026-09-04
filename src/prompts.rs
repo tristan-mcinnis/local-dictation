@@ -452,7 +452,7 @@ mod tests {
         let transform = file.transform.clone().expect("example sets transform");
         let cleanup = file.cleanup.clone().expect("example sets cleanup");
         assert!(transform.contains("Apply the user's instruction"));
-        assert!(cleanup.contains("dictation cleaner"));
+        assert_eq!(cleanup, DEFAULT_CLEANUP);
 
         let p = Prompts::resolve(None, file.cleanup, None, file.transform, file.formats);
         assert_eq!(p.transform, transform);

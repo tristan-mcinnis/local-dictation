@@ -113,5 +113,23 @@
     "preserve_exact": ["Lumen"],
     "known_vocabulary": ["Lumen"],
     "require_terminal_punctuation": true
+  },
+  {
+    "id": "email-enumerated-priorities",
+    "category": "content-preservation",
+    "input": "Okay, this is me dictating an email to Alex, hoping that they have a good day at work tomorrow. There are three things I want to focus on. The first one is signing a new deal, the second one is improving relations, and the third is planning a trip again in the fall. And those are the key priorities. So, thanks so much. Best, Sam.",
+    "must_contain": [
+      "dictating an email to Alex",
+      "good day at work tomorrow",
+      "signing a new deal",
+      "improving relations",
+      "planning a trip again in the fall",
+      "Best, Sam"
+    ],
+    "must_not_contain": [],
+    "preserve_exact": ["Alex", "Sam"],
+    "known_vocabulary": ["Alex", "Sam"],
+    "min_char_retention_ratio": 0.85,
+    "require_terminal_punctuation": true
   }
 ]

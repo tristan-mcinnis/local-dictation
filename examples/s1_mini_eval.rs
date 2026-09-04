@@ -10,6 +10,7 @@
 //! ```text
 //! cargo run --release --features cleaner --example s1_mini_eval
 //! DICTATE_LLM_MODEL_PATH=/path/to/s1-mini.gguf cargo run --release --features cleaner --example s1_mini_eval -- --reps 3
+//! cargo run --release --features cleaner --example s1_mini_eval -- --prompt-file /tmp/candidate.txt
 //! ```
 //!
 //! The runner does not modify user settings or dictionary files. Vocabulary
@@ -49,6 +50,8 @@ mod enabled {
         known_vocabulary: Vec<String>,
         #[serde(default)]
         require_terminal_punctuation: bool,
+        #[serde(default)]
+        min_char_retention_ratio: f64,
         #[serde(default = "default_expansion")]
         max_expansion_ratio: f64,
     }
@@ -105,8 +108,18 @@ mod enabled {
             .iter()
             .any(|m| output.contains(m));
         s.check(!marker, "leaked chat-template marker");
+        let output_chars = output_trimmed.chars().count() as f64;
+        if case.min_char_retention_ratio > 0.0 {
+            s.check(
+                output_chars >= input_chars * case.min_char_retention_ratio,
+                format!(
+                    "output character count is below {:.0}% of input",
+                    case.min_char_retention_ratio * 100.0
+                ),
+            );
+        }
         s.check(
-            output_trimmed.chars().count() as f64 <= input_chars * case.max_expansion_ratio + 32.0,
+            output_chars <= input_chars * case.max_expansion_ratio + 32.0,
             format!("output expanded beyond {:.1}x", case.max_expansion_ratio),
         );
         if case.require_terminal_punctuation {
@@ -144,6 +157,14 @@ mod enabled {
     fn compact(args: &[String]) -> bool {
         args.iter().any(|a| a == "--compact")
     }
+
+    fn prompt_file(args: &[String]) -> Option<PathBuf> {
+        args.iter()
+            .position(|a| a == "--prompt-file")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+    }
+
     fn json_output(args: &[String]) -> bool {
         args.iter().any(|a| a == "--json")
     }
@@ -166,15 +187,21 @@ mod enabled {
             ));
         }
         let reps = reps(&args);
-        let prompt_name = if compact(&args) {
-            "compact"
-        } else {
-            "production"
+        let prompt_override = match prompt_file(&args) {
+            Some(path) => Some((
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("prompt-file")
+                    .to_string(),
+                std::fs::read_to_string(&path)
+                    .map_err(|e| eyre::eyre!("read prompt file {}: {e}", path.display()))?,
+            )),
+            None => None,
         };
-        let base_prompt = if compact(&args) {
-            COMPACT_PROMPT
-        } else {
-            DEFAULT_CLEANUP
+        let (prompt_name, base_prompt): (&str, &str) = match prompt_override.as_ref() {
+            Some((name, prompt)) => (name, prompt),
+            None if compact(&args) => ("compact", COMPACT_PROMPT),
+            None => ("production", DEFAULT_CLEANUP),
         };
         let cases: Vec<EvalCase> =
             serde_json::from_str(include_str!("../evals/s1_mini_corpus.json"))

@@ -256,7 +256,9 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
 `menubar/` (`mod.rs` status item + menu actions, `pill.rs` waveform pill, `history.rs` history window, `dictionary.rs` dictionary editor) plus `settings_window.rs`. `history.rs` writes
 every injected dictation to SQLite at `~/.config/local-dictation/history.db`. `screen_context.rs`
 harvests proper nouns from the focused window and feeds them to
-`cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings.
+`cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. Normal
+cleanup never infers numbered-list structure from words such as "first" or "second"; structural
+formatting requires an explicit `numbered` or `bullets` output-format preset.
 `audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. `numbers.rs`
 converts spoken numbers to numerals deterministically; `spoken_command.rs` handles *prefix*
 commands (e.g. "translate to Chinese …") via the warm transform engine; `voice_commands.rs` parses
