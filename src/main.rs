@@ -136,7 +136,7 @@ fn run_inject_test(text: Option<String>) -> eyre::Result<()> {
 /// If FOCUS_APP is set, ensure that app has a writable doc and inject into
 /// its AXUIElement by PID (works even when cargo's terminal is OS-frontmost).
 /// Otherwise inject via the system-wide focused element (production path).
-fn inject_with_optional_focus(text: &str) -> eyre::Result<()> {
+fn inject_with_optional_focus(text: &str) -> eyre::Result<fast_dictate_backend::injector::InjectOutcome> {
     let Ok(app) = std::env::var("FOCUS_APP") else {
         return AccessibilityInjector::inject_text(text);
     };

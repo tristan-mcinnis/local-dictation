@@ -41,6 +41,11 @@ pub enum UiState {
     /// A recoverable failure cue. This is deliberately separate from
     /// `Processing` so the UI can provide a redundant text/icon signal.
     Error = 4,
+    /// The transcript finished but there was no editable field focused, so
+    /// nothing was written. Distinct from `Error`: it is not a failure — the
+    /// text is held recoverable (menu "Copy last dictation") and the pill says
+    /// "No text field selected" instead of pasting blindly.
+    NoEditableField = 5,
 }
 
 impl UiState {
@@ -51,6 +56,7 @@ impl UiState {
             2 => UiState::Processing,
             3 => UiState::Success,
             4 => UiState::Error,
+            5 => UiState::NoEditableField,
             _ => UiState::Idle,
         }
     }

@@ -672,10 +672,10 @@ fn build_status_item(
     let history_item = action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions);
     menu.addItem(&history_item);
 
-    // Re-run the last utterance: the pipeline replays the stored audio and
-    // injects the fresh transcript at the current cursor. Cheap and useful
-    // when the first pass was mistranscribed or landed in the wrong spot.
-    let retry_item = action_item(mtm, "Retry last dictation", sel!(retryLast:), "r", actions);
+    // Re-run the last recording (including a cancelled one): the pipeline
+    // replays the retained in-memory audio and injects the fresh transcript at
+    // the current cursor, obeying the same Escape + focus guard.
+    let retry_item = action_item(mtm, "Retry last recording", sel!(retryLast:), "r", actions);
     menu.addItem(&retry_item);
 
     // Pick the active Translate-mode target (only meaningful when targets are

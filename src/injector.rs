@@ -20,6 +20,238 @@ use crate::smart_pad::smart_pad;
 use crate::smart_pad::last_non_ws_before;
 use std::sync::Mutex;
 
+// ─── Focus editability + inject decision (pure, featureless, tested) ───────
+//
+// This is the safety contract the daemon enforces right before it writes
+// anywhere. It decides, from the *evidence* about the focused surface, whether
+// a finished transcript may be injected — and, when it may not, that the call
+//er holds it recoverable and shows a clear "No text field selected" state
+// instead of pasting blindly.
+//
+// Evidence is layered, never guessed:
+//   * `Editable`  — hard AX evidence: the focused element reports a text-entry
+//     role/subrole AND a writable value/selected-text attribute. Native apps.
+//   * `PasteSafe` — no (or unreliable) AX role, but the app itself is a known
+//     text-input surface (a terminal emulator, or a curated editor/compose
+//     allowlist such as VS Code / Cursor / Obsidian / Notion) and it is the
+//     focus target. Writing there is legitimate, so clipboard paste is fine.
+//     Terminals and editors are *always* text input; a browser is not.
+//   * `NotEditable` — nothing positive. Do NOT inject or paste. Hold + copy.
+//
+// The daemon combines this with the OOB cancel gate (`crate::cancel`) at the
+// single decision point before any write action (see `decide_inject`).
+
+/// Whether the currently-focused surface is a legitimate text-input target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusEditability {
+    /// Positive AX evidence: a text-entry role with a writable value.
+    Editable,
+    /// No AX role evidence, but a known text-input app (terminal / editor).
+    PasteSafe,
+    /// Nothing positive — do not inject or paste blindly.
+    NotEditable,
+}
+
+/// The outcome of a real injection attempt, so the caller can distinguish a
+/// hard failure from "there was simply no editable field to write into".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InjectOutcome {
+    /// The text was written (via AX or the clipboard route).
+    Injected,
+    /// No editable field was focused; nothing was written, and nothing was
+    /// pasted. The caller should hold the transcript recoverable and surface a
+    /// clear "No text field selected" state.
+    NoEditableField,
+    /// The write authorizer refused (an Escape/cancel landed during the focus
+    /// lookup, after resolution but before the first side effect). Nothing was
+    /// written. The caller should discard the utterance.
+    Cancelled,
+}
+
+/// Claim write authorization exactly once, immediately before the first
+/// write/clipboard side effect — i.e. **after** the focus/context/padding
+/// resolution, so a cancel that lands during a slow AX lookup is still honored.
+/// A `None` authorizer (the default CLI entry points) is always authorized.
+/// Returns `Some(Cancelled)` when the authorizer refuses; `None` when the
+/// caller may proceed to the write ladder.
+pub fn claim_write_authorization(
+    authorize: Option<&dyn Fn() -> bool>,
+) -> Option<InjectOutcome> {
+    match authorize {
+        Some(auth) if !auth() => Some(InjectOutcome::Cancelled),
+        _ => None,
+    }
+}
+
+/// The pure decision: what to do with a finished transcript. This is the seam
+/// the worker consults immediately before any write action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InjectDecision {
+    Inject,
+    /// Don't write. Keep the transcript recoverable; show a clear state.
+    Hold {
+        #[allow(dead_code)] // used by tests + the worker's logging
+        reason: HoldReason,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HoldReason {
+    /// An Escape / cancel arrived; the utterance is discarded.
+    Cancelled,
+    /// No editable field is focused; the transcript is held, not written.
+    NoEditableField,
+}
+
+/// How a `finalize_utterance` call actually settled. This is the observable
+/// result the worker + tests branch on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FinalizeResult {
+    Injected,
+    /// Held (transcript preserved, nothing written because no editable field).
+    Held,
+    /// Discarded (a cancel arrived; nothing written).
+    Cancelled,
+    /// The write was attempted but failed.
+    Failed,
+}
+
+/// Text-entry AX roles/subroles that read as editable fields.
+fn is_text_entry_role(role: Option<&str>, subrole: Option<&str>) -> bool {
+    matches!(
+        role,
+        Some("AXTextField" | "AXTextArea" | "AXComboBox")
+    ) || matches!(
+        subrole,
+        Some("AXSearchField" | "AXFullScreenSearchField" | "AXTextArea" | "AXTextView")
+    )
+}
+
+/// AX roles that are *positively* not a text-input target. When AX discloses
+/// one of these as the focused element, injection is denied **even for an
+/// allowlisted app** — a button, a window chrome, a page body, a rendered
+/// canvas, or read-only/static text is never a place to paste blindly.
+fn is_clearly_noninput_role(role: Option<&str>, _subrole: Option<&str>) -> bool {
+    matches!(
+        role,
+        Some(
+            "AXButton"
+                | "AXWindow"
+                | "AXWebArea"
+                | "AXCanvas"
+                | "AXStaticText"
+                | "AXCheckBox"
+                | "AXRadioButton"
+                | "AXMenu"
+                | "AXMenuBar"
+                | "AXMenuItem"
+                | "AXPopUpButton"
+                | "AXProgressIndicator"
+        )
+    )
+}
+
+/// Pure classification of a focused surface into [`FocusEditability`].
+///
+/// `role` / `subrole` are the AX attribute strings (None when AX did not
+/// disclose them). `value_settable` / `selected_text_settable` report whether
+/// AX says the value / selected-text attributes are writable. `is_terminal` is
+/// the one app-type fallback: a genuine terminal is *always* a text-input
+/// surface, and is the only surface allowed to paste when AX discloses no role.
+///
+/// This is deliberately strict and never guesses above the evidence:
+///   * a text-entry role that is writable → `Editable`;
+///   * a text-entry role that is **not** writable → `NotEditable` (read-only);
+///   * a positively non-input role (button / window / web area / canvas / static
+///     text / menu / checkbox / radio) → `NotEditable` **even for a terminal**;
+///   * a genuine terminal whose role is absent or ambiguous → `PasteSafe`
+///     (the narrow, justified fallback). This is NOT a broad editor/compose
+///     blanket — a Slack pane, a Notion page, a browser body, or an Outlook
+///     window is only pasted into when its focused element reports an editable
+///     role, never by app name.
+pub fn classify_focus_editability(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    value_settable: bool,
+    selected_text_settable: bool,
+    is_terminal: bool,
+) -> FocusEditability {
+    if is_text_entry_role(role, subrole) {
+        if value_settable || selected_text_settable {
+            FocusEditability::Editable
+        } else {
+            FocusEditability::NotEditable // read-only text field
+        }
+    } else if is_clearly_noninput_role(role, subrole) {
+        FocusEditability::NotEditable
+    } else if is_terminal {
+        // A genuine terminal whose focused element is not a clearly non-input
+        // control is a legitimate text-input target.
+        FocusEditability::PasteSafe
+    } else {
+        FocusEditability::NotEditable
+    }
+}
+
+/// The single decision point: given the cancel state and the focus evidence,
+/// should this transcript be injected, held, or dropped?
+///
+/// `editability: None` means the caller does NOT know the current focus (e.g. a
+/// failed press-time capture) — that is NOT a hold. It proceeds to the consumer
+/// (the fresh resolver at write time), which re-reads the *current* focused
+/// element and reports `Injected` or `NoEditableField`. Only a *known*
+/// `NotEditable` (positive negative evidence) holds without writing.
+pub fn decide_inject(cancel_requested: bool, editability: Option<FocusEditability>) -> InjectDecision {
+    if cancel_requested {
+        InjectDecision::Hold {
+            reason: HoldReason::Cancelled,
+        }
+    } else {
+        match editability {
+            // Unknown → let the fresh resolver decide at write time.
+            None => InjectDecision::Inject,
+            Some(FocusEditability::Editable | FocusEditability::PasteSafe) => InjectDecision::Inject,
+            Some(FocusEditability::NotEditable) => InjectDecision::Hold {
+                reason: HoldReason::NoEditableField,
+            },
+        }
+    }
+}
+
+/// Run the per-utterance finalization seam: decide inject-vs-hold from the
+/// cancel gate + focus evidence, then (when decided) perform the write through
+/// the injected sink and report the observable outcome. The sink is the real
+/// injector call in production; in tests it is a recording closure, so the
+/// suppression is observed through behaviour, not a tautological flag.
+///
+/// The sink returns `eyre::Result<InjectOutcome>` so a hard write failure is
+/// distinguishable from a transcription-time hold. `None` editability reaches
+/// the sink so the fresh resolver decides from the *current* focus.
+pub fn finalize_utterance(
+    cancel_requested: bool,
+    editability: Option<FocusEditability>,
+    transcript: &str,
+    inject: impl FnOnce(&str) -> eyre::Result<InjectOutcome>,
+) -> FinalizeResult {
+    match decide_inject(cancel_requested, editability) {
+        InjectDecision::Inject => match inject(transcript) {
+            Ok(InjectOutcome::Injected) => FinalizeResult::Injected,
+            // The fresh resolver found no editable field at write time.
+            Ok(InjectOutcome::NoEditableField) => FinalizeResult::Held,
+            // The write authorizer refused (a cancel landed during the focus
+            // lookup): nothing written, utterance discarded.
+            Ok(InjectOutcome::Cancelled) => FinalizeResult::Cancelled,
+            Err(_) => FinalizeResult::Failed,
+        },
+        InjectDecision::Hold {
+            reason: HoldReason::Cancelled,
+        } => FinalizeResult::Cancelled,
+        InjectDecision::Hold {
+            reason: HoldReason::NoEditableField,
+        } => FinalizeResult::Held,
+    }
+}
+
 pub struct AccessibilityInjector;
 
 /// Process-wide memory of the last character we successfully injected.
@@ -71,7 +303,18 @@ fn is_ax_blind(pid: i32) -> bool {
 ///      WezTerm, kitty, Alacritty) — they draw their own text grid and
 ///      ignore AX writes, confirmed via INJECT_PROFILE: Ghostty returns
 ///      err=0 on set_selected_text yet nothing renders.
-static CLIPBOARD_ONLY_CACHE: Mutex<Vec<(i32, bool, bool)>> = Mutex::new(Vec::new());
+/// Per-PID classification, cached so the `ps` lookup is paid once per PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PidClass {
+    /// App accepts but never renders AX writes (Electron/Chromium web views,
+    /// GPU terminals) — route to clipboard paste when the FOCUS evidence says
+    /// the surface is editable. App type alone is never the green light.
+    is_electron: bool,
+    /// GPU/native terminal emulator. The one narrow text-input-surface fallback.
+    is_terminal: bool,
+}
+
+static CLIPBOARD_ONLY_CACHE: Mutex<Vec<(i32, PidClass)>> = Mutex::new(Vec::new());
 
 /// Executable path of a running process (`ps -o comm=`), untrimmed. `None`
 /// when `ps` fails or the PID is gone. Shared by the injector's app
@@ -84,15 +327,16 @@ pub fn process_command_path(pid: i32) -> Option<String> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
 }
 
-/// Classify a PID by its executable name into `(is_electron, is_terminal)`.
-/// Both flags route to clipboard paste; `is_terminal` additionally lets the
-/// daemon skip prose cleanup (you almost never want Gemma rewriting a shell
-/// command). Result is cached per PID.
-fn classify_pid(pid: i32) -> (bool, bool) {
+/// Classify a PID by its executable name into a [`PidClass`]. The `is_electron`
+/// flag routes to clipboard paste; `is_terminal` additionally lets the daemon
+/// skip prose cleanup (you almost never want Gemma rewriting a shell command);
+/// `is_editor_surface` is the curated non-browser allowlist used by the
+/// focus-editability gate. Result is cached per PID.
+fn classify_pid(pid: i32) -> PidClass {
     if let Ok(cache) = CLIPBOARD_ONLY_CACHE.lock() {
-        for &(p, e, t) in cache.iter() {
+        for &(p, cls) in cache.iter() {
             if p == pid {
-                return (e, t);
+                return cls;
             }
         }
     }
@@ -127,21 +371,28 @@ fn classify_pid(pid: i32) -> (bool, bool) {
         || comm.contains("/wezterm")
         || comm.contains("/kitty")
         || comm.contains("/alacritty");
+    // The editor/compose blanket (VS Code, Slack, Notion, Obsidian, Figma, …)
+    // is deliberately ABSENT from a paste-safe allowlist. A paste is justified
+    // only by the FOCUSED element's AX role at write time, never by the app
+    // name — so a Slack pane or a browser body never receives a blind paste.
+    let cls = PidClass { is_electron, is_terminal };
     if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
-        cache.push((pid, is_electron, is_terminal));
+        cache.push((pid, cls));
     }
-    (is_electron, is_terminal)
+    cls
 }
 
 pub fn is_clipboard_only_pid(pid: i32) -> bool {
-    let (is_electron, is_terminal) = classify_pid(pid);
-    is_electron || is_terminal
+    let cls = classify_pid(pid);
+    cls.is_electron || cls.is_terminal
 }
 
 /// True when the focused app is a native terminal emulator. The daemon uses
-/// this to inject the raw transcript without Gemma cleanup.
+/// this to inject the raw transcript without Gemma cleanup, and the focus gate
+/// uses it (narrowly) as the one text-input-surface fallback when AX discloses
+/// no editable role.
 pub fn is_terminal_pid(pid: i32) -> bool {
-    classify_pid(pid).1
+    classify_pid(pid).is_terminal
 }
 
 /// PIDs whose AX write we've *verified* actually rendered (read the value
@@ -175,10 +426,10 @@ fn mark_ax_verified(pid: i32) {
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn mark_clipboard_only(pid: i32) {
     if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
-        if let Some(entry) = cache.iter_mut().find(|(p, _, _)| *p == pid) {
-            entry.1 = true;
+        if let Some(entry) = cache.iter_mut().find(|(p, _)| *p == pid) {
+            entry.1.is_electron = true;
         } else {
-            cache.push((pid, true, false));
+            cache.push((pid, PidClass { is_electron: true, is_terminal: false }));
         }
     }
 }
@@ -235,11 +486,11 @@ mod imp {
     use super::*;
     use accessibility_sys::{
         kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute, kAXSelectedTextAttribute,
-        kAXSelectedTextRangeAttribute, kAXTrustedCheckOptionPrompt, kAXValueAttribute,
-        kAXValueTypeCFRange, AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
-        AXUIElementCreateApplication, AXUIElementCreateSystemWide, AXUIElementGetPid,
-        AXUIElementSetMessagingTimeout, AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue,
-        AXValueRef,
+        kAXSelectedTextRangeAttribute, kAXSubroleAttribute, kAXTrustedCheckOptionPrompt,
+        kAXValueAttribute, kAXValueTypeCFRange, AXIsProcessTrustedWithOptions,
+        AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementCreateSystemWide,
+        AXUIElementGetPid, AXUIElementIsAttributeSettable, AXUIElementSetMessagingTimeout,
+        AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
     use core_foundation::base::{CFRange, CFTypeRef, TCFType};
     use core_foundation::boolean::CFBoolean;
@@ -273,7 +524,61 @@ mod imp {
         }
     }
 
-    pub fn inject_systemwide(text: &str) -> eyre::Result<()> {
+    /// Read a single string AX attribute off an element, or `None` when it is
+    /// absent or not a string. Used for role / subrole probes.
+    unsafe fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<String> {
+        let mut value_ref: CFTypeRef = ptr::null();
+        let a = CFString::new(attr);
+        let err =
+            AXUIElementCopyAttributeValue(element, a.as_concrete_TypeRef(), &mut value_ref);
+        if err != kAXErrorSuccess || value_ref.is_null() {
+            return None;
+        }
+        Some(CFString::wrap_under_create_rule(value_ref as CFStringRef).to_string())
+    }
+
+    /// True when AX reports an attribute as writable on the element. A settable
+    /// `AXValue` / `AXSelectedText` is the hard, positive evidence that a
+    /// focused surface is a real text-input field (its counterpart: a role that
+    /// merely *looks* like a field but is not writable is a label/static).
+    unsafe fn attribute_is_settable(element: AXUIElementRef, attr: &str) -> bool {
+        let mut settable: std::ffi::c_uchar = 0;
+        let a = CFString::new(attr);
+        let err = AXUIElementIsAttributeSettable(element, a.as_concrete_TypeRef(), &mut settable);
+        err == kAXErrorSuccess && settable != 0
+    }
+
+    /// Classify the editability of a focused element from its AX role/subrole +
+    /// writability, plus the (single, narrow) app-type signal from its PID: is
+    /// it a genuine terminal? This is the focus gate the write ladder consults
+    /// — it is what turns "no blind paste" from a comment into a decision. The
+    /// editor/compose app blanket is deliberately absent.
+    unsafe fn focused_editability(focused: AXUIElementRef, pid: Option<i32>) -> FocusEditability {
+        let role = copy_string_attr(focused, kAXRoleAttribute);
+        let subrole = copy_string_attr(focused, kAXSubroleAttribute);
+        let value_settable = attribute_is_settable(focused, kAXValueAttribute);
+        let sel_settable = attribute_is_settable(focused, kAXSelectedTextAttribute);
+        let is_terminal = pid.map(super::is_terminal_pid).unwrap_or(false);
+        classify_focus_editability(
+            role.as_deref(),
+            subrole.as_deref(),
+            value_settable,
+            sel_settable,
+            is_terminal,
+        )
+    }
+
+    pub fn inject_systemwide(text: &str) -> eyre::Result<InjectOutcome> {
+        inject_systemwide_with(text, None)
+    }
+
+    /// Cancellable systemwide injection: `authorize` is polled once, after
+    /// focus/context/padding resolution and immediately before the first
+    /// write/clipboard side effect. Refusal yields [`InjectOutcome::Cancelled`].
+    pub fn inject_systemwide_with(
+        text: &str,
+        authorize: Option<&dyn Fn() -> bool>,
+    ) -> eyre::Result<InjectOutcome> {
         if !ensure_trusted_or_prompt() {
             return Err(eyre::eyre!(
                 "Accessibility permission not granted — System Settings → Privacy & Security → Accessibility"
@@ -285,13 +590,13 @@ mod imp {
                 return Err(eyre::eyre!("AXUIElementCreateSystemWide returned null"));
             }
             bound_messaging_timeout(root);
-            let result = inject_through(root, text);
+            let result = inject_through(root, text, authorize);
             cf_release(root as CFTypeRef);
             result
         }
     }
 
-    pub fn inject_into_pid(pid: pid_t, text: &str) -> eyre::Result<()> {
+    pub fn inject_into_pid(pid: pid_t, text: &str) -> eyre::Result<InjectOutcome> {
         if !ensure_trusted_or_prompt() {
             return Err(eyre::eyre!("Accessibility permission not granted"));
         }
@@ -303,7 +608,7 @@ mod imp {
                 ));
             }
             bound_messaging_timeout(app);
-            let result = inject_through(app, text);
+            let result = inject_through(app, text, None);
             cf_release(app as CFTypeRef);
             result
         }
@@ -314,7 +619,11 @@ mod imp {
     /// entry points. The pre-captured-target path (`inject_via_target`) shares
     /// the same ladder; the only difference is *when* the focus element is
     /// resolved.
-    unsafe fn inject_through(root: AXUIElementRef, text: &str) -> eyre::Result<()> {
+    unsafe fn inject_through(
+        root: AXUIElementRef,
+        text: &str,
+        authorize: Option<&dyn Fn() -> bool>,
+    ) -> eyre::Result<InjectOutcome> {
         let prof = std::env::var("INJECT_PROFILE").is_ok();
 
         // 1. Focused element.
@@ -330,24 +639,48 @@ mod imp {
             eprintln!("[inject-prof] get_focused_element: {:?}", t.elapsed());
         }
         if err != kAXErrorSuccess || focused_ref.is_null() {
-            // No focused field exposed — try clipboard paste against whatever
-            // is frontmost. Still apply smart-pad using the remembered tail
-            // so consecutive utterances don't mash together.
-            eprintln!("[inject] no focused AX element (AXError {err}); using clipboard paste");
-            let tail = super::recall_tail();
-            let padded = smart_pad(text, tail, tail, None);
-            let r = crate::clipboard_paste::paste_via_clipboard(&padded);
-            if r.is_ok() {
-                super::remember_tail(&padded);
+            // No focused field exposed. This is NOT a green light to paste
+            // blindly: only a genuine terminal gets the narrow clipboard fallback.
+            // Anything else — a browser page body, a Slack pane, an editor
+            // window, a menu, an unknown app — holds the transcript. AX absence
+            // is alone never proof of a text field.
+            let front_paste_safe = super::frontmost_pid()
+                .map(super::is_terminal_pid)
+                .unwrap_or(false);
+            if front_paste_safe {
+                eprintln!(
+                    "[inject] no focused AX element (AXError {err}); terminal → clipboard paste"
+                );
+                let tail = super::recall_tail();
+                let padded = smart_pad(text, tail, tail, None);
+                // Claim authorization immediately before the first clipboard
+                // side effect (the no-focused-element terminal route shares the
+                // same guard as the native AX ladder in `write_padded`).
+                if let Some(cancelled) = claim_write_authorization(authorize) {
+                    return Ok(cancelled);
+                }
+                let r = crate::clipboard_paste::paste_via_clipboard(&padded);
+                if r.is_ok() {
+                    super::remember_tail(&padded);
+                    return Ok(InjectOutcome::Injected);
+                }
+                return r.map(|_| InjectOutcome::Injected);
             }
-            return r;
+            eprintln!(
+                "[inject] no focused AX element (AXError {err}); not a known text-input app → holding (never paste blindly)"
+            );
+            return Ok(InjectOutcome::NoEditableField);
         }
         let focused = focused_ref as AXUIElementRef;
         bound_messaging_timeout(focused);
 
-        // 2. Context (with the ax-blind shortcut), then tail fallback when the
-        //    element doesn't expose AXValue (Electron / web views / some Java).
+        // 2. Editability gate: is there positive evidence that this is a
+        //    writable text field? Decided before any audio work is spent.
         let pid = focused_pid_of(focused);
+        let editability = focused_editability(focused, pid);
+
+        // 3. Context (with the ax-blind shortcut), then tail fallback when the
+        //    element doesn't expose AXValue (Electron / web views / some Java).
         let (mut immediate_before, mut last_nws_before, char_after) =
             read_context_with_blind(focused, pid);
         if immediate_before.is_none() && last_nws_before.is_none() {
@@ -357,15 +690,15 @@ mod imp {
             }
         }
 
-        // 3. Smart-pad.
+        // 4. Smart-pad.
         let padded = smart_pad(text, immediate_before, last_nws_before, char_after);
         if padded.is_empty() {
             cf_release(focused as CFTypeRef);
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
 
-        // 4. Shared write ladder. Caller owns `focused`, so release after.
-        let r = write_padded(focused, pid, &padded, prof);
+        // 5. Shared write ladder. Caller owns `focused`, so release after.
+        let r = write_padded(focused, pid, &padded, prof, editability, authorize);
         cf_release(focused as CFTypeRef);
         r
     }
@@ -392,31 +725,61 @@ mod imp {
     }
 
     /// The single AX write ladder shared by both injection entry points:
-    /// Electron/browser short-circuit → `kAXSelectedText` → `kAXValue` →
-    /// clipboard paste. Records the injected tail on any success. Does **not**
+    /// focus gate → `kAXSelectedText` → `kAXValue` → clipboard paste.
+    /// Records the injected tail on any success. Does **not**
     /// release `focused` — the caller owns its lifetime.
+    ///
+    /// The `editability` argument is the focus gate: `NotEditable` returns
+    /// [`InjectOutcome::NoEditableField`] *before* any write so nothing is ever
+    /// pasted into a non-input surface. The clipboard route is used only when
+    /// there is positive editable evidence (`PasteSafe`, i.e. a terminal /
+    /// curated editor, or an `Editable` role in an AX-blind-for-writing app).
     unsafe fn write_padded(
         focused: AXUIElementRef,
         pid: Option<i32>,
         padded: &str,
         prof: bool,
-    ) -> eyre::Result<()> {
+        editability: FocusEditability,
+        authorize: Option<&dyn Fn() -> bool>,
+    ) -> eyre::Result<InjectOutcome> {
         let t_total = std::time::Instant::now();
 
-        // Electron / browser targets accept AX writes with kAXErrorSuccess but
-        // never render the text. Route them straight to clipboard paste, which
-        // always works because it goes through the system-level Cmd+V handler.
-        if let Some(pid) = pid {
-            if super::is_clipboard_only_pid(pid) {
-                if prof {
-                    eprintln!("[inject-prof] clipboard-only pid {pid} — clipboard paste");
-                }
-                let r = crate::clipboard_paste::paste_via_clipboard(padded);
-                if r.is_ok() {
-                    super::remember_tail(padded);
-                }
-                return r;
+        // Focus gate: no positive editable evidence → hold, never paste blindly.
+        // A hold never claims write authorization.
+        if editability == FocusEditability::NotEditable {
+            eprintln!(
+                "[inject] no editable field focused ({:?}) — holding transcript (never paste blindly)",
+                editability
+            );
+            return Ok(InjectOutcome::NoEditableField);
+        }
+
+        // Write authorization: claimed exactly once, after the focus/context/
+        // padding resolution above and immediately before the first write or
+        // clipboard side effect below. A cancel that landed during the (up to
+        // 1.5s) AX lookup is honored here; the existing write ladder (and any
+        // fallback) proceeds on one successful claim.
+        if let Some(cancelled) = claim_write_authorization(authorize) {
+            return Ok(cancelled);
+        }
+
+        // Electron / browser / terminal targets accept AX writes with
+        // kAXErrorSuccess but never render the text. Route them to clipboard
+        // paste — but only because we already have positive editable evidence
+        // (an `Editable` role, or `PasteSafe` for a known text-input surface).
+        // App type alone is never the green light; editability is.
+        let clipboard_route =
+            editability == FocusEditability::PasteSafe
+                || pid.map(super::is_clipboard_only_pid).unwrap_or(false);
+        if clipboard_route {
+            if prof {
+                eprintln!("[inject-prof] clipboard route (editability {editability:?}, pid {pid:?})");
             }
+            let r = crate::clipboard_paste::paste_via_clipboard(padded);
+            if r.is_ok() {
+                super::remember_tail(padded);
+            }
+            return r.map(|_| InjectOutcome::Injected);
         }
 
         let payload = CFString::new(padded);
@@ -460,7 +823,9 @@ mod imp {
             return r;
         }
 
-        // Both AX writes refused — clipboard fallback.
+        // Both AX writes refused — clipboard fallback. Only reachable when
+        // editability was Editable; the app refused the write, so Cmd+V is the
+        // remaining write path (and we already proved there is a field).
         eprintln!(
             "[inject] AX writes refused (selected={sel_err}, value={val_err}); using clipboard paste"
         );
@@ -468,7 +833,7 @@ mod imp {
         if r.is_ok() {
             super::remember_tail(padded);
         }
-        r
+        r.map(|_| InjectOutcome::Injected)
     }
 
     /// Called after an AX write returns `kAXErrorSuccess`. Some apps (Electron
@@ -492,20 +857,20 @@ mod imp {
         pid: Option<i32>,
         padded: &str,
         prof: bool,
-    ) -> eyre::Result<()> {
+    ) -> eyre::Result<InjectOutcome> {
         let pid = match pid {
             Some(p) if !super::is_ax_verified(p) => p,
             // No PID to cache against, or already trusted — believe the success.
             _ => {
                 super::remember_tail(padded);
-                return Ok(());
+                return Ok(InjectOutcome::Injected);
             }
         };
 
         if ax_write_rendered(focused, padded) {
             super::mark_ax_verified(pid);
             super::remember_tail(padded);
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
 
         if prof {
@@ -518,7 +883,7 @@ mod imp {
         if r.is_ok() {
             super::remember_tail(padded);
         }
-        r
+        r.map(|_| InjectOutcome::Injected)
     }
 
     /// True if the focused element's value now contains the text we just wrote.
@@ -690,6 +1055,10 @@ mod imp {
 
     /// Owned focus target — releases the retained AXUIElement on drop.
     /// AXUIElement is a CFType, thread-safe to use after CFRetain.
+    // The caret-context fields are retained for diagnostics; the write path
+    // re-resolves the CURRENT focus at inject time (freshness over the stale
+    // key-press snapshot), so they are not read by the write ladder anymore.
+    #[allow(dead_code)]
     pub struct FocusTargetInner {
         focused: AXUIElementRef,
         pub pid: Option<i32>,
@@ -699,6 +1068,10 @@ mod imp {
         /// Visible text near the focus (field value + window title), harvested
         /// at capture time for screen-context vocabulary. `None` in AX-blind apps.
         pub screen_text: Option<String>,
+        /// The focus-editability classification, computed at capture time from
+        /// the AX role/subrole/writability + the app type. The write ladder
+        /// gates on this; `NotEditable` holds the transcript instead of pasting.
+        pub editability: FocusEditability,
     }
 
     impl Drop for FocusTargetInner {
@@ -742,6 +1115,9 @@ mod imp {
             let focused_pid = focused_pid_of(focused);
             let (immediate_before, last_nws_before, char_after) =
                 read_context_with_blind(focused, focused_pid);
+            // Classify editability from the AX role/subrole + writability and
+            // the app type, so the write ladder can gate on positive evidence.
+            let editability = focused_editability(focused, focused_pid);
             // Harvest visible text for screen-context vocabulary while we hold
             // the element. AX-blind apps return None here, same as the caret read.
             let screen_text = harvest_screen_text(focused);
@@ -763,7 +1139,7 @@ mod imp {
                 } else {
                     format!("<unknown AXError {r_err}>")
                 };
-                eprintln!("[inject-diag] focus capture: pid={focused_pid:?} role={role}");
+                eprintln!("[inject-diag] focus capture: pid={focused_pid:?} role={role} editability={editability:?}");
             }
 
             // Retain — focused_ref was returned by AXUIElementCopyAttributeValue
@@ -775,34 +1151,34 @@ mod imp {
                 last_nws_before,
                 char_after,
                 screen_text,
+                editability,
             })
         }
     }
 
-    /// Write `text` into a pre-captured focus target. Skips the
-    /// get_focused_element + context read costs entirely (they were paid in
-    /// parallel with inference at capture time) and routes the actual write
-    /// through the same `write_padded` ladder as the resolve-now path.
-    pub fn inject_via_target(target: FocusTargetInner, text: &str) -> eyre::Result<()> {
-        let prof = std::env::var("INJECT_PROFILE").is_ok();
+    /// Write `text` at the CURRENT focused element, not the press-time capture.
+    ///
+    /// The retained `target` (and its caret context / editability) is a
+    /// key-press snapshot; by write time the user may have moved focus to a
+    /// different field in the SAME app, or the frontmost app changed. Writing
+    /// into the stale element would be wrong. So we RE-RESOLVE the current
+    /// focused element just before the write and gate there — "use fresh focused
+    /// field not stale original". The captured target still feeds the cleanup
+    /// vocabulary (screen_text) and the daemon's summary log, but never the
+    /// write target.
+    pub fn inject_via_target(_target: FocusTargetInner, text: &str) -> eyre::Result<InjectOutcome> {
+        // Re-resolve the current focus fresh via the system-wide proxy.
+        inject_systemwide(text)
+    }
 
-        // Apply remembered tail fallback if context was empty.
-        let (immediate_before, last_nws_before) =
-            if target.immediate_before.is_none() && target.last_nws_before.is_none() {
-                let tail = super::recall_tail();
-                (tail, tail)
-            } else {
-                (target.immediate_before, target.last_nws_before)
-            };
-
-        let padded = smart_pad(text, immediate_before, last_nws_before, target.char_after);
-        if padded.is_empty() {
-            return Ok(());
-        }
-
-        // `target` owns the retained focused element and releases it on drop
-        // when this function returns.
-        unsafe { write_padded(target.focused, target.pid, &padded, prof) }
+    /// Cancellable variant of [`inject_via_target`]: same fresh re-resolve, but
+    /// with a write authorizer polled immediately before the first side effect.
+    pub fn inject_via_target_with(
+        _target: FocusTargetInner,
+        text: &str,
+        authorize: Option<&dyn Fn() -> bool>,
+    ) -> eyre::Result<InjectOutcome> {
+        inject_systemwide_with(text, authorize)
     }
 }
 
@@ -851,6 +1227,13 @@ impl FocusTarget {
     pub fn screen_text(&self) -> Option<&str> {
         self.inner.screen_text.as_deref()
     }
+
+    /// The focus-editability classification computed at capture time. The
+    /// daemon reads this to decide whether to inject at all (a `NotEditable`
+    /// focus holds the transcript instead of writing anywhere).
+    pub fn editability(&self) -> FocusEditability {
+        self.inner.editability
+    }
 }
 
 #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
@@ -864,13 +1247,16 @@ impl FocusTarget {
     pub fn inner_pid(&self) -> Option<i32> {
         None
     }
+    pub fn editability(&self) -> FocusEditability {
+        FocusEditability::NotEditable
+    }
 }
 
 impl AccessibilityInjector {
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_text(text: &str) -> eyre::Result<()> {
+    pub fn inject_text(text: &str) -> eyre::Result<InjectOutcome> {
         if text.trim().is_empty() {
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
         imp::inject_systemwide(text)
     }
@@ -879,44 +1265,96 @@ impl AccessibilityInjector {
     /// Skips `get_focused_element` and `read_caret_context` — saves the
     /// ~80–150 ms those cost in Electron apps.
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_with_target(target: FocusTarget, text: &str) -> eyre::Result<()> {
+    pub fn inject_with_target(target: FocusTarget, text: &str) -> eyre::Result<InjectOutcome> {
         if text.trim().is_empty() {
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
         imp::inject_via_target(target.inner, text)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_with_target(_target: FocusTarget, text: &str) -> eyre::Result<()> {
+    pub fn inject_with_target(_target: FocusTarget, text: &str) -> eyre::Result<InjectOutcome> {
+        Self::inject_text(text)
+    }
+
+    /// Cancellable systemwide injection. `authorize` is polled exactly once,
+    /// after the focus/context/padding resolution and immediately before the
+    /// first write/clipboard side effect; refusal yields
+    /// [`InjectOutcome::Cancelled`] with nothing written.
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    pub fn inject_text_cancellable(
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if text.trim().is_empty() {
+            return Ok(InjectOutcome::Injected);
+        }
+        imp::inject_systemwide_with(text, Some(authorize))
+    }
+
+    /// Cancellable pre-captured-target injection: same fresh re-resolve, same
+    /// write authorizer immediately before the first side effect.
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    pub fn inject_with_target_cancellable(
+        target: FocusTarget,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if text.trim().is_empty() {
+            return Ok(InjectOutcome::Injected);
+        }
+        imp::inject_via_target_with(target.inner, text, Some(authorize))
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+    pub fn inject_text_cancellable(
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if !authorize() {
+            return Ok(InjectOutcome::Cancelled);
+        }
+        Self::inject_text(text)
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+    pub fn inject_with_target_cancellable(
+        _target: FocusTarget,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if !authorize() {
+            return Ok(InjectOutcome::Cancelled);
+        }
         Self::inject_text(text)
     }
 
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_into_pid(pid: i32, text: &str) -> eyre::Result<()> {
+    pub fn inject_into_pid(pid: i32, text: &str) -> eyre::Result<InjectOutcome> {
         if text.trim().is_empty() {
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
         imp::inject_into_pid(pid, text)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_text(text: &str) -> eyre::Result<()> {
+    pub fn inject_text(text: &str) -> eyre::Result<InjectOutcome> {
         let padded = smart_pad(text, None, None, None);
         if padded.is_empty() {
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
         println!("[INJECT-FALLBACK] {padded}");
-        Ok(())
+        Ok(InjectOutcome::Injected)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_into_pid(_pid: i32, text: &str) -> eyre::Result<()> {
+    pub fn inject_into_pid(_pid: i32, text: &str) -> eyre::Result<InjectOutcome> {
         let padded = smart_pad(text, None, None, None);
         if padded.is_empty() {
-            return Ok(());
+            return Ok(InjectOutcome::Injected);
         }
         println!("[INJECT-FALLBACK-PID] {padded}");
-        Ok(())
+        Ok(InjectOutcome::Injected)
     }
 
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
@@ -927,5 +1365,325 @@ impl AccessibilityInjector {
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
     pub fn check_permission() -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editable_role_with_writable_value_reads_editable() {
+        assert_eq!(
+            classify_focus_editability(Some("AXTextField"), None, true, false, false),
+            FocusEditability::Editable
+        );
+        assert_eq!(
+            classify_focus_editability(Some("AXTextArea"), None, false, true, false),
+            FocusEditability::Editable
+        );
+        // A search field via subrole counts as text-entry.
+        assert_eq!(
+            classify_focus_editability(None, Some("AXSearchField"), true, false, false),
+            FocusEditability::Editable
+        );
+    }
+
+    #[test]
+    fn editable_role_but_not_writable_is_not_editable() {
+        // A role that looks like a field but has no writable value is not a
+        // place to write — never treat a label/static as an input.
+        assert_eq!(
+            classify_focus_editability(Some("AXTextField"), None, false, false, false),
+            FocusEditability::NotEditable
+        );
+        // A static label is never editable, even though AX discloses it.
+        assert_eq!(
+            classify_focus_editability(Some("AXStaticText"), None, true, true, false),
+            FocusEditability::NotEditable
+        );
+    }
+
+    #[test]
+    fn terminal_without_a_noninput_role_is_paste_safe() {
+        // A terminal whose focused element exposes no clearly non-input role
+        // (here the ambiguous AXGroup / no role) is a legitimate text-input
+        // surface. This is the narrow, justified fallback.
+        assert_eq!(
+            classify_focus_editability(Some("AXGroup"), None, false, false, true),
+            FocusEditability::PasteSafe
+        );
+        assert_eq!(
+            classify_focus_editability(None, None, false, false, true),
+            FocusEditability::PasteSafe
+        );
+    }
+
+    // Reviewer: "ANY positively noneditable role denies even allowlisted". The
+    // app (terminal) is allowlisted, but the FOCUS role is not input.
+    #[test]
+    fn allowlisted_terminal_with_noninput_role_is_denied() {
+        // A button focused in a terminal is still a button — not input.
+        assert_eq!(
+            classify_focus_editability(Some("AXButton"), None, false, false, true),
+            FocusEditability::NotEditable
+        );
+        // A read-only text field in a terminal (role is text, but not
+        // settable) is denied.
+        assert_eq!(
+            classify_focus_editability(Some("AXTextField"), None, false, false, true),
+            FocusEditability::NotEditable
+        );
+        // Static/read-only text, a window chrome, a web page body, a canvas,
+        // a menu — all deny even for the allowlisted terminal.
+        assert_eq!(
+            classify_focus_editability(Some("AXStaticText"), None, false, false, true),
+            FocusEditability::NotEditable
+        );
+        assert_eq!(
+            classify_focus_editability(Some("AXWindow"), None, false, false, true),
+            FocusEditability::NotEditable
+        );
+        assert_eq!(
+            classify_focus_editability(Some("AXWebArea"), None, false, false, true),
+            FocusEditability::NotEditable
+        );
+        assert_eq!(
+            classify_focus_editability(Some("AXCanvas"), None, false, false, true),
+            FocusEditability::NotEditable
+        );
+    }
+
+    // Reviewer: "not all editor windows" — the app-level editor/compose
+    // blanket is gone. A black-holed editor surface is NOT PasteSafe.
+    #[test]
+    fn app_level_editor_blanket_is_removed() {
+        // An editor/compose app with a black-holed role but that is NOT a
+        // terminal is NotEditable — pasting must be justified by FOCUS role,
+        // not by app name. (An editable editor pane exposes an AXTextArea role
+        // at write time and reaches Editable that way.)
+        assert_eq!(
+            classify_focus_editability(None, None, false, false, false),
+            FocusEditability::NotEditable
+        );
+    }
+
+    #[test]
+    fn unknown_focus_is_not_editable() {
+        // No positive evidence, not a terminal → NotEditable. Never guess.
+        assert_eq!(
+            classify_focus_editability(Some("AXWebArea"), None, false, false, false),
+            FocusEditability::NotEditable
+        );
+        assert_eq!(
+            classify_focus_editability(None, None, false, false, false),
+            FocusEditability::NotEditable
+        );
+    }
+
+    // ── decide_inject / finalize_utterance: observable-sink behaviour ──────
+
+    #[test]
+    fn cancel_holds_even_when_editable() {
+        assert_eq!(
+            decide_inject(true, Some(FocusEditability::Editable)),
+            InjectDecision::Hold {
+                reason: HoldReason::Cancelled
+            }
+        );
+    }
+
+    #[test]
+    fn editable_and_paste_safe_inject() {
+        assert_eq!(
+            decide_inject(false, Some(FocusEditability::Editable)),
+            InjectDecision::Inject
+        );
+        assert_eq!(
+            decide_inject(false, Some(FocusEditability::PasteSafe)),
+            InjectDecision::Inject
+        );
+    }
+
+    #[test]
+    fn unknown_focus_does_not_hold_without_writing() {
+        // Reviewer: a failed initial capture (editability unknown = None) must
+        // reach the fresh resolver at write time, NOT hold as if NotEditable.
+        assert_eq!(decide_inject(false, None), InjectDecision::Inject);
+    }
+
+    #[test]
+    fn not_editable_holds_and_never_writes() {
+        // ONLY a KNOWN NotEditable holds without writing. Sink never called.
+        let mut sink_called = false;
+        let result = finalize_utterance(false, Some(FocusEditability::NotEditable), "hello", |_| {
+            sink_called = true;
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Held);
+        assert!(!sink_called, "a known NotEditable focus must never reach the injector");
+    }
+
+    #[test]
+    fn failed_capture_then_current_editable_injects() {
+        // Reviewer: "failed initial capture then current editable". captured
+        // target is None → editability None → the sink (fresh resolver) runs
+        // and, seeing the CURRENT field editable, injects.
+        let mut injected = Vec::new();
+        let result = finalize_utterance(false, None, "dictated", |t| {
+            injected.push(t.to_string());
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Injected);
+        assert_eq!(injected, vec!["dictated"]);
+    }
+
+    #[test]
+    fn failed_capture_then_current_not_editable_holds() {
+        // The fresh resolver at write time finds no editable field → Held.
+        let result = finalize_utterance(false, None, "dictated", |_| {
+            Ok(InjectOutcome::NoEditableField)
+        });
+        assert_eq!(result, FinalizeResult::Held);
+    }
+
+    #[test]
+    fn click_out_still_holds_but_click_back_injects() {
+        // Click-out (same app, focus moved to a non-input role): the injector's
+        // fresh gate reports NoEditableField → Held, sink still called (gate
+        // decided) but no write happened / nothing pasted.
+        let mut writes = 0usize;
+        let out = finalize_utterance(false, None, "x", |_| {
+            writes += 1;
+            Ok(InjectOutcome::NoEditableField)
+        });
+        assert_eq!(out, FinalizeResult::Held);
+        // Click back into the field: next utterance injects.
+        let in_ = finalize_utterance(false, None, "y", |_| {
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(in_, FinalizeResult::Injected);
+    }
+
+    #[test]
+    fn cancel_never_reaches_the_injector() {
+        let mut sink_called = false;
+        let result = finalize_utterance(true, Some(FocusEditability::Editable), "hello", |_| {
+            sink_called = true;
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Cancelled);
+        assert!(!sink_called, "a cancelled utterance must never be injected");
+    }
+
+    #[test]
+    fn fresh_dictation_after_cancel_injects() {
+        // The headlining user-visible guarantee: cancel one utterance, then a
+        // fresh dictation goes straight through to the injector.
+        let mut injected = Vec::new();
+        let result = finalize_utterance(true, Some(FocusEditability::Editable), "cancelled", |_| {
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Cancelled);
+        assert!(injected.is_empty());
+
+        let result = finalize_utterance(false, Some(FocusEditability::Editable), "fresh", |t| {
+            injected.push(t.to_string());
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Injected);
+        assert_eq!(injected, vec!["fresh"]);
+    }
+
+    #[test]
+    fn injector_discovering_no_field_reports_held() {
+        // Even with apparent positive evidence, the injector's fresh gate may
+        // find black-holed focus at write time → Held.
+        let result = finalize_utterance(false, Some(FocusEditability::Editable), "x", |_| {
+            Ok(InjectOutcome::NoEditableField)
+        });
+        assert_eq!(result, FinalizeResult::Held);
+    }
+
+    #[test]
+    fn hard_write_failure_reports_failed() {
+        let result = finalize_utterance(false, Some(FocusEditability::Editable), "x", |_| {
+            Err(eyre::eyre!("AX refused"))
+        });
+        assert_eq!(result, FinalizeResult::Failed);
+    }
+
+    // ── write-authorizer seam (the commit moved to just before the write) ──
+
+    #[test]
+    fn authorizer_none_is_always_authorized() {
+        assert_eq!(claim_write_authorization(None), None);
+    }
+
+    #[test]
+    fn authorizer_true_proceeds_false_cancels() {
+        assert_eq!(claim_write_authorization(Some(&|| true)), None);
+        assert_eq!(
+            claim_write_authorization(Some(&|| false)),
+            Some(InjectOutcome::Cancelled)
+        );
+    }
+
+    #[test]
+    fn cancel_during_lookup_then_resume_leaves_sink_untouched() {
+        // Mirrors the worker: the injector resolves focus/context/padding (a
+        // possibly-slow, up to 1.5s AX lookup), THEN claims write authorization
+        // via gate.commit(gen) immediately before the first side effect. A
+        // cancel that landed during that lookup (before the claim) must map to
+        // Cancelled with zero writes — the "prevent late insertion" guarantee.
+        let gate = crate::cancel::CancelGate::new();
+        let gen = gate.begin();
+
+        // The cancel arrives while the (simulated) AX lookup is blocked.
+        assert!(gate.request_cancel());
+
+        let mut writes = 0usize;
+        let result = finalize_utterance(false, None, "dictated", |_| {
+            // ...lookup resumes here; claim authorization at the last moment.
+            if !gate.commit(gen) {
+                return Ok(InjectOutcome::Cancelled);
+            }
+            writes += 1;
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Cancelled);
+        assert_eq!(writes, 0, "a cancelled utterance must never reach the write");
+    }
+
+    #[test]
+    fn uncancelled_authorization_writes_exactly_once() {
+        let gate = crate::cancel::CancelGate::new();
+        let gen = gate.begin();
+        let mut writes = 0usize;
+        let result = finalize_utterance(false, None, "dictated", |_| {
+            if !gate.commit(gen) {
+                return Ok(InjectOutcome::Cancelled);
+            }
+            writes += 1;
+            Ok(InjectOutcome::Injected)
+        });
+        assert_eq!(result, FinalizeResult::Injected);
+        assert_eq!(writes, 1);
+        // A second claim for the same generation is refused (exactly-once).
+        assert!(!gate.commit(gen));
+    }
+
+    #[test]
+    fn no_editable_hold_never_claims_authorization() {
+        // A hold (known NotEditable) is decided before the write ladder, so the
+        // authorizer is never polled and nothing is written.
+        let mut authorized = 0usize;
+        let result =
+            finalize_utterance(false, Some(FocusEditability::NotEditable), "x", |_| {
+                authorized += 1;
+                Ok(InjectOutcome::Injected)
+            });
+        assert_eq!(result, FinalizeResult::Held);
+        assert_eq!(authorized, 0);
     }
 }

@@ -113,6 +113,10 @@ pub(super) fn worker_loop(
     let mut t_press: Option<Instant> = None;
     // Whether the in-flight utterance is a transform instruction (Shift held).
     let mut transform_mode = false;
+    // Generation of the in-flight utterance, for the out-of-band cancel gate
+    // (`crate::cancel`). `u64::MAX` = no utterance in flight. Set whenever a
+    // real recording begins; read by the release pipeline's cancel checkpoints.
+    let mut cur_gen: u64 = u64::MAX;
 
     // Focus capture at key-press. The currently-focused UI element + caret
     // context are resolved on a background thread when recording starts, so the
@@ -262,19 +266,48 @@ pub(super) fn worker_loop(
                 eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
             }
             DaemonEvent::Retry => {
-                // Re-run the pipeline on the last utterance's audio (control
-                // socket "retry" / menu-bar item). No-op until the first
-                // successful dictation has stashed its audio.
+                // Re-run the pipeline on the retained "last recording" audio
+                // (control-socket "retry" / menu-bar item). Retry obeys the
+                // SAME cancel gate and focus/no-blind-paste guard as a live
+                // utterance: it begins a fresh generation, marks Processing (so
+                // Escape is recognised), and claims the write commit at the last
+                // moment via the injector's write authorizer. The retained audio
+                // is NOT cleared here — a cancelled retry keeps it until the next
+                // recording start or app quit.
+                if last_audio.is_empty() {
+                    eprintln!("  ↻    retry: nothing to retry yet");
+                    cues::play_error();
+                    continue;
+                }
+                ui_channel::set_state(UiState::Processing);
+                let retry_gen = crate::cancel::CANCEL.begin();
                 #[cfg(feature = "cleaner")]
-                retry_last(&rt, &mut worker, cleaner.as_ref(), &refiner, &last_audio);
+                retry_last(&rt, &mut worker, cleaner.as_ref(), &refiner, &last_audio, retry_gen);
                 #[cfg(not(feature = "cleaner"))]
-                retry_last(&mut worker, &refiner, &last_audio);
+                retry_last(&mut worker, &refiner, &last_audio, retry_gen);
+                crate::cancel::CANCEL.end();
+                if ui_channel::state() == UiState::Processing {
+                    ui_channel::set_state(UiState::Idle);
+                }
             }
             DaemonEvent::CancelRecording => {
-                // External "cancel" (control socket only): stop capture and throw
-                // the utterance away — no transcribe, no inject. Mirrors the
-                // StopRecording teardown minus the pipeline. Safe to fire when
-                // idle (nothing live ⇒ no-op).
+                // External "cancel" (control socket, or the Escape key): stop
+                // capture and throw the utterance away — no transcribe, no
+                // inject. Mirrors the StopRecording teardown minus the pipeline.
+                //
+                // Stale-cancel guard: a `CancelRecording` queued from a PREVIOUS
+                // utterance (whose gate was already ended when it settled) must
+                // NOT discard a recording that started since. Only honour the
+                // cancel when the gate still has it pending for the CURRENT
+                // utterance — a fresh `begin()` clears the target, so an idle /
+                // stale event is a no-op and leaves the live recording alone.
+                let genuine = cur_gen != u64::MAX
+                    && crate::cancel::CANCEL.requested(cur_gen);
+                if !genuine {
+                    continue;
+                }
+                crate::cancel::CANCEL.end();
+                cur_gen = u64::MAX;
                 crate::ipc::DAEMON_RECORDING.store(false, Ordering::SeqCst);
                 let mut on_demand_engine = engine.take();
                 let always_on_session = session_active;
@@ -290,11 +323,11 @@ pub(super) fn worker_loop(
                 if let Some(e) = on_demand_engine.as_mut() {
                     if warm_window_ms > 0 && preroll_ms == 0 {
                         // Warm-window cancel: park the mic for reuse, but first
-                        // drain + discard the cancelled audio so the next recording
-                        // starts from a clean ring.
+                        // drain the cancelled audio and RETAIN it for retry (the
+                        // next recording clears this buffer on start).
                         e.park();
                         if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
-                            let _ = crate::audio::drain_session(c, r);
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
                         }
                         engine = on_demand_engine.take();
                         warm_parked = true;
@@ -302,15 +335,20 @@ pub(super) fn worker_loop(
                             + Duration::from_millis(warm_window_ms as u64));
                     } else {
                         e.stop_capture();
+                        // Cold cancel: drain + retain the partial recording before
+                        // dropping the consumer below.
+                        if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                        }
                     }
                 }
                 if always_on_session {
-                    // End the session and drain+discard the buffered audio so the
-                    // next press starts from a clean ring.
+                    // End the session, drain the buffered audio, and RETAIN it for
+                    // retry (the next recording clears it on start).
                     if let Some((ao, cons)) = always.as_mut() {
                         ao.end_session();
                         let recflag = ao.recording_flag();
-                        let _ = crate::audio::drain_session(cons, &recflag);
+                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(cons), Some(recflag.as_ref()));
                     }
                 } else if !warm_parked {
                     // Drop the per-utterance consumer + recording flag unread (the
@@ -331,6 +369,10 @@ pub(super) fn worker_loop(
                 if session_active {
                     continue;
                 }
+                // A new recording attempt invalidates the previously retained
+                // "last recording" buffer, even if this attempt fails to open
+                // the mic — the stale audio must never be replayable.
+                last_audio.clear();
                 // Warm-window reuse: a parked engine (mic open but idle) is
                 // resumed in place, skipping cpal's ~120 ms stream-open cost for
                 // a back-to-back dictation. Rebuild instead if the default input
@@ -361,6 +403,8 @@ pub(super) fn worker_loop(
                             ui_channel::set_state(UiState::Recording);
                             eprintln!("▶ recording (warm reuse)");
                             crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+                            last_audio.clear(); // new recording invalidates the previous buffer
+                            cur_gen = crate::cancel::CANCEL.begin();
                             if streaming_asr {
                                 stream = Some(crate::vad::SegmentStream::new(
                                     crate::audio::SAMPLE_RATE,
@@ -426,6 +470,8 @@ pub(super) fn worker_loop(
                         eprintln!("▶ recording · pre-roll");
                         session_active = true;
                         crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+                        last_audio.clear(); // new recording invalidates the previous buffer
+                        cur_gen = crate::cancel::CANCEL.begin();
                         pending_target = Some(spawn_focus_capture());
                     }
                     continue;
@@ -448,6 +494,8 @@ pub(super) fn worker_loop(
                     cues::play_error();
                 } else {
                     noise_floor.clear();
+                    last_audio.clear(); // new recording invalidates the previous buffer
+                    cur_gen = crate::cancel::CANCEL.begin();
                     pending_target = Some(spawn_focus_capture());
                 }
             }
@@ -597,12 +645,19 @@ pub(super) fn worker_loop(
                         crate::audio_duck::mute();
                         ui_channel::set_state(UiState::Recording);
                         crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
+                        last_audio.clear(); // re-press abandons the old utterance
+                        cur_gen = crate::cancel::CANCEL.begin();
                         eprintln!("  ↻    re-press during tail-capture · reused warm stream");
                         pending_target = Some(spawn_focus_capture());
                         continue 'evloop;
                     }
                     Some(TailGraceOutcome::Cancel) => {
                         on_demand_engine.as_mut().unwrap().stop_capture();
+                        // Retain the partial recording (held streaming backup +
+                        // the grace-tail samples still in the ring) for retry.
+                        if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                        }
                         consumer.take();
                         is_recording.take();
                         pending_target = None; // discard the orphaned press-time capture
@@ -613,6 +668,8 @@ pub(super) fn worker_loop(
                         cues::play_cancel();
                         ui_channel::set_state(UiState::Idle);
                         let _unmute = crate::audio_duck::RestoreOnDrop;
+                        crate::cancel::CANCEL.end();
+                        cur_gen = u64::MAX;
                         eprintln!("⌫ cancelled · discarded");
                         eprintln!();
                         continue 'evloop;
@@ -644,6 +701,29 @@ pub(super) fn worker_loop(
                     if let Some((ao, _)) = always.as_ref() {
                         ao.end_session();
                     }
+                }
+                // Out-of-band cancel gate: an Escape / IPC cancel may have
+                // arrived during capture or the tail grace. Discard now — no
+                // transcribe, no inject — but RETAIN the recording's audio for
+                // retry (see `crate::cancel`). The audio has not been drained
+                // into `last_audio` yet at this checkpoint, so drain it from the
+                // active capture source first.
+                if cur_gen != u64::MAX && crate::cancel::CANCEL.consume_cancel(cur_gen) {
+                    if always_on_session {
+                        if let Some((ao, cons)) = always.as_mut() {
+                            let recflag = ao.recording_flag();
+                            retain_in_flight_audio(&mut last_audio, &[], Some(cons), Some(recflag.as_ref()));
+                        }
+                    } else if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                    }
+                    cues::play_cancel();
+                    ui_channel::set_state(UiState::Idle);
+                    crate::cancel::CANCEL.end();
+                    cur_gen = u64::MAX;
+                    eprintln!("⌫ cancelled · discarded");
+                    eprintln!();
+                    continue 'evloop;
                 }
                 cues::play_stop();
                 ui_channel::set_state(UiState::Processing);
@@ -814,6 +894,17 @@ pub(super) fn worker_loop(
                     eprintln!("  skip · empty transcript");
                     eprintln!();
                     ui_channel::set_state(UiState::Idle);
+                    continue;
+                }
+
+                // Cancel gate, second checkpoint — after ASR but before the
+                // (expensive) cleanup pass. An Escape during transcription must
+                // stop here rather than burn the cleanup model.
+                if cur_gen != u64::MAX && crate::cancel::CANCEL.consume_cancel(cur_gen) {
+                    cues::play_cancel();
+                    ui_channel::set_state(UiState::Idle);
+                    eprintln!("⌫ cancelled · discarded");
+                    eprintln!();
                     continue;
                 }
 
@@ -1057,15 +1148,41 @@ pub(super) fn worker_loop(
                     DictationOutcome::Inject { text, action } => (text, action),
                 };
 
-                // Inject using the focus target captured before cleanup.
+                // The critical reject gate, evaluated at write time through
+                // the injector's write-authorizer:
+                //   1. cancel: `commit()` is the linearizable point that flips
+                //      this utterance from cancellable → committing. It is
+                //      claimed by the injector at the LAST moment — after the
+                //      focus/context/padding re-resolve and immediately before
+                //      the first write/clipboard side effect — so a cancel that
+                //      lands during a slow (up to 1.5s) AX lookup is still
+                //      honored. A refusal maps to `FinalizeResult::Cancelled`.
+                //   2. focus: the injector re-resolves the CURRENT focused
+                //      element and gates on its role/writability, so a stale
+                //      key-press target or a same-app focus change never
+                //      writes blindly. `finalize_utterance` is the tested seam;
+                //      the sink is the actual AX/clipboard call.
+                let used_fresh_capture = captured_target.is_none();
+                let inject_source = captured_target; // moved into the sink
                 let t_inject = Instant::now();
-                let (inject_result, used_fresh_capture) = match captured_target {
-                    Some(target) => (
-                        AccessibilityInjector::inject_with_target(target, &final_text),
-                        false,
-                    ),
-                    None => (AccessibilityInjector::inject_text(&final_text), true),
-                };
+                let finish = crate::injector::finalize_utterance(
+                    false,
+                    None,
+                    &final_text,
+                    |text| {
+                        // One authorization claim, exactly once, immediately
+                        // before the first side effect (no second claim across
+                        // the write ladder's fallbacks).
+                        let authorize =
+                            || cur_gen != u64::MAX && crate::cancel::CANCEL.commit(cur_gen);
+                        match inject_source {
+                            Some(target) => AccessibilityInjector::inject_with_target_cancellable(
+                                target, text, &authorize,
+                            ),
+                            None => AccessibilityInjector::inject_text_cancellable(text, &authorize),
+                        }
+                    },
+                );
                 let t_inject_ms = ms(t_inject.elapsed());
 
                 // ─── per-utterance summary block ───────────────────────
@@ -1116,26 +1233,53 @@ pub(super) fn worker_loop(
                         "  ⚠    cleanup shrank text {raw_chars} → {final_chars} chars · raw: \"{raw_transcript}\""
                     );
                 }
-                if let Err(err) = &inject_result {
-                    eprintln!("  ✗    inject failed: {err:?}");
-                    cues::play_error();
-                    ui_channel::show_transient(UiState::Error, Duration::from_millis(650));
-                } else {
-                    eprintln!("  ✓    \"{final_text}\"");
-                    cues::play_success();
-                    ui_channel::show_transient(UiState::Success, Duration::from_millis(420));
-                    // Remember it for the menu-bar "Copy last dictation" item.
-                    ui_channel::set_last_dictation(&final_text);
-                    // Persist to the browsable dictation history (best-effort;
-                    // never blocks or fails the hot path).
-                    crate::history::record(&final_text);
-                    if !matches!(action, TrailingAction::None) {
-                        // Let the field commit the injected text before the key.
-                        std::thread::sleep(Duration::from_millis(40));
-                        execute_trailing_action(&action);
+                match finish {
+                    crate::injector::FinalizeResult::Injected => {
+                        eprintln!("  ✓    \"{final_text}\"");
+                        cues::play_success();
+                        ui_channel::show_transient(UiState::Success, Duration::from_millis(420));
+                        // Remember it for the menu-bar "Copy last dictation" item.
+                        ui_channel::set_last_dictation(&final_text);
+                        // Persist to the browsable dictation history (best-effort;
+                        // never blocks or fails the hot path).
+                        crate::history::record(&final_text);
+                        if !matches!(action, TrailingAction::None) {
+                            // Let the field commit the injected text before the key.
+                            std::thread::sleep(Duration::from_millis(40));
+                            execute_trailing_action(&action);
+                        }
+                    }
+                    crate::injector::FinalizeResult::Held => {
+                        // No editable field focused: never paste blindly. Keep the
+                        // transcript recoverable for the menu's "Copy last
+                        // dictation" and surface a clear "No text field selected"
+                        // state instead of writing anywhere.
+                        eprintln!(
+                            "  ◌    no text field selected — transcript held (copy from menu)"
+                        );
+                        ui_channel::set_last_dictation(&final_text);
+                        ui_channel::show_transient(
+                            UiState::NoEditableField,
+                            Duration::from_millis(900),
+                        );
+                    }
+                    crate::injector::FinalizeResult::Cancelled => {
+                        eprintln!("  ⌫    cancelled · discarded");
+                        cues::play_cancel();
+                        ui_channel::set_state(UiState::Idle);
+                    }
+                    crate::injector::FinalizeResult::Failed => {
+                        eprintln!("  ✗    inject failed");
+                        cues::play_error();
+                        ui_channel::show_transient(UiState::Error, Duration::from_millis(650));
                     }
                 }
                 eprintln!();
+                // The utterance settled (injected, held, cancelled, or failed):
+                // close the cancel window so the gate reads idle and an idle
+                // Escape is never swallowed.
+                crate::cancel::CANCEL.end();
+                cur_gen = u64::MAX;
                 if ui_channel::state() == UiState::Processing {
                     ui_channel::set_state(UiState::Idle);
                 }
@@ -1217,6 +1361,27 @@ pub(super) fn drain_available(consumer: &mut crate::audio::HeapAudioConsumer) ->
     let got = consumer.pop_slice(&mut buf);
     buf.truncate(got);
     buf
+}
+
+/// Retain the in-flight recording's raw PCM as the "last recording" buffer for
+/// retry, replacing whatever was there. Combines the already-drained streaming
+/// backup (`stream_audio`) with the still-queued ring samples drained from
+/// `consumer` (the caller must have stopped/parked capture first, so the
+/// recording flag is false and `drain_session` returns). A cancel with no
+/// captured audio yields an empty buffer — retry then no-ops. Memory only;
+/// never written to disk.
+pub(super) fn retain_in_flight_audio(
+    last_audio: &mut Vec<f32>,
+    stream_audio: &[f32],
+    consumer: Option<&mut crate::audio::HeapAudioConsumer>,
+    is_recording: Option<&std::sync::atomic::AtomicBool>,
+) {
+    let mut retained = Vec::with_capacity(stream_audio.len() + 4096);
+    retained.extend_from_slice(stream_audio);
+    if let (Some(c), Some(r)) = (consumer, is_recording) {
+        retained.extend(crate::audio::drain_session(c, r));
+    }
+    *last_audio = retained;
 }
 
 /// One incremental ASR step: pull available audio into the segment stream, then
@@ -1441,14 +1606,60 @@ pub(super) fn handle_spoken_command(
         None => AccessibilityInjector::inject_text(result),
     };
     match inject_result {
-        Ok(()) => {
+        Ok(crate::injector::InjectOutcome::Injected) => {
             eprintln!("  ✓    {} ms → \"{result}\"", ms(t.elapsed()));
             ui_channel::set_last_dictation(result);
             crate::history::record(result);
+        }
+        Ok(crate::injector::InjectOutcome::NoEditableField) => {
+            eprintln!(
+                "  ◌    no text field selected — result held (copy from menu)"
+            );
+            ui_channel::set_last_dictation(result);
+        }
+        Ok(crate::injector::InjectOutcome::Cancelled) => {
+            // Unreachable via the non-cancellable entry points used here, kept
+            // for exhaustiveness.
+            eprintln!("  ⌫    cancelled · discarded");
+            cues::play_cancel();
         }
         Err(e) => {
             eprintln!("  ✗    inject failed: {e:?}");
             cues::play_error();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Synthetic-audio fixture: the already-drained streaming backup (what the
+    /// hold-time ticks moved into `stream_audio`) plus a drained ring tail.
+    /// `retain_in_flight_audio` must concatenate both and REPLACE the previous
+    /// buffer — no history/log reads, no disk, memory only.
+    #[test]
+    fn retain_keeps_stream_backup_and_replaces_previous_buffer() {
+        let mut last = vec![9.0, 9.0, 9.0];
+        let stream_audio = vec![1.0, 2.0, 3.0];
+        // No live consumer: only the already-drained backup is retained.
+        retain_in_flight_audio(&mut last, &stream_audio, None, None);
+        assert_eq!(last, vec![1.0, 2.0, 3.0], "must replace, not append, the old buffer");
+    }
+
+    #[test]
+    fn retain_with_no_audio_yields_empty_so_retry_noops() {
+        let mut last = vec![5.0];
+        retain_in_flight_audio(&mut last, &[], None, None);
+        assert!(last.is_empty(), "a cancel with nothing captured must not leave a stale buffer");
+    }
+
+    #[test]
+    fn retain_empty_does_not_keep_zero_length_invalid_retry() {
+        // A retained buffer is only meaningful when it holds samples; the
+        // worker's retry path no-ops on an empty buffer.
+        let mut last = Vec::new();
+        retain_in_flight_audio(&mut last, &[], None, None);
+        assert!(last.is_empty());
     }
 }

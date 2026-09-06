@@ -383,7 +383,7 @@ pub(super) fn install_poll_timer() {
                     animate_processing_bars(globals);
                 }
             }
-            UiState::Success | UiState::Error | UiState::Idle => {}
+            UiState::Success | UiState::Error | UiState::NoEditableField | UiState::Idle => {}
         }
         if state != UiState::Idle {
             update_pill_hover(globals);
@@ -426,7 +426,9 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
     let icon = match state {
         UiState::Idle | UiState::Success => &globals.icon_idle,
         UiState::Recording => &globals.icon_recording,
-        UiState::Processing | UiState::Error => &globals.icon_processing,
+        UiState::Processing | UiState::Error | UiState::NoEditableField => {
+            &globals.icon_processing
+        }
     };
     if let Some(button) = globals.status_item.button(mtm) {
         if let Some(img) = icon {
@@ -438,7 +440,7 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 UiState::Recording => "●",
                 UiState::Processing => "◌",
                 UiState::Success => "✓",
-                UiState::Error => "!",
+                UiState::Error | UiState::NoEditableField => "!",
             };
             button.setTitle(&NSString::from_str(fallback));
         }
@@ -503,6 +505,19 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .status
                 .setStringValue(&NSString::from_str("Couldn’t transcribe"));
             globals.pill.hint.setStringValue(&NSString::from_str("Retry"));
+            set_pill_layout(globals, PillLayout::Error);
+            show_pill(globals);
+        }
+        UiState::NoEditableField => {
+            // The transcript was held (not pasted) because no editable field was
+            // focused. Say so plainly and point at the one real recovery path:
+            // the menu-bar "Copy last dictation" item (there is no copy button
+            // on the pill, so we label the menu recovery accurately, not "Copy").
+            globals
+                .pill
+                .status
+                .setStringValue(&NSString::from_str("No text field selected"));
+            globals.pill.hint.setStringValue(&NSString::from_str("Copy: menu"));
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }

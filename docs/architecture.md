@@ -51,8 +51,9 @@ Subcommands of the binary (a plain `match` in `src/main.rs`): `daemon [--no-clea
 - `toggle`/`start`/`stop`/`cancel` drive a **running** daemon over its local control socket
   (`src/ipc.rs`), so external automation (macOS Shortcuts, Raycast, a Stream Deck button, a foot
   pedal) can trigger dictation without the hotkey or a second copy of the models. `toggle` reads
-  live recording state to fire start-or-stop; `cancel` is socket-only — it stops capture and
-  discards without transcribing/injecting.
+  live recording state to fire start-or-stop; `cancel` stops capture and
+  discards without transcribing/injecting. Escape (while an utterance is in flight) is the
+  hotkey gesture for the same thing — both route through the out-of-band cancel gate.
 - `bench`/`dictate` transcribe a WAV or capture for N ms and report per-stage timings.
   `transform "<i>" "<t>"` runs the warm transform path on raw text (no audio/AX) — the fast loop
   for eyeballing transform prompts.
@@ -207,6 +208,24 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
 ```
 
 **Focus capture at key-press** (default on): the focused UI element + caret context (`kAXValue` + `kAXSelectedTextRange`) are resolved on a background thread when recording *starts*, so the AX wake / cross-process cost is paid while the user is speaking rather than after the pipelines finish. At release the daemon joins that result and injects via `inject_with_target`, skipping the resolve-now path. If the press-time capture failed, or the frontmost app changed by inject time, it re-resolves fresh at release (correctness over speed); a very short hold just blocks on the join (same cost as a release-time spawn). The clipboard fallback's snapshot restore runs on a *detached* thread after the Cmd+V settle, so a slow restore can't pin the next dictation.
+
+**Cancellation (Escape / IPC), out-of-band** (`src/cancel.rs`): the worker is *blocked* inside the release pipeline (ASR / cleanup), so a cancel queued on the event channel would only be processed after the utterance was already injected. Cancellation therefore goes through a lock-free atomic gate scoped to an **utterance generation**, linearized around a single write-commit point:
+  * `begin()` marks a recording in flight and returns a monotonically increasing generation.
+  * `request_cancel()` (Escape in the event tap, or the IPC `cancel` command) targets exactly the in-flight generation, via a compare-exchange so it is **linearizable** with `commit()`. The tap decides in-flight from `ui_channel::state()` (`Recording`/`Processing`), which the worker sets at begin and reverts at settle, so an idle Escape is never mistaken for a cancel.
+  * The worker polls `requested(gen)` at two early decision points (before transcribe, before cleanup) to discard early without burning compute.
+  * **`commit(gen)` is the linearization point** claimed *inside the injector's write-authorizer*, immediately before the first write/clipboard side effect (after the focus/context/padding re-resolve): it flips the utterance from *cancellable* → *committing* atomically. A cancel accepted **before** it forces commit to fail → the utterance is discarded and nothing is written. After a successful commit a late cancel is ignored — the write cannot (and is not pretended to be) rolled back. This closes the check-then-act TOCTOU; checking twice is not sufficient.
+  * A fresh `begin()` clears the stale target, so a cancel for utterance N never affects utterance N+1, and a *queued* `CancelRecording` from a settled utterance is a no-op (it never discards a fresh recording).
+
+Escape *while idle* passes through untouched (normal Escape use); only an in-flight utterance swallows it. Inference is never hard-interrupted — a mid-ASR/cleanup cancel lets that compute finish, but the text is never written (compute-cancel vs. write-commit are distinct: one discards later, the other suppresses the actual write).
+
+**Cancel retains audio + Retry last recording**: a cancel no longer throws the audio away — the daemon drains the in-flight recording (the already-drained streaming backup plus the still-queued ring tail) into an **in-memory** `last_audio` buffer, replacing whatever was there. Only the most-recent recording is kept; it is cleared when a new recording starts and on app quit, never written to disk. The menu "Retry last recording" re-transcribes that buffer through the same pipeline, beginning a fresh cancel generation and claiming `commit` through the same write-authorizer, so retry obeys the identical Escape-cancel and current-editable-focus/no-blind-paste guard as a live utterance. A cancelled retry keeps the retained audio until the next recording start.
+
+**No-blind-paste focus gate** (`src/injector.rs`): before any write, the injector classifies the focused surface from *positive, focus-level evidence* — never an app name — into `FocusEditability`:
+  * `Editable` — hard AX evidence: a text-entry role (`AXTextField`/`AXTextArea`/`AXComboBox`, or the `AXSearchField`/`AXFullScreenSearchField`/`AXTextArea` subroles) **and** a writable `AXValue`/`AXSelectedText`. Native apps write via the AX ladder.
+  * `PasteSafe` — the *narrow, justified* fallback: a genuine terminal emulator whose focused element discloses no clearly non-input role. A terminal is always a text-input surface. **There is no editor/compose blanket** — a Slack pane, a Notion/Obsidian page, an Outlook window, a Cursor/VS Code editor *window*, or a browser body is only pasted into when its **focused element** reports an editable role, never by app name.
+  * `NotEditable` — a positively non-input role (`AXButton`/`AXWindow`/`AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio/read-only text field) denies injection **even for an allowlisted terminal**; or an unknown app / no focused AX element outside a terminal. The daemon **never** pastes here. It holds the transcript recoverable (menu "Copy last dictation") and surfaces a distinct `UiState::NoEditableField` (pill: "No text field selected").
+
+The daemon runs the focus decision through the tested seam `injector::finalize_utterance` immediately before the write. Crucially, the injector **re-resolves the CURRENT focused element at write time** (freshness, not the stale key-press target), so a same-app field change never writes into a stale element, and a failed initial capture still reaches the fresh resolver. `AX` absence alone is never proof of no input: a terminal is a legitimate `PasteSafe` target, while a page body / unknown app reads `NotEditable` and is held.
 
 **Release tail-capture** (default on, open-on-press only): on key release the daemon used to drop
 the mic immediately, clipping a word still being spoken. Instead it now enters a short grace loop

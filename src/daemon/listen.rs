@@ -166,11 +166,6 @@ pub(super) fn listen_dictate(refiner: &Refiner, body: &str) {
     inject_refined(refiner, body);
 }
 
-/// Re-run the pipeline on the last utterance's raw audio (the "retry" control
-/// command / menu item): re-transcribe, clean (when a cleaner is loaded), refine,
-/// and inject at the current cursor. Faithful to the original cleanup path — the
-/// deterministic seed makes cleanup reproduce the same text. A no-op (with an
-/// error cue) when there is no stashed audio yet.
 #[cfg(feature = "cleaner")]
 pub(super) fn retry_last(
     rt: &tokio::runtime::Runtime,
@@ -178,6 +173,7 @@ pub(super) fn retry_last(
     cleaner: Option<&TextCleanupEngine>,
     refiner: &Refiner,
     audio: &[f32],
+    retry_gen: u64,
 ) {
     if audio.is_empty() {
         eprintln!("  ↻    retry: nothing to retry yet");
@@ -202,7 +198,10 @@ pub(super) fn retry_last(
             .unwrap_or_else(|_| transcript.clone()),
         None => transcript,
     };
-    inject_refined(refiner, &cleaned);
+    // Same cancel gate + focus guard as a live utterance: claim the write
+    // commit at the last moment, immediately before the first side effect.
+    let authorize = || crate::cancel::CANCEL.commit(retry_gen);
+    inject_refined_authorized(refiner, &cleaned, &authorize);
 }
 
 /// Non-cleaner build: retry re-transcribes and injects the raw transcript
@@ -212,6 +211,7 @@ pub(super) fn retry_last(
     worker: &mut LocalInferenceWorker,
     refiner: &Refiner,
     audio: &[f32],
+    retry_gen: u64,
 ) {
     if audio.is_empty() {
         eprintln!("  ↻    retry: nothing to retry yet");
@@ -226,12 +226,24 @@ pub(super) fn retry_last(
             return;
         }
     };
-    inject_refined(refiner, &transcript);
+    let authorize = || crate::cancel::CANCEL.commit(retry_gen);
+    inject_refined_authorized(refiner, &transcript, &authorize);
 }
 
 /// Shared tail of `listen_dictate`: run the refiner's terminal classification
 /// and act on it (inject text + trailing key, run a bare command, or discard).
 pub(super) fn inject_refined(refiner: &Refiner, text: &str) {
+    inject_refined_authorized(refiner, text, &|| true);
+}
+
+/// Cancellable form of [`inject_refined`]: `authorize` is polled once by the
+/// injector immediately before the first write/clipboard side effect, so retry
+/// obeys the same Escape + focus/no-blind-paste guard as a live utterance.
+pub(super) fn inject_refined_authorized(
+    refiner: &Refiner,
+    text: &str,
+    authorize: &dyn Fn() -> bool,
+) {
     use crate::refiner::DictationOutcome;
     match refiner.refine(text).outcome() {
         DictationOutcome::Discard => eprintln!("  ⌫    scratch that · discarded"),
@@ -243,11 +255,11 @@ pub(super) fn inject_refined(refiner: &Refiner, text: &str) {
         DictationOutcome::Inject { text, action } => {
             let target = FocusTarget::capture().ok();
             let res = match target {
-                Some(t) => AccessibilityInjector::inject_with_target(t, &text),
-                None => AccessibilityInjector::inject_text(&text),
+                Some(t) => AccessibilityInjector::inject_with_target_cancellable(t, &text, authorize),
+                None => AccessibilityInjector::inject_text_cancellable(&text, authorize),
             };
             match res {
-                Ok(()) => {
+                Ok(crate::injector::InjectOutcome::Injected) => {
                     eprintln!("  ✓    \"{text}\"");
                     ui_channel::set_last_dictation(&text);
                     crate::history::record(&text);
@@ -255,6 +267,18 @@ pub(super) fn inject_refined(refiner: &Refiner, text: &str) {
                         std::thread::sleep(Duration::from_millis(40));
                         execute_trailing_action(&action);
                     }
+                }
+                Ok(crate::injector::InjectOutcome::NoEditableField) => {
+                    eprintln!(
+                        "  ◌    no text field selected — text held (copy from menu)"
+                    );
+                    ui_channel::set_last_dictation(&text);
+                }
+                Ok(crate::injector::InjectOutcome::Cancelled) => {
+                    // A cancel landed during retry: suppress the write. The
+                    // retained audio is kept (not cleared) for another retry.
+                    eprintln!("  ⌫    cancelled · discarded");
+                    cues::play_cancel();
                 }
                 Err(e) => {
                     eprintln!("  ✗    inject failed: {e:?}");

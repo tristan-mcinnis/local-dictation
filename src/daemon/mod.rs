@@ -86,6 +86,12 @@ const SCREEN_VOCAB_CAP: usize = 16;
 // Spacebar — kVK_Space. Chorded with the held PTT key to arm hands-free mode.
 const SPACE_KEYCODE: i64 = 0x31;
 
+// Escape — kVK_Escape. A plain Escape cancels an in-flight utterance (record
+// or pending transcription); it passes through untouched when idle. The pill
+// advertises "Cancel recording (Escape)" but no global Escape binding existed
+// — this fixes that, via the out-of-band cancel gate in `crate::cancel`.
+const ESCAPE_KEYCODE: i64 = 0x35;
+
 
 // Raw CFMachPortRef of the live event tap, stashed after creation so the
 // callback can re-enable the tap if macOS ever disables it. Active taps can be
@@ -139,8 +145,8 @@ enum DaemonEvent {
     },
     StopRecording,
     /// Cancel an in-flight utterance: stop capture and discard it (no
-    /// transcribe, no inject). Reached only via the control socket — there's no
-    /// hotkey gesture for it. A no-op when nothing is recording.
+    /// transcribe, no inject). Reached via the control socket or the Escape
+    /// key. A no-op when nothing is recording.
     CancelRecording,
     /// PTT + Space chord recognised mid-hold: the session became hands-free, so
     /// releasing the keys won't stop recording. Worker just plays the cue.
@@ -320,6 +326,42 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                 }
                 CGEventType::KeyDown => {
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    // Escape cancels an in-flight utterance (recording or pending
+                    // transcription) and prevents any late insertion. It swallows
+                    // the keystroke while active so it never leaks into the field;
+                    // when idle it passes through so normal Escape use (dismiss a
+                    // dialog, end a drag) is unaffected.
+                    if keycode == ESCAPE_KEYCODE {
+                        // An utterance is in flight while the worker is capturing
+                        // (`Recording`) or running the release pipeline
+                        // (`Processing`). This is the reliable signal — the worker
+                        // sets it at begin and reverts to `Idle`/`Success`/
+                        // `Error` at settle, so an idle Escape (no utterance) is
+                        // never mistaken for a cancel.
+                        let in_flight = matches!(
+                            ui_channel::state(),
+                            UiState::Recording | UiState::Processing
+                        );
+                        // Only swallow + wake + unwind when a cancel was actually
+                        // ACCEPTED. `request_cancel` returns false when idle or when
+                        // the utterance already committed to write — in that case the
+                        // Escape must pass through untouched, not be silently eaten
+                        // (and the PTT latch must not be reset out from under a live
+                        // post-commit settle).
+                        if in_flight && crate::cancel::CANCEL.request_cancel() {
+                            // Wake a worker blocked waiting for an event (recording)
+                            // so capture stops now rather than at release. Harmless
+                            // if it's already mid-pipeline: the out-of-band gate is
+                            // what suppresses the eventual injection.
+                            let _ = tx_for_callback.send(DaemonEvent::CancelRecording);
+                            // Cancellation ends the session, so unwind the PTT latch
+                            // state machine too — otherwise a hands-free session left
+                            // a `ST_LATCHED` the next PTT tap would have to clear.
+                            state_cb.store(ST_IDLE, Ordering::SeqCst);
+                            return CallbackResult::Drop;
+                        }
+                        return CallbackResult::Keep;
+                    }
                     if !modifier_only && keycode == hotkey_keycode {
                         // Chord hotkey: the non-modifier key went down with the
                         // required modifiers held. Swallow it so the keystroke
@@ -404,11 +446,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     if modifier_only {
         eprintln!(
             "[boot] ready · hold {hotkey_label} to dictate · \
-             {hotkey_label}+Space then release = hands-free (tap {hotkey_label} to stop) · ⌘Q quits"
+             {hotkey_label}+Space then release = hands-free (tap {hotkey_label} to stop) · Esc cancels · ⌘Q quits"
         );
     } else {
         eprintln!(
-            "[boot] ready · hold {hotkey_label} to dictate · ⌘Q quits \
+            "[boot] ready · hold {hotkey_label} to dictate · Esc cancels · ⌘Q quits \
              (hands-free Space chord is not available for a chord hotkey)"
         );
     }
@@ -426,7 +468,12 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         let _ = match cmd {
             Command::Start => tx_for_ctl.send(DaemonEvent::StartRecording { transform: false }),
             Command::Stop => tx_for_ctl.send(DaemonEvent::StopRecording),
-            Command::Cancel => tx_for_ctl.send(DaemonEvent::CancelRecording),
+            Command::Cancel => {
+                // Signal the out-of-band cancel gate too, so an IPC cancel lands
+                // even if the worker is blocked mid-pipeline (see `crate::cancel`).
+                crate::cancel::CANCEL.request_cancel();
+                tx_for_ctl.send(DaemonEvent::CancelRecording)
+            }
             Command::Retry => tx_for_ctl.send(DaemonEvent::Retry),
             // The server resolves Toggle → Start/Stop before dispatch, so a
             // Toggle reaching here would be a bug; treat it as a no-op.
