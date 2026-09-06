@@ -1,4 +1,4 @@
-// GENERATED from design-system/tokens.json f7490aadb52c; do not edit
+// GENERATED from design-system/tokens.json fe2b0cd6e404; do not edit
 // Source of truth: the design-system repo (DESIGN.md + tokens.json).
 // Regenerate with `make rust` there; `make check` verifies this copy.
 #![allow(dead_code)]
@@ -207,6 +207,7 @@ pub const SPACE_XXL: f64 = 32.0;
 pub const SPACE_XXXL: f64 = 48.0;
 pub const SPACE_XXXXL: f64 = 64.0;
 
+pub const CONTROL_STATUSGLYPH: f64 = 15.0;
 pub const CONTROL_KEYCAP: f64 = 20.0;
 pub const CONTROL_TILE: f64 = 26.0;
 pub const CONTROL_COMPACT: f64 = 28.0;

@@ -26,11 +26,19 @@ use super::*;
 /// menu-bar tint). Returns None if the symbol doesn't exist.
 pub(super) fn sf_symbol(name: &str) -> Option<Retained<NSImage>> {
     let ns_name = NSString::from_str(name);
-    let img = { NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None) };
-    if let Some(ref img) = img {
-        img.setTemplate(true);
-    }
-    img
+    let base = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None)?;
+    // Status item (DESIGN.md): every house glyph at `CONTROL_STATUSGLYPH`,
+    // medium weight, so the items share one baseline and one weight.
+    let img = base.imageWithSymbolConfiguration(&status_glyph_configuration())?;
+    img.setTemplate(true);
+    Some(img)
+}
+
+/// The one symbol configuration every house status item uses.
+fn status_glyph_configuration() -> Retained<NSImageSymbolConfiguration> {
+    // SAFETY: NSFontWeightMedium is a plain static CGFloat exported by AppKit.
+    let medium = unsafe { objc2_app_kit::NSFontWeightMedium };
+    NSImageSymbolConfiguration::configurationWithPointSize_weight(CONTROL_STATUSGLYPH, medium)
 }
 
 /// The same glyph, rendered once into `danger` so the recording state reads as
@@ -41,7 +49,8 @@ pub(super) fn sf_symbol_tinted(name: &str, color: &NSColor) -> Option<Retained<N
     let base = NSImage::imageWithSystemSymbolName_accessibilityDescription(&ns_name, None)?;
     // A hierarchical symbol configuration is the native way to colour an SF
     // Symbol; a template image would ignore it and adopt the menu-bar tint.
-    let cfg = NSImageSymbolConfiguration::configurationWithHierarchicalColor(color);
+    let cfg = status_glyph_configuration()
+        .configurationByApplyingConfiguration(&NSImageSymbolConfiguration::configurationWithHierarchicalColor(color));
     let tinted = base.imageWithSymbolConfiguration(&cfg)?;
     tinted.setTemplate(false);
     Some(tinted)
