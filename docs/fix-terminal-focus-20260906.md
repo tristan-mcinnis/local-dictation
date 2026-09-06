@@ -30,11 +30,14 @@ and the existing clipboard routing are unchanged. There is no editor allowlist.
 - The prior signed app is retained at
   `~/Library/Application Support/HousePerformance/rollback-followup-20260906/Local Dictation.app`.
 
-## Remaining live check
+## Live confirmation
 
-The user has been asked to dictate one sentence into Ghostty. A successful actual
-paste is not yet claimed. Other applications' end-to-end UI behavior was not
-manually exercised; their denial rules remain covered by the test suite.
+The user confirmed the live paste works after deployment. A content-free check
+of the post-restart log found **three successful dictations**, a Ghostty focus
+marker, **zero no-field holds**, zero injection failures and zero worker errors.
+The installed daemon remained running. No transcript text was copied into this
+record. Other applications' end-to-end UI behavior was not manually exercised;
+their denial rules remain covered by the test suite.
 
 The terminal exception does not distinguish a shell prompt from a pager or other
 terminal program. Choose the intended terminal input before dictating. The rule
