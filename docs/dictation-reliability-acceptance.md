@@ -111,14 +111,15 @@ audio fixtures).
 is_terminal)` maps a focused surface to `FocusEditability`:
 - `Editable` — text-entry AX role **and** a writable `AXValue`/`AXSelectedText`.
 - `PasteSafe` — the **narrow, justified** fallback: a genuine *terminal* whose
-  focused element discloses no clearly non-input role. A terminal is always a
-  text-input surface. **The app-level editor/compose blanket was removed** —
+  focused element discloses no clearly non-input role, including a text-entry
+  role whose AX attributes are non-settable (Ghostty's clipboard-only grid).
+  The exception does not distinguish shell prompts from terminal pagers. **The app-level editor/compose blanket was removed** —
   Slack, Discord, Figma, Notion, Obsidian, Outlook, Cursor, Zed, VS Code are NOT
   paste-safe by name.
 - `NotEditable` — a **positively non-input role** (`AXButton`/`AXWindow`/
-  `AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio, or a read-only text
-  field) denies injection **even for an allowlisted terminal**; plus any
-  unknown/black-holed non-terminal focus. Never pastes. Owned and authored by
+  `AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio) denies injection
+  **even for an allowlisted terminal**. Read-only text-entry fields and
+  unknown/black-holed focus are denied in **non-terminal** apps. Never pastes. Owned and authored by
   the FOCUS role, never the app name.
 
 `finalize_utterance(cancel, editability, text, inject)` is the single tested seam;

@@ -24,18 +24,18 @@ use std::sync::Mutex;
 //
 // This is the safety contract the daemon enforces right before it writes
 // anywhere. It decides, from the *evidence* about the focused surface, whether
-// a finished transcript may be injected — and, when it may not, that the call
-//er holds it recoverable and shows a clear "No text field selected" state
+// a finished transcript may be injected — and, when it may not, that the caller
+// holds it recoverable and shows a clear "No text field selected" state
 // instead of pasting blindly.
 //
 // Evidence is layered, never guessed:
 //   * `Editable`  — hard AX evidence: the focused element reports a text-entry
 //     role/subrole AND a writable value/selected-text attribute. Native apps.
-//   * `PasteSafe` — no (or unreliable) AX role, but the app itself is a known
-//     text-input surface (a terminal emulator, or a curated editor/compose
-//     allowlist such as VS Code / Cursor / Obsidian / Notion) and it is the
-//     focus target. Writing there is legitimate, so clipboard paste is fine.
-//     Terminals and editors are *always* text input; a browser is not.
+//   * `PasteSafe` — the focused element belongs to a known terminal and is not
+//     a positively non-input control. A terminal text grid may report a text
+//     role without writable AX attributes; clipboard paste is its input path.
+//     There is no editor/compose allowlist exception. Other apps require the
+//     positive writable-text evidence above.
 //   * `NotEditable` — nothing positive. Do NOT inject or paste. Hold + copy.
 //
 // The daemon combines this with the OOB cancel gate (`crate::cancel`) at the
@@ -46,7 +46,7 @@ use std::sync::Mutex;
 pub enum FocusEditability {
     /// Positive AX evidence: a text-entry role with a writable value.
     Editable,
-    /// No AX role evidence, but a known text-input app (terminal / editor).
+    /// Known terminal focus without a positively non-input role; paste via clipboard.
     PasteSafe,
     /// Nothing positive — do not inject or paste blindly.
     NotEditable,
@@ -160,15 +160,20 @@ fn is_clearly_noninput_role(role: Option<&str>, _subrole: Option<&str>) -> bool 
 /// surface, and is the only surface allowed to paste when AX discloses no role.
 ///
 /// This is deliberately strict and never guesses above the evidence:
-///   * a text-entry role that is writable → `Editable`;
-///   * a text-entry role that is **not** writable → `NotEditable` (read-only);
 ///   * a positively non-input role (button / window / web area / canvas / static
 ///     text / menu / checkbox / radio) → `NotEditable` **even for a terminal**;
-///   * a genuine terminal whose role is absent or ambiguous → `PasteSafe`
-///     (the narrow, justified fallback). This is NOT a broad editor/compose
-///     blanket — a Slack pane, a Notion page, a browser body, or an Outlook
-///     window is only pasted into when its focused element reports an editable
-///     role, never by app name.
+///   * a genuine terminal whose focused element is not a positively non-input
+///     control → `PasteSafe` — even when its role is a text-entry role
+///     (AXTextArea / AXTextField) that AX reports as **not** writable: a GPU
+///     terminal draws its own text grid and is AX-blind, so that is a text-input
+///     surface (clipboard paste), not a read-only label. This is the narrow,
+///     justified fallback the architecture sanctions for terminals. It is NOT a
+///     broad editor/compose blanket — a Slack pane, a Notion page, a browser
+///     body, or an Outlook window is only pasted into when its focused element
+///     reports an editable role, never by app name;
+///   * a non-terminal text-entry role that is writable → `Editable`;
+///   * a non-terminal text-entry role that is **not** writable → `NotEditable`
+///     (read-only label).
 pub fn classify_focus_editability(
     role: Option<&str>,
     subrole: Option<&str>,
@@ -176,18 +181,27 @@ pub fn classify_focus_editability(
     selected_text_settable: bool,
     is_terminal: bool,
 ) -> FocusEditability {
-    if is_text_entry_role(role, subrole) {
+    // A positively non-input control (button / window chrome / page body /
+    // canvas / static text / menu / checkbox / radio) is never a place to write,
+    // even for an allowlisted terminal.
+    if is_clearly_noninput_role(role, subrole) {
+        FocusEditability::NotEditable
+    } else if is_terminal {
+        // A genuine terminal is ALWAYS a text-input surface. Its focused element
+        // frequently reports a text-entry role (AXTextArea / AXTextField /
+        // AXComboBox, or a search-field subrole) whose AXValue / AXSelectedText
+        // are NOT settable — the terminal draws its own text grid and is
+        // AX-blind, so writing must go through Cmd+V (see `classify_pid`). That
+        // is NOT a read-only field; it is a text-input surface, so it is
+        // `PasteSafe`, never `NotEditable`. Only a positively non-input control
+        // above ever holds a terminal.
+        FocusEditability::PasteSafe
+    } else if is_text_entry_role(role, subrole) {
         if value_settable || selected_text_settable {
             FocusEditability::Editable
         } else {
             FocusEditability::NotEditable // read-only text field
         }
-    } else if is_clearly_noninput_role(role, subrole) {
-        FocusEditability::NotEditable
-    } else if is_terminal {
-        // A genuine terminal whose focused element is not a clearly non-input
-        // control is a legitimate text-input target.
-        FocusEditability::PasteSafe
     } else {
         FocusEditability::NotEditable
     }
@@ -1419,6 +1433,33 @@ mod tests {
         );
     }
 
+    // REGRESSION (2026-09-06, Ghostty): a GPU/native terminal emulator exposes
+    // its shell grid to Accessibility as a TEXT-ENTRY role (AXTextArea) whose
+    // AXValue / AXSelectedText are NOT settable — the terminal draws its own
+    // text grid and is AX-blind (writes must go through Cmd+V). This is NOT a
+    // read-only field; it is a legitimate text-input surface. The previous
+    // classifier read "text-entry role but not AX-writable" as "read-only
+    // field" and held the transcript ("No text field selected"), which broke
+    // dictation into the terminal that used to work. A real terminal is always
+    // a text-input surface (see `classify_pid`), so a text-entry role there is
+    // `PasteSafe` (clipboard), never a hold.
+    #[test]
+    fn terminal_ax_textarea_nonwritable_is_paste_safe_not_readonly() {
+        for role in [Some("AXTextArea"), Some("AXTextField"), Some("AXComboBox")] {
+            // value and selected-text both non-settable (the AX-blind grid).
+            assert_eq!(
+                classify_focus_editability(role, None, false, false, true),
+                FocusEditability::PasteSafe,
+                "terminal role {role:?} with non-settable value must be PasteSafe, not NotEditable"
+            );
+        }
+        // Search-field subrole variant.
+        assert_eq!(
+            classify_focus_editability(None, Some("AXSearchField"), false, false, true),
+            FocusEditability::PasteSafe
+        );
+    }
+
     // Reviewer: "ANY positively noneditable role denies even allowlisted". The
     // app (terminal) is allowlisted, but the FOCUS role is not input.
     #[test]
@@ -1428,11 +1469,13 @@ mod tests {
             classify_focus_editability(Some("AXButton"), None, false, false, true),
             FocusEditability::NotEditable
         );
-        // A read-only text field in a terminal (role is text, but not
-        // settable) is denied.
+        // A text-entry role in a terminal that is not AX-writable is still the
+        // terminal's shell grid (AX-blind, written via Cmd+V), not a read-only
+        // label — so it is PasteSafe, not denied. See the regression test
+        // `terminal_ax_textarea_nonwritable_is_paste_safe_not_readonly`.
         assert_eq!(
             classify_focus_editability(Some("AXTextField"), None, false, false, true),
-            FocusEditability::NotEditable
+            FocusEditability::PasteSafe
         );
         // Static/read-only text, a window chrome, a web page body, a canvas,
         // a menu — all deny even for the allowlisted terminal.
