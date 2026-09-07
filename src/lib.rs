@@ -15,6 +15,7 @@ pub mod ipc;
 pub mod model_fetch;
 pub mod numbers;
 pub mod prompts;
+pub mod recovery;
 pub mod refiner;
 pub mod screen_context;
 pub mod settings;

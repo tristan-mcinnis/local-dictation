@@ -4,10 +4,11 @@
 //! at the bottom-center of the cursor's screen, containing a live
 //! waveform driven by mic RMS. Hidden when idle.
 //!
-//! The status-item menu exposes the settings a GUI user would expect —
-//! cleanup model, push-to-talk key, cleanup on/off, edit cleanup prompts —
-//! plus quality-of-life items (copy last dictation, open/export log,
-//! corrections folder).
+//! The status-item menu is recovery-first and minimal at the top level: the
+//! last dictation (preview + Copy + an explicit "Paste last dictation" that
+//! re-inserts the already-captured text into the app that was frontmost before
+//! the menu opened — never a re-transcribe), Settings, a single "More" submenu
+//! that groups history / retranscribe / config / diagnostics, and Quit.
 //! Settings-changing items write `settings.json` and relaunch the daemon
 //! so the change takes effect; the model load makes in-process swapping not
 //! worth the complexity.
@@ -32,7 +33,7 @@ use pill::*;
 pub use render_ui::render_ui;
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
@@ -40,7 +41,7 @@ use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSButton, NSColor, NSControl, NSControlStateValueOff,
     NSControlStateValueOn, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSGraphicsContext, NSImage, NSImageSymbolConfiguration, NSImageView, NSKernAttributeName, NSLineBreakMode, NSMenu,
-    NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSShadow, NSStatusBar, NSStatusItem,
+    NSMenuDelegate, NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSShadow, NSStatusBar, NSStatusItem,
     NSTextAlignment, NSTextField, NSTextView, NSTrackingArea, NSView, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask, NSWindowTitleVisibility,
@@ -214,6 +215,10 @@ struct UiGlobals {
     last_item: Retained<NSMenuItem>,
     /// Held alive so the menu items' action target stays valid.
     _actions: Retained<MenuActions>,
+    /// Held alive so the status menu's delegate (which records the pre-menu
+    /// frontmost app for recovery paste) is not deallocated. NSMenu keeps its
+    /// delegate weakly.
+    _menu_delegate: Retained<MenuDelegate>,
 }
 unsafe impl Sync for UiGlobals {}
 unsafe impl Send for UiGlobals {}
@@ -377,6 +382,17 @@ define_class!(
             }
         }
 
+        // Recovery paste: re-insert the last dictation text into the app that
+        // was frontmost before this menu opened. This is NOT a re-transcribe —
+        // it uses the already-captured text, restoring + verifying the target
+        // app (see `crate::recovery`). No-op/logs when there is nothing to
+        // paste or the target is unsafe (self / unknown / no editable field).
+        #[unsafe(method(pasteLast:))]
+        fn paste_last(&self, _sender: *mut AnyObject) {
+            let recorded = RECOVERY_TARGET_PID.lock().ok().and_then(|g| *g);
+            crate::recovery::paste_last_dictation(recorded);
+        }
+
         // Pick the active Translate-mode target. representedObject holds the
         // target name; the translate path reads settings per utterance, so a
         // save (no relaunch) is enough for the change to take effect.
@@ -439,6 +455,46 @@ impl MenuActions {
     }
 }
 
+// ─── Menu delegate: record the pre-menu frontmost app ──────────────────
+//
+// The recovery paste needs the app that was frontmost BEFORE the user opened
+// the menu. This delegate's `menuWillOpen:` fires exactly when the status menu
+// is about to show — i.e. right after the click but before any menu row is
+// chosen — so it is the earliest reliable place to snapshot the foreign app.
+// The value is stored in a process-wide static (the delegate is main-thread
+// only and the action dispatch is main-thread too, so a Mutex keeps them in
+// sync without plumbing a handle between the two objects).
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "FDMenuDelegate"]
+    struct MenuDelegate;
+
+    impl MenuDelegate {}
+
+    unsafe impl NSObjectProtocol for MenuDelegate {}
+
+    unsafe impl NSMenuDelegate for MenuDelegate {
+        #[unsafe(method(menuWillOpen:))]
+        fn menu_will_open(&self, _menu: &NSMenu) {
+            // Snapshot the app that was frontmost when the menu opened; it is
+            // the recovery-paste target (the guard refuses Local Dictation
+            // itself / an unknown target).
+            let pid = crate::injector::frontmost_pid();
+            if let Ok(mut g) = RECOVERY_TARGET_PID.lock() {
+                *g = pid;
+            }
+        }
+    }
+);
+
+impl MenuDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm);
+        unsafe { msg_send![this, init] }
+    }
+}
+
 // ─── Flipped container for the history list ─────────────────────────────
 //
 // NSView's default coordinate origin is bottom-left, which makes a top-down
@@ -470,6 +526,13 @@ static HISTORY_ENTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// so clearing the query restores the full list without re-querying the DB.
 static HISTORY_ALL: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 
+/// The app (PID) that was frontmost just before the status menu opened. This is
+/// the recovery-paste target — the foreign app the user was dictating into.
+/// Written by the menu delegate's `menuWillOpen:`, read by the
+/// "Paste last dictation" action. `None` = nothing recorded yet (or the recorded
+/// app was Local Dictation itself, which the guard refuses).
+static RECOVERY_TARGET_PID: Mutex<Option<i32>> = Mutex::new(None);
+
 pub fn init_and_run() -> eyre::Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| eyre::eyre!("menubar::init_and_run must be on main thread"))?;
@@ -498,6 +561,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         icon_processing: built.icon_processing,
         last_item: built.last_item,
         _actions: actions,
+        _menu_delegate: built.menu_delegate,
     };
     let _ = GLOBALS.set(globals);
 
@@ -559,6 +623,7 @@ struct StatusItemBuild {
     icon_recording: Option<Retained<NSImage>>,
     icon_processing: Option<Retained<NSImage>>,
     last_item: Retained<NSMenuItem>,
+    menu_delegate: Retained<MenuDelegate>,
 }
 
 /// Build a plain menu item with a title, selector, and key-equivalent,
@@ -645,6 +710,13 @@ fn build_status_item(
     // any env-locked items).
     menu.setAutoenablesItems(false);
 
+    // Menu delegate: records the app that was frontmost just before this menu
+    // opened — the recovery-paste target. Retained by the caller so it is not
+    // freed (NSMenu keeps its delegate weakly).
+    let menu_delegate = MenuDelegate::new(mtm);
+    let delegate_proto = ProtocolObject::from_retained(menu_delegate.clone());
+    menu.setDelegate(Some(&*delegate_proto));
+
     let settings = Settings::load();
     // Output-format presets: the built-in set (numbered / bullets / email /
     // code) plus any the user added/overrode in prompts.json `formats`. Uses
@@ -652,7 +724,7 @@ fn build_status_item(
     // summary.
     let format_names = crate::prompts::Prompts::load_quiet().format_names();
 
-    // ── Last dictation preview (disabled label) + Copy ──────────────────
+    // ── Recovery: disabled preview + copy + explicit paste ──────────────
     let last_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -667,169 +739,36 @@ fn build_status_item(
     let copy_last = action_item(mtm, "Copy last dictation", sel!(copyLast:), "c", actions);
     menu.addItem(&copy_last);
 
-    // Browsable history of past dictations — the friendly counterpart to the
-    // verbose daemon log.
-    let history_item = action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions);
-    menu.addItem(&history_item);
+    // Explicit recovery: paste the already-captured last dictation into the
+    // app that was frontmost before this menu opened. This is NOT a
+    // re-transcribe — it does not touch audio or the pipeline, only re-inserts
+    // the text (restoring + verifying the target; see `crate::recovery`). The
+    // injector's focus gate still applies — never a blind paste.
+    let paste_last = action_item(mtm, "Paste last dictation", sel!(pasteLast:), "", actions);
+    menu.addItem(&paste_last);
 
-    // Re-run the last recording (including a cancelled one): the pipeline
-    // replays the retained in-memory audio and injects the fresh transcript at
-    // the current cursor, obeying the same Escape + focus guard.
-    let retry_item = action_item(mtm, "Retry last recording", sel!(retryLast:), "r", actions);
-    menu.addItem(&retry_item);
+    menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
-    // Pick the active Translate-mode target (only meaningful when targets are
-    // configured; reads settings per utterance, so no relaunch).
-    let translate_parent = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Translate to"),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    translate_parent.setEnabled(true);
-    let translate_submenu = build_translate_submenu(mtm, actions, &settings);
-    translate_parent.setSubmenu(Some(&translate_submenu));
-    menu.addItem(&translate_parent);
-
-    // How long to keep dictation history (read per record, so no relaunch).
-    let retention_parent = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("History retention"),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    retention_parent.setEnabled(true);
-    let retention_submenu = build_retention_submenu(mtm, actions, &settings);
-    retention_parent.setSubmenu(Some(&retention_submenu));
-    menu.addItem(&retention_parent);
-
-    // Simple editor for the personal dictionary (names/terms to keep spelled
-    // verbatim). Counterpart to Dictation History — one clean native window.
-    let dictionary_item = action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions);
-    menu.addItem(&dictionary_item);
-
-    // Import a .csv of vocabulary entries into the personal dictionary.
-    let import_csv_item =
-        action_item(mtm, "Import Dictionary CSV…", sel!(importCsv:), "", actions);
-    menu.addItem(&import_csv_item);
-
-    // Native Settings window (⌘,): all tunables in one place, batched apply.
+    // ── Settings + More + Quit ─────────────────────────────────────────
+    // The top level stays minimal: the recoverable last dictation (preview,
+    // copy, paste), Settings, a single "More" that gathers everything else, and
+    // Quit. Model choices are intentionally absent (this personal build is one
+    // warmed Cohere MLX transcriber followed by S1-mini).
     let settings_item = action_item(mtm, "Settings…", sel!(openSettings:), ",", actions);
     menu.addItem(&settings_item);
 
-    menu.addItem(&*NSMenuItem::separatorItem(mtm));
-
-    // Model choices are intentionally absent: this personal build is one
-    // warmed Cohere MLX transcriber followed by S1-mini.
-
-    // ── Hotkey submenu ──────────────────────────────────────────────────
-    let hotkey_parent = unsafe {
+    let more_parent = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str("Push-to-talk key"),
+            &NSString::from_str("More"),
             None,
             &NSString::from_str(""),
         )
     };
-    hotkey_parent.setEnabled(true);
-    let hotkey_submenu = build_hotkey_submenu(mtm, actions, &settings);
-    hotkey_parent.setSubmenu(Some(&hotkey_submenu));
-    menu.addItem(&hotkey_parent);
-
-    // ── Cleanup on/off toggle ───────────────────────────────────────────
-    let cleanup_item = action_item(mtm, "Cleanup enabled", sel!(toggleCleanup:), "", actions);
-    let cleanup_on = settings.cleanup_enabled.unwrap_or(true);
-    {
-        cleanup_item.setState(if cleanup_on {
-            NSControlStateValueOn
-        } else {
-            NSControlStateValueOff
-        });
-    }
-    menu.addItem(&cleanup_item);
-
-    // ── Always-on mic (pre-roll) toggle ─────────────────────────────────
-    // Keeps the mic stream warm and retains a short lookback so the first
-    // words aren't clipped and there's no stream-open latency on key-press.
-    // Note: the mic indicator stays on while enabled. (Wake-word listen mode
-    // is the separate `listen` subcommand — see docs/wake-word-and-preroll.md.)
-    let preroll_item = action_item(
-        mtm,
-        "Always-on mic (pre-roll)",
-        sel!(togglePreroll:),
-        "",
-        actions,
-    );
-    let preroll_on = settings.preroll_ms.unwrap_or(0) > 0;
-    preroll_item.setState(if preroll_on {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    menu.addItem(&preroll_item);
-
-    // ── Edit the cleanup / transform system prompts ─────────────────────
-    // Opens prompts.json in a text editor (seeded with the live prompts the
-    // first time, so there's real text to edit). Sits right under the cleanup
-    // controls because it's the knob that shapes what cleanup/transform do.
-    menu.addItem(&action_item(
-        mtm,
-        "Edit cleanup prompts…",
-        sel!(editPrompts:),
-        "",
-        actions,
-    ));
-
-    // ── Output-format preset submenu ────────────────────────────────────
-    // Built-in presets (numbered / bullets / email / code) plus any the user
-    // added in prompts.json `formats`; this picks which one cleanup uses.
-    // `format_names` is non-empty out of the box, so the submenu always shows.
-    if !format_names.is_empty() {
-        let format_parent = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Output format"),
-                None,
-                &NSString::from_str(""),
-            )
-        };
-        format_parent.setEnabled(true);
-        let format_submenu = build_format_submenu(mtm, actions, &settings, &format_names);
-        format_parent.setSubmenu(Some(&format_submenu));
-        menu.addItem(&format_parent);
-    }
-
-    menu.addItem(&*NSMenuItem::separatorItem(mtm));
-
-    // ── Logs + corrections ──────────────────────────────────────────────
-    menu.addItem(&action_item(mtm, "Open Log", sel!(openLog:), "l", actions));
-    menu.addItem(&action_item(
-        mtm,
-        "Export Log to Downloads…",
-        sel!(exportLog:),
-        "",
-        actions,
-    ));
-    menu.addItem(&action_item(
-        mtm,
-        "Open corrections folder",
-        sel!(openCorrections:),
-        "",
-        actions,
-    ));
-    // A clear, always-current reference of every voice command + the wake-word
-    // and shortcut settings (generated from the live tables, opened as text).
-    menu.addItem(&action_item(
-        mtm,
-        "Voice Commands & Shortcuts…",
-        sel!(openCommandsRef:),
-        "",
-        actions,
-    ));
+    more_parent.setEnabled(true);
+    let more_submenu = build_more_submenu(mtm, actions, &settings, &format_names);
+    more_parent.setSubmenu(Some(&more_submenu));
+    menu.addItem(&more_parent);
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
@@ -852,7 +791,145 @@ fn build_status_item(
         icon_recording,
         icon_processing,
         last_item,
+        menu_delegate,
     })
+}
+
+/// Build the "More" submenu: history · retranscribe · config · diagnostics.
+/// This keeps the previously-flat rows reachable while the top level stays
+/// minimal (last dictation, Settings, More, Quit). Pure NSMenu grouping with
+/// separators for the four groups — no new visual system.
+fn build_more_submenu(
+    mtm: MainThreadMarker,
+    actions: &Retained<MenuActions>,
+    settings: &Settings,
+    format_names: &[String],
+) -> Retained<NSMenu> {
+    let submenu = NSMenu::new(mtm);
+    submenu.setAutoenablesItems(false);
+
+    // ── History ─────────────────────────────────────────────────────────
+    // Browsable history of past dictations — the friendly counterpart to the
+    // verbose daemon log.
+    submenu.addItem(&action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions));
+
+    // How long to keep dictation history (read per record, so no relaunch).
+    let retention_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("History retention"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    retention_parent.setEnabled(true);
+    let retention_submenu = build_retention_submenu(mtm, actions, settings);
+    retention_parent.setSubmenu(Some(&retention_submenu));
+    submenu.addItem(&retention_parent);
+
+    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+
+    // ── Retranscribe ─────────────────────────────────────────────────────
+    // Re-run the last recording (including a cancelled one): the pipeline
+    // replays the retained in-memory audio and injects the fresh transcript at
+    // the current cursor, obeying the same Escape + focus guard.
+    submenu.addItem(&action_item(mtm, "Retry last recording", sel!(retryLast:), "r", actions));
+
+    // Pick the active Translate-mode target (only meaningful when targets are
+    // configured; reads settings per utterance, so no relaunch).
+    let translate_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Translate to"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    translate_parent.setEnabled(true);
+    let translate_submenu = build_translate_submenu(mtm, actions, settings);
+    translate_parent.setSubmenu(Some(&translate_submenu));
+    submenu.addItem(&translate_parent);
+
+    // Output-format preset picker. `format_names` is non-empty out of the box.
+    if !format_names.is_empty() {
+        let format_parent = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Output format"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        format_parent.setEnabled(true);
+        let format_submenu = build_format_submenu(mtm, actions, settings, format_names);
+        format_parent.setSubmenu(Some(&format_submenu));
+        submenu.addItem(&format_parent);
+    }
+
+    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+
+    // ── Config ───────────────────────────────────────────────────────────
+    let hotkey_parent = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Push-to-talk key"),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    hotkey_parent.setEnabled(true);
+    let hotkey_submenu = build_hotkey_submenu(mtm, actions, settings);
+    hotkey_parent.setSubmenu(Some(&hotkey_submenu));
+    submenu.addItem(&hotkey_parent);
+
+    let cleanup_item = action_item(mtm, "Cleanup enabled", sel!(toggleCleanup:), "", actions);
+    let cleanup_on = settings.cleanup_enabled.unwrap_or(true);
+    cleanup_item.setState(if cleanup_on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    submenu.addItem(&cleanup_item);
+
+    // Keeps the mic stream warm and retains a short lookback so the first
+    // words aren't clipped and there's no stream-open latency on key-press.
+    let preroll_item = action_item(
+        mtm,
+        "Always-on mic (pre-roll)",
+        sel!(togglePreroll:),
+        "",
+        actions,
+    );
+    let preroll_on = settings.preroll_ms.unwrap_or(0) > 0;
+    preroll_item.setState(if preroll_on {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    submenu.addItem(&preroll_item);
+
+    // Opens prompts.json in a text editor (seeded with the live prompts the
+    // first time, so there's real text to edit).
+    submenu.addItem(&action_item(mtm, "Edit cleanup prompts…", sel!(editPrompts:), "", actions));
+
+    // Simple editor for the personal dictionary (names/terms to keep spelled
+    // verbatim).
+    submenu.addItem(&action_item(mtm, "Dictionary…", sel!(openDictionary:), "d", actions));
+
+    // Import a .csv of vocabulary entries into the personal dictionary.
+    submenu.addItem(&action_item(mtm, "Import Dictionary CSV…", sel!(importCsv:), "", actions));
+
+    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+
+    // ── Diagnostics ──────────────────────────────────────────────────────
+    submenu.addItem(&action_item(mtm, "Open Log", sel!(openLog:), "l", actions));
+    submenu.addItem(&action_item(mtm, "Export Log to Downloads…", sel!(exportLog:), "", actions));
+    submenu.addItem(&action_item(mtm, "Open corrections folder", sel!(openCorrections:), "", actions));
+    // A clear, always-current reference of every voice command + the wake-word
+    // and shortcut settings (generated from the live tables, opened as text).
+    submenu.addItem(&action_item(mtm, "Voice Commands & Shortcuts…", sel!(openCommandsRef:), "", actions));
+
+    submenu
 }
 
 /// Build the output-format picker. A "Default (no preset)" row clears the

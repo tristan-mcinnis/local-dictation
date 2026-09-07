@@ -139,6 +139,58 @@ recoverable copy) and surfaces the pill state. The pill's hint is labeled
 "Copy: menu" (accurate), not a fake "Copy" affordance — there is no copy button
 on the pill. No clipboard is touched (never clobber a user's copy).
 
+### Recovery paste + recovery-first menu — `src/recovery.rs`, `src/menubar/mod.rs`
+The status menu is now recovery-first: the top level is the last dictation
+(preview + Copy + an explicit **"Paste last dictation"**), Settings, a single
+**"More"** submenu (history / retranscribe / config / diagnostics), and Quit.
+`Paste last dictation` is NOT a re-transcribe — it re-inserts the already-captured
+text into the app that was frontmost *before* the menu opened. A menu delegate's
+`menuWillOpen:` snapshots that app; the action restores (activates) + **verifies**
+it via `injector::activate_app`, then injects through `inject_into_pid` through the
+SAME focus-editability gate (a non-input target holds, never a blind paste). The
+pure guard `recovery::decide_recovery_target` refuses a self PID (settings / the
+menu app) and any missing recorded target, so a recovery paste cannot land in
+Local Dictation itself. The path is also fail-closed on the target PID: the
+by-PID `inject_into_pid` no-focused-element fallback classifies the *explicit*
+PID (never the live frontmost), and the global Cmd+V is verified — via
+`injector::clipboard_target_is_frontmost` — immediately before posting that the
+target is the OS-frontmost app, else refused and held. The same guard is applied
+to the automatic systemwide dictation path (which keeps its fresh
+frontmost-PID app resolver, Escape-cancel gate, and noneditable hold). The live
+resolver no longer relies on the systemwide AX proxy: `injector::plan_live_inject`
+snapshots the OS-frontmost app via `NSWorkspace` and resolves ITS focused element
+per-app (`AXUIElementCreateApplication(pid)`), which the reproduced red loop
+proved works where the systemwide proxy returned `kAXErrorCannotComplete`
+(-25204) with an empty TextEdit readback. Recovery work runs on a background
+thread. Recovery refuses while dictation is recording/processing and serializes
+recovery requests. All clipboard pastes hold the shared write lock through the
+consume window, including when a live dictation starts during recovery. The
+foreground guard runs both before clipboard mutation and just before Cmd+V;
+a late refusal leaves the dictation on the clipboard for manual recovery.
+`error`/`success`/`no-editable-field` outcomes are mirrored to the existing UI
+transients. Unit coverage: 3 tests in `recovery.rs` (recorded-foreign target,
+refuse-self, refuse-no-recorded-app) plus 3 in `injector.rs` (fail-closed
+`clipboard_target_is_frontmost`, `RefusedForeground` → `Held`, and
+`plan_live_inject` → current-frontmost / hold-with-none). The full featureless
+suite is now **329** passed and `--features full` **354** passed.
+
+### 2026-09-07 parent verification
+
+- `cargo test`: 329 library tests plus 4 integration tests passed.
+- `cargo test --features full`: 354 library tests plus 4 integration tests passed.
+- `design-lint --strict --changed`: clean, zero hits.
+- Live regression: opened an owned temporary TextEdit file, activated TextEdit,
+  confirmed it was frontmost, ran `inject-test` without `FOCUS_APP`, and read the
+  exact document text back. Before: AX -25204 and empty document. After: injected
+  marker matched exactly. This exercises the production injector, not audio/ASR.
+- Installed signed app: repeated marker injection with its bundled executable;
+  exact TextEdit readback passed. Installed executable matches the signed build.
+- Installed menu: AX inspection and screenshot review confirmed preview, Copy,
+  Paste, Settings, More, Quit with no clipping. Empty-state Paste safely refused.
+  Recovery with a fresh spoken dictation remains unverified after restart.
+- Full spoken-dictation and terminal focus-switch checks remain separate live
+  acceptance items; the TextEdit check does not prove every app's AX behavior.
+
 ### Test coverage (behavioral, observable-sink driven)
 - `cancel.rs`: 14 tests — packed generation+phase gate, sticky idempotent cancel,
   generation ordering, idle can't cancel, stale-cancel-cleared-on-fresh-begin,
@@ -155,7 +207,7 @@ on the pill. No clipboard is touched (never clobber a user's copy).
 
 ---
 
-## 3. Automated verification (exact commands + results)
+## 3. Historical automated verification (before this recovery change)
 
 Run from the repo root (`/Users/user/Documents/code/house/local-dictation`),
 on `main` (HEAD `69fff3e`), against a clean tree at start.

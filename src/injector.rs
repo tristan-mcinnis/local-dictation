@@ -66,6 +66,11 @@ pub enum InjectOutcome {
     /// lookup, after resolution but before the first side effect). Nothing was
     /// written. The caller should discard the utterance.
     Cancelled,
+    /// The expected target was not the OS-frontmost application at the moment a
+    /// global Cmd+V was about to be delivered, so it was NOT posted (fail-closed:
+    /// a global paste would land in the wrong app). Nothing was written. The
+    /// caller should hold the transcript recoverable, like [`NoEditableField`].
+    RefusedForeground,
 }
 
 /// Claim write authorization exactly once, immediately before the first
@@ -80,6 +85,47 @@ pub fn claim_write_authorization(
     match authorize {
         Some(auth) if !auth() => Some(InjectOutcome::Cancelled),
         _ => None,
+    }
+}
+
+/// Fail-closed guard for the global Cmd+V delivery: may the paste be posted
+/// when the OS-frontmost app is `current_frontmost` and we intend to deliver to
+/// `expected_pid`? A global `Cmd+V` lands in the OS-frontmost application, so it
+/// may only fire when the expected target IS frontmost. `expected_pid: None`
+/// means "no specific target" (the systemwide path): that still requires SOME
+/// frontmost app, never a paste with no foreground app. Consulted immediately
+/// before posting the Cmd+V.
+pub fn clipboard_target_is_frontmost(
+    expected_pid: Option<i32>,
+    current_frontmost: Option<i32>,
+) -> bool {
+    match expected_pid {
+        Some(pid) => current_frontmost == Some(pid),
+        None => current_frontmost.is_some(),
+    }
+}
+
+/// What a live (systemwide) injection should do, planned from the current
+/// OS-frontmost app at write time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveInjectPlan {
+    /// Resolve this app's focused element per-app (fresh at write time).
+    ResolveApp { pid: i32 },
+    /// No frontmost app — no live field. Hold the transcript recoverable.
+    Hold,
+}
+
+/// Pure: plan a live injection from the current frontmost PID.
+///
+/// The live (systemwide) resolver is deliberately seeded from `frontmost_pid()`
+/// FRESH at write time — never a retained press-time target, which is stale or
+/// backgrounded by now. This is what honors a same-app field change or a
+/// foreground switch during the hold. `None` means there is no live field to
+/// write to; the caller must hold (`Hold`), never invent a target.
+pub fn plan_live_inject(current_frontmost: Option<i32>) -> LiveInjectPlan {
+    match current_frontmost {
+        Some(pid) => LiveInjectPlan::ResolveApp { pid },
+        None => LiveInjectPlan::Hold,
     }
 }
 
@@ -252,6 +298,9 @@ pub fn finalize_utterance(
             Ok(InjectOutcome::Injected) => FinalizeResult::Injected,
             // The fresh resolver found no editable field at write time.
             Ok(InjectOutcome::NoEditableField) => FinalizeResult::Held,
+            // A fail-closed clipboard guard refused (the expected app was not
+            // frontmost at Cmd+V delivery): nothing written, hold recoverable.
+            Ok(InjectOutcome::RefusedForeground) => FinalizeResult::Held,
             // The write authorizer refused (a cancel landed during the focus
             // lookup): nothing written, utterance discarded.
             Ok(InjectOutcome::Cancelled) => FinalizeResult::Cancelled,
@@ -495,6 +544,39 @@ pub fn focus_target_still_current(t: &FocusTarget) -> bool {
     }
 }
 
+/// Activate a running application by PID and confirm it becomes the OS-frontmost
+/// application. Used by the recovery paste to bring back the app that was
+/// frontmost before the menu opened.
+///
+/// Returns `true` only when the app is running, activation succeeds, and the
+/// frontmost verification passes (activation is asynchronous, so this briefly
+/// polls the OS frontmost application). A `false` verdict means the app did not
+/// (or would not) come forward — never inject into a target that will not take
+/// focus, because that is exactly the "wrong target" case recovery must avoid.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn activate_app(pid: i32) -> bool {
+    use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
+    let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) else {
+        return false;
+    };
+    // Bare activation brings the app's main/key window forward. We do not use
+    // the (deprecated, no-op on macOS 14+) `ActivateIgnoringOtherApps` flag;
+    // default options already activate the receiver, and the target app was
+    // frontmost before the menu anyway.
+    let requested = app.activateWithOptions(NSApplicationActivationOptions::empty());
+    if !requested {
+        return false;
+    }
+    // Activation is async. Poll the OS frontmost application for a short window.
+    for _ in 0..24 {
+        if frontmost_pid() == Some(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    frontmost_pid() == Some(pid)
+}
+
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 mod imp {
     use super::*;
@@ -598,15 +680,30 @@ mod imp {
                 "Accessibility permission not granted — System Settings → Privacy & Security → Accessibility"
             ));
         }
-        unsafe {
-            let root = AXUIElementCreateSystemWide();
-            if root.is_null() {
-                return Err(eyre::eyre!("AXUIElementCreateSystemWide returned null"));
+        // Live resolution: snapshot the OS-frontmost app and resolve ITS focused
+        // element per-app (fresh at write time). We deliberately do NOT rely on
+        // the systemwide proxy (AXUIElementCreateSystemWide → focused), which
+        // can return kAXErrorCannotComplete (-25204) even when the frontmost
+        // app's focused element resolves fine. The fail-closed Cmd+V guard still
+        // protects the actual delivery, and the write-authorizer still holds the
+        // cancellation gate (passed through to `inject_through`).
+        match plan_live_inject(frontmost_pid()) {
+            LiveInjectPlan::Hold => {
+                eprintln!("[inject] no frontmost app at write time — holding (no live field)");
+                return Ok(InjectOutcome::NoEditableField);
             }
-            bound_messaging_timeout(root);
-            let result = inject_through(root, text, authorize);
-            cf_release(root as CFTypeRef);
-            result
+            LiveInjectPlan::ResolveApp { pid } => unsafe {
+                let app = AXUIElementCreateApplication(pid);
+                if app.is_null() {
+                    return Err(eyre::eyre!(
+                        "AXUIElementCreateApplication({pid}) returned null"
+                    ));
+                }
+                bound_messaging_timeout(app);
+                let result = inject_through(app, text, authorize, Some(pid));
+                cf_release(app as CFTypeRef);
+                result
+            },
         }
     }
 
@@ -622,7 +719,7 @@ mod imp {
                 ));
             }
             bound_messaging_timeout(app);
-            let result = inject_through(app, text, None);
+            let result = inject_through(app, text, None, Some(pid));
             cf_release(app as CFTypeRef);
             result
         }
@@ -633,10 +730,16 @@ mod imp {
     /// entry points. The pre-captured-target path (`inject_via_target`) shares
     /// the same ladder; the only difference is *when* the focus element is
     /// resolved.
+    ///
+    /// `expected_app` is the app that must be frontmost before any global
+    /// Cmd+V is posted: `Some(pid)` for the by-PID entry point (the explicit
+    /// target), `None` for the systemwide path (resolved from the focused
+    /// element). Clipboard delivery is fail-closed on it.
     unsafe fn inject_through(
         root: AXUIElementRef,
         text: &str,
         authorize: Option<&dyn Fn() -> bool>,
+        expected_app: Option<i32>,
     ) -> eyre::Result<InjectOutcome> {
         let prof = std::env::var("INJECT_PROFILE").is_ok();
 
@@ -658,9 +761,13 @@ mod imp {
             // Anything else — a browser page body, a Slack pane, an editor
             // window, a menu, an unknown app — holds the transcript. AX absence
             // is alone never proof of a text field.
-            let front_paste_safe = super::frontmost_pid()
-                .map(super::is_terminal_pid)
-                .unwrap_or(false);
+            // The expected app for the Cmd+V guard: the explicit target for the
+            // by-PID entry, or (systemwide) whatever is frontmost right now.
+            // Never a foreign app we didn't intend — and never the frontmost
+            // bolted in place of the explicit target.
+            let expected_pid = expected_app.or_else(super::frontmost_pid);
+            let front_paste_safe =
+                expected_pid.map(super::is_terminal_pid).unwrap_or(false);
             if front_paste_safe {
                 eprintln!(
                     "[inject] no focused AX element (AXError {err}); terminal → clipboard paste"
@@ -673,12 +780,19 @@ mod imp {
                 if let Some(cancelled) = claim_write_authorization(authorize) {
                     return Ok(cancelled);
                 }
-                let r = crate::clipboard_paste::paste_via_clipboard(&padded);
-                if r.is_ok() {
-                    super::remember_tail(&padded);
-                    return Ok(InjectOutcome::Injected);
+                match crate::clipboard_paste::paste_via_clipboard(&padded, expected_pid) {
+                    Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
+                        super::remember_tail(&padded);
+                        return Ok(InjectOutcome::Injected);
+                    }
+                    Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
+                        eprintln!(
+                            "[inject] target {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                        );
+                        return Ok(InjectOutcome::RefusedForeground);
+                    }
+                    Err(e) => return Err(e),
                 }
-                return r.map(|_| InjectOutcome::Injected);
             }
             eprintln!(
                 "[inject] no focused AX element (AXError {err}); not a known text-input app → holding (never paste blindly)"
@@ -712,7 +826,13 @@ mod imp {
         }
 
         // 5. Shared write ladder. Caller owns `focused`, so release after.
-        let r = write_padded(focused, pid, &padded, prof, editability, authorize);
+        // `expected_pid` is what must be frontmost before a global Cmd+V. For the
+        // by-PID entry it is the explicit target; for the systemwide path it is
+        // the focused element's app (or, if AX won't disclose the PID, the
+        // frontmost app captured here at resolve time) — so a foreground switch
+        // between resolve and the Cmd+V is caught.
+        let expected_pid = expected_app.or(pid).or_else(super::frontmost_pid);
+        let r = write_padded(focused, pid, &padded, prof, editability, authorize, expected_pid);
         cf_release(focused as CFTypeRef);
         r
     }
@@ -755,6 +875,7 @@ mod imp {
         prof: bool,
         editability: FocusEditability,
         authorize: Option<&dyn Fn() -> bool>,
+        expected_pid: Option<i32>,
     ) -> eyre::Result<InjectOutcome> {
         let t_total = std::time::Instant::now();
 
@@ -789,11 +910,19 @@ mod imp {
             if prof {
                 eprintln!("[inject-prof] clipboard route (editability {editability:?}, pid {pid:?})");
             }
-            let r = crate::clipboard_paste::paste_via_clipboard(padded);
-            if r.is_ok() {
-                super::remember_tail(padded);
+            match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
+                Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
+                    super::remember_tail(padded);
+                    return Ok(InjectOutcome::Injected);
+                }
+                Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
+                    eprintln!(
+                        "[inject] expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                    );
+                    return Ok(InjectOutcome::RefusedForeground);
+                }
+                Err(e) => return Err(e),
             }
-            return r.map(|_| InjectOutcome::Injected);
         }
 
         let payload = CFString::new(padded);
@@ -812,7 +941,7 @@ mod imp {
             );
         }
         if sel_err == kAXErrorSuccess {
-            let r = confirm_or_fallback(focused, pid, padded, prof);
+            let r = confirm_or_fallback(focused, pid, padded, prof, expected_pid);
             if prof {
                 eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
             }
@@ -830,7 +959,7 @@ mod imp {
             eprintln!("[inject-prof] set_value: {:?} (err={val_err})", t.elapsed());
         }
         if val_err == kAXErrorSuccess {
-            let r = confirm_or_fallback(focused, pid, padded, prof);
+            let r = confirm_or_fallback(focused, pid, padded, prof, expected_pid);
             if prof {
                 eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
             }
@@ -843,11 +972,19 @@ mod imp {
         eprintln!(
             "[inject] AX writes refused (selected={sel_err}, value={val_err}); using clipboard paste"
         );
-        let r = crate::clipboard_paste::paste_via_clipboard(padded);
-        if r.is_ok() {
-            super::remember_tail(padded);
+        match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
+            Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
+                super::remember_tail(padded);
+                Ok(InjectOutcome::Injected)
+            }
+            Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
+                eprintln!(
+                    "[inject] expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                );
+                Ok(InjectOutcome::RefusedForeground)
+            }
+            Err(e) => Err(e),
         }
-        r.map(|_| InjectOutcome::Injected)
     }
 
     /// Called after an AX write returns `kAXErrorSuccess`. Some apps (Electron
@@ -871,6 +1008,7 @@ mod imp {
         pid: Option<i32>,
         padded: &str,
         prof: bool,
+        expected_pid: Option<i32>,
     ) -> eyre::Result<InjectOutcome> {
         let pid = match pid {
             Some(p) if !super::is_ax_verified(p) => p,
@@ -893,11 +1031,19 @@ mod imp {
             );
         }
         super::mark_clipboard_only(pid);
-        let r = crate::clipboard_paste::paste_via_clipboard(padded);
-        if r.is_ok() {
-            super::remember_tail(padded);
+        match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
+            Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
+                super::remember_tail(padded);
+                Ok(InjectOutcome::Injected)
+            }
+            Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
+                eprintln!(
+                    "[inject] expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                );
+                Ok(InjectOutcome::RefusedForeground)
+            }
+            Err(e) => Err(e),
         }
-        r.map(|_| InjectOutcome::Injected)
     }
 
     /// True if the focused element's value now contains the text we just wrote.
@@ -1565,6 +1711,45 @@ mod tests {
         });
         assert_eq!(result, FinalizeResult::Held);
         assert!(!sink_called, "a known NotEditable focus must never reach the injector");
+    }
+
+    // ORCHESTRATION (2026-09-07): a global Cmd+V lands in the OS-frontmost app,
+    // so it must not be posted unless the intended target IS frontmost. This is
+    // the fail-closed seam consulted immediately before the Cmd+V. A naive
+    // "always deliver" guard (or one that falls back to the current frontmost)
+    // would make this test go red.
+    #[test]
+    fn clipboard_delivery_fail_closed_when_expected_not_frontmost() {
+        // Explicit target PID: only deliver when it is the frontmost app.
+        assert!(clipboard_target_is_frontmost(Some(100), Some(100)));
+        assert!(!clipboard_target_is_frontmost(Some(100), Some(200)));
+        assert!(!clipboard_target_is_frontmost(Some(100), None));
+        // No specific target (systemwide): require SOME frontmost, never a paste
+        // with no foreground app, and never guess a foreign app.
+        assert!(clipboard_target_is_frontmost(None, Some(200)));
+        assert!(!clipboard_target_is_frontmost(None, None));
+    }
+
+    // ORCHESTRATION (2026-09-07): the live (systemwide) resolver must target the
+    // CURRENT OS-frontmost app resolved FRESH at write time — never the retained
+    // press-time PID, and never the systemwide proxy that returned -25204 in the
+    // reproduced red loop. A naive "use the retained target" or "fall back to
+    // the press-time PID" resolver makes this go red.
+    #[test]
+    fn live_plan_targets_current_frontmost_and_holds_with_none() {
+        assert_eq!(plan_live_inject(Some(555)), LiveInjectPlan::ResolveApp { pid: 555 });
+        // No frontmost app → no live field → hold (never invent a target).
+        assert_eq!(plan_live_inject(None), LiveInjectPlan::Hold);
+    }
+
+    #[test]
+    fn refused_foreground_holds_recoverable_not_failed() {
+        // A fail-closed foreground refusal at Cmd+V delivery is a HOLD (the
+        // transcript stays recoverable), never a hard failure.
+        let result = finalize_utterance(false, None, "dictated", |_| {
+            Ok(InjectOutcome::RefusedForeground)
+        });
+        assert_eq!(result, FinalizeResult::Held);
     }
 
     #[test]

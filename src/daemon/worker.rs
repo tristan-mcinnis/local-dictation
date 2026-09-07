@@ -1335,11 +1335,19 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
         return;
     }
 
-    match crate::clipboard_paste::paste_via_clipboard(result) {
-        Ok(()) => eprintln!(
+    // The transformed text must land in the app the selection came from. Snapshot
+    // the frontmost app and require it at the global Cmd+V (fail-closed).
+    let expected = crate::injector::frontmost_pid();
+    match crate::clipboard_paste::paste_via_clipboard(result, expected) {
+        Ok(crate::clipboard_paste::PasteOutcome::Delivered) => eprintln!(
             "  ✓    transformed in {} ms → \"{result}\"",
             ms(t.elapsed())
         ),
+        Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
+            eprintln!(
+                "  ◌    transform refused — target app not frontmost at paste (text held)"
+            );
+        }
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
             cues::play_error();
@@ -1622,6 +1630,12 @@ pub(super) fn handle_spoken_command(
             // for exhaustiveness.
             eprintln!("  ⌫    cancelled · discarded");
             cues::play_cancel();
+        }
+        Ok(crate::injector::InjectOutcome::RefusedForeground) => {
+            // Fail-closed: the expected app was not frontmost at the global
+            // Cmd+V, so nothing was written. Hold it recoverable.
+            eprintln!("  ◌    target not frontmost at paste — result held (copy from menu)");
+            ui_channel::set_last_dictation(result);
         }
         Err(e) => {
             eprintln!("  ✗    inject failed: {e:?}");

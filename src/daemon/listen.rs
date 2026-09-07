@@ -280,6 +280,12 @@ pub(super) fn inject_refined_authorized(
                     eprintln!("  ⌫    cancelled · discarded");
                     cues::play_cancel();
                 }
+                Ok(crate::injector::InjectOutcome::RefusedForeground) => {
+                    // Fail-closed: the expected app was not frontmost at the
+                    // global Cmd+V, so nothing was written. Hold it recoverable.
+                    eprintln!("  ◌    target not frontmost at paste — text held (copy from menu)");
+                    ui_channel::set_last_dictation(&text);
+                }
                 Err(e) => {
                     eprintln!("  ✗    inject failed: {e:?}");
                     cues::play_error();

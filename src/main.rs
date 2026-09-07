@@ -128,9 +128,24 @@ async fn run_mock_loop() -> eyre::Result<()> {
 
 fn run_inject_test(text: Option<String>) -> eyre::Result<()> {
     let text = text.unwrap_or_else(|| "hello from fast-dictate-backend!".to_string());
-    inject_with_optional_focus(&text)?;
-    println!("[inject-test] injected: {text:?}");
-    Ok(())
+    let outcome = inject_with_optional_focus(&text)?;
+    // Surface the ACTUAL outcome so a live loop is red-capable: a held or
+    // cancelled verdict must be nonzero, never a false "injected" broadcast.
+    match outcome {
+        fast_dictate_backend::injector::InjectOutcome::Injected => {
+            println!("[inject-test] injected: {text:?}");
+            Ok(())
+        }
+        fast_dictate_backend::injector::InjectOutcome::NoEditableField => Err(eyre::eyre!(
+            "no editable field focused — text held (nothing written)"
+        )),
+        fast_dictate_backend::injector::InjectOutcome::Cancelled => {
+            Err(eyre::eyre!("cancelled — discarded"))
+        }
+        fast_dictate_backend::injector::InjectOutcome::RefusedForeground => Err(eyre::eyre!(
+            "target not frontmost at paste — held (nothing written)"
+        )),
+    }
 }
 
 /// If FOCUS_APP is set, ensure that app has a writable doc and inject into

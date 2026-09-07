@@ -15,6 +15,17 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// Outcome of a clipboard paste attempt. The paste is a GLOBAL Cmd+V that lands
+/// in the OS-frontmost app, so the delivery guard decides whether it may fire.
+pub enum PasteOutcome {
+    /// The text was set and Cmd+V was posted to the expected frontmost app.
+    Delivered,
+    /// The expected target was not frontmost at the moment of delivery, so the
+    /// Cmd+V was NOT posted (fail-closed — it would land in the wrong app).
+    /// The caller holds the transcript recoverable and never pastes blindly.
+    RefusedForeground,
+}
+
 // US ANSI virtual key codes.
 const KEY_C: CGKeyCode = 8;
 const KEY_V: CGKeyCode = 9;
@@ -102,11 +113,23 @@ fn pasteboard_change_count() -> Option<isize> {
     Some(pb.changeCount())
 }
 
-pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
+pub fn paste_via_clipboard(text: &str, expected_pid: Option<i32>) -> eyre::Result<PasteOutcome> {
     // Save current plain text (if any) and set ours under the write lock. The
     // lock keeps a pending background restore (from a previous dictation) from
     // clobbering the pasteboard between our set and the target consuming it.
     let _guard = CLIPBOARD_WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Fail-closed foreground guard, immediately before the Cmd+V: a global
+    // Cmd+V lands in the OS-frontmost app, so it must not be posted unless the
+    // expected target IS frontmost. A mismatch means we'd paste into the wrong
+    // app — refuse with nothing modified (checked before any clipboard write).
+    if !crate::injector::clipboard_target_is_frontmost(expected_pid, crate::injector::frontmost_pid()) {
+        eprintln!(
+            "[clipboard] refusing Cmd+V: expected pid {expected_pid:?} is not frontmost — not pasting"
+        );
+        return Ok(PasteOutcome::RefusedForeground);
+    }
+
     let mut cb = Clipboard::new().map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
     let saved = cb.get_text().ok();
 
@@ -117,14 +140,19 @@ pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
     // stays put unless the user copies something during the settle wait below.
     let our_count = pasteboard_change_count();
 
+    // Pasteboard access can itself yield. Check again at the delivery boundary;
+    // on refusal leave the dictation available for a deliberate manual paste.
+    if !crate::injector::clipboard_target_is_frontmost(expected_pid, crate::injector::frontmost_pid()) {
+        return Ok(PasteOutcome::RefusedForeground);
+    }
     synthesize_cmd_v()?;
-    drop(_guard);
 
     // Let the OS + target app actually consume the Cmd+V before restoring. This
     // stays on the worker: the consume-window also marshals the next dictation's
     // set_text until this paste is consumed, so a quick follow-up can't overwrite
     // text this paste hasn't pulled yet.
     std::thread::sleep(Duration::from_millis(paste_settle_ms(text.chars().count())));
+    drop(_guard);
 
     if let Some(orig) = saved {
         // Detach the restore so the worker returns immediately — a ~1 s restore
@@ -135,7 +163,7 @@ pub fn paste_via_clipboard(text: &str) -> eyre::Result<()> {
     }
     // If the clipboard was empty before, leave our injected text on it (better
     // than wiping it — gives the user a manual paste fallback).
-    Ok(())
+    Ok(PasteOutcome::Delivered)
 }
 
 /// Detached clipboard restore. Runs on a background thread so a slow restore
