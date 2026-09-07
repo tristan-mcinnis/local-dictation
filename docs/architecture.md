@@ -112,8 +112,9 @@ Developer ID would make grants stick. When bundled, the daemon redirects stdout/
 The model + all config are read **once at daemon boot**, so changes take effect on relaunch — but
 there are two very different loops, and only one needs a rebuild:
 
-1. **Tuning prompts / formats / corrections (no code change).** Edit
-   `~/.config/local-dictation/prompts.json` (or `settings.json` / `corrections.json`), then
+1. **Tuning prompts / formats / corrections (no code change).** Use Settings → Dictionary for
+   personal terms and heard→correct replacements, or edit `~/.config/local-dictation/prompts.json`
+   (`settings.json` / `corrections.json` remain available to power users), then
    **`./scripts/reload-daemon.sh`** — it kills the running daemon and relaunches the *same*
    installed bundle, so the signature is unchanged and macOS keeps the Mic + Accessibility grants.
    Even faster: don't touch the live app at all — A/B candidate prompts offline with
@@ -157,8 +158,8 @@ When adding code, gate it behind the right feature and keep the default (feature
 
 ## The house design (Slate)
 
-Every surface the app draws — the pill, the history panel, the dictionary editor, the settings
-shell — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
+Every surface the app draws — the pill, the history panel, the dictionary editor, the seven-pane
+settings shell (including the plain-language Dictionary form) — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
 `tokens.json`). The generated token file is vendored at `src/menubar/house_theme.rs`; it is
 generated, never hand-edited, and `make check` in `design-system` flags a stale copy. Nothing in
 the UI types a colour, a radius, a font size or a control height: `src/menubar/slate.rs` is the
@@ -202,7 +203,8 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
   → cleaner.rs (S1-mini; skipped when the deterministic gate says the speech is clean
     and no format preset is active — clear dictation goes straight through)
   → text_polish.rs (polish, fix_speech_mechanics, flatten or preserve line breaks)
-  → refiner.rs (corrections dict + trailing voice-command parse) — shared by daemon & CLI
+  → refiner.rs (deterministic corrections dict + trailing voice-command parse) — shared by daemon & CLI;
+    corrections run on raw terminal/no-cleanup text and again after model cleanup
   → smart_pad.rs (spacing/capitalization from caret context)
   → injector.rs (AX direct, or clipboard paste for Electron) + trailing-action keystroke
 ```

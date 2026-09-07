@@ -29,7 +29,7 @@ subscription, or runtime telemetry.
 4. **Guarded S1-mini cleanup.** Clean speech skips generation. Messy speech is
    offered to S1-mini; deterministic cleanup and content/runaway guards win if
    the model truncates, repeats, or changes intent.
-5. **Personal dictionary.** Your names, brands, and tools (Todoist, Pencil, macOS) are kept as you mean them instead of being "corrected" to common words. Edit it from the menu bar.
+5. **Personal dictionary.** Your names, brands, and tools (Todoist, Pencil, macOS) are kept as you mean them instead of being "corrected" to common words. Add an exact spelling or a heard→correct replacement directly in Settings → Dictionary; Apply & Restart makes it active.
 6. **Hands-free mode.** Hold the key and tap Space to latch, then talk with nothing held down. Tap the key once to stop. Good for long thoughts. No Spacebar? Double-tap the key to latch instead.
 7. **Voice commands.** End an utterance with "press enter", "new line", or "press tab" to emit the keystroke. Say "scratch that" to cancel, or "undo that" to revert the last dictation.
 8. **Transform selected text by voice.** Select a passage, hold Shift plus the key, speak an instruction ("make this concise", "translate to Spanish"), and it rewrites in place.
@@ -115,7 +115,7 @@ For hands-free, hold Right Option and tap **Space** (a short pop confirms), let 
 
 To edit existing text, select it, hold **Shift plus Right Option**, speak an instruction, and release.
 
-The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, the personal dictionary, dictation history, and prompt and log tools.
+The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON.
 
 ## Performance
 
@@ -161,7 +161,7 @@ If you want zero setup and a maintained app, the others win. If you want the low
 
 ## Configuration
 
-User config lives in `~/.config/local-dictation/`. The menu bar writes `settings.json` (model, hotkey, cleanup, output format). Hand-edit `prompts.json` for the cleanup and transform prompts, and `corrections.json` for the dictionary. Env vars win over files. Common ones
+User config lives in `~/.config/local-dictation/`. The app writes `settings.json` (model, hotkey, cleanup, output format) and Settings → Dictionary writes `corrections.json`. Hand-edit `prompts.json` only for custom cleanup and transform prompts. Env vars win over files. Common ones
 (the full list is in `docs/architecture.md`):
 
 | Var | Effect |

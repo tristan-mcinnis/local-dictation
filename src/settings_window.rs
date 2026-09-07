@@ -2,7 +2,7 @@
 //!
 //! `LAYOUT_SETTINGS_WIDTH` × `LAYOUT_SETTINGS_HEIGHT` (760 × 540): a
 //! `LAYOUT_SETTINGS_RAIL` (220) rail on `surface_sunken` carrying the app mark
-//! and six `CONTROL_RAILROW` rows, each with a 26 px icon tile; the selected
+//! and seven `CONTROL_RAILROW` rows, each with a 26 px icon tile; the selected
 //! row is a raised tile. The pane on the right has a `title` heading with a
 //! `meta` subtitle, groups as cards at `Radius.lg` with an uppercase `section`
 //! label and `CONTROL_ROW` rows, and a `CONTROL_FOOTER` well carrying the
@@ -79,6 +79,11 @@ const PANES: &[(&str, &str, &str)] = &[
         "Key, cleanup, and what happens after release.",
     ),
     (
+        "Dictionary",
+        "text.book.closed",
+        "Names and phrases that must always come out right.",
+    ),
+    (
         "Translate",
         "character.book.closed",
         "Speak in one language, land in another.",
@@ -127,6 +132,12 @@ pub struct SettingsUi {
     custom_hotkey_field: Retained<NSTextField>,
     custom_hotkey_hint: Retained<NSTextField>,
     whisper_switch: Retained<slate::InkToggle>,
+    // Dictionary
+    dictionary_heard_field: Retained<NSTextField>,
+    dictionary_correct_field: Retained<NSTextField>,
+    dictionary_status: Retained<NSTextField>,
+    pending_corrections: Mutex<crate::corrections::Corrections>,
+    original_correction_lines: Vec<String>,
     // Translate
     translate_targets_field: Retained<NSTextField>,
     active_translate_popup: Retained<NSPopUpButton>,
@@ -260,6 +271,35 @@ define_class!(
             with_pending(|p| {
                 p.wake_word = if t.is_empty() { None } else { Some(t) };
             });
+        }
+
+        #[unsafe(method(addDictionaryEntry:))]
+        fn add_dictionary_entry(&self, _sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            let heard = ui.dictionary_heard_field.stringValue().to_string();
+            let correct = ui.dictionary_correct_field.stringValue().to_string();
+            let Some(line) = crate::corrections::quick_add_line(&heard, &correct) else {
+                ui.dictionary_status.setStringValue(&NSString::from_str(
+                    "Type the spelling you want in ‘Correct to’.",
+                ));
+                ui.window.makeFirstResponder(Some(&*ui.dictionary_correct_field));
+                return;
+            };
+            let mut corrections = ui.pending_corrections.lock().unwrap();
+            let previous_count = corrections.len();
+            let mut lines = corrections.to_editor_lines();
+            lines.push(line);
+            *corrections = crate::corrections::Corrections::from_editor_text(&lines.join("\n"));
+            let count = corrections.len();
+            let verb = if count == previous_count { "Updated" } else { "Added" };
+            ui.dictionary_heard_field.setStringValue(&NSString::from_str(""));
+            ui.dictionary_correct_field.setStringValue(&NSString::from_str(""));
+            ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                "{verb}. {count} terms will be active after Apply & Restart.",
+            )));
+            ui.window.makeFirstResponder(Some(&*ui.dictionary_heard_field));
         }
 
         #[unsafe(method(applyAndRestart:))]
@@ -761,7 +801,53 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&dictation, &card);
 
-    // ═══ Pane 1 — Translate ═════════════════════════════════════════════
+    // ═══ Pane 1 — Dictionary ════════════════════════════════════════════
+    let dictionary = new_pane();
+    let mut card = card_begin(mtm, &dictionary, SPACE_MD, "Add a term");
+    let dictionary_heard_field = text_row(mtm, &mut card, "What dictation hears", "");
+    dictionary_heard_field
+        .setPlaceholderString(Some(&NSString::from_str("e.g. exampleco")));
+    let dictionary_correct_field = text_row(mtm, &mut card, "Correct to", "");
+    dictionary_correct_field
+        .setPlaceholderString(Some(&NSString::from_str("e.g. Example Co")));
+    action_button_row(
+        mtm,
+        &mut card,
+        "Add to dictionary",
+        "Add",
+        "plus",
+        &controller,
+        sel!(addDictionaryEntry:),
+    );
+    let loaded_corrections = crate::corrections::Corrections::load_default()
+        .unwrap_or_else(|_| crate::corrections::Corrections::empty());
+    let original_correction_lines = loaded_corrections.to_editor_lines();
+    let dictionary_status = hint_line(
+        mtm,
+        &mut card,
+        &format!(
+            "{} terms. Replacements run before and after cleanup, including raw terminal dictation.",
+            loaded_corrections.len()
+        ),
+    );
+    let y = card_end(&card);
+    let mut card = card_begin(mtm, &dictionary, y, "Manage");
+    hint_line(
+        mtm,
+        &mut card,
+        "Leave the first field blank to preserve an exact spelling. Use both fields to fix a mishearing.",
+    );
+    button_row(
+        mtm,
+        &mut card,
+        "Open dictionary file",
+        &controller,
+        sel!(openCorrections:),
+    );
+    let _ = card_end(&card);
+    finish_pane(&dictionary, &card);
+
+    // ═══ Pane 2 — Translate ═════════════════════════════════════════════
     let translate = new_pane();
     let mut card = card_begin(mtm, &translate, SPACE_MD, "Targets");
     let loaded_targets = loaded.resolve_translation_targets();
@@ -804,7 +890,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&translate, &card);
 
-    // ═══ Pane 2 — Output ════════════════════════════════════════════════
+    // ═══ Pane 3 — Output ════════════════════════════════════════════════
     let output = new_pane();
     let mut card = card_begin(mtm, &output, SPACE_MD, "Format");
     let format_popup = popup_row(mtm, &mut card, "Output format");
@@ -843,7 +929,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&output, &card);
 
-    // ═══ Pane 3 — Speech engine ═════════════════════════════════════════
+    // ═══ Pane 4 — Speech engine ═════════════════════════════════════════
     let speech = new_pane();
     let mut card = card_begin(mtm, &speech, SPACE_MD, "Engine");
     let resolved_asr = loaded.resolve_asr();
@@ -919,7 +1005,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&speech, &card);
 
-    // ═══ Pane 4 — Experimental ══════════════════════════════════════════
+    // ═══ Pane 5 — Experimental ══════════════════════════════════════════
     let experimental = new_pane();
     let mut card = card_begin(mtm, &experimental, SPACE_MD, "Experimental");
     let streaming_switch = toggle_row(mtm, &mut card, "Streaming ASR", "Live preview during the hold");
@@ -960,7 +1046,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&experimental, &card);
 
-    // ═══ Pane 5 — About ═════════════════════════════════════════════════
+    // ═══ Pane 6 — About ═════════════════════════════════════════════════
     let about = new_pane();
     let mut card = card_begin(mtm, &about, SPACE_MD, "Files & logs");
     for (title, action) in [
@@ -991,7 +1077,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&about, &card);
 
-    let panes = vec![dictation, translate, output, speech, experimental, about];
+    let panes = vec![dictation, dictionary, translate, output, speech, experimental, about];
     scroll.setDocumentView(Some(&*panes[0]));
 
     window.setContentView(Some(&*panel));
@@ -1019,6 +1105,11 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         custom_hotkey_field,
         custom_hotkey_hint,
         whisper_switch,
+        dictionary_heard_field,
+        dictionary_correct_field,
+        dictionary_status,
+        pending_corrections: Mutex::new(loaded_corrections),
+        original_correction_lines,
         translate_targets_field,
         active_translate_popup,
         retention_popup,
@@ -1382,10 +1473,30 @@ fn button_row(
     controller: &Retained<SettingsController>,
     action: objc2::runtime::Sel,
 ) {
+    action_button_row(
+        mtm,
+        card,
+        title,
+        "Open",
+        "arrow.up.forward",
+        controller,
+        action,
+    );
+}
+
+fn action_button_row(
+    mtm: MainThreadMarker,
+    card: &mut Card,
+    title: &str,
+    button_label: &str,
+    symbol: &str,
+    controller: &Retained<SettingsController>,
+    action: objc2::runtime::Sel,
+) {
     let y = card_row(card, CONTROL_ROW);
     row_label(mtm, card, y, CONTROL_ROW, title, None);
     let mid = y + CONTROL_ROW / 2.0;
-    let chip = slate::chip(mtm, "Open", Some("arrow.up.forward"), CARD_W - CARD_PAD_X, mid);
+    let chip = slate::chip(mtm, button_label, Some(symbol), CARD_W - CARD_PAD_X, mid);
     // A flipped parent flips the chip's y, so re-centre it in card space.
     let f = chip.frame();
     chip.setFrame(NSRect::new(
@@ -1551,14 +1662,24 @@ fn with_pending<F: FnOnce(&mut Settings)>(f: F) {
 
 fn apply_and_restart(ui: &SettingsUi) {
     let pending = ui.pending.lock().unwrap().clone();
-    if pending == ui.original {
+    let corrections = ui.pending_corrections.lock().unwrap();
+    let corrections_changed = corrections.to_editor_lines() != ui.original_correction_lines;
+    if pending == ui.original && !corrections_changed {
         // Nothing changed — don't restart for nothing.
         ui.window.close();
         return;
     }
-    if let Err(e) = pending.save() {
-        eprintln!("[settings] failed to save settings: {e}");
-        return;
+    if pending != ui.original {
+        if let Err(e) = pending.save() {
+            eprintln!("[settings] failed to save settings: {e}");
+            return;
+        }
+    }
+    if corrections_changed {
+        if let Err(e) = corrections.save() {
+            eprintln!("[settings] failed to save dictionary: {e}");
+            return;
+        }
     }
     menubar::relaunch_daemon();
 }

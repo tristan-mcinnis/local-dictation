@@ -315,6 +315,23 @@ mod tests {
     }
 
     #[test]
+    fn personal_replacement_is_deterministic_for_raw_and_cleaned_text() {
+        let r = refiner(&[("exampleco", "Example Co")]);
+
+        // Terminal and no-cleanup paths hand the raw transcript to refine().
+        let raw = r.refine("make an exampleco template");
+        assert_eq!(raw.text, "make an Example Co template");
+
+        // The cleanup path may change surrounding prose, but the same canonical
+        // tail must still enforce the personal replacement afterwards.
+        let cleaned = r.refine("Please use the exampleco PowerPoint template.");
+        assert_eq!(
+            cleaned.text,
+            "Please use the Example Co PowerPoint template."
+        );
+    }
+
+    #[test]
     fn bare_command_has_empty_body() {
         let r = refiner(&[]);
         let out = r.refine("press enter");
