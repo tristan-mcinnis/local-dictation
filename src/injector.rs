@@ -201,20 +201,22 @@ fn is_clearly_noninput_role(role: Option<&str>, _subrole: Option<&str>) -> bool 
 ///
 /// `role` / `subrole` are the AX attribute strings (None when AX did not
 /// disclose them). `value_settable` / `selected_text_settable` report whether
-/// AX says the value / selected-text attributes are writable. `is_terminal` is
-/// the one app-type fallback: a genuine terminal is *always* a text-input
-/// surface, and is the only surface allowed to paste when AX discloses no role.
+/// AX says the value / selected-text attributes are writable. `paste_safe` is
+/// the one app-type fallback: a genuine terminal or an AX-blind native chat
+/// app (WeChat) is *always* a text-input surface, and is the only surface
+/// allowed to paste when AX discloses no role.
 ///
 /// This is deliberately strict and never guesses above the evidence:
 ///   * a positively non-input role (button / window / web area / canvas / static
 ///     text / menu / checkbox / radio) → `NotEditable` **even for a terminal**;
-///   * a genuine terminal whose focused element is not a positively non-input
+///   * a paste-safe app (a genuine terminal, or an AX-blind native chat app
+///     like WeChat) whose focused element is not a positively non-input
 ///     control → `PasteSafe` — even when its role is a text-entry role
-///     (AXTextArea / AXTextField) that AX reports as **not** writable: a GPU
-///     terminal draws its own text grid and is AX-blind, so that is a text-input
-///     surface (clipboard paste), not a read-only label. This is the narrow,
-///     justified fallback the architecture sanctions for terminals. It is NOT a
-///     broad editor/compose blanket — a Slack pane, a Notion page, a browser
+///     (AXTextArea / AXTextField) that AX reports as **not** writable: the app
+///     draws its own input and is AX-blind, so that is a text-input surface
+///     (clipboard paste), not a read-only label. This is the narrow, justified
+///     fallback the architecture sanctions for terminals and WeChat. It is NOT
+///     a broad editor/compose blanket — a Slack pane, a Notion page, a browser
 ///     body, or an Outlook window is only pasted into when its focused element
 ///     reports an editable role, never by app name;
 ///   * a non-terminal text-entry role that is writable → `Editable`;
@@ -225,22 +227,23 @@ pub fn classify_focus_editability(
     subrole: Option<&str>,
     value_settable: bool,
     selected_text_settable: bool,
-    is_terminal: bool,
+    paste_safe: bool,
 ) -> FocusEditability {
     // A positively non-input control (button / window chrome / page body /
     // canvas / static text / menu / checkbox / radio) is never a place to write,
-    // even for an allowlisted terminal.
+    // even for an allowlisted paste-safe app.
     if is_clearly_noninput_role(role, subrole) {
         FocusEditability::NotEditable
-    } else if is_terminal {
-        // A genuine terminal is ALWAYS a text-input surface. Its focused element
+    } else if paste_safe {
+        // A paste-safe app (a genuine terminal, or an AX-blind native chat app
+        // like WeChat) is ALWAYS a text-input surface. Its focused element
         // frequently reports a text-entry role (AXTextArea / AXTextField /
         // AXComboBox, or a search-field subrole) whose AXValue / AXSelectedText
-        // are NOT settable — the terminal draws its own text grid and is
-        // AX-blind, so writing must go through Cmd+V (see `classify_pid`). That
-        // is NOT a read-only field; it is a text-input surface, so it is
-        // `PasteSafe`, never `NotEditable`. Only a positively non-input control
-        // above ever holds a terminal.
+        // are NOT settable — the app draws its own input and is AX-blind, so
+        // writing must go through Cmd+V (see `classify_pid`). That is NOT a
+        // read-only field; it is a text-input surface, so it is `PasteSafe`,
+        // never `NotEditable`. Only a positively non-input control above ever
+        // holds such an app.
         FocusEditability::PasteSafe
     } else if is_text_entry_role(role, subrole) {
         if value_settable || selected_text_settable {
@@ -375,6 +378,12 @@ struct PidClass {
     is_electron: bool,
     /// GPU/native terminal emulator. The one narrow text-input-surface fallback.
     is_terminal: bool,
+    /// AX-blind native chat app (WeChat): its message box is a custom control
+    /// that accepts keyboard + Cmd+V paste but exposes no focused UI element
+    /// through AX (AXFocusedUIElement → kAXErrorNoValue -25212) even with the
+    /// caret visible. Paste-safe like a terminal, but prose cleanup still runs
+    /// (chat messages benefit from cleanup; shell commands do not).
+    is_wechat: bool,
 }
 
 static CLIPBOARD_ONLY_CACHE: Mutex<Vec<(i32, PidClass)>> = Mutex::new(Vec::new());
@@ -388,6 +397,16 @@ pub fn process_command_path(pid: i32) -> Option<String> {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
+}
+
+/// Pure app-name check for AX-blind native chat apps (WeChat). Split out of
+/// `classify_pid` so the name matching is unit-testable without shelling to
+/// `ps`. Case-insensitive. Matches only WeChat's main app process
+/// (`…/MacOS/WeChat`), not the Chromium-based `WeChatAppEx` mini-program
+/// engine (whose helpers end in `wechatappex`, `wechatappex helper (renderer)`,
+/// etc.).
+fn is_ax_blind_chat_app_comm(comm: &str) -> bool {
+    comm.trim().to_lowercase().ends_with("/wechat")
 }
 
 /// Classify a PID by its executable name into a [`PidClass`]. The `is_electron`
@@ -434,11 +453,12 @@ fn classify_pid(pid: i32) -> PidClass {
         || comm.contains("/wezterm")
         || comm.contains("/kitty")
         || comm.contains("/alacritty");
+    let is_wechat = is_ax_blind_chat_app_comm(&comm);
     // The editor/compose blanket (VS Code, Slack, Notion, Obsidian, Figma, …)
     // is deliberately ABSENT from a paste-safe allowlist. A paste is justified
     // only by the FOCUSED element's AX role at write time, never by the app
     // name — so a Slack pane or a browser body never receives a blind paste.
-    let cls = PidClass { is_electron, is_terminal };
+    let cls = PidClass { is_electron, is_terminal, is_wechat };
     if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
         cache.push((pid, cls));
     }
@@ -447,7 +467,7 @@ fn classify_pid(pid: i32) -> PidClass {
 
 pub fn is_clipboard_only_pid(pid: i32) -> bool {
     let cls = classify_pid(pid);
-    cls.is_electron || cls.is_terminal
+    cls.is_electron || cls.is_terminal || cls.is_wechat
 }
 
 /// True when the focused app is a native terminal emulator. The daemon uses
@@ -456,6 +476,14 @@ pub fn is_clipboard_only_pid(pid: i32) -> bool {
 /// no editable role.
 pub fn is_terminal_pid(pid: i32) -> bool {
     classify_pid(pid).is_terminal
+}
+
+/// True when the focused app is an AX-blind native chat app (WeChat). Used by
+/// the focus gate as a paste-safe fallback when AX discloses no focused element
+/// (see `is_wechat` on [`PidClass`]), and by `is_clipboard_only_pid` to route
+/// any editable WeChat field straight to clipboard paste.
+pub fn is_wechat_pid(pid: i32) -> bool {
+    classify_pid(pid).is_wechat
 }
 
 /// PIDs whose AX write we've *verified* actually rendered (read the value
@@ -492,7 +520,7 @@ fn mark_clipboard_only(pid: i32) {
         if let Some(entry) = cache.iter_mut().find(|(p, _)| *p == pid) {
             entry.1.is_electron = true;
         } else {
-            cache.push((pid, PidClass { is_electron: true, is_terminal: false }));
+            cache.push((pid, PidClass { is_electron: true, is_terminal: false, is_wechat: false }));
         }
     }
 }
@@ -646,21 +674,24 @@ mod imp {
 
     /// Classify the editability of a focused element from its AX role/subrole +
     /// writability, plus the (single, narrow) app-type signal from its PID: is
-    /// it a genuine terminal? This is the focus gate the write ladder consults
-    /// — it is what turns "no blind paste" from a comment into a decision. The
-    /// editor/compose app blanket is deliberately absent.
+    /// it a genuine terminal or an AX-blind native chat app (WeChat)? This is
+    /// the focus gate the write ladder consults — it is what turns "no blind
+    /// paste" from a comment into a decision. The editor/compose app blanket is
+    /// deliberately absent.
     unsafe fn focused_editability(focused: AXUIElementRef, pid: Option<i32>) -> FocusEditability {
         let role = copy_string_attr(focused, kAXRoleAttribute);
         let subrole = copy_string_attr(focused, kAXSubroleAttribute);
         let value_settable = attribute_is_settable(focused, kAXValueAttribute);
         let sel_settable = attribute_is_settable(focused, kAXSelectedTextAttribute);
-        let is_terminal = pid.map(super::is_terminal_pid).unwrap_or(false);
+        let paste_safe = pid
+            .map(|p| super::is_terminal_pid(p) || super::is_wechat_pid(p))
+            .unwrap_or(false);
         classify_focus_editability(
             role.as_deref(),
             subrole.as_deref(),
             value_settable,
             sel_settable,
-            is_terminal,
+            paste_safe,
         )
     }
 
@@ -757,20 +788,22 @@ mod imp {
         }
         if err != kAXErrorSuccess || focused_ref.is_null() {
             // No focused field exposed. This is NOT a green light to paste
-            // blindly: only a genuine terminal gets the narrow clipboard fallback.
-            // Anything else — a browser page body, a Slack pane, an editor
-            // window, a menu, an unknown app — holds the transcript. AX absence
-            // is alone never proof of a text field.
+            // blindly: only a genuine terminal or an AX-blind native chat app
+            // (WeChat) gets the narrow clipboard fallback. Anything else — a
+            // browser page body, a Slack pane, an editor window, a menu, an
+            // unknown app — holds the transcript. AX absence is alone never
+            // proof of a text field.
             // The expected app for the Cmd+V guard: the explicit target for the
             // by-PID entry, or (systemwide) whatever is frontmost right now.
             // Never a foreign app we didn't intend — and never the frontmost
             // bolted in place of the explicit target.
             let expected_pid = expected_app.or_else(super::frontmost_pid);
-            let front_paste_safe =
-                expected_pid.map(super::is_terminal_pid).unwrap_or(false);
+            let front_paste_safe = expected_pid
+                .map(|p| super::is_terminal_pid(p) || super::is_wechat_pid(p))
+                .unwrap_or(false);
             if front_paste_safe {
                 eprintln!(
-                    "[inject] no focused AX element (AXError {err}); terminal → clipboard paste"
+                    "[inject] no focused AX element (AXError {err}); paste-safe app → clipboard paste"
                 );
                 let tail = super::recall_tail();
                 let padded = smart_pad(text, tail, tail, None);
@@ -1668,6 +1701,29 @@ mod tests {
             classify_focus_editability(None, None, false, false, false),
             FocusEditability::NotEditable
         );
+    }
+
+    #[test]
+    fn wechat_main_app_is_ax_blind_chat_app() {
+        // WeChat's main chat process is AX-blind (no focused element), so it is
+        // paste-safe. Match the main app only, not the Chromium mini-program
+        // engine or other apps.
+        assert!(is_ax_blind_chat_app_comm(
+            "/applications/wechat.app/contents/macos/wechat"
+        ));
+        assert!(is_ax_blind_chat_app_comm(
+            "/Applications/WeChat.app/Contents/MacOS/WeChat\n"
+        ));
+        assert!(!is_ax_blind_chat_app_comm(
+            "/applications/wechat.app/contents/macos/wechatappex.app/contents/macos/wechatappex"
+        ));
+        assert!(!is_ax_blind_chat_app_comm(
+            "/applications/wechat.app/contents/frameworks/crashpad_handler"
+        ));
+        assert!(!is_ax_blind_chat_app_comm(
+            "/applications/safari.app/contents/macos/safari"
+        ));
+        assert!(!is_ax_blind_chat_app_comm(""));
     }
 
     // ── decide_inject / finalize_utterance: observable-sink behaviour ──────
