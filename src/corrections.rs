@@ -122,6 +122,44 @@ impl Corrections {
         crate::app_paths::config_file("corrections.json")
     }
 
+    /// Every entry as `(key, replacement)`, key-sorted — the list the
+    /// Dictionary pane draws, one row per entry. Keys are already lowercased,
+    /// so the sort is the same order `to_editor_lines` produces.
+    pub fn entries(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .map
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The entries whose key or replacement contains `needle`, case-insensitively
+    /// — the Dictionary pane's search. A blank needle matches everything, so the
+    /// list and the filtered list are one code path.
+    pub fn search(&self, needle: &str) -> Vec<(String, String)> {
+        let needle = needle.trim().to_lowercase();
+        self.entries()
+            .into_iter()
+            .filter(|(k, v)| {
+                needle.is_empty() || k.contains(&needle) || v.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    /// Drop the entry keyed by `key` (matched case-insensitively, like every
+    /// other lookup). Returns whether anything was removed. Rebuilds through
+    /// `build` so the phrase index cannot drift.
+    pub fn remove(&mut self, key: &str) -> bool {
+        let mut map = self.map.clone();
+        if map.remove(&key.to_lowercase()).is_none() {
+            return false;
+        }
+        *self = Self::build(map);
+        true
+    }
+
     /// Render the map as lines for the Dictionary editor. An identity entry
     /// (key equals value, case-insensitively) shows as just the word — a "keep
     /// this spelling" hint; a real fix shows as `from → to`. Sorted for a stable,
@@ -550,6 +588,62 @@ mod tests {
             .map(|(k, v)| (k.to_lowercase(), v.to_string()))
             .collect();
         Corrections::build(map)
+    }
+
+    #[test]
+    fn entries_are_key_sorted_pairs() {
+        let c = dict(&[("teh", "the"), ("lings", "Lumen"), ("macos", "macOS")]);
+        assert_eq!(
+            c.entries(),
+            vec![
+                ("lings".to_string(), "Lumen".to_string()),
+                ("macos".to_string(), "macOS".to_string()),
+                ("teh".to_string(), "the".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_matches_either_side_and_blank_matches_all() {
+        let c = dict(&[("lings", "Lumen"), ("teh", "the"), ("macos", "macOS")]);
+        // The heard side.
+        assert_eq!(
+            c.search("ling"),
+            vec![("lings".to_string(), "Lumen".to_string())]
+        );
+        // The replacement side, case-insensitively.
+        assert_eq!(
+            c.search("MACOS"),
+            vec![("macos".to_string(), "macOS".to_string())]
+        );
+        assert_eq!(c.search("  ").len(), 3);
+        assert!(c.search("nothing here").is_empty());
+    }
+
+    #[test]
+    fn remove_drops_the_entry_and_its_phrase_index() {
+        let mut c = dict(&[("to twist", "Todoist"), ("teh", "the")]);
+        assert!(c.remove("TO TWIST"));
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.apply("open to twist now"), "open to twist now");
+        assert_eq!(c.apply("teh end"), "the end");
+        assert!(!c.remove("to twist"));
+    }
+
+    #[test]
+    fn edit_round_trip_replaces_the_original_key() {
+        // What the Dictionary pane does on a row click + Add: drop the key it
+        // pulled into the fields, then re-add the edited line.
+        let mut c = dict(&[("exampleco", "Example Co")]);
+        c.remove("exampleco");
+        let line = quick_add_line("inner chapta", "Example Co").unwrap();
+        let mut lines = c.to_editor_lines();
+        lines.push(line);
+        c = Corrections::from_editor_text(&lines.join("\n"));
+        assert_eq!(
+            c.entries(),
+            vec![("inner chapta".to_string(), "Example Co".to_string())]
+        );
     }
 
     #[test]

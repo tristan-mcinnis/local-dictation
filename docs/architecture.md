@@ -159,7 +159,7 @@ When adding code, gate it behind the right feature and keep the default (feature
 ## The house design (Slate)
 
 Every surface the app draws — the pill, the history panel, the dictionary editor, the seven-pane
-settings shell (including the plain-language Dictionary form) — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
+settings shell (including the Dictionary form and its term list) — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
 `tokens.json`). The generated token file is vendored at `src/menubar/house_theme.rs`; it is
 generated, never hand-edited, and `make check` in `design-system` flags a stale copy. Nothing in
 the UI types a colour, a radius, a font size or a control height: `src/menubar/slate.rs` is the

@@ -115,7 +115,7 @@ For hands-free, hold Right Option and tap **Space** (a short pop confirms), let 
 
 To edit existing text, select it, hold **Shift plus Right Option**, speak an instruction, and release.
 
-The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON.
+The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON, above a searchable list of every term: click a row to edit it, use the trash chip to remove it.
 
 ## Performance
 

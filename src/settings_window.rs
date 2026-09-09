@@ -29,7 +29,8 @@ use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSImageView, NSMenuItem,
-    NSPopUpButton, NSScrollView, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSPopUpButton, NSScrollView, NSSearchField, NSTextAlignment, NSTextField, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString,
@@ -70,6 +71,16 @@ const CARD_PAD_Y: f64 = 4.0;
 const CARD_LABEL_H: f64 = 28.0;
 /// Widest a popup chip may grow before its title truncates.
 const POPUP_MAX_W: f64 = 220.0;
+/// The pane viewport: what is left of the window once the titlebar, the pane
+/// heading and the footer well have taken their bands. A pane document view is
+/// never shorter than this, so a short pane still fills the scroll view.
+const PANE_VIEWPORT_H: f64 = WIN_H - TITLEBAR_H - HEADER_H - CONTROL_FOOTER - HAIRLINE;
+/// How much of a dictionary row's text width the heard spelling takes; the
+/// replacement gets the rest.
+const TERM_HEARD_FRACTION: f64 = 0.42;
+/// Rows drawn before the list stops and asks for a search instead. A settings
+/// pane is a list you scan, not a database you page through.
+const TERM_ROW_CAP: usize = 60;
 
 /// The rail's six sections, in order: label, SF Symbol, subtitle.
 const PANES: &[(&str, &str, &str)] = &[
@@ -136,6 +147,24 @@ pub struct SettingsUi {
     dictionary_heard_field: Retained<NSTextField>,
     dictionary_correct_field: Retained<NSTextField>,
     dictionary_status: Retained<NSTextField>,
+    /// Filters the term list live (the field sends its action per keystroke).
+    dictionary_search: Retained<NSSearchField>,
+    /// The pane, the term-list card, and the flipped body inside that card.
+    /// Rows are rebuilt in place on every search, add, edit and delete, so the
+    /// body's height changes and the card and pane are resized around it. The
+    /// list is the pane's last card, so nothing below it can shift.
+    dictionary_pane: Retained<SettingsFlippedView>,
+    dictionary_card: Retained<slate::SlateView>,
+    dictionary_body: Retained<slate::SlateView>,
+    /// Where the list card sits in the pane, and the body inside the card.
+    dictionary_card_y: f64,
+    dictionary_body_y: f64,
+    /// Row index → dictionary key, refreshed on every rebuild: a row's tag
+    /// addresses its entry through this.
+    dictionary_keys: Mutex<Vec<String>>,
+    /// The key a row click pulled into the fields, so Add replaces that entry
+    /// instead of leaving the old spelling behind beside the new one.
+    dictionary_editing: Mutex<Option<String>>,
     pending_corrections: Mutex<crate::corrections::Corrections>,
     original_correction_lines: Vec<String>,
     // Translate
@@ -287,19 +316,83 @@ define_class!(
                 ui.window.makeFirstResponder(Some(&*ui.dictionary_correct_field));
                 return;
             };
-            let mut corrections = ui.pending_corrections.lock().unwrap();
-            let previous_count = corrections.len();
-            let mut lines = corrections.to_editor_lines();
-            lines.push(line);
-            *corrections = crate::corrections::Corrections::from_editor_text(&lines.join("\n"));
-            let count = corrections.len();
-            let verb = if count == previous_count { "Updated" } else { "Added" };
+            // A row click pulls an entry into the fields; saving it must drop
+            // the original key, or renaming the heard side leaves both.
+            let editing = ui.dictionary_editing.lock().unwrap().take();
+            let count = {
+                let mut corrections = ui.pending_corrections.lock().unwrap();
+                if let Some(key) = editing {
+                    corrections.remove(&key);
+                }
+                let mut lines = corrections.to_editor_lines();
+                lines.push(line);
+                *corrections =
+                    crate::corrections::Corrections::from_editor_text(&lines.join("\n"));
+                corrections.len()
+            };
             ui.dictionary_heard_field.setStringValue(&NSString::from_str(""));
             ui.dictionary_correct_field.setStringValue(&NSString::from_str(""));
             ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
-                "{verb}. {count} terms will be active after Apply & Restart.",
+                "Saved. {count} terms will be active after Apply & Restart.",
             )));
+            refresh_dictionary_list(ui);
             ui.window.makeFirstResponder(Some(&*ui.dictionary_heard_field));
+        }
+
+        #[unsafe(method(searchDictionary:))]
+        fn search_dictionary(&self, _sender: *mut AnyObject) {
+            if let Some(ui) = SETTINGS_UI.get() {
+                refresh_dictionary_list(ui);
+            }
+        }
+
+        #[unsafe(method(editDictionaryEntry:))]
+        fn edit_dictionary_entry(&self, sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some((key, value)) = dictionary_entry_at(ui, tag) else {
+                return;
+            };
+            // An identity entry ("keep this spelling") has no heard side.
+            let heard = if key.eq_ignore_ascii_case(&value) { "" } else { &key };
+            ui.dictionary_heard_field
+                .setStringValue(&NSString::from_str(heard));
+            ui.dictionary_correct_field
+                .setStringValue(&NSString::from_str(&value));
+            *ui.dictionary_editing.lock().unwrap() = Some(key);
+            ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                "Editing “{value}”. Change it above, then Add.",
+            )));
+            ui.window
+                .makeFirstResponder(Some(&*ui.dictionary_correct_field));
+        }
+
+        #[unsafe(method(removeDictionaryEntry:))]
+        fn remove_dictionary_entry(&self, sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some((key, value)) = dictionary_entry_at(ui, tag) else {
+                return;
+            };
+            let count = {
+                let mut corrections = ui.pending_corrections.lock().unwrap();
+                corrections.remove(&key);
+                corrections.len()
+            };
+            // Removing the entry that is open in the fields ends that edit.
+            let mut editing = ui.dictionary_editing.lock().unwrap();
+            if editing.as_deref() == Some(key.as_str()) {
+                *editing = None;
+            }
+            drop(editing);
+            ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                "Removed “{value}”. {count} terms after Apply & Restart.",
+            )));
+            refresh_dictionary_list(ui);
         }
 
         #[unsafe(method(applyAndRestart:))]
@@ -424,6 +517,12 @@ pub fn build_for_render(mtm: MainThreadMarker) -> SettingsUi {
 /// below the fold.
 pub fn scroll_to_bottom_for_render(ui: &SettingsUi) {
     scroll_render(ui, true);
+}
+
+/// Switch the visible pane while snapshotting, so a render proof can capture a
+/// pane other than the first.
+pub fn show_pane_for_render(ui: &SettingsUi, index: usize) {
+    show_pane(ui, index);
 }
 
 pub fn scroll_to_top_for_render(ui: &SettingsUi) {
@@ -665,7 +764,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     // ── Scroll area holding one document view per pane ──────────────────
     let scroll_y = CONTROL_FOOTER + HAIRLINE;
-    let scroll_h = header_y - scroll_y;
+    let scroll_h = PANE_VIEWPORT_H;
+    debug_assert_eq!(scroll_h, header_y - scroll_y);
     let scroll: Retained<NSScrollView> = unsafe {
         msg_send![
             NSScrollView::alloc(mtm),
@@ -853,22 +953,45 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
             loaded_corrections.len()
         ),
     );
-    let y = card_end(&card);
-    let mut card = card_begin(mtm, &dictionary, y, "Manage");
     hint_line(
         mtm,
         &mut card,
-        "Leave the first field blank to preserve an exact spelling. Use both fields to fix a mishearing.",
+        "Leave the first field blank to keep a spelling. Use both to fix a mishearing.",
     );
-    button_row(
+    let dictionary_card_y = card_end(&card);
+
+    // The terms themselves: one row per entry, what dictation hears on the
+    // left and what lands on the right. A row click loads it into the fields
+    // above; the trash chip drops it. Both rebuild the rows in place.
+    let mut card = card_begin(mtm, &dictionary, dictionary_card_y, "Your dictionary");
+    let dictionary_search = dictionary_search_row(mtm, &mut card, &controller);
+    let dictionary_body_y = card.y;
+    let dictionary_body = slate::SlateView::flipped(
         mtm,
-        &mut card,
-        "Open dictionary file",
-        &controller,
-        sel!(openCorrections:),
+        NSRect::new(
+            NSPoint::new(0.0, dictionary_body_y),
+            NSSize::new(CARD_W, 0.0),
+        ),
+        slate::Paint::None,
+        0.0,
     );
-    let _ = card_end(&card);
-    finish_pane(&dictionary, &card);
+    card.view.addSubview(&dictionary_body);
+    let dictionary_card = card.view.clone();
+    let dictionary_keys = fill_dictionary_body(
+        mtm,
+        &dictionary_body,
+        &controller,
+        &loaded_corrections,
+        "",
+    );
+    let dictionary_pane = dictionary.clone();
+    size_dictionary_list(
+        &dictionary,
+        &dictionary_card,
+        dictionary_card_y,
+        dictionary_body_y,
+        dictionary_body.frame().size.height,
+    );
 
     // ═══ Pane 2 — Translate ═════════════════════════════════════════════
     let translate = new_pane();
@@ -1131,6 +1254,14 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         dictionary_heard_field,
         dictionary_correct_field,
         dictionary_status,
+        dictionary_search,
+        dictionary_pane,
+        dictionary_card,
+        dictionary_body,
+        dictionary_card_y,
+        dictionary_body_y,
+        dictionary_keys: Mutex::new(dictionary_keys),
+        dictionary_editing: Mutex::new(None),
         pending_corrections: Mutex::new(loaded_corrections),
         original_correction_lines,
         translate_targets_field,
@@ -1533,6 +1664,402 @@ fn action_button_row(
         let _: () = msg_send![&*btn, setAccessibilityLabel: &*NSString::from_str(title)];
     }
     card.view.addSubview(&btn);
+}
+
+// ─── Dictionary list ─────────────────────────────────────────────────────
+//
+// The Dictionary pane shows the terms themselves: one row per entry, the heard
+// spelling on the left and what lands on the right. Rows are drawn into a
+// flipped body view inside the last card, and rebuilt in place whenever the
+// search text or the dictionary changes — so a row's `tag` is its index into
+// `dictionary_keys`, refreshed by the same pass that draws it.
+
+/// The list card's header row: a search glyph, a field that filters as you
+/// type, and the chip that opens the JSON file behind the list.
+fn dictionary_search_row(
+    mtm: MainThreadMarker,
+    card: &mut Card,
+    controller: &Retained<SettingsController>,
+) -> Retained<NSSearchField> {
+    let y = card_row(card, CONTROL_ROW);
+    let mid = y + CONTROL_ROW / 2.0;
+
+    let chip = slate::chip(
+        mtm,
+        "Open file",
+        Some("arrow.up.forward"),
+        CARD_W - CARD_PAD_X,
+        mid,
+    );
+    // A flipped card flips the chip's y, so re-centre it in card space.
+    let cf = chip.frame();
+    chip.setFrame(NSRect::new(
+        NSPoint::new(cf.origin.x, (mid - CONTROL_CHIP / 2.0).round()),
+        cf.size,
+    ));
+    card.view.addSubview(&chip);
+    let open_btn = slate::click_overlay(mtm, chip.frame(), controller, sel!(openCorrections:), 0);
+    unsafe {
+        let title = NSString::from_str("Open dictionary file");
+        let _: () = msg_send![&*open_btn, setToolTip: &*title];
+        let _: () = msg_send![&*open_btn, setAccessibilityLabel: &*title];
+    }
+    card.view.addSubview(&open_btn);
+
+    if let Some(img) = slate::template_symbol("magnifyingglass") {
+        let iv = NSImageView::new(mtm);
+        iv.setImage(Some(&img));
+        unsafe {
+            let _: () = msg_send![&*iv, setContentTintColor: &*theme::text_tertiary()];
+        }
+        iv.setFrame(NSRect::new(
+            NSPoint::new(CARD_PAD_X, (mid - slate::GLYPH / 2.0).round()),
+            NSSize::new(slate::GLYPH, slate::GLYPH),
+        ));
+        card.view.addSubview(&iv);
+    }
+
+    let field_x = CARD_PAD_X + slate::GLYPH + SPACE_XS;
+    let field_w = (chip.frame().origin.x - SPACE_SM - field_x).max(CARD_PAD_X);
+    let search: Retained<NSSearchField> = unsafe {
+        msg_send![
+            NSSearchField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(field_x, (mid - FIELD_TEXT_H / 2.0).round()),
+                NSSize::new(field_w, FIELD_TEXT_H),
+            )
+        ]
+    };
+    unsafe {
+        // Filter on every keystroke, not just on Return.
+        let _: () = msg_send![&*search, setSendsWholeSearchString: false];
+        let _: () = msg_send![&*search, setSendsSearchStringImmediately: true];
+        let ph = NSString::from_str("Search terms…");
+        let _: () = msg_send![&*search, setPlaceholderString: &*ph];
+        // The row draws its own glyph, so strip the cell's bezel and its
+        // built-in magnifier / cancel buttons.
+        search.setBezeled(false);
+        search.setDrawsBackground(false);
+        let _: () = msg_send![&*search, setFocusRingType: 1usize]; // None
+        search.setFont(Some(&slate::font(TYPE_META, WEIGHT_REGULAR)));
+        let _: () = msg_send![&*search, setTextColor: &*theme::text_primary()];
+        let cell: *mut AnyObject = msg_send![&*search, cell];
+        if !cell.is_null() {
+            let _: () = msg_send![cell, setSearchButtonCell: std::ptr::null_mut::<AnyObject>()];
+            let _: () = msg_send![cell, setCancelButtonCell: std::ptr::null_mut::<AnyObject>()];
+        }
+        let _: () = msg_send![&*search, setTarget: &**controller];
+        let _: () = msg_send![&*search, setAction: sel!(searchDictionary:)];
+    }
+    card.view.addSubview(&search);
+    search
+}
+
+/// Draw one row per entry into `body`, filtered by `filter`, then size `body`
+/// to what it drew. Returns the key behind each row, in row order.
+fn fill_dictionary_body(
+    mtm: MainThreadMarker,
+    body: &slate::SlateView,
+    controller: &Retained<SettingsController>,
+    corrections: &crate::corrections::Corrections,
+    filter: &str,
+) -> Vec<String> {
+    for view in body.subviews().iter() {
+        view.removeFromSuperview();
+    }
+    let needle = filter.trim().to_lowercase();
+    let matched = corrections.search(&needle);
+
+    let mut keys: Vec<String> = Vec::new();
+    let mut y = 0.0;
+    for (index, (key, value)) in matched.iter().take(TERM_ROW_CAP).enumerate() {
+        y = dictionary_row(mtm, body, controller, index, key, value, y);
+        keys.push(key.clone());
+    }
+
+    let note = if matched.is_empty() {
+        if needle.is_empty() {
+            "No terms yet. Add one above.".to_string()
+        } else {
+            format!("No term matches “{}”.", filter.trim())
+        }
+    } else if matched.len() > TERM_ROW_CAP {
+        format!(
+            "Showing {TERM_ROW_CAP} of {} matches. Search to narrow the list.",
+            matched.len()
+        )
+    } else if needle.is_empty() {
+        "Click a row to edit it. The trash chip removes it.".to_string()
+    } else {
+        format!("{} of {} terms match.", matched.len(), corrections.len())
+    };
+    y = dictionary_note(mtm, body, y, &note);
+
+    body.setFrameSize(NSSize::new(CARD_W, y));
+    keys
+}
+
+/// One term row: heard spelling, arrow, replacement, and a trash chip. The row
+/// click edits, the chip removes; both carry the row index as their tag.
+fn dictionary_row(
+    mtm: MainThreadMarker,
+    body: &slate::SlateView,
+    controller: &Retained<SettingsController>,
+    index: usize,
+    key: &str,
+    value: &str,
+    y: f64,
+) -> f64 {
+    let mut y = y;
+    if y > 0.0 {
+        let line = slate::SlateView::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(CARD_PAD_X, y),
+                NSSize::new(CARD_W - 2.0 * CARD_PAD_X, HAIRLINE),
+            ),
+            slate::Paint::Divider,
+            0.0,
+        );
+        body.addSubview(&line);
+        y += HAIRLINE;
+    }
+
+    let row_w = CARD_W - 2.0 * CARD_PAD_X + 2.0 * SPACE_XXS;
+    let row = slate::SlateView::flipped(
+        mtm,
+        NSRect::new(
+            NSPoint::new(CARD_PAD_X - SPACE_XXS, y),
+            NSSize::new(row_w, CONTROL_ROW),
+        ),
+        slate::Paint::Row,
+        RADIUS_SM,
+    );
+    row.enable_hover();
+    let mid = CONTROL_ROW / 2.0;
+
+    let trash = slate::chip(mtm, "", Some("trash"), row_w - SPACE_XXS, mid);
+    let tf = trash.frame();
+    trash.setFrame(NSRect::new(
+        NSPoint::new(tf.origin.x, (mid - CONTROL_CHIP / 2.0).round()),
+        tf.size,
+    ));
+    row.addSubview(&trash);
+
+    let x0 = SPACE_XXS;
+    let text_right = trash.frame().origin.x - SPACE_SM;
+    let avail = (text_right - x0).max(0.0);
+    if key.eq_ignore_ascii_case(value) {
+        // An identity entry: the spelling is kept, nothing is replaced.
+        let word = clamped_label(
+            mtm,
+            value,
+            TYPE_LABEL,
+            WEIGHT_MEDIUM,
+            theme::text_primary(),
+            x0,
+            mid,
+            avail,
+        );
+        let used = word.frame().size.width;
+        row.addSubview(&word);
+        let note = clamped_label(
+            mtm,
+            "kept as spelled",
+            TYPE_META,
+            WEIGHT_REGULAR,
+            theme::text_tertiary(),
+            x0 + used + SPACE_XS,
+            mid,
+            (avail - used - SPACE_XS).max(0.0),
+        );
+        row.addSubview(&note);
+    } else {
+        let heard_w = (avail * TERM_HEARD_FRACTION).round();
+        let heard = clamped_label(
+            mtm,
+            key,
+            TYPE_LABEL,
+            WEIGHT_REGULAR,
+            theme::text_secondary(),
+            x0,
+            mid,
+            heard_w,
+        );
+        row.addSubview(&heard);
+        let arrow = clamped_label(
+            mtm,
+            "→",
+            TYPE_META,
+            WEIGHT_REGULAR,
+            theme::text_tertiary(),
+            x0 + heard_w + SPACE_XS,
+            mid,
+            avail,
+        );
+        let arrow_w = arrow.frame().size.width;
+        row.addSubview(&arrow);
+        let value_x = x0 + heard_w + SPACE_XS + arrow_w + SPACE_XS;
+        let replacement = clamped_label(
+            mtm,
+            value,
+            TYPE_LABEL,
+            WEIGHT_MEDIUM,
+            theme::text_primary(),
+            value_x,
+            mid,
+            (text_right - value_x).max(0.0),
+        );
+        row.addSubview(&replacement);
+    }
+
+    // The row click edits. The trash overlay goes on last, so it wins the hit
+    // test over the row beneath it.
+    let edit = slate::click_overlay(
+        mtm,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(row_w, CONTROL_ROW)),
+        controller,
+        sel!(editDictionaryEntry:),
+        index as isize,
+    );
+    unsafe {
+        let title = NSString::from_str(&format!("Edit {value}"));
+        let _: () = msg_send![&*edit, setToolTip: &*title];
+        let _: () = msg_send![&*edit, setAccessibilityLabel: &*title];
+    }
+    row.addSubview(&edit);
+    let remove = slate::click_overlay(
+        mtm,
+        trash.frame(),
+        controller,
+        sel!(removeDictionaryEntry:),
+        index as isize,
+    );
+    unsafe {
+        let title = NSString::from_str(&format!("Remove {value}"));
+        let _: () = msg_send![&*remove, setToolTip: &*title];
+        let _: () = msg_send![&*remove, setAccessibilityLabel: &*title];
+    }
+    row.addSubview(&remove);
+
+    body.addSubview(&row);
+    y + CONTROL_ROW
+}
+
+/// The `caption` line under the rows: the count, the empty state, or the cap.
+fn dictionary_note(mtm: MainThreadMarker, body: &slate::SlateView, y: f64, text: &str) -> f64 {
+    let mut y = y;
+    if y > 0.0 {
+        let line = slate::SlateView::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(CARD_PAD_X, y),
+                NSSize::new(CARD_W - 2.0 * CARD_PAD_X, HAIRLINE),
+            ),
+            slate::Paint::Divider,
+            0.0,
+        );
+        body.addSubview(&line);
+        y += HAIRLINE;
+    }
+    let l = slate::label(
+        mtm,
+        text,
+        TYPE_CAPTION,
+        WEIGHT_REGULAR,
+        theme::text_tertiary(),
+    );
+    l.setFrame(NSRect::new(
+        NSPoint::new(
+            CARD_PAD_X,
+            (y + (HINT_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round(),
+        ),
+        NSSize::new(CARD_W - 2.0 * CARD_PAD_X, TYPE_CAPTION + SPACE_XXS),
+    ));
+    body.addSubview(&l);
+    y + HINT_H
+}
+
+/// A label sized to its text but never wider than `max_w` (it truncates), left
+/// edge at `x`, centred on `mid_y` inside a flipped parent.
+fn clamped_label(
+    mtm: MainThreadMarker,
+    text: &str,
+    size: f64,
+    weight: f64,
+    color: objc2::rc::Retained<objc2_app_kit::NSColor>,
+    x: f64,
+    mid_y: f64,
+    max_w: f64,
+) -> Retained<NSTextField> {
+    let l = slate::label(mtm, text, size, weight, color);
+    l.sizeToFit();
+    let f = l.frame();
+    l.setFrame(NSRect::new(
+        NSPoint::new(x, (mid_y - f.size.height / 2.0).round()),
+        NSSize::new(f.size.width.min(max_w), f.size.height),
+    ));
+    l
+}
+
+/// Size the list card to its body, and the pane to the card. The list is the
+/// pane's last card, so growing it moves nothing else.
+fn size_dictionary_list(
+    pane: &SettingsFlippedView,
+    card: &slate::SlateView,
+    card_y: f64,
+    body_y: f64,
+    body_h: f64,
+) {
+    let card_h = body_y + body_h + CARD_PAD_Y;
+    card.setFrameSize(NSSize::new(CARD_W, card_h));
+    let pane_h = (card_y + card_h + SPACE_LG).max(PANE_VIEWPORT_H);
+    pane.setFrameSize(NSSize::new(PANE_W, pane_h));
+}
+
+/// Redraw the term list from `pending_corrections` and the search field.
+fn refresh_dictionary_list(ui: &SettingsUi) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let filter = ui.dictionary_search.stringValue().to_string();
+    let keys = {
+        let corrections = ui.pending_corrections.lock().unwrap();
+        fill_dictionary_body(
+            mtm,
+            &ui.dictionary_body,
+            &ui._controller,
+            &corrections,
+            &filter,
+        )
+    };
+    *ui.dictionary_keys.lock().unwrap() = keys;
+    size_dictionary_list(
+        &ui.dictionary_pane,
+        &ui.dictionary_card,
+        ui.dictionary_card_y,
+        ui.dictionary_body_y,
+        ui.dictionary_body.frame().size.height,
+    );
+    ui.dictionary_card.setNeedsDisplay(true);
+}
+
+/// The `(key, replacement)` a row's tag addresses, or `None` if the list moved
+/// under the click.
+fn dictionary_entry_at(ui: &SettingsUi, tag: isize) -> Option<(String, String)> {
+    if tag < 0 {
+        return None;
+    }
+    let key = ui.dictionary_keys.lock().unwrap().get(tag as usize).cloned()?;
+    let value = ui
+        .pending_corrections
+        .lock()
+        .unwrap()
+        .entries()
+        .into_iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, v)| v)?;
+    Some((key, value))
 }
 
 /// A full-width `caption` line inside a card: hints, env-var locks, and the

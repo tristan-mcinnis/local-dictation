@@ -126,6 +126,33 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             )?);
         }
         crate::settings_window::scroll_to_top_for_render(&settings);
+
+        // The Dictionary pane carries the term list, so prove that pane too.
+        crate::settings_window::show_pane_for_render(&settings, 1);
+        if let Some(content) = settings.window.contentView() {
+            written.push(snapshot(
+                mtm,
+                &content,
+                out_dir,
+                &format!("settings-dictionary-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+        // …and its tail, where the note line under the rows lives.
+        crate::settings_window::scroll_to_bottom_for_render(&settings);
+        if let Some(content) = settings.window.contentView() {
+            written.push(snapshot(
+                mtm,
+                &content,
+                out_dir,
+                &format!("settings-dictionary-end-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+        crate::settings_window::scroll_to_top_for_render(&settings);
+        crate::settings_window::show_pane_for_render(&settings, 0);
     }
 
     slate::set_opaque_materials(false);
