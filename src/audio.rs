@@ -1415,3 +1415,132 @@ pub fn recording_tail(
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// ASR request length cap
+// ---------------------------------------------------------------------------
+
+/// The most audio Cohere Transcribe Q4 decodes faithfully in one request.
+///
+/// Measured 2026-09-09 against the shipped helper with a 177 s script of forty
+/// numbered markers (`docs/truncation-diagnosis-20260909.md`): every marker
+/// survives up to 40 s; at 50 s the model starts silently dropping whole
+/// sentences from the middle; by 100 s only nine of twenty markers remain and
+/// the word count saturates near 140 no matter how long the audio runs. There
+/// is no error and no truncation marker — the transcript simply comes back
+/// short and plausible, which is the worst possible failure for dictation.
+///
+/// `max_tokens` is not the limit (256, 1024 and 4096 return identical text),
+/// and mlx-audio's own chunking is disabled by `chunkDuration: 1200` in the
+/// Swift bridge. So the cap has to be enforced here, on the Rust side, as a
+/// floor that holds even when the VAD fails to segment a long hold.
+///
+/// 30 s keeps a safety margin under the measured 40 s cliff. Chunking is also
+/// *faster* than one long request (3.9 s vs 4.7 s over the same 177 s).
+pub const ASR_MAX_CHUNK_SECS: f32 = 30.0;
+
+/// Fraction of a chunk that is eligible as a cut point. The split search scans
+/// the last 40% of each chunk (18 s–30 s at the default cap) for the quietest
+/// frame, so a cut lands in a pause rather than mid-word whenever the speaker
+/// draws breath at all.
+const ASR_SPLIT_SEARCH_FRAC: f32 = 0.40;
+
+/// Frame length used by the split search, in milliseconds.
+const ASR_SPLIT_FRAME_MS: f32 = 20.0;
+
+/// Split `audio` into chunks no longer than `max_secs`, cutting at the quietest
+/// frame near the end of each chunk so the boundary falls in a pause.
+///
+/// Audio at or under the cap comes back as a single whole-buffer range, so the
+/// common short dictation is untouched (same bytes, same ASR request, no cost).
+/// Ranges are inclusive-start / exclusive-end and always cover the whole buffer
+/// with no gaps and no overlap: every sample is transcribed exactly once.
+pub fn split_for_asr(audio: &[f32], sr: u32, max_secs: f32) -> Vec<(usize, usize)> {
+    let max_len = (max_secs.max(1.0) * sr as f32) as usize;
+    if audio.is_empty() {
+        return vec![(0, 0)];
+    }
+    if audio.len() <= max_len {
+        return vec![(0, audio.len())];
+    }
+    let frame_len = ((ASR_SPLIT_FRAME_MS / 1000.0) * sr as f32).max(1.0) as usize;
+    let search_len = ((max_len as f32) * ASR_SPLIT_SEARCH_FRAC) as usize;
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while audio.len() - start > max_len {
+        let hard_end = start + max_len;
+        let search_start = hard_end.saturating_sub(search_len).max(start + frame_len);
+        // Quietest frame in the eligible window becomes the cut point. Ties take
+        // the earliest frame, which keeps chunks a touch shorter rather than
+        // risking the hard cap.
+        let quietest = frame_rms(&audio[search_start..hard_end], frame_len)
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        // Cut at the middle of the quietest frame, never before `start`.
+        let cut = (search_start + quietest * frame_len + frame_len / 2).min(hard_end);
+        let cut = cut.max(start + frame_len).min(hard_end);
+        out.push((start, cut));
+        start = cut;
+    }
+    if start < audio.len() {
+        out.push((start, audio.len()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod asr_split_tests {
+    use super::*;
+
+    #[test]
+    fn short_audio_is_one_whole_range() {
+        let audio = vec![0.5_f32; SAMPLE_RATE as usize * 5];
+        assert_eq!(split_for_asr(&audio, SAMPLE_RATE, 30.0), vec![(0, audio.len())]);
+    }
+
+    #[test]
+    fn empty_audio_yields_one_empty_range() {
+        assert_eq!(split_for_asr(&[], SAMPLE_RATE, 30.0), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn long_audio_is_split_under_the_cap_with_full_coverage() {
+        let sr = SAMPLE_RATE;
+        let audio = vec![0.5_f32; sr as usize * 100];
+        let segs = split_for_asr(&audio, sr, 30.0);
+        assert!(segs.len() >= 4, "100 s at a 30 s cap needs ≥4 chunks: {segs:?}");
+        let max_len = (30.0 * sr as f32) as usize;
+        for &(s, e) in &segs {
+            assert!(e > s, "empty range in {segs:?}");
+            assert!(e - s <= max_len, "chunk over the cap in {segs:?}");
+        }
+        // Gapless, non-overlapping, complete coverage.
+        assert_eq!(segs[0].0, 0);
+        assert_eq!(segs.last().unwrap().1, audio.len());
+        for w in segs.windows(2) {
+            assert_eq!(w[0].1, w[1].0, "gap or overlap in {segs:?}");
+        }
+    }
+
+    #[test]
+    fn cut_lands_in_the_quiet_gap() {
+        let sr = SAMPLE_RATE;
+        let mut audio = vec![0.5_f32; sr as usize * 40];
+        // A 400 ms silence at 25 s, inside the 18–30 s search window.
+        let gap_start = sr as usize * 25;
+        let gap_end = gap_start + sr as usize * 4 / 10;
+        for s in &mut audio[gap_start..gap_end] {
+            *s = 0.0;
+        }
+        let segs = split_for_asr(&audio, sr, 30.0);
+        let cut = segs[0].1;
+        assert!(
+            cut >= gap_start && cut <= gap_end,
+            "cut {cut} outside the silence {gap_start}..{gap_end}"
+        );
+    }
+}

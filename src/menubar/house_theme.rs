@@ -1,4 +1,4 @@
-// GENERATED from design-system/tokens.json fe2b0cd6e404; do not edit
+// GENERATED from design-system/tokens.json 85ead24dee81; do not edit
 // Source of truth: the design-system repo (DESIGN.md + tokens.json).
 // Regenerate with `make rust` there; `make check` verifies this copy.
 #![allow(dead_code)]
@@ -264,5 +264,5 @@ pub const LAYOUT_PANEL_WIDTH: f64 = 720.0;
 pub const LAYOUT_ANSWER_PANEL_WIDTH: f64 = 800.0;
 pub const LAYOUT_ANSWER_MAX_WIDTH: f64 = 620.0;
 pub const LAYOUT_SETTINGS_RAIL: f64 = 220.0;
-pub const LAYOUT_SETTINGS_WIDTH: f64 = 760.0;
-pub const LAYOUT_SETTINGS_HEIGHT: f64 = 540.0;
+pub const LAYOUT_SETTINGS_WIDTH: f64 = 860.0;
+pub const LAYOUT_SETTINGS_HEIGHT: f64 = 620.0;

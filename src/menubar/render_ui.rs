@@ -182,6 +182,36 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             )?);
         }
         crate::settings_window::scroll_to_top_for_render(&settings);
+
+        // The copy confirmation: the clicked row takes the selection paint and
+        // its "Copied" chip appears. Proved because a confirmation nobody sees
+        // is the bug this replaced.
+        crate::settings_window::flash_history_for_render(&settings, 1);
+        if let Some(content) = settings.window.contentView() {
+            written.push(snapshot(
+                mtm,
+                &content,
+                out_dir,
+                &format!("settings-history-copied-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+
+        // The sidebar shelf closed: the rail is off-screen and the pane keeps
+        // its geometry against the narrowed window.
+        crate::settings_window::set_sidebar_for_render(&settings, false);
+        if let Some(content) = settings.window.contentView() {
+            written.push(snapshot(
+                mtm,
+                &content,
+                out_dir,
+                &format!("settings-shelf-closed-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+        crate::settings_window::set_sidebar_for_render(&settings, true);
         crate::settings_window::show_pane_for_render(&settings, 0);
     }
 

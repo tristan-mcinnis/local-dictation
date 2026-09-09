@@ -72,6 +72,10 @@ const CARD_PAD_Y: f64 = 4.0;
 const CARD_LABEL_H: f64 = 28.0;
 /// Widest a popup chip may grow before its title truncates.
 const POPUP_MAX_W: f64 = 220.0;
+/// The shelf toggle's two glyphs: the standard macOS sidebar pair, so the
+/// control reads the same here as in Finder or Mail.
+const SIDEBAR_GLYPH_OPEN: &str = "sidebar.left";
+const SIDEBAR_GLYPH_CLOSED: &str = "sidebar.leading";
 /// The pane viewport: what is left of the window once the titlebar, the pane
 /// heading and the footer well have taken their bands. A pane document view is
 /// never shorter than this, so a short pane still fills the scroll view.
@@ -139,6 +143,16 @@ const PANES: &[(&str, &str, &str)] = &[
 #[allow(dead_code)]
 pub struct SettingsUi {
     pub(crate) window: Retained<NSWindow>,
+    /// The fixed 760-wide layout. Slides left by `RAIL_W` when the shelf closes.
+    panel: Retained<slate::SlateView>,
+    /// The toggle in the titlebar band, and the click target over it. Both are
+    /// re-placed when the window width changes.
+    sidebar_btn: Retained<slate::SlateView>,
+    sidebar_click: Retained<objc2_app_kit::NSButton>,
+    /// Shelf state. Open on every launch; not persisted, because a settings
+    /// window that opens missing its navigation is a worse default than one
+    /// extra click.
+    sidebar_open: Mutex<bool>,
     _scroll: Retained<NSScrollView>,
     /// One flipped document view per rail section; the scroll view swaps
     /// between them so a pane change is one assignment, not a rebuild.
@@ -213,6 +227,14 @@ pub struct SettingsUi {
     history_ids: Mutex<Vec<i64>>,
     /// Row index → full text, so a click copies the untruncated dictation.
     history_texts: Mutex<Vec<String>>,
+    /// Row index → the row view and its hidden "Copied" chip. A copy flashes
+    /// the row it landed on, so the confirmation is where the eye already is.
+    history_rows: Mutex<Vec<Retained<slate::SlateView>>>,
+    history_pills: Mutex<Vec<Retained<slate::SlateView>>>,
+    history_trashes: Mutex<Vec<Retained<slate::SlateView>>>,
+    /// The row currently flashing, so the next copy (or the timer) can clear it
+    /// without walking the whole list.
+    history_flashed: Mutex<Option<usize>>,
     /// In-memory edits, not yet written. Updated by every control action;
     /// flushed by `Apply & Restart`.
     pending: Mutex<Settings>,
@@ -457,6 +479,39 @@ define_class!(
             }
             menubar::copy_to_clipboard(&text);
             set_history_status(ui, &format!("Copied “{}”.", history_preview(&text)));
+            flash_history_row(ui, tag as usize);
+            // Cancel any un-flash already in flight, so a second copy restarts
+            // the full window rather than inheriting the first one's remainder.
+            unsafe {
+                let obj: &AnyObject = &*(self as *const Self as *const AnyObject);
+                let _: () = msg_send![
+                    objc2::class!(NSObject),
+                    cancelPreviousPerformRequestsWithTarget: obj,
+                    selector: sel!(clearHistoryFlash:),
+                    object: std::ptr::null::<AnyObject>(),
+                ];
+                let _: () = msg_send![
+                    self,
+                    performSelector: sel!(clearHistoryFlash:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    afterDelay: HISTORY_COPIED_FLASH_S,
+                ];
+            }
+        }
+
+        #[unsafe(method(toggleSidebar:))]
+        fn toggle_sidebar(&self, _sender: *mut AnyObject) {
+            if let Some(ui) = SETTINGS_UI.get() {
+                set_sidebar_open(ui, !*ui.sidebar_open.lock().unwrap());
+            }
+        }
+
+        /// Fired by `performSelector:afterDelay:` to end a copy flash.
+        #[unsafe(method(clearHistoryFlash:))]
+        fn clear_history_flash_action(&self, _sender: *mut AnyObject) {
+            if let Some(ui) = SETTINGS_UI.get() {
+                clear_history_flash(ui);
+            }
         }
 
         #[unsafe(method(copyAllHistory:))]
@@ -648,7 +703,7 @@ pub fn seed_history_for_render(ui: &SettingsUi, entries: &[crate::history::Entry
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let (ids, texts) = fill_history_body(
+    let list = fill_history_body(
         mtm,
         &ui.history_body,
         &ui._controller,
@@ -656,8 +711,7 @@ pub fn seed_history_for_render(ui: &SettingsUi, entries: &[crate::history::Entry
         entries.len(),
         "",
     );
-    *ui.history_ids.lock().unwrap() = ids;
-    *ui.history_texts.lock().unwrap() = texts;
+    adopt_history_list(ui, list);
     size_list_card(
         &ui.history_pane,
         &ui.history_card,
@@ -667,6 +721,17 @@ pub fn seed_history_for_render(ui: &SettingsUi, entries: &[crate::history::Entry
     );
     ui.history_status
         .setStringValue(&NSString::from_str(&history_count_line(entries.len())));
+}
+
+/// Light row `idx` of the History list as a copy would, so the render proof
+/// shows the confirmation state and not just the resting one.
+pub fn flash_history_for_render(ui: &SettingsUi, idx: usize) {
+    flash_history_row(ui, idx);
+}
+
+/// Open or close the sidebar shelf for a render proof.
+pub fn set_sidebar_for_render(ui: &SettingsUi, open: bool) {
+    set_sidebar_open(ui, open);
 }
 
 pub fn scroll_to_top_for_render(ui: &SettingsUi) {
@@ -1177,7 +1242,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     card.view.addSubview(&history_body);
     let history_card = card.view.clone();
     let (initial_history, initial_history_total) = history_query("");
-    let (history_ids, history_texts) = fill_history_body(
+    let initial_history_list = fill_history_body(
         mtm,
         &history_body,
         &controller,
@@ -1435,12 +1500,48 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     ];
     scroll.setDocumentView(Some(&*panes[0]));
 
-    window.setContentView(Some(&*panel));
+    // ── Sidebar shelf ───────────────────────────────────────────────────
+    // The whole 760-wide layout lives in `panel`, which sits inside a `shell`
+    // that is the content view. Closing the shelf slides `panel` left by
+    // exactly the rail width and narrows the window by the same amount, so the
+    // pane keeps its geometry — no relayout, no reflow, and the rail is simply
+    // off-screen. Opening reverses it. Open is the default on every launch.
+    let shell = slate::SlateView::new(mtm, frame, slate::Paint::Surface, 0.0);
+    shell.addSubview(&panel);
+    let sidebar_btn = slate::chip(
+        mtm,
+        "",
+        Some(SIDEBAR_GLYPH_OPEN),
+        WIN_W - SPACE_SM,
+        WIN_H - TITLEBAR_H / 2.0 - SPACE_XXS,
+    );
+    shell.addSubview(&sidebar_btn);
+    let sidebar_click = slate::click_overlay(
+        mtm,
+        sidebar_btn.frame(),
+        &controller,
+        sel!(toggleSidebar:),
+        0,
+    );
+    unsafe {
+        let title = NSString::from_str("Hide the sidebar");
+        let _: () = msg_send![&*sidebar_click, setToolTip: &*title];
+        let _: () = msg_send![&*sidebar_click, setAccessibilityLabel: &*title];
+        let _: () = msg_send![&*sidebar_click, setKeyEquivalent: &*NSString::from_str("s")];
+        let _: () = msg_send![&*sidebar_click, setKeyEquivalentModifierMask: 1_u64 << 20 | 1_u64 << 19];
+    }
+    shell.addSubview(&sidebar_click);
+
+    window.setContentView(Some(&*shell));
     slate::apply_panel_chrome(&window);
     window.center();
 
     SettingsUi {
         window,
+        panel,
+        sidebar_btn,
+        sidebar_click,
+        sidebar_open: Mutex::new(true),
         _scroll: scroll,
         panes,
         rail_rows,
@@ -1483,8 +1584,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         history_body,
         history_card_y,
         history_body_y,
-        history_ids: Mutex::new(history_ids),
-        history_texts: Mutex::new(history_texts),
+        history_ids: Mutex::new(initial_history_list.ids),
+        history_texts: Mutex::new(initial_history_list.texts),
+        history_rows: Mutex::new(initial_history_list.rows),
+        history_pills: Mutex::new(initial_history_list.pills),
+        history_trashes: Mutex::new(initial_history_list.trashes),
+        history_flashed: Mutex::new(None),
         pending: Mutex::new(loaded.clone()),
         original: loaded,
         _controller: controller,
@@ -2414,7 +2519,7 @@ fn fill_history_body(
     matched: &[crate::history::Entry],
     total: usize,
     filter: &str,
-) -> (Vec<i64>, Vec<String>) {
+) -> HistoryList {
     for view in body.subviews().iter() {
         view.removeFromSuperview();
     }
@@ -2424,6 +2529,9 @@ fn fill_history_body(
 
     let mut ids: Vec<i64> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
+    let mut rows: Vec<Retained<slate::SlateView>> = Vec::new();
+    let mut pills: Vec<Retained<slate::SlateView>> = Vec::new();
+    let mut trashes: Vec<Retained<slate::SlateView>> = Vec::new();
     let mut y = 0.0;
     // One day-grouping implementation, shared with the launcher's history
     // panel, so both surfaces read the same dates in the same locale.
@@ -2433,9 +2541,14 @@ fn fill_history_body(
                 y = history_day_header(mtm, body, y, &day);
             }
             menubar::HistoryRow::Item { time, text, index } => {
-                y = history_row(mtm, body, controller, index, &time, &text, y);
+                let (next_y, row_view, copied_pill, trash_chip) =
+                    history_row(mtm, body, controller, index, &time, &text, y);
+                y = next_y;
                 ids.push(shown[index].id);
                 texts.push(shown[index].text.clone());
+                rows.push(row_view);
+                pills.push(copied_pill);
+                trashes.push(trash_chip);
             }
         }
     }
@@ -2457,7 +2570,24 @@ fn fill_history_body(
     y = list_note(mtm, body, y, &note);
 
     body.setFrameSize(NSSize::new(CARD_W, y));
-    (ids, texts)
+    HistoryList {
+        ids,
+        texts,
+        rows,
+        pills,
+        trashes,
+    }
+}
+
+/// What one history-list rebuild produced: the store id and full text behind
+/// each row (so a click addresses the right entry), plus the row view and its
+/// hidden "Copied" chip (so a copy can flash the row it landed on).
+struct HistoryList {
+    ids: Vec<i64>,
+    texts: Vec<String>,
+    rows: Vec<Retained<slate::SlateView>>,
+    pills: Vec<Retained<slate::SlateView>>,
+    trashes: Vec<Retained<slate::SlateView>>,
 }
 
 /// A day band: the date in the uppercase `section` style, the same label the
@@ -2496,6 +2626,7 @@ fn history_day_header(
 /// One dictation row: the time in a fixed column, the text beside it, and a
 /// trash chip. The row click copies, the chip deletes; both carry the row index
 /// as their tag.
+#[allow(clippy::too_many_arguments)]
 fn history_row(
     mtm: MainThreadMarker,
     body: &slate::SlateView,
@@ -2504,7 +2635,12 @@ fn history_row(
     time: &str,
     text: &str,
     y: f64,
-) -> f64 {
+) -> (
+    f64,
+    Retained<slate::SlateView>,
+    Retained<slate::SlateView>,
+    Retained<slate::SlateView>,
+) {
     let row_w = CARD_W - 2.0 * CARD_PAD_X + 2.0 * SPACE_XXS;
     let row = slate::SlateView::flipped(
         mtm,
@@ -2554,6 +2690,20 @@ fn history_row(
     );
     row.addSubview(&said);
 
+    // Copy confirmation. A status line under the retention row is easy to miss
+    // when the eye is on the row that was just clicked, so the row itself says
+    // it: for [`HISTORY_COPIED_FLASH_S`] the row takes the selection paint and
+    // a checkmark chip stands exactly where the trash chip was, which is the
+    // one spot on the row that is already reserved. Same frame, so it can
+    // never crowd the text; the trash hides underneath it for the flash, so a
+    // confirmation is never something you can click to delete by mistake.
+    // Built hidden on every row: the flash is a visibility toggle, not a
+    // rebuild.
+    let copied = slate::chip(mtm, "", Some("checkmark"), row_w - SPACE_XXS, mid);
+    copied.setFrame(trash.frame());
+    copied.setHidden(true);
+    row.addSubview(&copied);
+
     // The row click copies. The trash overlay goes on last, so it wins the hit
     // test over the row beneath it.
     let copy = slate::click_overlay(
@@ -2584,7 +2734,7 @@ fn history_row(
     row.addSubview(&remove);
 
     body.addSubview(&row);
-    y + CONTROL_ROW
+    (y + CONTROL_ROW, row, copied, trash)
 }
 
 /// Re-query the store through the search field and redraw the list.
@@ -2594,7 +2744,7 @@ fn refresh_history_list(ui: &SettingsUi) {
     };
     let filter = ui.history_search.stringValue().to_string();
     let (matched, total) = history_query(&filter);
-    let (ids, texts) = fill_history_body(
+    let list = fill_history_body(
         mtm,
         &ui.history_body,
         &ui._controller,
@@ -2602,8 +2752,7 @@ fn refresh_history_list(ui: &SettingsUi) {
         total,
         &filter,
     );
-    *ui.history_ids.lock().unwrap() = ids;
-    *ui.history_texts.lock().unwrap() = texts;
+    adopt_history_list(ui, list);
     size_list_card(
         &ui.history_pane,
         &ui.history_card,
@@ -2612,6 +2761,108 @@ fn refresh_history_list(ui: &SettingsUi) {
         ui.history_body.frame().size.height,
     );
     ui.history_card.setNeedsDisplay(true);
+}
+
+/// Open or close the sidebar shelf.
+///
+/// The pane never moves relative to the panel: the panel slides by `RAIL_W`
+/// and the window narrows by the same amount, so the rail leaves the visible
+/// area intact rather than reflowing every card. The window's top-left corner
+/// is held, which is what an Apple sidebar toggle looks like from the user's
+/// side even though the mechanism differs.
+fn set_sidebar_open(ui: &SettingsUi, open: bool) {
+    let width = if open { WIN_W } else { PANE_W };
+    ui.panel
+        .setFrameOrigin(NSPoint::new(if open { 0.0 } else { -RAIL_W }, 0.0));
+
+    let frame = ui.window.frame();
+    let content = ui.window.contentRectForFrameRect(frame);
+    let chrome_h = frame.size.height - content.size.height;
+    // Hold the top-left corner: only the right edge moves.
+    let new_frame = NSRect::new(
+        NSPoint::new(frame.origin.x, frame.origin.y + frame.size.height - (WIN_H + chrome_h)),
+        NSSize::new(width, WIN_H + chrome_h),
+    );
+    ui.window.setFrame_display_animate(new_frame, true, true);
+
+    // Re-place the toggle against the new right edge, and re-point its glyph.
+    let btn = ui.sidebar_btn.frame();
+    let x = width - SPACE_SM - btn.size.width;
+    ui.sidebar_btn
+        .setFrameOrigin(NSPoint::new(x, btn.origin.y));
+    ui.sidebar_click
+        .setFrameOrigin(NSPoint::new(x, btn.origin.y));
+    let glyph = if open {
+        SIDEBAR_GLYPH_OPEN
+    } else {
+        SIDEBAR_GLYPH_CLOSED
+    };
+    if let Some(img) = slate::template_symbol(glyph) {
+        for sub in ui.sidebar_btn.subviews().iter() {
+            if let Ok(iv) = sub.downcast::<NSImageView>() {
+                iv.setImage(Some(&img));
+            }
+        }
+    }
+    unsafe {
+        let title = NSString::from_str(if open {
+            "Hide the sidebar"
+        } else {
+            "Show the sidebar"
+        });
+        let _: () = msg_send![&*ui.sidebar_click, setToolTip: &*title];
+        let _: () = msg_send![&*ui.sidebar_click, setAccessibilityLabel: &*title];
+    }
+    *ui.sidebar_open.lock().unwrap() = open;
+}
+
+/// Take a fresh list rebuild into the UI state. Any flash belongs to rows that
+/// no longer exist, so it is dropped rather than reapplied to whatever moved
+/// into that index.
+fn adopt_history_list(ui: &SettingsUi, list: HistoryList) {
+    clear_history_flash(ui);
+    *ui.history_ids.lock().unwrap() = list.ids;
+    *ui.history_texts.lock().unwrap() = list.texts;
+    *ui.history_rows.lock().unwrap() = list.rows;
+    *ui.history_pills.lock().unwrap() = list.pills;
+    *ui.history_trashes.lock().unwrap() = list.trashes;
+}
+
+/// How long a copied row stays lit. Long enough to register after the eye
+/// leaves the pointer, short enough that it never reads as selection.
+const HISTORY_COPIED_FLASH_S: f64 = 1.1;
+
+/// Light the row a copy landed on: selection paint plus its "Copied" chip.
+/// Replaces any previous flash, so a fast run of copies lights one row at a
+/// time rather than leaving a trail.
+fn flash_history_row(ui: &SettingsUi, idx: usize) {
+    clear_history_flash(ui);
+    if let Some(row) = ui.history_rows.lock().unwrap().get(idx) {
+        row.set_selected(true);
+    }
+    if let Some(trash) = ui.history_trashes.lock().unwrap().get(idx) {
+        trash.setHidden(true);
+    }
+    if let Some(pill) = ui.history_pills.lock().unwrap().get(idx) {
+        pill.setHidden(false);
+    }
+    *ui.history_flashed.lock().unwrap() = Some(idx);
+}
+
+/// Put the flashed row back to rest. Safe to call when nothing is lit.
+fn clear_history_flash(ui: &SettingsUi) {
+    let Some(idx) = ui.history_flashed.lock().unwrap().take() else {
+        return;
+    };
+    if let Some(row) = ui.history_rows.lock().unwrap().get(idx) {
+        row.set_selected(false);
+    }
+    if let Some(pill) = ui.history_pills.lock().unwrap().get(idx) {
+        pill.setHidden(true);
+    }
+    if let Some(trash) = ui.history_trashes.lock().unwrap().get(idx) {
+        trash.setHidden(false);
+    }
 }
 
 /// Set the status line under the retention row, then re-state the stored count

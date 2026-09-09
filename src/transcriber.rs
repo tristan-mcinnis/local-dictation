@@ -88,17 +88,51 @@ impl LocalInferenceWorker {
         self.transcribe_pcm(&audio_buffer)
     }
 
+    /// Transcribe a mono 16 kHz buffer.
+    ///
+    /// Audio longer than [`crate::audio::ASR_MAX_CHUNK_SECS`] is split at its
+    /// quietest points and sent as several requests, because the model silently
+    /// drops speech from a longer one (see `split_for_asr`). This is the single
+    /// funnel every ASR path goes through — streamed segments, the final
+    /// segment, the whole-buffer fallback, the CLI and the wake-word listener —
+    /// so the cap holds even when VAD segmentation fails to split a long hold.
     pub fn transcribe_pcm(&mut self, audio: &[f32]) -> eyre::Result<String> {
         if audio.is_empty() {
             return Ok(String::new());
         }
+        // Normalise once over the whole utterance so every chunk carries the
+        // same gain; splitting first would let the ASR hear a level step.
         let mut buffer = audio.to_vec();
         if !normalize_disabled() {
             crate::audio::normalize_for_asr(&mut buffer);
         }
+        let chunks =
+            crate::audio::split_for_asr(&buffer, SAMPLE_RATE, crate::audio::ASR_MAX_CHUNK_SECS);
+        if chunks.len() > 1 {
+            eprintln!(
+                "  ✂    {:.1}s audio · split into {} ASR requests (cap {:.0}s)",
+                buffer.len() as f32 / SAMPLE_RATE as f32,
+                chunks.len(),
+                crate::audio::ASR_MAX_CHUNK_SECS
+            );
+        }
+        let mut parts: Vec<String> = Vec::with_capacity(chunks.len());
+        for (start, end) in chunks {
+            let text = self.transcribe_one(&buffer[start..end])?;
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+        Ok(parts.join(" "))
+    }
+
+    /// One ASR request. Callers must respect the length cap; go through
+    /// [`Self::transcribe_pcm`].
+    fn transcribe_one(&mut self, buffer: &[f32]) -> eyre::Result<String> {
         match &mut self.backend {
             #[cfg(feature = "cohere-mlx")]
-            Backend::Cohere(worker) => worker.transcribe(&buffer),
+            Backend::Cohere(worker) => worker.transcribe(buffer),
             Backend::Mock => Ok(format!(
                 "<mock transcript of {} samples @ {} Hz>",
                 buffer.len(),
