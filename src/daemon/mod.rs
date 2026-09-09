@@ -315,7 +315,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     // Only a physical key controls the session. A FlagsChanged
                     // posted by another process (AppleScript, an automation
                     // tool, a remote's companion app) carries that process's
-                    // PID here; hardware and Karabiner's virtual HID carry 0.
+                    // PID here; a physical keyboard carries 0.
                     // Without this guard, any app posting Right Option ends a
                     // hands-free session and pastes the transcript wherever
                     // focus is.
