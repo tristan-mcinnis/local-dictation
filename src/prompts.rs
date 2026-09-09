@@ -23,14 +23,33 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Default cleanup prompt: strip disfluencies, fix punctuation, expand
-/// colloquial contractions, preserve domain casing, never paraphrase. Lives
-/// here (not in `cleaner.rs`) so all prompt text is in one place.
+/// Default cleanup prompt. Lives here (not in `cleaner.rs`) so all prompt text
+/// is in one place.
+///
+/// Shape matters more than wording. "Reformat the user's message" (the previous
+/// opening) reads to a 1B model as a licence to rewrite, and it took it: over
+/// 429 real transcripts it deleted a content word in 25 of the 120 utterances
+/// that reached it, 52 words in all, once dropping fourteen words of a
+/// half-finished sentence to make the rest read tidily. Framing the job as the
+/// *smallest* change, listing what may be touched, and forbidding the tidy-up
+/// explicitly cuts that to 18 utterances and 29 words, and is slightly faster
+/// (419 ms vs 453 ms). Measured with `examples/cleanup_lab.rs`; see
+/// `docs/cleanup-behaviour-20260909.md`.
 pub const DEFAULT_CLEANUP: &str =
-    "Reformat the user's message. Fix grammar, spelling, and punctuation. \
-     Remove filler words like um and uh. Break long content into paragraphs. \
-     Keep the original tone and meaning. Preserve every name, technical term, \
-     number, and clause. Return only the cleaned text; do not answer it or add anything.";
+    "Clean up the user's dictated message with the smallest change that works.\n\
+     You may only:\n\
+     - fix punctuation, capitalization, obvious misspellings, and homophones\n\
+     - write clearly spoken numbers and dates as digits\n\
+     - delete \"um\", \"uh\", an accidentally repeated word, and an explicit \
+       self-correction\n\
+     - start a new paragraph where the message is long or turns to a new \
+       subject\n\
+     Do not rephrase, tighten, summarize, or improve the wording. Keep every \
+     other word the speaker said, and keep their tone, hesitation, slang, and \
+     force. Never soften or cut profanity. Never drop a clause, an aside, or a \
+     trailing thought to make the rest read as a tidy sentence: an unfinished \
+     sentence stays unfinished.\n\
+     Return only the cleaned message. Do not answer it, and add nothing.";
 
 /// Default transform prompt (Shift + push-to-talk). Deliberately permissive:
 /// the user spoke an explicit instruction, so follow it even when that means

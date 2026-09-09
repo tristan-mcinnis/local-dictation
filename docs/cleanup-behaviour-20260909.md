@@ -61,15 +61,53 @@ Typical edits (real, from the run):
 - "in slash document slash code" → "in /document/code"
 - "quote unquote power user" → "quote-unquote power user"
 
-## The prompt
+## The prompt, and why it changed today
 
 No `cleanup` key exists in `~/.config/local-dictation/prompts.json`, so the
-built-in default is live (`prompts.rs::DEFAULT_CLEANUP`):
+built-in default is what runs. The old one opened "Reformat the user's
+message", which a 1B model reads as permission to rewrite, and it took it.
 
-> Reformat the user's message. Fix grammar, spelling, and punctuation. Remove
-> filler words like um and uh. Break long content into paragraphs. Keep the
-> original tone and meaning. Preserve every name, technical term, number, and
-> clause. Return only the cleaned text; do not answer it or add anything.
+Superwhisper ships the same S1-mini and solves this in the prompt. Its live
+cleanup prompt, read out of `/Applications/superwhisper.app` (it is on this
+Mac), frames the job as the *smallest possible change*, gives an explicit
+allow-list of what may be touched, and then forbids the failure directly:
+
+> Do not rewrite or improve the user's phrasing. Keep every other word and
+> preserve the user's tone, uncertainty, slang, and emotional intensity. Never
+> soften or remove profanity. Keep every clause the speaker said […] Never
+> delete part of the message to make the rest read as a tidy sentence.
+
+It also applies a separate Tone instruction (formal / semi-formal / semi-casual
+/ casual) that is explicitly allowed to change casing, punctuation and word
+forms only.
+
+That shape was measured, not assumed. Three prompts over the same 429
+transcripts, counting non-filler words the LLM deleted (spelled numbers
+excluded, since digits are the intended output):
+
+| prompt | utterances that lost a content word | content words lost | latency |
+|---|---|---|---|
+| old default ("Reformat the user's message…") | 25 of 120 | 52 | 453 ms |
+| Superwhisper's, verbatim | 19 of 120 | 34 | 423 ms |
+| **our rewrite of the same principles (now shipped)** | **18 of 120** | **29–42** | **421 ms** |
+
+The new default is our own wording, not a copy of theirs. It wins on the metric
+and is slightly faster. The worst old failure, fourteen words deleted from a
+half-finished sentence to tidy the rest, does not recur.
+
+The shipped default is now:
+
+> Clean up the user's dictated message with the smallest change that works.
+> You may only: fix punctuation, capitalization, obvious misspellings, and
+> homophones; write clearly spoken numbers and dates as digits; delete "um",
+> "uh", an accidentally repeated word, and an explicit self-correction; start a
+> new paragraph where the message is long or turns to a new subject.
+> Do not rephrase, tighten, summarize, or improve the wording. Keep every other
+> word the speaker said, and keep their tone, hesitation, slang, and force.
+> Never soften or cut profanity. Never drop a clause, an aside, or a trailing
+> thought to make the rest read as a tidy sentence: an unfinished sentence
+> stays unfinished.
+> Return only the cleaned message. Do not answer it, and add nothing.
 
 An output-format preset (numbered / bullets / email / code) replaces this
 prompt entirely while it is active. Transform mode (Shift + push-to-talk) is a
@@ -88,7 +126,10 @@ separate, deliberately permissive prompt, and that one IS overridden in his
 
    `cleanup_dropped_content` only fires on a whole missing clause, so a
    three-word drop passes. Hits mail, Slack and browser fields; terminals are
-   immune because cleanup is skipped there.
+   immune because cleanup is skipped there. **The new prompt does not fix this
+   one**: it cuts the aggregate loss roughly in half, but this sentence still
+   comes out as "whatever it go back". The real fix is a stricter diff-guard,
+   not more prompt text.
 
 2. **Garbage in, more garbage out.** One transcript was a degenerate ASR repeat
    loop ("one business, one business, …"), the product of the long-audio bug
