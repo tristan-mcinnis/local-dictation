@@ -29,6 +29,9 @@ mod render_ui;
 pub(crate) mod slate;
 use dictionary::*;
 use history::*;
+// The Settings window's History pane groups rows by day with the same
+// formatter the launcher panel uses — one implementation, two surfaces.
+pub(crate) use history::{history_rows, HistoryRow};
 use pill::*;
 pub use render_ui::render_ui;
 
@@ -1258,7 +1261,7 @@ fn terminate_app() {
 
 // ─── Menu action helpers (plain Rust, no AppKit) ────────────────────────
 
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     use std::io::Write;
     use std::process::{Command, Stdio};
     if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
@@ -1461,10 +1464,12 @@ mod tests {
         // is locale/timezone dependent.
         let entries = vec![
             Entry {
+                id: 2,
                 text: "second day line".into(),
                 created_at: 1_747_900_000,
             },
             Entry {
+                id: 1,
                 text: "first day line".into(),
                 created_at: 1_747_900_000 - 90_000,
             },

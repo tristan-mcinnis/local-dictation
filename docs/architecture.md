@@ -158,8 +158,9 @@ When adding code, gate it behind the right feature and keep the default (feature
 
 ## The house design (Slate)
 
-Every surface the app draws — the pill, the history panel, the dictionary editor, the seven-pane
-settings shell (including the Dictionary form and its term list) — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
+Every surface the app draws — the pill, the history panel, the dictionary editor, the eight-pane
+settings shell (including the Dictionary form and its term list, and the History pane and its
+day-grouped dictation list) — follows the shared house rule kept in the `design-system` repo (`DESIGN.md` +
 `tokens.json`). The generated token file is vendored at `src/menubar/house_theme.rs`; it is
 generated, never hand-edited, and `make check` in `design-system` flags a stale copy. Nothing in
 the UI types a colour, a radius, a font size or a control height: `src/menubar/slate.rs` is the
@@ -184,7 +185,8 @@ tinted `danger` while recording, and the template at 40 % while the pipeline wor
 
 `fast-dictate-backend render-ui <dir>` snapshots the whole design offscreen. It builds the pill in
 each of its five layouts, the history panel with sample rows, the dictionary editor and the
-settings shell, draws each straight into a bitmap with `cacheDisplay(in:to:)` under both
+settings shell (its Dictation, Dictionary and History panes, the last two seeded with the same
+sample rows so the proof never depends on what this Mac dictated today), draws each straight into a bitmap with `cacheDisplay(in:to:)` under both
 `NSAppearanceNameDarkAqua` and `NSAppearanceNameAqua`, writes PNGs and exits. No window is ever
 ordered on screen and the activation policy is `Prohibited`, so it never steals focus. A blur
 material renders nothing useful in a window that was never ordered in, so while the snapshot runs
@@ -277,7 +279,12 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
 
 `ui_channel.rs` carries worker→UI state (recording/processing, last dictation, audio levels) to
 `menubar/` (`mod.rs` status item + menu actions, `pill.rs` waveform pill, `history.rs` history window, `dictionary.rs` dictionary editor) plus `settings_window.rs`. `history.rs` writes
-every injected dictation to SQLite at `~/.config/local-dictation/history.db`. `screen_context.rs`
+every injected dictation to SQLite at `~/.config/local-dictation/history.db` and is the only
+module that reads it back: `recent`, `search`, `count`, `delete` and `clear` serve both the
+launcher's history panel and the Settings History pane. Retention is a pending setting applied on
+Apply & Restart; a row delete and Delete all land immediately, because history is a store rather
+than a setting. The Settings pane re-queries on every visit, since the daemon keeps appending
+while the window is open. `screen_context.rs`
 harvests proper nouns from the focused window and feeds them to
 `cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. Normal
 cleanup never infers numbered-list structure from words such as "first" or "second"; structural

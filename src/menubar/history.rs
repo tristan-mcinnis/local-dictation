@@ -432,7 +432,7 @@ fn select_row(ui: &HistoryUi, tag: isize) {
 /// entry's position in the (newest-first) input — the same index used as the
 /// row's `tag` and as the key into HISTORY_ENTRIES.
 #[derive(Debug)]
-pub(super) enum HistoryRow {
+pub(crate) enum HistoryRow {
     Day(String),
     Item {
         time: String,
@@ -443,7 +443,7 @@ pub(super) enum HistoryRow {
 
 /// Group entries by local calendar day (newest first) into a flat row list.
 /// `NSDateFormatter` renders dates/times in the user's locale + timezone.
-pub(super) fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
+pub(crate) fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
     let day_fmt = NSDateFormatter::new();
     day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
     let time_fmt = NSDateFormatter::new();

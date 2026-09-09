@@ -38,6 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// One stored dictation.
 #[derive(Debug, Clone)]
 pub struct Entry {
+    /// The row's primary key. Stable across list rebuilds, so the settings
+    /// window can delete the row a click meant even after a re-query moved it.
+    pub id: i64,
     pub text: String,
     /// Creation time in unix seconds (UTC).
     pub created_at: i64,
@@ -240,14 +243,15 @@ pub fn recent(limit: usize) -> Vec<Entry> {
 fn try_recent_at(path: &Path, limit: usize) -> eyre::Result<Vec<Entry>> {
     let conn = open_at(path)?;
     let mut stmt = conn.prepare(
-        "SELECT text, created_at FROM dictations
+        "SELECT id, text, created_at FROM dictations
          ORDER BY created_at DESC, id DESC
          LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit as i64], |row| {
         Ok(Entry {
-            text: row.get(0)?,
-            created_at: row.get(1)?,
+            id: row.get(0)?,
+            text: row.get(1)?,
+            created_at: row.get(2)?,
         })
     })?;
     let mut out = Vec::new();
@@ -255,6 +259,134 @@ fn try_recent_at(path: &Path, limit: usize) -> eyre::Result<Vec<Entry>> {
         out.push(r?);
     }
     Ok(out)
+}
+
+/// Most-recent-first dictations whose text contains `query`, capped at
+/// `limit`. A blank query is the same as [`recent`]. Returns an empty vec on
+/// any error, so a search can never fail loudly in the UI.
+///
+/// Matching is SQL `LIKE`, which is case-insensitive for ASCII and exact for
+/// everything else — the right behaviour for a store that holds both English
+/// and Chinese dictations. `%`, `_` and `\` in the query are escaped so a
+/// literal wildcard searches for itself.
+pub fn search(query: &str, limit: usize) -> Vec<Entry> {
+    let needle = query.trim();
+    if needle.is_empty() {
+        return recent(limit);
+    }
+    if let Some(path) = db_path() {
+        try_search_at(&path, needle, limit).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Escape the `LIKE` metacharacters so a query matches itself literally.
+fn like_escape(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len() + 2);
+    for ch in needle.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn try_search_at(path: &Path, needle: &str, limit: usize) -> eyre::Result<Vec<Entry>> {
+    let conn = open_at(path)?;
+    let pattern = format!("%{}%", like_escape(needle));
+    let mut stmt = conn.prepare(
+        r"SELECT id, text, created_at FROM dictations
+          WHERE text LIKE ?1 ESCAPE '\'
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![pattern, limit as i64], |row| {
+        Ok(Entry {
+            id: row.get(0)?,
+            text: row.get(1)?,
+            created_at: row.get(2)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+/// How many dictations are stored. `0` on any error (a missing DB is "none").
+pub fn count() -> usize {
+    match_count("")
+}
+
+/// How many dictations match `query` — a blank query counts them all. Counted
+/// in SQL rather than by measuring a fetch, so a caller that pages a long
+/// store can still report the true total.
+pub fn match_count(query: &str) -> usize {
+    let Some(path) = db_path() else {
+        return 0;
+    };
+    try_match_count_at(&path, query.trim()).unwrap_or(0)
+}
+
+fn try_match_count_at(path: &Path, needle: &str) -> eyre::Result<usize> {
+    let conn = open_at(path)?;
+    let n: i64 = if needle.is_empty() {
+        conn.query_row("SELECT COUNT(*) FROM dictations", [], |row| row.get(0))?
+    } else {
+        let pattern = format!("%{}%", like_escape(needle));
+        conn.query_row(
+            r"SELECT COUNT(*) FROM dictations WHERE text LIKE ?1 ESCAPE '\'",
+            rusqlite::params![pattern],
+            |row| row.get(0),
+        )?
+    };
+    Ok(n.max(0) as usize)
+}
+
+/// Delete one dictation by id. Returns whether a row actually went away, so a
+/// caller can tell a stale click from a real delete.
+pub fn delete(id: i64) -> bool {
+    let Some(path) = db_path() else {
+        return false;
+    };
+    match delete_at(&path, id) {
+        Ok(n) => n > 0,
+        Err(e) => {
+            eprintln!("[history] delete failed: {e}");
+            false
+        }
+    }
+}
+
+fn delete_at(path: &Path, id: i64) -> eyre::Result<usize> {
+    let conn = open_at(path)?;
+    Ok(conn.execute(
+        "DELETE FROM dictations WHERE id = ?1",
+        rusqlite::params![id],
+    )?)
+}
+
+/// Delete every dictation. Returns how many rows went away; logs and reports
+/// `0` on error rather than propagating — this is called from a UI click.
+pub fn clear() -> usize {
+    let Some(path) = db_path() else {
+        return 0;
+    };
+    match clear_at(&path) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[history] clear failed: {e}");
+            0
+        }
+    }
+}
+
+fn clear_at(path: &Path) -> eyre::Result<usize> {
+    let conn = open_at(path)?;
+    Ok(conn.execute("DELETE FROM dictations", [])?)
 }
 
 #[cfg(test)]
@@ -356,6 +488,105 @@ mod tests {
 
         let rows = try_recent_at(&db, 10).unwrap();
         assert!(rows.is_empty(), "Never must prune every row");
+    }
+
+    #[test]
+    fn search_matches_case_insensitively_and_newest_first() {
+        let db = test_db("search_basic");
+        let now = unix_now();
+        insert_at(&db, "Call Sam about Acme", now - 60).unwrap();
+        insert_at(&db, "acme air force one", now).unwrap();
+        insert_at(&db, "unrelated note", now - 30).unwrap();
+
+        let hits = try_search_at(&db, "acme", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].text, "acme air force one", "newest first");
+        assert_eq!(hits[1].text, "Call Sam about Acme");
+    }
+
+    #[test]
+    fn search_treats_wildcards_as_literals() {
+        let db = test_db("search_wildcards");
+        let now = unix_now();
+        insert_at(&db, "100% done", now).unwrap();
+        insert_at(&db, "nothing to see", now - 10).unwrap();
+
+        // Unescaped, "%" would match every row.
+        let hits = try_search_at(&db, "%", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "100% done");
+
+        let underscore = try_search_at(&db, "_", 10).unwrap();
+        assert!(underscore.is_empty(), "_ must not match any character");
+    }
+
+    #[test]
+    fn search_honours_the_limit() {
+        let db = test_db("search_limit");
+        let now = unix_now();
+        for i in 0..5 {
+            insert_at(&db, &format!("note {i}"), now - i).unwrap();
+        }
+        assert_eq!(try_search_at(&db, "note", 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn delete_removes_only_the_named_row() {
+        let db = test_db("delete_one");
+        let now = unix_now();
+        insert_at(&db, "keep me", now - 10).unwrap();
+        insert_at(&db, "drop me", now).unwrap();
+
+        let rows = try_recent_at(&db, 10).unwrap();
+        let doomed = rows.iter().find(|e| e.text == "drop me").unwrap().id;
+        assert_eq!(delete_at(&db, doomed).unwrap(), 1);
+
+        let left = try_recent_at(&db, 10).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].text, "keep me");
+
+        // A stale id deletes nothing rather than erroring.
+        assert_eq!(delete_at(&db, doomed).unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_empties_the_store_and_reports_the_count() {
+        let db = test_db("clear_all");
+        let now = unix_now();
+        insert_at(&db, "one", now - 2).unwrap();
+        insert_at(&db, "two", now - 1).unwrap();
+        insert_at(&db, "three", now).unwrap();
+
+        assert_eq!(try_match_count_at(&db, "").unwrap(), 3);
+        assert_eq!(clear_at(&db).unwrap(), 3);
+        assert_eq!(try_match_count_at(&db, "").unwrap(), 0);
+        assert!(try_recent_at(&db, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn match_count_counts_the_whole_store_and_a_query() {
+        let db = test_db("match_count");
+        let now = unix_now();
+        insert_at(&db, "acme one", now).unwrap();
+        insert_at(&db, "acme two", now - 1).unwrap();
+        insert_at(&db, "something else", now - 2).unwrap();
+
+        assert_eq!(try_match_count_at(&db, "").unwrap(), 3);
+        assert_eq!(try_match_count_at(&db, "acme").unwrap(), 2);
+        assert_eq!(try_match_count_at(&db, "absent").unwrap(), 0);
+        // Wildcards are literal here too, exactly as in `search`.
+        assert_eq!(try_match_count_at(&db, "%").unwrap(), 0);
+    }
+
+    #[test]
+    fn entries_carry_their_row_id() {
+        let db = test_db("entry_ids");
+        record_at(&db, "first").unwrap();
+        record_at(&db, "second").unwrap();
+        let rows = try_recent_at(&db, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|e| e.id > 0));
+        assert_ne!(rows[0].id, rows[1].id);
     }
 
     #[test]

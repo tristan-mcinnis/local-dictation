@@ -35,8 +35,12 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
     let dictionary = build_dictionary_window(mtm);
     let settings = crate::settings_window::build_for_render(mtm);
 
-    // Six rows over two days, matching the mockup's sample list.
+    // Six rows over two days, matching the mockup's sample list. The same
+    // rows fill the Settings History pane, so both surfaces are proved on one
+    // known list rather than on whatever this Mac dictated today.
     seed_sample_history(mtm, &history);
+    let sample_entries = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+    crate::settings_window::seed_history_for_render(&settings, &sample_entries);
     dictionary
         .text_view
         .setString(&NSString::from_str(SAMPLE_DICTIONARY));
@@ -147,6 +151,32 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 &content,
                 out_dir,
                 &format!("settings-dictionary-end-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+        crate::settings_window::scroll_to_top_for_render(&settings);
+
+        // The History pane: the retention card over the day-grouped list.
+        crate::settings_window::show_pane_for_render(&settings, 2);
+        if let Some(content) = settings.window.contentView() {
+            written.push(snapshot(
+                mtm,
+                &content,
+                out_dir,
+                &format!("settings-history-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+        // …and its tail, where the older day and the note line sit.
+        crate::settings_window::scroll_to_bottom_for_render(&settings);
+        if let Some(content) = settings.window.contentView() {
+            written.push(snapshot(
+                mtm,
+                &content,
+                out_dir,
+                &format!("settings-history-end-{suffix}"),
                 None,
                 0.0,
             )?);
@@ -287,7 +317,9 @@ fn seed_sample_history(mtm: MainThreadMarker, ui: &HistoryUi) {
     ];
     let entries: Vec<Entry> = rows
         .iter()
-        .map(|(text, _app, at)| Entry {
+        .enumerate()
+        .map(|(i, (text, _app, at))| Entry {
+            id: i as i64 + 1,
             text: (*text).to_string(),
             created_at: *at,
         })

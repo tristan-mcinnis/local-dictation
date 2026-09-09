@@ -46,7 +46,8 @@ use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 use crate::menubar::house_theme::{
     CONTROL_CHIP, CONTROL_FOOTER, CONTROL_RAILROW, CONTROL_ROW, CONTROL_TILE, HAIRLINE,
     LAYOUT_SETTINGS_HEIGHT, LAYOUT_SETTINGS_RAIL, LAYOUT_SETTINGS_WIDTH, RADIUS_LG, RADIUS_MD,
-    RADIUS_SM, RADIUS_TILE, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XS, SPACE_XXS, TYPE_BODY_SMALL,
+    RADIUS_SM, RADIUS_TILE, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
+    TYPE_BODY_SMALL,
     TYPE_CAPTION, TYPE_LABEL, TYPE_META, TYPE_TITLE, WEIGHT_MEDIUM, WEIGHT_REGULAR,
     WEIGHT_SEMIBOLD,
 };
@@ -81,8 +82,23 @@ const TERM_HEARD_FRACTION: f64 = 0.42;
 /// Rows drawn before the list stops and asks for a search instead. A settings
 /// pane is a list you scan, not a database you page through.
 const TERM_ROW_CAP: usize = 60;
+/// The same cap for the history list, which is a longer read: a month of
+/// dictation still scrolls, and past this the search field is the faster path.
+const HISTORY_ROW_CAP: usize = 200;
+/// How many rows are pulled from the DB per open. Well past the row cap, so
+/// the "narrow your search" note reports a real total rather than the fetch.
+const HISTORY_FETCH: usize = 2000;
+/// The day header band inside the history list: the `section` label plus the
+/// air above and below it.
+const HISTORY_DAY_H: f64 = SPACE_XL;
+/// The fixed time column on the left of a history row, so every row's text
+/// starts on one edge whatever the hour reads.
+const HISTORY_TIME_W: f64 = 40.0;
+/// The History section's index in `PANES`. Its list is re-queried on each
+/// visit, so the switch needs to know which pane it is.
+const HISTORY_PANE: usize = 2;
 
-/// The rail's six sections, in order: label, SF Symbol, subtitle.
+/// The rail's sections, in order: label, SF Symbol, subtitle.
 const PANES: &[(&str, &str, &str)] = &[
     (
         "Dictation",
@@ -93,6 +109,11 @@ const PANES: &[(&str, &str, &str)] = &[
         "Dictionary",
         "text.book.closed",
         "Names and phrases that must always come out right.",
+    ),
+    (
+        "History",
+        "clock.arrow.circlepath",
+        "Every dictation, newest first. Click one to copy it.",
     ),
     (
         "Translate",
@@ -172,6 +193,26 @@ pub struct SettingsUi {
     active_translate_popup: Retained<NSPopUpButton>,
     // History
     retention_popup: Retained<NSPopUpButton>,
+    /// The line under the retention row: the stored count, and the last thing
+    /// a click did (copied, deleted, cleared).
+    history_status: Retained<NSTextField>,
+    /// Filters the dictation list live (the field sends its action per
+    /// keystroke); an empty query is "everything, newest first".
+    history_search: Retained<NSSearchField>,
+    /// The pane, the list card, and the flipped body inside that card — the
+    /// same in-place rebuild the dictionary list uses. History rows are rebuilt
+    /// on every search, delete and pane visit, because the daemon keeps
+    /// appending while the window is open.
+    history_pane: Retained<SettingsFlippedView>,
+    history_card: Retained<slate::SlateView>,
+    history_body: Retained<slate::SlateView>,
+    history_card_y: f64,
+    history_body_y: f64,
+    /// Row index → dictation row id, refreshed on every rebuild: a delete
+    /// addresses the row the user clicked, not the position it sat in.
+    history_ids: Mutex<Vec<i64>>,
+    /// Row index → full text, so a click copies the untruncated dictation.
+    history_texts: Mutex<Vec<String>>,
     /// In-memory edits, not yet written. Updated by every control action;
     /// flushed by `Apply & Restart`.
     pending: Mutex<Settings>,
@@ -395,6 +436,81 @@ define_class!(
             refresh_dictionary_list(ui);
         }
 
+        #[unsafe(method(searchHistory:))]
+        fn search_history(&self, _sender: *mut AnyObject) {
+            if let Some(ui) = SETTINGS_UI.get() {
+                refresh_history_list(ui);
+            }
+        }
+
+        #[unsafe(method(copyHistoryEntry:))]
+        fn copy_history_entry(&self, sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some((_, text)) = history_entry_at(ui, tag) else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            menubar::copy_to_clipboard(&text);
+            set_history_status(ui, &format!("Copied “{}”.", history_preview(&text)));
+        }
+
+        #[unsafe(method(copyAllHistory:))]
+        fn copy_all_history(&self, _sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            // Everything currently shown, in the order it reads, so a search
+            // scopes the copy the way it scopes the list.
+            let texts = ui.history_texts.lock().unwrap().clone();
+            if texts.is_empty() {
+                set_history_status(ui, "Nothing to copy.");
+                return;
+            }
+            let n = texts.len();
+            menubar::copy_to_clipboard(&texts.join("\n\n"));
+            let plural = if n == 1 { "dictation" } else { "dictations" };
+            set_history_status(ui, &format!("Copied {n} {plural}."));
+        }
+
+        #[unsafe(method(deleteHistoryEntry:))]
+        fn delete_history_entry(&self, sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            let Some((id, text)) = history_entry_at(ui, tag) else {
+                return;
+            };
+            // History is a store, not a pending setting: the delete lands now.
+            if !crate::history::delete(id) {
+                set_history_status(ui, "That dictation was already gone.");
+                refresh_history_list(ui);
+                return;
+            }
+            refresh_history_list(ui);
+            set_history_status(ui, &format!("Deleted “{}”.", history_preview(&text)));
+        }
+
+        #[unsafe(method(clearHistory:))]
+        fn clear_history(&self, _sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else {
+                return;
+            };
+            let n = crate::history::clear();
+            refresh_history_list(ui);
+            if n == 0 {
+                set_history_status(ui, "There was nothing to delete.");
+            } else {
+                let plural = if n == 1 { "dictation" } else { "dictations" };
+                set_history_status(ui, &format!("Deleted {n} {plural}."));
+            }
+        }
+
         #[unsafe(method(applyAndRestart:))]
         fn apply_and_restart(&self, _sender: *mut AnyObject) {
             if let Some(ui) = SETTINGS_UI.get() {
@@ -520,9 +636,37 @@ pub fn scroll_to_bottom_for_render(ui: &SettingsUi) {
 }
 
 /// Switch the visible pane while snapshotting, so a render proof can capture a
-/// pane other than the first.
+/// pane other than the first. Unlike a click this never re-queries history, so
+/// rows seeded by [`seed_history_for_render`] survive the switch.
 pub fn show_pane_for_render(ui: &SettingsUi, index: usize) {
-    show_pane(ui, index);
+    select_pane_view(ui, index);
+}
+
+/// Draw `entries` into the History pane instead of the store's real rows, so a
+/// render proof shows a known list rather than whatever the Mac dictated today.
+pub fn seed_history_for_render(ui: &SettingsUi, entries: &[crate::history::Entry]) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let (ids, texts) = fill_history_body(
+        mtm,
+        &ui.history_body,
+        &ui._controller,
+        entries,
+        entries.len(),
+        "",
+    );
+    *ui.history_ids.lock().unwrap() = ids;
+    *ui.history_texts.lock().unwrap() = texts;
+    size_list_card(
+        &ui.history_pane,
+        &ui.history_card,
+        ui.history_card_y,
+        ui.history_body_y,
+        ui.history_body.frame().size.height,
+    );
+    ui.history_status
+        .setStringValue(&NSString::from_str(&history_count_line(entries.len())));
 }
 
 pub fn scroll_to_top_for_render(ui: &SettingsUi) {
@@ -822,29 +966,6 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     }
     let custom_hotkey_hint = hint_line(mtm, &mut card, &initial_hotkey_hint);
 
-    let retention_locked = std::env::var_os("DICTATE_HISTORY_RETENTION").is_some();
-    let retention_popup = popup_row(mtm, &mut card, "History retention");
-    for (label_str, rep) in [
-        ("Forever", "forever"),
-        ("1 year", "1year"),
-        ("1 month", "1month"),
-        ("1 week", "1week"),
-        ("24 hours", "24hours"),
-        ("Never", "never"),
-    ] {
-        popup_add_item(&retention_popup, label_str, None, Some(rep));
-    }
-    select_popup_rep(&retention_popup, &loaded.resolve_history_retention());
-    finish_popup(&retention_popup);
-    wire_popup(
-        &retention_popup,
-        &controller,
-        sel!(changeRetention:),
-        retention_locked,
-    );
-    if retention_locked {
-        env_hint(mtm, &mut card, "DICTATE_HISTORY_RETENTION");
-    }
     y = card_end(&card);
 
     let mut card = card_begin(mtm, &dictation, y, "Cleanup");
@@ -985,12 +1106,91 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         "",
     );
     let dictionary_pane = dictionary.clone();
-    size_dictionary_list(
+    size_list_card(
         &dictionary,
         &dictionary_card,
         dictionary_card_y,
         dictionary_body_y,
         dictionary_body.frame().size.height,
+    );
+
+    // ═══ Pane 2 — History ═══════════════════════════════════════════════
+    //
+    // What was dictated, newest first, grouped by day. The retention window
+    // lives here too, beside the rows it governs, rather than three panes away
+    // among the input settings.
+    let history_pane_view = new_pane();
+    let mut card = card_begin(mtm, &history_pane_view, SPACE_MD, "Keeping");
+
+    let retention_locked = std::env::var_os("DICTATE_HISTORY_RETENTION").is_some();
+    let retention_popup = popup_row(mtm, &mut card, "Keep dictations for");
+    for (label_str, rep) in [
+        ("Forever", "forever"),
+        ("1 year", "1year"),
+        ("1 month", "1month"),
+        ("1 week", "1week"),
+        ("24 hours", "24hours"),
+        ("Never", "never"),
+    ] {
+        popup_add_item(&retention_popup, label_str, None, Some(rep));
+    }
+    select_popup_rep(&retention_popup, &loaded.resolve_history_retention());
+    finish_popup(&retention_popup);
+    wire_popup(
+        &retention_popup,
+        &controller,
+        sel!(changeRetention:),
+        retention_locked,
+    );
+    if retention_locked {
+        env_hint(mtm, &mut card, "DICTATE_HISTORY_RETENTION");
+    }
+    action_button_row(
+        mtm,
+        &mut card,
+        "Delete every dictation",
+        "Delete all",
+        "trash",
+        &controller,
+        sel!(clearHistory:),
+    );
+    let history_status = hint_line(mtm, &mut card, &history_count_line(crate::history::count()));
+    hint_line(
+        mtm,
+        &mut card,
+        "Deletes apply straight away. Retention waits for Apply & Restart.",
+    );
+    let history_card_y = card_end(&card);
+
+    // The dictations themselves. Same in-place list as the dictionary: a
+    // search row on top, rows rebuilt into a flipped body below it, and the
+    // card sized to what the body drew.
+    let mut card = card_begin(mtm, &history_pane_view, history_card_y, "Your dictations");
+    let history_search = history_search_row(mtm, &mut card, &controller);
+    let history_body_y = card.y;
+    let history_body = slate::SlateView::flipped(
+        mtm,
+        NSRect::new(NSPoint::new(0.0, history_body_y), NSSize::new(CARD_W, 0.0)),
+        slate::Paint::None,
+        0.0,
+    );
+    card.view.addSubview(&history_body);
+    let history_card = card.view.clone();
+    let (initial_history, initial_history_total) = history_query("");
+    let (history_ids, history_texts) = fill_history_body(
+        mtm,
+        &history_body,
+        &controller,
+        &initial_history,
+        initial_history_total,
+        "",
+    );
+    size_list_card(
+        &history_pane_view,
+        &history_card,
+        history_card_y,
+        history_body_y,
+        history_body.frame().size.height,
     );
 
     // ═══ Pane 2 — Translate ═════════════════════════════════════════════
@@ -1223,7 +1423,16 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let _ = card_end(&card);
     finish_pane(&about, &card);
 
-    let panes = vec![dictation, dictionary, translate, output, speech, experimental, about];
+    let panes = vec![
+        dictation,
+        dictionary,
+        history_pane_view.clone(),
+        translate,
+        output,
+        speech,
+        experimental,
+        about,
+    ];
     scroll.setDocumentView(Some(&*panes[0]));
 
     window.setContentView(Some(&*panel));
@@ -1267,6 +1476,15 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         translate_targets_field,
         active_translate_popup,
         retention_popup,
+        history_status,
+        history_search,
+        history_pane: history_pane_view,
+        history_card,
+        history_body,
+        history_card_y,
+        history_body_y,
+        history_ids: Mutex::new(history_ids),
+        history_texts: Mutex::new(history_texts),
         pending: Mutex::new(loaded.clone()),
         original: loaded,
         _controller: controller,
@@ -1275,6 +1493,18 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
 /// Swap the visible pane and move the rail's selection fill.
 fn show_pane(ui: &SettingsUi, index: usize) {
+    // The daemon keeps appending while the window sits open, so the history
+    // list is re-queried on every visit rather than frozen at build time.
+    if index == HISTORY_PANE {
+        refresh_history_list(ui);
+    }
+    select_pane_view(ui, index);
+}
+
+/// Put pane `index` in the scroll view and move the rail's selection fill to
+/// it. The half of [`show_pane`] that only touches views, so a render proof can
+/// switch panes without re-reading any store.
+fn select_pane_view(ui: &SettingsUi, index: usize) {
     let Some(pane) = ui.panes.get(index) else {
         return;
     };
@@ -1793,7 +2023,7 @@ fn fill_dictionary_body(
     } else {
         format!("{} of {} terms match.", matched.len(), corrections.len())
     };
-    y = dictionary_note(mtm, body, y, &note);
+    y = list_note(mtm, body, y, &note);
 
     body.setFrameSize(NSSize::new(CARD_W, y));
     keys
@@ -1946,8 +2176,9 @@ fn dictionary_row(
     y + CONTROL_ROW
 }
 
-/// The `caption` line under the rows: the count, the empty state, or the cap.
-fn dictionary_note(mtm: MainThreadMarker, body: &slate::SlateView, y: f64, text: &str) -> f64 {
+/// The `caption` line under a list's rows: the count, the empty state, or the
+/// cap. Shared by the dictionary and history lists.
+fn list_note(mtm: MainThreadMarker, body: &slate::SlateView, y: f64, text: &str) -> f64 {
     let mut y = y;
     if y > 0.0 {
         let line = slate::SlateView::new(
@@ -2002,9 +2233,10 @@ fn clamped_label(
     l
 }
 
-/// Size the list card to its body, and the pane to the card. The list is the
-/// pane's last card, so growing it moves nothing else.
-fn size_dictionary_list(
+/// Size a list card to its body, and the pane to the card. A list is always its
+/// pane's last card, so growing it moves nothing else. Shared by the dictionary
+/// and history lists.
+fn size_list_card(
     pane: &SettingsFlippedView,
     card: &slate::SlateView,
     card_y: f64,
@@ -2034,7 +2266,7 @@ fn refresh_dictionary_list(ui: &SettingsUi) {
         )
     };
     *ui.dictionary_keys.lock().unwrap() = keys;
-    size_dictionary_list(
+    size_list_card(
         &ui.dictionary_pane,
         &ui.dictionary_card,
         ui.dictionary_card_y,
@@ -2060,6 +2292,358 @@ fn dictionary_entry_at(ui: &SettingsUi, tag: isize) -> Option<(String, String)> 
         .find(|(k, _)| *k == key)
         .map(|(_, v)| v)?;
     Some((key, value))
+}
+
+// ─── History list ────────────────────────────────────────────────────────
+//
+// The History pane shows what was dictated: rows grouped under a day header,
+// newest first, the time on the left and the text beside it. A row click
+// copies the untruncated dictation; the trash chip deletes it from the store
+// immediately (history is data, not a pending setting). Rows are rebuilt in
+// place on every search, delete and pane visit — the daemon keeps appending
+// while the window is open — so a row's `tag` is its index into the ids and
+// texts captured by the same pass that drew it.
+
+/// The count line under the retention row. Also the sentence the pane opens
+/// with, so an empty store explains itself instead of showing a blank card.
+fn history_count_line(count: usize) -> String {
+    match count {
+        0 => "Nothing stored yet. Hold your hotkey and speak.".to_string(),
+        1 => "1 dictation stored.".to_string(),
+        n => format!("{n} dictations stored."),
+    }
+}
+
+/// The list card's header row: a search glyph, a field that filters as you
+/// type, and the chip that copies every row currently shown.
+fn history_search_row(
+    mtm: MainThreadMarker,
+    card: &mut Card,
+    controller: &Retained<SettingsController>,
+) -> Retained<NSSearchField> {
+    let y = card_row(card, CONTROL_ROW);
+    let mid = y + CONTROL_ROW / 2.0;
+
+    let chip = slate::chip(mtm, "Copy all", Some("doc.on.doc"), CARD_W - CARD_PAD_X, mid);
+    // A flipped card flips the chip's y, so re-centre it in card space.
+    let cf = chip.frame();
+    chip.setFrame(NSRect::new(
+        NSPoint::new(cf.origin.x, (mid - CONTROL_CHIP / 2.0).round()),
+        cf.size,
+    ));
+    card.view.addSubview(&chip);
+    let copy_all = slate::click_overlay(mtm, chip.frame(), controller, sel!(copyAllHistory:), 0);
+    unsafe {
+        let title = NSString::from_str("Copy every dictation shown");
+        let _: () = msg_send![&*copy_all, setToolTip: &*title];
+        let _: () = msg_send![&*copy_all, setAccessibilityLabel: &*title];
+    }
+    card.view.addSubview(&copy_all);
+
+    if let Some(img) = slate::template_symbol("magnifyingglass") {
+        let iv = NSImageView::new(mtm);
+        iv.setImage(Some(&img));
+        unsafe {
+            let _: () = msg_send![&*iv, setContentTintColor: &*theme::text_tertiary()];
+        }
+        iv.setFrame(NSRect::new(
+            NSPoint::new(CARD_PAD_X, (mid - slate::GLYPH / 2.0).round()),
+            NSSize::new(slate::GLYPH, slate::GLYPH),
+        ));
+        card.view.addSubview(&iv);
+    }
+
+    let field_x = CARD_PAD_X + slate::GLYPH + SPACE_XS;
+    let field_w = (chip.frame().origin.x - SPACE_SM - field_x).max(CARD_PAD_X);
+    let search: Retained<NSSearchField> = unsafe {
+        msg_send![
+            NSSearchField::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(field_x, (mid - FIELD_TEXT_H / 2.0).round()),
+                NSSize::new(field_w, FIELD_TEXT_H),
+            )
+        ]
+    };
+    unsafe {
+        // Filter on every keystroke, not just on Return.
+        let _: () = msg_send![&*search, setSendsWholeSearchString: false];
+        let _: () = msg_send![&*search, setSendsSearchStringImmediately: true];
+        let ph = NSString::from_str("Search dictations…");
+        let _: () = msg_send![&*search, setPlaceholderString: &*ph];
+        // The row draws its own glyph, so strip the cell's bezel and its
+        // built-in magnifier / cancel buttons.
+        search.setBezeled(false);
+        search.setDrawsBackground(false);
+        let _: () = msg_send![&*search, setFocusRingType: 1usize]; // None
+        search.setFont(Some(&slate::font(TYPE_META, WEIGHT_REGULAR)));
+        let _: () = msg_send![&*search, setTextColor: &*theme::text_primary()];
+        let cell: *mut AnyObject = msg_send![&*search, cell];
+        if !cell.is_null() {
+            let _: () = msg_send![cell, setSearchButtonCell: std::ptr::null_mut::<AnyObject>()];
+            let _: () = msg_send![cell, setCancelButtonCell: std::ptr::null_mut::<AnyObject>()];
+        }
+        let _: () = msg_send![&*search, setTarget: &**controller];
+        let _: () = msg_send![&*search, setAction: sel!(searchHistory:)];
+    }
+    card.view.addSubview(&search);
+    search
+}
+
+/// The newest [`HISTORY_FETCH`] dictations matching `filter`, and how many
+/// match in total. The one place the History pane reads the store, so the
+/// drawing below stays free of IO and a render proof can hand it sample rows
+/// instead. The total is counted in SQL rather than taken from the fetch, so
+/// the note under a long store reports the real number.
+fn history_query(filter: &str) -> (Vec<crate::history::Entry>, usize) {
+    let filter = filter.trim();
+    (
+        crate::history::search(filter, HISTORY_FETCH),
+        crate::history::match_count(filter),
+    )
+}
+
+/// Draw `matched` as a day-grouped list into `body`, then size `body` to what
+/// it drew. Only the newest [`HISTORY_ROW_CAP`] are drawn; `total` (which may
+/// exceed `matched`, since the fetch is itself capped) is what the note counts.
+/// `filter` is what produced `matched`, and only shapes that note. Returns the
+/// row id and the full text behind each row, in row order.
+fn fill_history_body(
+    mtm: MainThreadMarker,
+    body: &slate::SlateView,
+    controller: &Retained<SettingsController>,
+    matched: &[crate::history::Entry],
+    total: usize,
+    filter: &str,
+) -> (Vec<i64>, Vec<String>) {
+    for view in body.subviews().iter() {
+        view.removeFromSuperview();
+    }
+    let needle = filter.trim();
+    let shown: Vec<crate::history::Entry> =
+        matched.iter().take(HISTORY_ROW_CAP).cloned().collect();
+
+    let mut ids: Vec<i64> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut y = 0.0;
+    // One day-grouping implementation, shared with the launcher's history
+    // panel, so both surfaces read the same dates in the same locale.
+    for row in menubar::history_rows(&shown) {
+        match row {
+            menubar::HistoryRow::Day(day) => {
+                y = history_day_header(mtm, body, y, &day);
+            }
+            menubar::HistoryRow::Item { time, text, index } => {
+                y = history_row(mtm, body, controller, index, &time, &text, y);
+                ids.push(shown[index].id);
+                texts.push(shown[index].text.clone());
+            }
+        }
+    }
+
+    let note = if matched.is_empty() {
+        if needle.is_empty() {
+            "No dictations yet. Hold your hotkey and speak.".to_string()
+        } else {
+            format!("No dictation matches “{needle}”.")
+        }
+    } else if total > shown.len() {
+        format!(
+            "Showing the newest {} of {total} matches. Search to narrow the list.",
+            shown.len()
+        )
+    } else {
+        "Click a row to copy it. The trash chip deletes it.".to_string()
+    };
+    y = list_note(mtm, body, y, &note);
+
+    body.setFrameSize(NSSize::new(CARD_W, y));
+    (ids, texts)
+}
+
+/// A day band: the date in the uppercase `section` style, the same label the
+/// launcher's history panel uses to break its list.
+fn history_day_header(
+    mtm: MainThreadMarker,
+    body: &slate::SlateView,
+    y: f64,
+    day: &str,
+) -> f64 {
+    let mut y = y;
+    if y > 0.0 {
+        let line = slate::SlateView::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(CARD_PAD_X, y),
+                NSSize::new(CARD_W - 2.0 * CARD_PAD_X, HAIRLINE),
+            ),
+            slate::Paint::Divider,
+            0.0,
+        );
+        body.addSubview(&line);
+        y += HAIRLINE;
+    }
+    let l = slate::section_label(mtm, day);
+    l.sizeToFit();
+    let lh = l.frame().size.height;
+    l.setFrame(NSRect::new(
+        NSPoint::new(CARD_PAD_X, (y + (HISTORY_DAY_H - lh) / 2.0).round()),
+        NSSize::new(CARD_W - 2.0 * CARD_PAD_X, lh),
+    ));
+    body.addSubview(&l);
+    y + HISTORY_DAY_H
+}
+
+/// One dictation row: the time in a fixed column, the text beside it, and a
+/// trash chip. The row click copies, the chip deletes; both carry the row index
+/// as their tag.
+fn history_row(
+    mtm: MainThreadMarker,
+    body: &slate::SlateView,
+    controller: &Retained<SettingsController>,
+    index: usize,
+    time: &str,
+    text: &str,
+    y: f64,
+) -> f64 {
+    let row_w = CARD_W - 2.0 * CARD_PAD_X + 2.0 * SPACE_XXS;
+    let row = slate::SlateView::flipped(
+        mtm,
+        NSRect::new(
+            NSPoint::new(CARD_PAD_X - SPACE_XXS, y),
+            NSSize::new(row_w, CONTROL_ROW),
+        ),
+        slate::Paint::Row,
+        RADIUS_SM,
+    );
+    row.enable_hover();
+    let mid = CONTROL_ROW / 2.0;
+
+    let trash = slate::chip(mtm, "", Some("trash"), row_w - SPACE_XXS, mid);
+    let tf = trash.frame();
+    trash.setFrame(NSRect::new(
+        NSPoint::new(tf.origin.x, (mid - CONTROL_CHIP / 2.0).round()),
+        tf.size,
+    ));
+    row.addSubview(&trash);
+
+    let x0 = SPACE_XXS;
+    // Times are monospaced digits so every row's text starts on one edge. The
+    // font goes on before the measure: tabular digits are wider than
+    // proportional ones, and a label sized to the narrower set truncates.
+    let clock = slate::label(mtm, time, TYPE_META, WEIGHT_REGULAR, theme::text_tertiary());
+    clock.setFont(Some(&slate::tabular_font(TYPE_META, WEIGHT_REGULAR)));
+    clock.sizeToFit();
+    let cs = clock.frame().size;
+    clock.setFrame(NSRect::new(
+        NSPoint::new(x0, (mid - cs.height / 2.0).round()),
+        NSSize::new(cs.width.min(HISTORY_TIME_W), cs.height),
+    ));
+    row.addSubview(&clock);
+
+    let text_x = x0 + HISTORY_TIME_W + SPACE_XS;
+    let text_right = trash.frame().origin.x - SPACE_SM;
+    let said = clamped_label(
+        mtm,
+        text,
+        TYPE_BODY_SMALL,
+        WEIGHT_REGULAR,
+        theme::text_primary(),
+        text_x,
+        mid,
+        (text_right - text_x).max(0.0),
+    );
+    row.addSubview(&said);
+
+    // The row click copies. The trash overlay goes on last, so it wins the hit
+    // test over the row beneath it.
+    let copy = slate::click_overlay(
+        mtm,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(row_w, CONTROL_ROW)),
+        controller,
+        sel!(copyHistoryEntry:),
+        index as isize,
+    );
+    unsafe {
+        let title = NSString::from_str("Copy this dictation");
+        let _: () = msg_send![&*copy, setToolTip: &*title];
+        let _: () = msg_send![&*copy, setAccessibilityLabel: &*title];
+    }
+    row.addSubview(&copy);
+    let remove = slate::click_overlay(
+        mtm,
+        trash.frame(),
+        controller,
+        sel!(deleteHistoryEntry:),
+        index as isize,
+    );
+    unsafe {
+        let title = NSString::from_str("Delete this dictation");
+        let _: () = msg_send![&*remove, setToolTip: &*title];
+        let _: () = msg_send![&*remove, setAccessibilityLabel: &*title];
+    }
+    row.addSubview(&remove);
+
+    body.addSubview(&row);
+    y + CONTROL_ROW
+}
+
+/// Re-query the store through the search field and redraw the list.
+fn refresh_history_list(ui: &SettingsUi) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let filter = ui.history_search.stringValue().to_string();
+    let (matched, total) = history_query(&filter);
+    let (ids, texts) = fill_history_body(
+        mtm,
+        &ui.history_body,
+        &ui._controller,
+        &matched,
+        total,
+        &filter,
+    );
+    *ui.history_ids.lock().unwrap() = ids;
+    *ui.history_texts.lock().unwrap() = texts;
+    size_list_card(
+        &ui.history_pane,
+        &ui.history_card,
+        ui.history_card_y,
+        ui.history_body_y,
+        ui.history_body.frame().size.height,
+    );
+    ui.history_card.setNeedsDisplay(true);
+}
+
+/// Set the status line under the retention row, then re-state the stored count
+/// so the pane never leaves a stale total behind an action.
+fn set_history_status(ui: &SettingsUi, message: &str) {
+    let line = format!("{message} {}", history_count_line(crate::history::count()));
+    ui.history_status.setStringValue(&NSString::from_str(&line));
+}
+
+/// A one-line preview of `text` for a status message.
+fn history_preview(text: &str) -> String {
+    const PREVIEW_CHARS: usize = 42;
+    let flat = text.replace('\n', " ");
+    let short: String = flat.chars().take(PREVIEW_CHARS).collect();
+    let ellipsis = if flat.chars().count() > PREVIEW_CHARS {
+        "…"
+    } else {
+        ""
+    };
+    format!("{short}{ellipsis}")
+}
+
+/// The `(id, text)` a row's tag addresses, or `None` if the list moved under
+/// the click.
+fn history_entry_at(ui: &SettingsUi, tag: isize) -> Option<(i64, String)> {
+    if tag < 0 {
+        return None;
+    }
+    let idx = tag as usize;
+    let id = *ui.history_ids.lock().unwrap().get(idx)?;
+    let text = ui.history_texts.lock().unwrap().get(idx).cloned()?;
+    Some((id, text))
 }
 
 /// A full-width `caption` line inside a card: hints, env-var locks, and the
@@ -2232,4 +2816,43 @@ fn apply_and_restart(ui: &SettingsUi) {
         }
     }
     menubar::relaunch_daemon();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_count_line_reads_naturally_at_every_size() {
+        assert_eq!(
+            history_count_line(0),
+            "Nothing stored yet. Hold your hotkey and speak."
+        );
+        assert_eq!(history_count_line(1), "1 dictation stored.");
+        assert_eq!(history_count_line(7), "7 dictations stored.");
+    }
+
+    #[test]
+    fn history_preview_flattens_and_truncates() {
+        assert_eq!(history_preview("one\ntwo"), "one two");
+        let long = "a".repeat(60);
+        let preview = history_preview(&long);
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.chars().count(), 43, "42 chars plus the ellipsis");
+    }
+
+    #[test]
+    fn history_preview_counts_characters_not_bytes() {
+        // A 42-character CJK line is 126 bytes; slicing by byte would panic or
+        // cut a character in half.
+        let cjk = "字".repeat(42);
+        assert_eq!(history_preview(&cjk), cjk);
+        let longer = "字".repeat(43);
+        assert_eq!(history_preview(&longer).chars().count(), 43);
+    }
+
+    #[test]
+    fn history_pane_index_points_at_the_history_section() {
+        assert_eq!(PANES[HISTORY_PANE].0, "History");
+    }
 }

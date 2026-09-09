@@ -34,6 +34,7 @@ subscription, or runtime telemetry.
 7. **Voice commands.** End an utterance with "press enter", "new line", or "press tab" to emit the keystroke. Say "scratch that" to cancel, or "undo that" to revert the last dictation.
 8. **Transform selected text by voice.** Select a passage, hold Shift plus the key, speak an instruction ("make this concise", "translate to Spanish"), and it rewrites in place.
 9. **Output formats.** Numbered, bullets, email, and code presets reshape a dictation when you want structure. Off by default, picked from the menu bar.
+10. **Searchable history.** Every dictation is kept on-device in SQLite. Settings → History lists them by day, newest first: search, click a row to copy it, trash a row to delete it, copy everything a search matched, or set how long dictations are kept (forever down to never).
 
 Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first word is never clipped, release tail-capture and a warm mic window on by default, a live waveform pill at the cursor, a menu-bar app with searchable history, a control socket so Shortcuts / Raycast / a foot pedal can trigger it, and editable system prompts in plain JSON.
 
@@ -115,7 +116,7 @@ For hands-free, hold Right Option and tap **Space** (a short pop confirms), let 
 
 To edit existing text, select it, hold **Shift plus Right Option**, speak an instruction, and release.
 
-The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON, above a searchable list of every term: click a row to edit it, use the trash chip to remove it.
+The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON, above a searchable list of every term: click a row to edit it, use the trash chip to remove it. Settings → History is the same list for what you have said: every dictation grouped by day, newest first, with a search field, click-to-copy, a trash chip per row, "Copy all" for everything currently shown, and the retention window that prunes the store.
 
 ## Performance
 
