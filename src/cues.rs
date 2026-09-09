@@ -1,5 +1,5 @@
 //! Feedback cues for the dictation state machine. Start and the landed cue
-//! are Superwhisper's "simple" theme pair; the rest are original.
+//! are Superwhisper's Classic theme pair; the rest are original.
 //!
 //! Samples are embedded in the binary and registered with macOS' native
 //! system-sound service on first use. Playback is asynchronous, so a cue never
@@ -13,7 +13,7 @@ const CANCEL: &[u8] = include_bytes!("../resources/sounds/cancel.wav");
 const LATCH: &[u8] = include_bytes!("../resources/sounds/latch.wav");
 const ERROR: &[u8] = include_bytes!("../resources/sounds/error.wav");
 
-/// Recording started. Superwhisper's "simple" start cue.
+/// Recording started. Superwhisper's Classic start cue.
 pub fn play_start() {
     play(Cue::Start);
 }
@@ -27,7 +27,7 @@ pub fn play_stop() {
     }
 }
 
-/// Text was accepted and injected. Superwhisper's "simple" stop cue.
+/// Text was accepted and injected. Superwhisper's Classic stop cue.
 pub fn play_success() {
     play(Cue::Success);
 }
@@ -272,7 +272,7 @@ mod tests {
     fn bundled_cues_are_short_and_valid() {
         for bytes in [START, STOP, SUCCESS, CANCEL, LATCH, ERROR] {
             assert!(bytes.len() > 44);
-            assert!(wav_duration_ms(bytes) <= 320);
+            assert!(wav_duration_ms(bytes) <= 800);
         }
     }
 }
