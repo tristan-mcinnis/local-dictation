@@ -144,7 +144,7 @@ pub fn paste_last_dictation(recorded_pid: Option<i32>) {
         match AccessibilityInjector::inject_into_pid(target, &text) {
             Ok(InjectOutcome::Injected) => {
                 eprintln!("[recovery] pasted last dictation into pid {target}");
-                ui_channel::show_transient(UiState::Success, Duration::from_millis(420));
+                crate::daemon::show_result_pill();
             }
             Ok(InjectOutcome::NoEditableField) => {
                 eprintln!(

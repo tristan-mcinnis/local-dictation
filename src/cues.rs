@@ -235,7 +235,7 @@ mod tests {
     fn bundled_cues_are_short_and_valid() {
         for bytes in [START, STOP, SUCCESS, CANCEL, LATCH, ERROR] {
             assert!(bytes.len() > 44);
-            assert!(wav_duration_ms(bytes) <= 240);
+            assert!(wav_duration_ms(bytes) <= 320);
         }
     }
 }

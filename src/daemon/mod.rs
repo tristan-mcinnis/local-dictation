@@ -19,6 +19,7 @@ mod listen;
 use ptt::*;
 use worker::*;
 pub use listen::run_listen;
+pub(crate) use worker::show_result_pill;
 use listen::*;
 
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
@@ -246,8 +247,15 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         let tx = tx_for_callback.clone();
         let scb = state_cb.clone();
         move |input: PttInput| {
-            let (next, decision) = ptt_transition(scb.load(Ordering::SeqCst), input);
+            let prev = scb.load(Ordering::SeqCst);
+            let (next, decision) = ptt_transition(prev, input);
             scb.store(next, Ordering::SeqCst);
+            if !matches!(decision, PttDecision::Nothing | PttDecision::SwallowSpace) || prev != next {
+                eprintln!(
+                    "[hotkey] {} {input:?} · state {prev}→{next} · {decision:?}",
+                    stamp()
+                );
+            }
             match decision {
                 PttDecision::Start { transform } => {
                     let _ = tx.send(DaemonEvent::StartRecording { transform });
@@ -259,6 +267,8 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     let _ = tx.send(DaemonEvent::LatchArmed);
                 }
                 PttDecision::Stop => {
+                    let why = if prev == ST_LATCHED { "hotkey tap ended hands-free" } else { "hotkey released" };
+                    eprintln!("[hotkey] {} stop · {why}", stamp());
                     let _ = tx.send(DaemonEvent::StopRecording);
                 }
                 _ => {}
@@ -302,7 +312,23 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     if keycode != hotkey_keycode {
                         return CallbackResult::Keep;
                     }
+                    // Only a physical key controls the session. A FlagsChanged
+                    // posted by another process (AppleScript, an automation
+                    // tool, a remote's companion app) carries that process's
+                    // PID here; hardware and Karabiner's virtual HID carry 0.
+                    // Without this guard, any app posting Right Option ends a
+                    // hands-free session and pastes the transcript wherever
+                    // focus is.
+                    let src_pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
                     let flags = event.get_flags();
+                    if src_pid != 0 {
+                        eprintln!(
+                            "[hotkey] {} ignored synthesized hotkey event from pid {src_pid} (flags {:#x})",
+                            stamp(),
+                            flags.bits()
+                        );
+                        return CallbackResult::Keep;
+                    }
                     let input = if let Some(hf) = hotkey_flag {
                         if flags.contains(hf) {
                             // Shift co-held at press → transform mode (rewrite the
@@ -465,6 +491,9 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let tx_for_ctl = tx.clone();
     crate::ipc::serve(move |cmd| {
         use crate::ipc::Command;
+        // Every socket command is logged: it is the one path that ends a
+        // session with no key involved, so it must never be invisible.
+        eprintln!("[ipc] {} control socket · {cmd:?}", stamp());
         let _ = match cmd {
             Command::Start => tx_for_ctl.send(DaemonEvent::StartRecording { transform: false }),
             Command::Stop => tx_for_ctl.send(DaemonEvent::StopRecording),
@@ -525,6 +554,40 @@ fn vad_config(whisper: bool) -> crate::vad::VadConfig {
     } else {
         crate::vad::VadConfig::default().streaming()
     }
+}
+
+/// Wall-clock stamp for the session-control log lines (`HH:MM:SS.mmm`,
+/// local time). The daemon log had no timestamps and no stop reasons, which
+/// made a "stopped by itself" report impossible to check (2026-09-09).
+pub(crate) fn stamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs() as i64;
+    let ms = now.subsec_millis();
+    // Local offset via libc, no chrono dependency.
+    extern "C" {
+        fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
+    }
+    #[repr(C)]
+    struct Tm {
+        tm_sec: i32,
+        tm_min: i32,
+        tm_hour: i32,
+        tm_mday: i32,
+        tm_mon: i32,
+        tm_year: i32,
+        tm_wday: i32,
+        tm_yday: i32,
+        tm_isdst: i32,
+        tm_gmtoff: i64,
+        tm_zone: *const std::os::raw::c_char,
+    }
+    let mut tm = Tm {
+        tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0,
+        tm_wday: 0, tm_yday: 0, tm_isdst: 0, tm_gmtoff: 0, tm_zone: std::ptr::null(),
+    };
+    unsafe { localtime_r(&secs, &mut tm) };
+    format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, ms)
 }
 
 /// Map a modifier-key keycode to the CGEvent flag bit it toggles. On a

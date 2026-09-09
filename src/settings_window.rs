@@ -334,6 +334,12 @@ define_class!(
             menubar::export_log_to_downloads();
         }
 
+        #[unsafe(method(changeShowResult:))]
+        fn change_show_result(&self, sender: *mut AnyObject) {
+            let on = switch_on(sender);
+            with_pending(|p| p.show_result = Some(on));
+        }
+
         #[unsafe(method(changeWhisper:))]
         fn change_whisper(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
@@ -766,6 +772,23 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
     if std::env::var_os("DICTATE_WHISPER_MODE").is_some() {
         env_hint(mtm, &mut card, "DICTATE_WHISPER_MODE");
+    }
+
+    let result_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Show result",
+        "\"Landed · N words\" pill for 2 s after each dictation",
+    );
+    result_switch.set_on(loaded.resolve_show_result());
+    wire_switch(
+        &result_switch,
+        &controller,
+        sel!(changeShowResult:),
+        std::env::var_os("DICTATE_SHOW_RESULT").is_some(),
+    );
+    if std::env::var_os("DICTATE_SHOW_RESULT").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_SHOW_RESULT");
     }
 
     let preroll_switch = toggle_row(

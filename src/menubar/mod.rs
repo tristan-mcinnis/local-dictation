@@ -373,6 +373,17 @@ define_class!(
             let _ = crate::ipc::send(crate::ipc::Command::Cancel);
         }
 
+        // The success pill's Undo: send ⌘Z to the app that just received the
+        // text. (It was wired to cancelPill: before, which discarded nothing
+        // useful after the text had already landed.)
+        #[unsafe(method(undoPill:))]
+        fn undo_pill(&self, _sender: *mut AnyObject) {
+            if let Err(e) = crate::clipboard_paste::synthesize_undo() {
+                eprintln!("[pill] undo failed: {e}");
+            }
+            crate::ui_channel::set_state(crate::ui_channel::UiState::Idle);
+        }
+
         // Re-run the pipeline on the last utterance's audio at the current
         // cursor. No-op when nothing has been dictated this session.
         #[unsafe(method(retryLast:))]

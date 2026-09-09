@@ -1237,9 +1237,11 @@ pub(super) fn worker_loop(
                     crate::injector::FinalizeResult::Injected => {
                         eprintln!("  ✓    \"{final_text}\"");
                         cues::play_success();
-                        ui_channel::show_transient(UiState::Success, Duration::from_millis(420));
                         // Remember it for the menu-bar "Copy last dictation" item.
+                        // Stored BEFORE the pill shows so the word count is this
+                        // dictation's, not the previous one's.
                         ui_channel::set_last_dictation(&final_text);
+                        show_result_pill();
                         // Persist to the browsable dictation history (best-effort;
                         // never blocks or fails the hot path).
                         crate::history::record(&final_text);
@@ -1675,5 +1677,18 @@ mod tests {
         let mut last = Vec::new();
         retain_in_flight_audio(&mut last, &[], None, None);
         assert!(last.is_empty());
+    }
+}
+
+/// Flash the "Landed · N words" pill, or go straight to Idle when the result
+/// pill is off (default). The text landing at the cursor is the real feedback.
+pub(crate) fn show_result_pill() {
+    if crate::settings::Settings::load().resolve_show_result() {
+        ui_channel::show_transient(
+            UiState::Success,
+            Duration::from_millis(crate::settings::RESULT_PILL_MS),
+        );
+    } else {
+        ui_channel::set_state(UiState::Idle);
     }
 }

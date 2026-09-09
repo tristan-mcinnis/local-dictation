@@ -173,6 +173,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | `DICTATE_LLM_MODEL_PATH` | Cleanup-LLM GGUF path override (`S1_MODEL_PATH` alias, `GEMMA_MODEL_PATH` deprecated) |
 | `DICTATE_FORMAT` | Active output-format preset |
 | `DICTATE_QUIET` | Mute audio cues |
+| `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_NO_MUTE` | Do not mute other audio during capture |
 
 ## Subcommands

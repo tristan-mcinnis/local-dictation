@@ -181,6 +181,13 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub double_tap_latch: Option<bool>,
 
+    /// Show the "Landed · N words" result pill after a dictation lands.
+    /// `None`/false ⇒ off (the text arriving at the cursor is the feedback).
+    /// When on, the pill stays for [`RESULT_PILL_MS`]. Override:
+    /// `DICTATE_SHOW_RESULT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_result: Option<bool>,
+
     /// Window appearance: `"system"`, `"light"`, or `"dark"`. `None` ⇒
     /// [`DEFAULT_APPEARANCE`] (dark — the house design's default). Applied with
     /// `NSApplication.setAppearance`, so every window follows it; nothing is
@@ -188,6 +195,10 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance: Option<String>,
 }
+
+/// How long the optional "Landed · N words" result pill stays on screen. Long
+/// enough to read; the old 420 ms vanished before the eye reached it.
+pub const RESULT_PILL_MS: u64 = 2000;
 
 /// Appearance choices offered in the menu and the Settings window, as
 /// `(on-disk value, label)`.
@@ -534,6 +545,15 @@ impl Settings {
             return matches!(v.as_str(), "1" | "true" | "on" | "yes");
         }
         self.whisper_mode.unwrap_or(false)
+    }
+
+    /// Resolve the result pill: `DICTATE_SHOW_RESULT` env > settings > off.
+    pub fn resolve_show_result(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_SHOW_RESULT") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.show_result.unwrap_or(false)
     }
 
     /// Resolve double-tap-to-latch (hands-free from a hotkey double-tap):

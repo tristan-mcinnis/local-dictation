@@ -299,7 +299,7 @@ re-joining the path:
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
-  `double_tap_latch`, `appearance`.
+  `double_tap_latch`, `show_result`, `appearance`.
   `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
   `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
   silently ignored by serde — an old settings file still parses.
@@ -341,6 +341,7 @@ stack:
 | `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key) |
 | `DICTATE_DOUBLE_TAP_LATCH` | Double-tap the hotkey to latch hands-free (`0`/`false`/`off` disables) |
 | `DICTATE_WHISPER_MODE` | Lower VAD speech threshold for quiet speech |
+| `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_TRANSLATION_TARGETS` / `DICTATE_ACTIVE_TRANSLATION_TARGET` | Translate-mode target list (comma-separated) and the active one |
 | `DICTATE_HISTORY_RETENTION` | History pruning window (see `history.rs`) |
 | `DICTATE_REDUCED_MOTION` | Force the pill's reduced-motion animation |

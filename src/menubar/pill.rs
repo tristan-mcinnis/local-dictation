@@ -222,7 +222,7 @@ pub(super) fn build_pill_window(
     unsafe {
         let _: () = msg_send![&*undo, setTransparent: true];
         let _: () = msg_send![&*undo, setTarget: &**actions];
-        let _: () = msg_send![&*undo, setAction: sel!(cancelPill:)];
+        let _: () = msg_send![&*undo, setAction: sel!(undoPill:)];
         let _: () = msg_send![&*undo, setAccessibilityLabel: &*NSString::from_str("Undo dictation")];
     }
     undo.setHidden(true);
@@ -558,11 +558,12 @@ pub(super) fn update_pill_hover(globals: &UiGlobals) {
     if !matches!(state, UiState::Recording | UiState::Processing) {
         return;
     }
-    let target = if pointer_over_pill(&globals.pill_window) {
-        1.0
-    } else {
-        0.0
-    };
+    // The hover shelf is retired (2026-09-09): the pill reacting to the mouse
+    // was jarring, and Superwhisper / Wispr Flow never do it. The keys are
+    // documented in Settings and the README instead. `pointer_over_pill`
+    // stays for the click targets; the shelf target is pinned closed.
+    let _ = pointer_over_pill(&globals.pill_window);
+    let target = 0.0;
     let Ok(mut progress) = globals.pill_expanded.lock() else {
         return;
     };
@@ -654,6 +655,16 @@ pub(super) fn reduced_motion_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// RMS below this is treated as room tone and shows the resting bar.
+const BAR_GATE_RMS: f32 = 0.003;
+/// dBFS that maps to the resting bar / the full bar.
+const BAR_DB_FLOOR: f64 = -48.0;
+const BAR_DB_CEIL: f64 = -12.0;
+/// Per-bar gain bias (±12 %) so adjacent bars never move as one block.
+const BAR_BIAS: [f64; BAR_COUNT] = [
+    0.92, 1.06, 0.97, 1.10, 0.90, 1.04, 1.12, 0.95, 1.08, 0.93, 1.02, 0.89, 1.05, 0.98,
+];
+
 pub(super) fn update_bars(globals: &UiGlobals) {
     let levels = ui_channel::recent_levels();
     let mut displayed = match globals.displayed_heights.lock() {
@@ -676,25 +687,29 @@ pub(super) fn update_bars(globals: &UiGlobals) {
             }
         };
 
-        // Noise gate + moderate gain. Floor at RMS 0.003 silences the
-        // "hum animation" the user noticed — ambient mic noise sits
-        // around 0.001-0.0025, real speech starts around 0.005+. powf
-        // shape (0.45) gives quiet speech visible presence without
-        // making the bars constantly max out on loud syllables.
-        let target = if level < 0.003 {
+        // Decibel window, the way Superwhisper / Wispr Flow shape their
+        // bars. The old linear-ish map (RMS 0.043 = full height, 0.45 power)
+        // pinned every spoken syllable at 50-100 %, so speech read as a solid
+        // wall. Speech RMS spans roughly -45 dBFS (soft) to -15 dBFS (loud);
+        // mapping that window linearly in dB gives the bars room to breathe.
+        // Below the gate the bar rests. A small per-bar bias decorrelates
+        // neighbours so the row does not move as one block.
+        let target = if level < BAR_GATE_RMS {
             BAR_MIN_H
         } else {
-            let normalized = (((level - 0.003) * 25.0) as f64).powf(0.45).min(1.0);
+            let db = 20.0 * (level as f64).max(1e-6).log10();
+            let normalized = ((db - BAR_DB_FLOOR) / (BAR_DB_CEIL - BAR_DB_FLOOR)).clamp(0.0, 1.0);
+            let normalized = (normalized * BAR_BIAS[i]).clamp(0.0, 1.0);
             BAR_MIN_H + normalized * (BAR_MAX_H - BAR_MIN_H)
         };
 
-        // Peak-hold with slow decay: rise instantly to new highs, drop
-        // gently toward target so the eye can catch the peak.
+        // Eased attack and slower release: the eye follows a swell, not a
+        // strobe. (Previously rise was instant.)
         let current = displayed[i];
         let new_h = if target >= current {
-            target
+            current * 0.45 + target * 0.55
         } else {
-            current * 0.78 + target * 0.22
+            current * 0.82 + target * 0.18
         };
         displayed[i] = new_h;
         *slot = new_h;
