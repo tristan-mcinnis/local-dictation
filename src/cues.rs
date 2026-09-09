@@ -106,42 +106,70 @@ fn play(cue: Cue) {
 
 #[cfg(target_os = "macos")]
 mod macos {
+    //! Playback goes through `NSSound`, the same path Superwhisper uses, so the
+    //! cues follow the normal output volume. The previous
+    //! `AudioServicesPlaySystemSound` route played on the *alert* channel, and
+    //! a Mac with alert volume at 0 (the user's, 2026-09-09) never heard a cue.
+    //! Driven through the Objective-C runtime directly so this module stays
+    //! free of the optional objc2 crates and the featureless build links.
     use super::Cue;
     use std::{
-        ffi::c_void,
+        ffi::{c_void, CString},
         fs,
-        os::unix::ffi::OsStrExt,
         path::{Path, PathBuf},
         sync::OnceLock,
     };
 
-    type CFIndex = isize;
-    type CFURLRef = *const c_void;
-    type SystemSoundID = u32;
+    type Id = *mut c_void;
+    type Sel = *const c_void;
 
-    #[link(name = "AudioToolbox", kind = "framework")]
+    #[link(name = "objc", kind = "dylib")]
     extern "C" {
-        fn AudioServicesCreateSystemSoundID(
-            file_url: CFURLRef,
-            sound_id: *mut SystemSoundID,
-        ) -> i32;
-        fn AudioServicesPlaySystemSound(sound_id: SystemSoundID);
+        fn objc_getClass(name: *const std::os::raw::c_char) -> Id;
+        fn sel_registerName(name: *const std::os::raw::c_char) -> Sel;
+        fn objc_msgSend();
     }
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {}
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
-        fn CFURLCreateFromFileSystemRepresentation(
-            allocator: *const c_void,
-            buffer: *const u8,
-            buffer_len: CFIndex,
-            is_directory: bool,
-        ) -> CFURLRef;
+        fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            c_str: *const std::os::raw::c_char,
+            encoding: u32,
+        ) -> Id;
         fn CFRelease(value: *const c_void);
+    }
+    const UTF8: u32 = 0x0800_0100;
+
+    fn sel(name: &str) -> Sel {
+        let c = CString::new(name).expect("selector");
+        unsafe { sel_registerName(c.as_ptr()) }
+    }
+
+    unsafe fn send0(receiver: Id, selector: Sel) -> Id {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(receiver, selector)
+    }
+    unsafe fn send2(receiver: Id, selector: Sel, a: Id, b: bool) -> Id {
+        let f: unsafe extern "C" fn(Id, Sel, Id, bool) -> Id =
+            std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(receiver, selector, a, b)
+    }
+    unsafe fn send_f32(receiver: Id, selector: Sel, v: f32) {
+        let f: unsafe extern "C" fn(Id, Sel, f32) = std::mem::transmute(objc_msgSend as unsafe extern "C" fn());
+        f(receiver, selector, v)
     }
 
     pub(super) struct Sounds {
-        ids: [SystemSoundID; 6],
+        sounds: [Id; 6],
         _directory: PathBuf,
     }
+    // NSSound is safe to `play` from any thread; the objects are created once
+    // and never mutated afterwards.
+    unsafe impl Send for Sounds {}
+    unsafe impl Sync for Sounds {}
+
     static SOUNDS: OnceLock<Option<Sounds>> = OnceLock::new();
 
     pub(super) fn sounds() -> Option<&'static Sounds> {
@@ -160,16 +188,16 @@ mod macos {
                 Cue::Latch,
                 Cue::Error,
             ];
-            let mut ids = [0; 6];
+            let mut sounds = [std::ptr::null_mut(); 6];
             for (index, cue) in cues.into_iter().enumerate() {
                 let path = directory.join(cue.file_name());
                 if !matches_bytes(&path, cue.bytes()) {
                     fs::write(&path, cue.bytes()).ok()?;
                 }
-                ids[index] = create_id(&path)?;
+                sounds[index] = create_sound(&path)?;
             }
             Some(Self {
-                ids,
+                sounds,
                 _directory: directory,
             })
         }
@@ -183,41 +211,45 @@ mod macos {
                 Cue::Latch => 4,
                 Cue::Error => 5,
             };
+            let sound = self.sounds[index];
             unsafe {
-                AudioServicesPlaySystemSound(self.ids[index]);
+                // Restart from the top if the same cue is still sounding.
+                send0(sound, sel("stop"));
+                send0(sound, sel("play"));
             }
         }
     }
 
-    fn create_id(path: &Path) -> Option<SystemSoundID> {
-        let bytes = path.as_os_str().as_bytes();
-        let url = unsafe {
-            CFURLCreateFromFileSystemRepresentation(
-                std::ptr::null(),
-                bytes.as_ptr(),
-                bytes.len() as CFIndex,
-                false,
-            )
-        };
-        if url.is_null() {
-            return None;
-        }
-        let mut id = 0;
-        let status = unsafe { AudioServicesCreateSystemSoundID(url, &mut id) };
+    /// `[[NSSound alloc] initWithContentsOfFile:path byReference:NO]`, retained
+    /// for the life of the process.
+    fn create_sound(path: &Path) -> Option<Id> {
+        let c_path = CString::new(path.to_str()?).ok()?;
         unsafe {
-            CFRelease(url);
+            let cls = objc_getClass(c"NSSound".as_ptr());
+            if cls.is_null() {
+                return None;
+            }
+            let ns_path = CFStringCreateWithCString(std::ptr::null(), c_path.as_ptr(), UTF8);
+            if ns_path.is_null() {
+                return None;
+            }
+            let alloc = send0(cls, sel("alloc"));
+            let sound = send2(alloc, sel("initWithContentsOfFile:byReference:"), ns_path, false);
+            CFRelease(ns_path);
+            if sound.is_null() {
+                return None;
+            }
+            send_f32(sound, sel("setVolume:"), 1.0);
+            Some(sound)
         }
-        (status == 0).then_some(id)
     }
 
     fn cache_directory() -> Option<PathBuf> {
         crate::app_paths::cache_dir("Sounds")
     }
 
-    fn matches_bytes(path: &Path, expected: &[u8]) -> bool {
-        fs::read(path)
-            .map(|actual| actual == expected)
-            .unwrap_or(false)
+    fn matches_bytes(path: &Path, bytes: &[u8]) -> bool {
+        fs::read(path).map(|existing| existing == bytes).unwrap_or(false)
     }
 }
 
