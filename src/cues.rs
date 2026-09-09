@@ -1,4 +1,5 @@
-//! Short, original feedback cues for the dictation state machine.
+//! Feedback cues for the dictation state machine. Start and the landed cue
+//! are Superwhisper's "simple" theme pair; the rest are original.
 //!
 //! Samples are embedded in the binary and registered with macOS' native
 //! system-sound service on first use. Playback is asynchronous, so a cue never
@@ -12,17 +13,21 @@ const CANCEL: &[u8] = include_bytes!("../resources/sounds/cancel.wav");
 const LATCH: &[u8] = include_bytes!("../resources/sounds/latch.wav");
 const ERROR: &[u8] = include_bytes!("../resources/sounds/error.wav");
 
-/// Recording started. A gentle, rising two-note cue.
+/// Recording started. Superwhisper's "simple" start cue.
 pub fn play_start() {
     play(Cue::Start);
 }
 
-/// Recording stopped. A soft, descending release cue.
+/// Recording stopped. Silent by design (2026-09-09): the pair the user wants
+/// is start-at-press and stop-when-the-text-lands, not a third cue at release.
+/// The Stop sample stays registered for `DICTATE_STOP_CUE=1`.
 pub fn play_stop() {
-    play(Cue::Stop);
+    if std::env::var_os("DICTATE_STOP_CUE").is_some() {
+        play(Cue::Stop);
+    }
 }
 
-/// Text was accepted and injected successfully.
+/// Text was accepted and injected. Superwhisper's "simple" stop cue.
 pub fn play_success() {
     play(Cue::Success);
 }
