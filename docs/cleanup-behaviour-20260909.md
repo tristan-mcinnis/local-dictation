@@ -87,13 +87,22 @@ excluded, since digits are the intended output):
 
 | prompt | utterances that lost a content word | content words lost | latency |
 |---|---|---|---|
-| old default ("Reformat the user's message…") | 25 of 120 | 52 | 453 ms |
+| old default ("Reformat the user's message…") | 25, 25, 27 of 120 | 52, 52, 57 | 453 ms |
 | Superwhisper's, verbatim | 19 of 120 | 34 | 423 ms |
-| **our rewrite of the same principles (now shipped)** | **18 of 120** | **29–42** | **421 ms** |
+| **our rewrite of the same principles (now shipped)** | **18, 18, 21, 22 of 120** | **29, 42, 50, 52** | **421 ms** |
 
-The new default is our own wording, not a copy of theirs. It wins on the metric
-and is slightly faster. The worst old failure, fourteen words deleted from a
-half-finished sentence to tidy the rest, does not recur.
+Repeated runs, because S1 is not bit-identical between runs even at
+temperature 0. Read them honestly:
+
+- **The utterance count separates cleanly.** Old 25–27, new 18–22. Fewer
+  dictations come back damaged, every run.
+- **The word total overlaps at the top end.** Old 52–57, new 29–52. The new
+  prompt is better on average, but a bad run of it costs about what a typical
+  run of the old one did. This is an improvement, not a cure.
+
+The new default is our own wording, not a copy of theirs. The worst old
+failure, fourteen words deleted from a half-finished sentence to tidy the rest,
+did not recur in any run of the new one.
 
 The shipped default is now:
 
