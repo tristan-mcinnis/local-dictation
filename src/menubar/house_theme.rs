@@ -1,4 +1,4 @@
-// GENERATED from design-system/tokens.json 85ead24dee81; do not edit
+// GENERATED from design-system/tokens.json 139c2b88c9cd; do not edit
 // Source of truth: the design-system repo (DESIGN.md + tokens.json).
 // Regenerate with `make rust` there; `make check` verifies this copy.
 #![allow(dead_code)]
@@ -260,9 +260,11 @@ pub const SHADOW_SELECTION: Shadow = Shadow { y: 1.0, blur: 2.0, light: 0.08, da
 pub const SHADOW_CARD: Shadow = Shadow { y: 2.0, blur: 8.0, light: 0.06, dark: 0.24 };
 
 /// Fixed layout widths and heights shared by the apps.
-pub const LAYOUT_PANEL_WIDTH: f64 = 720.0;
-pub const LAYOUT_ANSWER_PANEL_WIDTH: f64 = 800.0;
+pub const LAYOUT_PANEL_WIDTH: f64 = 750.0;
+pub const LAYOUT_ANSWER_PANEL_WIDTH: f64 = 750.0;
 pub const LAYOUT_ANSWER_MAX_WIDTH: f64 = 620.0;
+pub const LAYOUT_QUICK_A_I_HEIGHT: f64 = 475.0;
+pub const LAYOUT_QUICK_A_I_ANSWER_MAX_WIDTH: f64 = 690.0;
 pub const LAYOUT_SETTINGS_RAIL: f64 = 220.0;
 pub const LAYOUT_SETTINGS_WIDTH: f64 = 860.0;
 pub const LAYOUT_SETTINGS_HEIGHT: f64 = 620.0;
