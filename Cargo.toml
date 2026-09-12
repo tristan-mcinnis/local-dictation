@@ -62,7 +62,7 @@ libc = "0.2"
 # Menu-bar status item. Pulled in only with the ax-inject feature (the daemon
 # path) — the lib build doesn't need it.
 objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSArray", "NSData", "NSRunLoop", "NSThread", "NSDate", "NSDateFormatter", "NSAttributedString", "NSDictionary", "NSValue", "NSGeometry", "NSEnumerator"] }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSString", "NSArray", "NSData", "NSRunLoop", "NSThread", "NSDate", "NSDateFormatter", "NSAttributedString", "NSDictionary", "NSValue", "NSGeometry", "NSEnumerator", "NSNotification"] }
 objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSApplication",
     "NSStatusBar",

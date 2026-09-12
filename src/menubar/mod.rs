@@ -40,7 +40,8 @@ use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua,
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath,
+    NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate, NSBackingStoreType,
+    NSBezierPath,
     NSBitmapImageFileType, NSBitmapImageRep, NSButton, NSColor, NSControl, NSControlStateValueOff,
     NSControlStateValueOn, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSGraphicsContext, NSImage, NSImageSymbolConfiguration, NSImageView, NSKernAttributeName, NSLineBreakMode, NSMenu,
@@ -54,8 +55,8 @@ use objc2_core_foundation::{
     CFRunLoopTimerContext,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSMutableAttributedString, NSNumber,
-    NSObject, NSPoint, NSRange, NSRect, NSSize, NSString,
+    MainThreadMarker, NSArray, NSDate, NSDateFormatter, NSMutableAttributedString, NSNotification,
+    NSNumber, NSObject, NSPoint, NSRange, NSRect, NSSize, NSString,
 };
 
 use crate::history::Entry;
@@ -222,6 +223,10 @@ struct UiGlobals {
     /// frontmost app for recovery paste) is not deallocated. NSMenu keeps its
     /// delegate weakly.
     _menu_delegate: Retained<MenuDelegate>,
+    /// Held alive so the application delegate (which releases the models on the
+    /// way out — see `AppDelegate`) survives. NSApplication, like NSMenu, keeps
+    /// its delegate weakly.
+    _app_delegate: Retained<AppDelegate>,
 }
 unsafe impl Sync for UiGlobals {}
 unsafe impl Send for UiGlobals {}
@@ -509,6 +514,58 @@ impl MenuDelegate {
     }
 }
 
+// ─── Application delegate: release the models before the process exits ──
+//
+// Quit runs `-[NSApplication terminate:]`, which calls `exit()` from inside
+// `NSApp.run()`. `exit()` runs the C++ static destructors, and ggml frees its
+// Metal devices from one of them — asserting (and aborting) if any Metal buffer
+// is still alive. The daemon's model buffers live on the worker thread, so the
+// process aborted on every quit.
+//
+// `applicationWillTerminate:` is the last main-thread callback before that
+// `exit()`, and Metal is still alive here, so this is where the ordered release
+// belongs. `crate::shutdown::release_models` asks the worker to drop its models
+// and blocks until it has.
+//
+// Delete this once ggml's Metal teardown tolerates live buffers at exit.
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "FDAppDelegate"]
+    struct AppDelegate;
+
+    impl AppDelegate {}
+
+    unsafe impl NSObjectProtocol for AppDelegate {}
+
+    unsafe impl NSApplicationDelegate for AppDelegate {
+        #[unsafe(method(applicationWillTerminate:))]
+        fn application_will_terminate(&self, _notification: &NSNotification) {
+            // Bounded: a worker wedged mid-utterance must not hang the quit.
+            // Timing out only restores the old behaviour (a possible abort in
+            // ggml's static teardown), so it is never worse than not waiting.
+            if !crate::shutdown::release_models(MODEL_RELEASE_TIMEOUT) {
+                eprintln!(
+                    "[quit] models not released within {} ms — exiting anyway",
+                    MODEL_RELEASE_TIMEOUT.as_millis()
+                );
+            }
+        }
+    }
+);
+
+impl AppDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm);
+        unsafe { msg_send![this, init] }
+    }
+}
+
+/// How long quit waits for the worker to drop its models. Generous enough to
+/// cover a cleanup generation in flight, short enough that quit still feels
+/// immediate if the worker is stuck.
+const MODEL_RELEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 // ─── Flipped container for the history list ─────────────────────────────
 //
 // NSView's default coordinate origin is bottom-left, which makes a top-down
@@ -558,6 +615,11 @@ pub fn init_and_run() -> eyre::Result<()> {
     // Dark is the default; the setting can pin Light or follow the system.
     apply_app_appearance(mtm, &Settings::load().resolve_appearance());
 
+    // Install before anything can quit: the delegate is what releases the
+    // models ahead of the process-exit teardown (see `AppDelegate`).
+    let app_delegate = AppDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*app_delegate)));
+
     let actions = MenuActions::new();
     let built = build_status_item(mtm, &actions)?;
     let pill = build_pill_window(mtm, &actions)?;
@@ -576,6 +638,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         last_item: built.last_item,
         _actions: actions,
         _menu_delegate: built.menu_delegate,
+        _app_delegate: app_delegate,
     };
     let _ = GLOBALS.set(globals);
 

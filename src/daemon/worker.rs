@@ -265,6 +265,15 @@ pub(super) fn worker_loop(
                 cues::play_latch();
                 eprintln!("⤓ hands-free · release keys, keep talking · tap PTT to stop");
             }
+            DaemonEvent::Shutdown => {
+                // Quit: return so every local here — the cleanup engine with
+                // its LlamaContext, the ASR worker — is dropped while Metal is
+                // still alive. The spawning thread then calls
+                // `shutdown::mark_released`, which unblocks the delegate that
+                // is holding `exit()` open.
+                eprintln!("[daemon] shutdown · releasing models before exit");
+                return Ok(());
+            }
             DaemonEvent::Retry => {
                 // Re-run the pipeline on the retained "last recording" audio
                 // (control-socket "retry" / menu-bar item). Retry obeys the
@@ -591,6 +600,12 @@ pub(super) fn worker_loop(
                                 Ok(DaemonEvent::StopRecording)
                                 | Ok(DaemonEvent::LatchArmed)
                                 | Ok(DaemonEvent::Retry) => {}
+                                // Quit during the tail: abandon this utterance
+                                // and release the models (see `crate::shutdown`).
+                                Ok(DaemonEvent::Shutdown) => {
+                                    eprintln!("[daemon] shutdown · releasing models before exit");
+                                    return Ok(());
+                                }
                                 Err(_) => {}
                             }
                             recovered_ms = grace_start.elapsed().as_millis();
