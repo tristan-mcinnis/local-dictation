@@ -51,6 +51,16 @@ APP_SUPPORT="$HOME/Library/Application Support/$APP_NAME"
 
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 
+# WHICH COMMIT this bundle was built from, stamped into Info.plist below
+# ALONGSIDE the version (never replacing it), so an installed binary is always
+# traceable to a revision. A build always compiles the WORKING TREE, not HEAD,
+# so a dirty tree is marked: such a build traces to no commit at all. Marking is
+# not refusing — only --install refuses (see below).
+COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
+  COMMIT="$COMMIT-dirty"
+fi
+
 # Fixed software-of-one model stack.
 COHERE_REL="dictation/cohere-mlx-q4"
 LLM_REL="llm/s1-mini"
@@ -71,6 +81,26 @@ done
 
 if [ "$SLIM" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 1 ]; then
   echo "--slim and --bundle-models are mutually exclusive" >&2; exit 2
+fi
+
+# Installing from a dirty checkout puts a binary in /Applications that traces to
+# no commit at all (bitten 2026-09-12 in a sibling house repo: a build installed
+# mid-edit ran for an hour answering in a reply format that existed only in
+# uncommitted edits, which is the only reason the mismatch was ever noticed).
+# Refuse --install by default; override deliberately with
+# DICTATION_ALLOW_DIRTY=1, and the stamp above then records <sha>-dirty. Only
+# the install path is guarded: a plain build, a --dmg, and every dev loop still
+# build a dirty tree without complaint, they just get a marked stamp. The check
+# is here, before the multi-minute compile, so a refusal costs nothing.
+if [ "$INSTALL" -eq 1 ] && [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
+  if [ "${DICTATION_ALLOW_DIRTY:-0}" = "1" ]; then
+    echo "⚠ dirty tree: this build traces to no commit; stamping it $COMMIT" >&2
+  else
+    echo "refusing to install from a dirty working tree." >&2
+    git -C "$REPO_ROOT" status --short >&2
+    echo "commit or stash first, or re-run with DICTATION_ALLOW_DIRTY=1 to override." >&2
+    exit 1
+  fi
 fi
 
 # A DMG is meant to be moved/shared, so a dev symlink into the repo would dangle
@@ -119,6 +149,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>CFBundlePackageType</key>         <string>APPL</string>
     <key>CFBundleShortVersionString</key>  <string>$VERSION</string>
     <key>CFBundleVersion</key>             <string>$VERSION</string>
+    <key>LocalDictationBuiltFromCommit</key> <string>$COMMIT</string>
     <key>LSMinimumSystemVersion</key>      <string>$MIN_MACOS</string>
     <key>NSHighResolutionCapable</key>     <true/>
     <!-- Menu-bar agent: no Dock icon, no app-switcher entry. -->
