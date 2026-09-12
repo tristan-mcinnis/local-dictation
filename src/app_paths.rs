@@ -50,6 +50,14 @@ pub fn app_support_dir() -> Option<PathBuf> {
     Some(home_dir()?.join("Library/Application Support/Local Dictation"))
 }
 
+/// `~/Library/Application Support/House/commands` — the shared directory where
+/// every house app publishes its command manifest, so one app can list what the
+/// others do without knowing any of them by name. The contract lives in
+/// `design-system/docs/app-commands.md`. `None` if `$HOME` is unset.
+pub fn house_commands_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join("Library/Application Support/House/commands"))
+}
+
 /// `~/Library/Caches/Local Dictation/<sub>` (None if `$HOME` is unset).
 pub fn cache_dir(sub: &str) -> Option<PathBuf> {
     Some(home_dir()?.join("Library/Caches/Local Dictation").join(sub))

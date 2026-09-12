@@ -53,6 +53,8 @@ async fn main() -> eyre::Result<()> {
         "stop" => run_control(fast_dictate_backend::ipc::Command::Stop),
         "cancel" => run_control(fast_dictate_backend::ipc::Command::Cancel),
         "retry" => run_control(fast_dictate_backend::ipc::Command::Retry),
+        // Ask a running daemon what it is doing, as one line of JSON.
+        "status" => run_status(),
         "synth-press" => run_synth_press(
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000),
         ),
@@ -64,7 +66,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
         )),
     }
 }
@@ -84,6 +86,18 @@ fn run_control(cmd: fast_dictate_backend::ipc::Command) -> eyre::Result<()> {
              Start it with `daemon` (or launch Local Dictation.app)."
         )),
     }
+}
+
+/// Print the running daemon's status document — one line of JSON, per the
+/// house command contract (`design-system/docs/app-commands.md`). When the
+/// socket can't be reached we still print a well-formed document with
+/// `"ok": false`, so a caller polling this never has to parse an error string.
+fn run_status() -> eyre::Result<()> {
+    match fast_dictate_backend::ipc::send(fast_dictate_backend::ipc::Command::Status) {
+        Ok(reply) => println!("{reply}"),
+        Err(_) => println!("{}", fast_dictate_backend::ipc::offline_status_json()),
+    }
+    Ok(())
 }
 
 /// Snapshot every UI surface offscreen, in both appearances, for design review.

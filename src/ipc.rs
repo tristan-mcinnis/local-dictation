@@ -7,6 +7,12 @@
 //! `fast-dictate-backend toggle`. It speaks a one-word line protocol so the
 //! client side stays a three-line shell-out.
 //!
+//! It also answers `status` with one line of JSON and publishes a manifest of
+//! its commands under `~/Library/Application Support/House/commands/`, so Quick
+//! Launch can list and drive dictation without knowing anything about it. That
+//! contract is `design-system/docs/app-commands.md`, and this file is the
+//! reference it was written from.
+//!
 //! Design: the socket thread is deliberately dumb — it parses a word, resolves
 //! `toggle` against the live recording state, and hands a concrete command to a
 //! closure the daemon provides (which forwards it onto the same mpsc channel the
@@ -38,6 +44,11 @@ pub enum Command {
     /// cleanup + inject at the current cursor). No-op when nothing has been
     /// dictated yet in this daemon session.
     Retry,
+    /// Report live state as one line of JSON. Answered by the socket thread
+    /// itself — it never reaches the daemon's dispatch closure, so asking is
+    /// free and cannot touch the audio path. See the house command contract
+    /// (`design-system/docs/app-commands.md`).
+    Status,
 }
 
 impl Command {
@@ -50,6 +61,7 @@ impl Command {
             "toggle" => Some(Command::Toggle),
             "cancel" => Some(Command::Cancel),
             "retry" => Some(Command::Retry),
+            "status" => Some(Command::Status),
             _ => None,
         }
     }
@@ -62,7 +74,106 @@ impl Command {
             Command::Toggle => "toggle",
             Command::Cancel => "cancel",
             Command::Retry => "retry",
+            Command::Status => "status",
         }
+    }
+}
+
+/// The app id this daemon answers to in the house command contract. Also the
+/// manifest's filename stem.
+pub const APP_ID: &str = "dictation";
+
+/// Live state as one line of JSON, per the house status document: `app`, `ok`,
+/// `busy`, `detail`, plus every boolean the manifest's `unavailableWhen`
+/// clauses name (here: `recording`). `busy` mirrors `recording` — capturing an
+/// utterance is the only thing this daemon is ever busy with from outside.
+pub fn status_json() -> String {
+    let recording = DAEMON_RECORDING.load(Ordering::SeqCst);
+    serde_json::json!({
+        "app": APP_ID,
+        "ok": true,
+        "busy": recording,
+        "recording": recording,
+        "detail": if recording { "Listening" } else { "Idle" },
+    })
+    .to_string()
+}
+
+/// The same document for a daemon that isn't running, so a caller that can't
+/// reach the socket still gets a well-formed answer instead of a parse error.
+/// `ok: false` is the honest signal; nothing is claimed about the daemon.
+pub fn offline_status_json() -> String {
+    serde_json::json!({
+        "app": APP_ID,
+        "ok": false,
+        "busy": false,
+        "recording": false,
+        "detail": "Not running",
+    })
+    .to_string()
+}
+
+/// The command manifest, built against an explicit endpoint. Factored out from
+/// [`manifest_json`] so it's unit-testable without depending on where this
+/// machine's socket happens to resolve.
+fn manifest_for(endpoint: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema": 1,
+        "app": APP_ID,
+        "name": "Local Dictation",
+        "transport": "socket",
+        "endpoint": endpoint,
+        "status": "status",
+        "commands": [
+            // Toggle is always offered: it resolves itself against the live
+            // recording state, so it is correct in both directions.
+            {"id": "dictation.toggle", "title": "Toggle Dictation", "verb": "toggle",
+             "needs": null, "unavailableWhen": null},
+            {"id": "dictation.start", "title": "Start Dictation", "verb": "start",
+             "needs": null, "unavailableWhen": "recording"},
+            {"id": "dictation.stop", "title": "Stop Dictation", "verb": "stop",
+             "needs": null, "unavailableWhen": "!recording"},
+            {"id": "dictation.cancel", "title": "Cancel Dictation", "verb": "cancel",
+             "needs": null, "unavailableWhen": "!recording"},
+            // Retry re-runs the pipeline on the *last* utterance, so it only
+            // makes sense between utterances.
+            {"id": "dictation.retry", "title": "Retry Last Dictation", "verb": "retry",
+             "needs": null, "unavailableWhen": "recording"},
+        ],
+    })
+}
+
+/// The command manifest for this daemon, as pretty JSON with the endpoint
+/// resolved to the socket path actually in use.
+pub fn manifest_json() -> String {
+    let value = manifest_for(&socket_path().to_string_lossy());
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Write the manifest to `path`, creating the directory if needed.
+fn write_manifest_to(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, format!("{}\n", manifest_json()))
+}
+
+/// Publish this app's command manifest under the shared house commands
+/// directory, so Quick Launch can list what we do without knowing us by name.
+/// Every failure is logged and swallowed: a daemon that can't advertise itself
+/// still dictates, and that is the part that matters.
+pub fn write_manifest() {
+    let Some(dir) = crate::app_paths::house_commands_dir() else {
+        eprintln!("[ctl]  no $HOME — skipping the command manifest");
+        return;
+    };
+    let path = dir.join(format!("{APP_ID}.json"));
+    match write_manifest_to(&path) {
+        Ok(()) => eprintln!("[boot] commands   manifest {}", path.display()),
+        Err(e) => eprintln!(
+            "[ctl]  couldn't write the command manifest at {} ({e}) — carrying on",
+            path.display()
+        ),
     }
 }
 
@@ -147,7 +258,9 @@ where
 }
 
 /// Handle one client connection: read a command word, resolve `toggle`, dispatch
-/// it, and write back a status line (`ok <cmd>` / `err ...`).
+/// it, and write back a status line (`ok <cmd>` / `err ...`). `status` is the
+/// one verb answered here instead of dispatched — it only reads an atomic, so
+/// it stays off the daemon's channel entirely.
 fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -155,6 +268,7 @@ fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
         return;
     }
     let reply = match Command::parse(&line) {
+        Some(Command::Status) => format!("{}\n", status_json()),
         Some(cmd) => {
             let resolved = resolve(cmd);
             dispatch(resolved);
@@ -186,6 +300,16 @@ pub fn send(cmd: Command) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `DAEMON_RECORDING` is process-global, so every test that writes it takes
+    /// this lock first. Poisoning is ignored: a panicking test tells us about
+    /// its own failure, it shouldn't cascade into the others.
+    static FLAG_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_flag() -> std::sync::MutexGuard<'static, ()> {
+        FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn parse_is_case_insensitive_and_trims() {
@@ -204,6 +328,8 @@ mod tests {
             Command::Stop,
             Command::Toggle,
             Command::Cancel,
+            Command::Retry,
+            Command::Status,
         ] {
             assert_eq!(Command::parse(c.as_str()), Some(c));
         }
@@ -233,9 +359,9 @@ mod tests {
 
     #[test]
     fn toggle_resolves_against_recording_state() {
-        // This is the only test that touches the global recording flag, so it
-        // can read it back without racing the socket test (which uses concrete
-        // start/cancel commands that never read the flag).
+        // The recording flag is process-global; `FLAG_LOCK` serialises the
+        // tests that write it so neither reads the other's value.
+        let _guard = lock_flag();
         DAEMON_RECORDING.store(false, Ordering::SeqCst);
         assert_eq!(resolve(Command::Toggle), Command::Start);
         DAEMON_RECORDING.store(true, Ordering::SeqCst);
@@ -276,7 +402,120 @@ mod tests {
             Command::Cancel
         );
 
+        // `status` is answered by the server itself — nothing reaches the
+        // dispatch closure — and comes back as one line of JSON.
+        {
+            let _guard = lock_flag();
+            DAEMON_RECORDING.store(true, Ordering::SeqCst);
+            let reply = send(Command::Status).expect("send status");
+            let doc: serde_json::Value = serde_json::from_str(&reply).expect("status is JSON");
+            assert_eq!(doc["recording"], serde_json::json!(true));
+            assert_eq!(doc["detail"], serde_json::json!("Listening"));
+            DAEMON_RECORDING.store(false, Ordering::SeqCst);
+        }
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "status must not reach the daemon's dispatch closure"
+        );
+
         std::env::remove_var("DICTATE_CONTROL_SOCK");
         let _ = std::fs::remove_file(&sock);
+    }
+
+    #[test]
+    fn status_json_carries_the_contract_fields() {
+        let _guard = lock_flag();
+
+        DAEMON_RECORDING.store(false, Ordering::SeqCst);
+        let doc: serde_json::Value = serde_json::from_str(&status_json()).expect("valid JSON");
+        assert_eq!(doc["app"], serde_json::json!("dictation"));
+        assert_eq!(doc["ok"], serde_json::json!(true));
+        assert_eq!(doc["busy"], serde_json::json!(false));
+        assert_eq!(doc["recording"], serde_json::json!(false));
+        assert_eq!(doc["detail"], serde_json::json!("Idle"));
+        // One line, always: the protocol is one reply line per request.
+        assert!(!status_json().contains('\n'));
+
+        DAEMON_RECORDING.store(true, Ordering::SeqCst);
+        let doc: serde_json::Value = serde_json::from_str(&status_json()).expect("valid JSON");
+        assert_eq!(doc["busy"], serde_json::json!(true));
+        assert_eq!(doc["recording"], serde_json::json!(true));
+        assert_eq!(doc["detail"], serde_json::json!("Listening"));
+        DAEMON_RECORDING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn offline_status_is_a_well_formed_not_running_document() {
+        let doc: serde_json::Value = serde_json::from_str(&offline_status_json()).expect("JSON");
+        assert_eq!(doc["app"], serde_json::json!("dictation"));
+        assert_eq!(doc["ok"], serde_json::json!(false));
+        assert_eq!(doc["busy"], serde_json::json!(false));
+        assert_eq!(doc["recording"], serde_json::json!(false));
+        assert_eq!(doc["detail"], serde_json::json!("Not running"));
+    }
+
+    #[test]
+    fn manifest_matches_the_house_contract() {
+        let m = manifest_for("/tmp/test-control.sock");
+        assert_eq!(m["schema"], serde_json::json!(1));
+        assert_eq!(m["app"], serde_json::json!("dictation"));
+        assert_eq!(m["name"], serde_json::json!("Local Dictation"));
+        assert_eq!(m["transport"], serde_json::json!("socket"));
+        assert_eq!(m["endpoint"], serde_json::json!("/tmp/test-control.sock"));
+        assert_eq!(m["status"], serde_json::json!("status"));
+
+        let cmds = m["commands"].as_array().expect("commands is an array");
+        let verbs: Vec<&str> = cmds.iter().map(|c| c["verb"].as_str().unwrap()).collect();
+        assert_eq!(verbs, ["toggle", "start", "stop", "cancel", "retry"]);
+
+        for c in cmds {
+            // Every advertised verb must actually be one we parse…
+            let verb = c["verb"].as_str().unwrap();
+            assert!(Command::parse(verb).is_some(), "unparseable verb {verb}");
+            // …every command carries the full contract shape…
+            assert!(c["id"].is_string(), "{verb} needs an id");
+            assert!(c["title"].is_string(), "{verb} needs a title");
+            assert!(c.get("needs").is_some(), "{verb} needs a `needs` field");
+            // …and `unavailableWhen` is null or names a status boolean.
+            let when = &c["unavailableWhen"];
+            assert!(
+                when.is_null() || when.is_string(),
+                "{verb}: bad unavailableWhen"
+            );
+            if let Some(s) = when.as_str() {
+                assert_eq!(s.trim_start_matches('!'), "recording", "{verb}");
+            }
+        }
+
+        // The named clauses, spelled out: start is gone mid-utterance, stop and
+        // cancel only exist mid-utterance, retry works on the last one.
+        let when = |verb: &str| -> serde_json::Value {
+            cmds.iter()
+                .find(|c| c["verb"] == serde_json::json!(verb))
+                .unwrap()["unavailableWhen"]
+                .clone()
+        };
+        assert_eq!(when("toggle"), serde_json::Value::Null);
+        assert_eq!(when("start"), serde_json::json!("recording"));
+        assert_eq!(when("stop"), serde_json::json!("!recording"));
+        assert_eq!(when("cancel"), serde_json::json!("!recording"));
+        assert_eq!(when("retry"), serde_json::json!("recording"));
+    }
+
+    #[test]
+    fn manifest_is_written_as_parseable_json() {
+        let dir =
+            std::env::temp_dir().join(format!("dictate-manifest-test-{}", std::process::id()));
+        let path = dir.join("dictation.json");
+        write_manifest_to(&path).expect("write manifest");
+
+        let text = std::fs::read_to_string(&path).expect("read manifest back");
+        let doc: serde_json::Value = serde_json::from_str(&text).expect("manifest is valid JSON");
+        assert_eq!(doc["app"], serde_json::json!("dictation"));
+        assert_eq!(doc["schema"], serde_json::json!(1));
+        assert_eq!(doc["commands"].as_array().unwrap().len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
