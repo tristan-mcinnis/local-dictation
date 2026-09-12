@@ -157,6 +157,10 @@ enum DaemonEvent {
     /// socket ("retry") or the menu-bar item. A no-op when nothing has been
     /// dictated yet this session.
     Retry,
+    /// Quit is underway: leave the worker loop so the models — and the Metal
+    /// buffers they hold — are dropped while Metal is still alive. Sent by the
+    /// AppKit delegate's release hook; see `crate::shutdown`.
+    Shutdown,
 }
 
 /// How a tail-capture grace loop ended, when it was cut short by an event rather
@@ -193,6 +197,10 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         if let Err(e) = worker_loop(rx, config) {
             eprintln!("[daemon] worker exited with error: {e:?}");
         }
+        // Every model this thread owned is dropped by now, so the process can
+        // safely run ggml's static Metal teardown. Unblocks a quit that is
+        // waiting on us (see `crate::shutdown`).
+        crate::shutdown::mark_released();
     });
 
     eprintln!("[daemon] installing event tap on main run loop...");
@@ -513,9 +521,21 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // Hand the main thread to NSApplication. AppKit pumps the same
     // CFRunLoop that our event tap is attached to, so the tap + menu bar +
     // pill all coexist on the same loop.
+    // Quit goes through `-[NSApplication terminate:]`, which calls `exit()`
+    // from inside `NSApp.run()` — so everything below `init_and_run` is dead
+    // code, and `exit()` used to destroy ggml's static Metal device while this
+    // worker still held model buffers, aborting the process. Register the
+    // ordered release the AppKit delegate performs from
+    // `applicationWillTerminate:`, before Metal goes away.
+    let tx_for_shutdown = tx.clone();
+    crate::shutdown::on_release_requested(move || {
+        let _ = tx_for_shutdown.send(DaemonEvent::Shutdown);
+    });
+
     menubar::init_and_run()?;
 
-    // Reachable only after NSApp.terminate.
+    // Only reached if NSApp.run() ever returns without terminating (it does not
+    // today — terminate: exits from inside it). Harmless either way.
     drop(tx);
     let _ = worker_handle.join();
     Ok(())
