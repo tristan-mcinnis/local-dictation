@@ -515,8 +515,16 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             // The server resolves Toggle → Start/Stop before dispatch, so a
             // Toggle reaching here would be a bug; treat it as a no-op.
             Command::Toggle => Ok(()),
+            // Status is answered by the socket thread straight from
+            // DAEMON_RECORDING, so it never reaches this closure either.
+            Command::Status => Ok(()),
         };
     });
+
+    // Publish what this app can do, so Quick Launch (and anything else reading
+    // the house command manifests) can list our commands without knowing us by
+    // name. Best-effort by design: a failure logs and is ignored.
+    crate::ipc::write_manifest();
 
     // Hand the main thread to NSApplication. AppKit pumps the same
     // CFRunLoop that our event tap is attached to, so the tap + menu bar +
