@@ -161,6 +161,30 @@ impl Hotkey {
     }
 }
 
+/// Read a physical modifier's side-specific state from a FlagsChanged event.
+/// The high Option/Command/etc. flags combine both sides: releasing Right
+/// Option while Left Option is held still carries OPTION. Device masks come
+/// from the macOS SDK's IOKit/hidsystem/IOLLEvent.h. Fall back to the aggregate
+/// bit for keyboards that provide no side-specific bits for this modifier.
+pub fn modifier_key_is_down(keycode: i64, flags: u64) -> bool {
+    let (own, pair, aggregate) = match keycode {
+        0x3A => (0x20, 0x60, OPTION),
+        0x3D => (0x40, 0x60, OPTION),
+        0x37 => (0x08, 0x18, COMMAND),
+        0x36 => (0x10, 0x18, COMMAND),
+        0x3B => (0x01, 0x2001, CONTROL),
+        0x3E => (0x2000, 0x2001, CONTROL),
+        0x38 => (0x02, 0x06, SHIFT),
+        0x3C => (0x04, 0x06, SHIFT),
+        _ => return false,
+    };
+    if flags & pair != 0 {
+        flags & own != 0
+    } else {
+        flags & aggregate != 0
+    }
+}
+
 /// Map a modifier keycode to its human name (used for `display` of a
 /// modifier-only hotkey). Unknown codes fall back to `key 0x{keycode:x}`.
 pub fn modifier_keycode_name(keycode: i64) -> String {
@@ -351,6 +375,24 @@ pub fn detect_conflict(_hotkey: &Hotkey) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn modifier_state_distinguishes_each_physical_side() {
+        for (left, right, left_bit, right_bit, aggregate) in [
+            (0x3A, 0x3D, 0x20, 0x40, OPTION),
+            (0x37, 0x36, 0x08, 0x10, COMMAND),
+            (0x3B, 0x3E, 0x01, 0x2000, CONTROL),
+            (0x38, 0x3C, 0x02, 0x04, SHIFT),
+        ] {
+            assert!(modifier_key_is_down(left, aggregate | left_bit));
+            assert!(!modifier_key_is_down(right, aggregate | left_bit));
+            assert!(modifier_key_is_down(right, aggregate | right_bit));
+            assert!(!modifier_key_is_down(left, aggregate | right_bit));
+            assert!(modifier_key_is_down(right, aggregate | left_bit | right_bit));
+            assert!(modifier_key_is_down(right, aggregate)); // aggregate-only keyboard
+            assert!(!modifier_key_is_down(right, 0));
+        }
+    }
 
     #[test]
     fn modifier_names_cover_the_four_configurable_modifiers() {

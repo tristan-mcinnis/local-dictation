@@ -214,11 +214,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // A modifier-only hotkey (Right Option etc.) is detected via FlagsChanged
     // on its own modifier bit; a chord hotkey is detected via KeyDown/KeyUp of
     // the non-modifier key while the required modifiers are held.
-    let hotkey_flag = if modifier_only {
-        Some(keycode_to_modifier_flag(hotkey_keycode))
-    } else {
-        None
-    };
     let required_mask = if modifier_only {
         CGEventFlags::empty()
     } else {
@@ -239,8 +234,8 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let space_down = Arc::new(AtomicBool::new(false));
     let state_cb = state.clone();
     let space_down_cb = space_down.clone();
-    // Whether the (chord) hotkey's non-modifier key is currently held, so we
-    // swallow its matching key-up and never emit a stray release.
+    // Track physical edges separately from latch state. Repeated key-downs
+    // must never be mistaken for a new tap that stops hands-free capture.
     let hotkey_down = Arc::new(AtomicBool::new(false));
     let hotkey_down_cb = hotkey_down.clone();
 
@@ -337,8 +332,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         );
                         return CallbackResult::Keep;
                     }
-                    let input = if let Some(hf) = hotkey_flag {
-                        if flags.contains(hf) {
+                    let input = {
+                        if crate::hotkeys::modifier_key_is_down(hotkey_keycode, flags.bits()) {
+                            if !hotkey_edge(&hotkey_down_cb, true) {
+                                return CallbackResult::Keep;
+                            }
                             // Shift co-held at press → transform mode (rewrite the
                             // selection). The user holds Shift *before* the PTT key.
                             let press = Instant::now();
@@ -349,12 +347,17 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                                 double_tap,
                             }
                         } else {
+                            if !hotkey_edge(&hotkey_down_cb, false) {
+                                return CallbackResult::Keep;
+                            }
                             detector_cb.lock().unwrap().on_release(Instant::now());
                             PttInput::HotkeyRelease
                         }
-                    } else {
-                        PttInput::HotkeyRelease
                     };
+                    eprintln!(
+                        "[hotkey] {} modifier edge · key {hotkey_keycode:#x} · flags {:#x}",
+                        stamp(), flags.bits()
+                    );
                     drive(input);
                     // FlagsChanged is never swallowed — let the modifier through.
                 }
@@ -402,13 +405,18 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         // never reaches the app (no stray character / menu).
                         let flags = event.get_flags();
                         if flags.contains(required_mask) {
+                            // Key repeat is still the same physical press. In
+                            // double-tap hands-free, treating it as a fresh tap
+                            // would immediately stop capture before release.
+                            if !hotkey_edge(&hotkey_down_cb, true) {
+                                return CallbackResult::Drop;
+                            }
                             let shift = flags.contains(CGEventFlags::CGEventFlagShift)
                                 && !required_mask.contains(CGEventFlags::CGEventFlagShift);
                             let press = Instant::now();
                             let double_tap = double_tap_latch
                                 && detector_cb.lock().unwrap().on_press(press);
                             drive(PttInput::HotkeyPress { shift, double_tap });
-                            hotkey_down_cb.store(true, Ordering::SeqCst);
                             return CallbackResult::Drop;
                         }
                         return CallbackResult::Keep;
@@ -437,7 +445,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
                     if !modifier_only && keycode == hotkey_keycode {
                         // Chord hotkey release: swallow the matching key-up.
-                        if hotkey_down_cb.swap(false, Ordering::SeqCst) {
+                        if hotkey_edge(&hotkey_down_cb, false) {
                             detector_cb.lock().unwrap().on_release(Instant::now());
                             drive(PttInput::HotkeyRelease);
                             return CallbackResult::Drop;
@@ -618,24 +626,58 @@ pub(crate) fn stamp() -> String {
     format!("{:02}:{:02}:{:02}.{:03}", tm.tm_hour, tm.tm_min, tm.tm_sec, ms)
 }
 
-/// Map a modifier-key keycode to the CGEvent flag bit it toggles. On a
-/// FlagsChanged event the keycode tells us which physical key moved; this
-/// tells us which flag bit to read to know if it's now held or released.
-/// Unknown keycodes fall back to Option (the historical default).
-fn keycode_to_modifier_flag(keycode: i64) -> CGEventFlags {
-    match keycode {
-        0x3A | 0x3D => CGEventFlags::CGEventFlagAlternate, // Left / Right Option
-        0x37 | 0x36 => CGEventFlags::CGEventFlagCommand,   // Left / Right Command
-        0x3B | 0x3E => CGEventFlags::CGEventFlagControl,   // Left / Right Control
-        0x38 | 0x3C => CGEventFlags::CGEventFlagShift,     // Left / Right Shift
-        _ => CGEventFlags::CGEventFlagAlternate,
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_second_press_of_double_tap_cannot_stop_hands_free() {
+        let down = AtomicBool::new(false);
+        let mut state = ST_IDLE;
+        let mut decisions = Vec::new();
+        // First tap, second press, autorepeats while held, then release.
+        for (pressed, double_tap) in [
+            (true, false), (false, false), (true, true),
+            (true, false), (true, false), (false, false),
+        ] {
+            if hotkey_edge(&down, pressed) {
+                let input = if pressed {
+                    PttInput::HotkeyPress { shift: false, double_tap }
+                } else {
+                    PttInput::HotkeyRelease
+                };
+                let (next, decision) = ptt_transition(state, input);
+                state = next;
+                decisions.push(decision);
+            }
+        }
+        assert_eq!(state, ST_LATCHED);
+        assert_eq!(decisions, vec![
+            PttDecision::Start { transform: false },
+            PttDecision::Stop,
+            PttDecision::StartLatched { transform: false },
+            PttDecision::Nothing,
+        ]);
+        // A genuinely new tap still ends capture.
+        assert!(hotkey_edge(&down, true));
+        assert_eq!(
+            ptt_transition(state, PttInput::HotkeyPress { shift: false, double_tap: false }),
+            (ST_STOPPING_TAP, PttDecision::Stop)
+        );
+    }
+
+    #[test]
+    fn releasing_right_option_while_left_option_is_held_keeps_hands_free_recording() {
+        // The second press of a double-tap has already latched recording.
+        // Its release carries aggregate Option because Left Option is still down.
+        let flags = CGEventFlags::from_bits_retain(crate::hotkeys::OPTION | 0x20);
+        let input = if crate::hotkeys::modifier_key_is_down(0x3D, flags.bits()) {
+            PttInput::HotkeyPress { shift: false, double_tap: false }
+        } else {
+            PttInput::HotkeyRelease
+        };
+        assert_eq!(ptt_transition(ST_LATCHED, input), (ST_LATCHED, PttDecision::Nothing));
+    }
 
     /// Drive the state machine through a sequence of inputs, returning the
     /// (state, decision) at each step plus the final state. Mirrors exactly

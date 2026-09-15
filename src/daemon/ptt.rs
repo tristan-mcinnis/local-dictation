@@ -1,6 +1,12 @@
 //! Push-to-talk state machine and double-tap detector (pure logic; unit-tested from `daemon::tests`).
 use super::*;
 
+/// Accept only a changed physical key state, independently of hold/latch mode.
+/// In particular an autorepeated KeyDown is not a tap to stop hands-free.
+pub(super) fn hotkey_edge(down: &AtomicBool, is_down: bool) -> bool {
+    down.swap(is_down, Ordering::SeqCst) != is_down
+}
+
 // Double-tap-to-latch gesture timing. A quick tap (press+release within
 // TAP_MAX_HOLD) followed by a second press within DOUBLE_TAP_WINDOW of that
 // release arms hands-free — the no-Spacebar route into latch. Detected in the
