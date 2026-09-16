@@ -28,13 +28,10 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSImageView, NSMenuItem,
-    NSPopUpButton, NSScrollView, NSSearchField, NSTextAlignment, NSTextField, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSImageView, NSMenuItem, NSPopUpButton, NSScrollView,
+    NSSearchField, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{
-    MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString,
-};
+use objc2_foundation::{MainThreadMarker, NSObject, NSPoint, NSRect, NSSize, NSString};
 
 use crate::menubar::{self, slate, theme};
 use crate::settings::{self, Settings};
@@ -47,9 +44,8 @@ use crate::menubar::house_theme::{
     CONTROL_CHIP, CONTROL_FOOTER, CONTROL_RAILROW, CONTROL_ROW, CONTROL_TILE, HAIRLINE,
     LAYOUT_SETTINGS_HEIGHT, LAYOUT_SETTINGS_RAIL, LAYOUT_SETTINGS_WIDTH, RADIUS_LG, RADIUS_MD,
     RADIUS_SM, RADIUS_TILE, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
-    TYPE_BODY_SMALL,
-    TYPE_CAPTION, TYPE_LABEL, TYPE_META, TYPE_TITLE, WEIGHT_MEDIUM, WEIGHT_REGULAR,
-    WEIGHT_SEMIBOLD,
+    TYPE_BODY_SMALL, TYPE_CAPTION, TYPE_LABEL, TYPE_META, TYPE_TITLE, WEIGHT_MEDIUM,
+    WEIGHT_REGULAR, WEIGHT_SEMIBOLD,
 };
 
 // ─── Shell geometry, all derived from tokens ─────────────────────────────
@@ -101,6 +97,8 @@ const HISTORY_TIME_W: f64 = 40.0;
 /// The History section's index in `PANES`. Its list is re-queried on each
 /// visit, so the switch needs to know which pane it is.
 const HISTORY_PANE: usize = 2;
+const WAVEFORM_SENSITIVITY_NOTE: &str =
+    "Visual response only. Microphone gain and recognition stay the same.";
 
 /// The rail's sections, in order: label, SF Symbol, subtitle.
 const PANES: &[(&str, &str, &str)] = &[
@@ -117,7 +115,7 @@ const PANES: &[(&str, &str, &str)] = &[
     (
         "History",
         "clock.arrow.circlepath",
-        "Every dictation, newest first. Click one to copy it.",
+        "Every dictation, newest first. Open one to inspect its audio and text.",
     ),
     (
         "Translate",
@@ -135,7 +133,11 @@ const PANES: &[(&str, &str, &str)] = &[
         "flask",
         "Rough edges. Off unless you want them.",
     ),
-    ("About", "info.circle", "Files, logs, and where things live."),
+    (
+        "About",
+        "info.circle",
+        "Files, logs, and where things live.",
+    ),
 ];
 
 // Control fields are held for ownership/future refresh even when not read after
@@ -171,6 +173,11 @@ pub struct SettingsUi {
     model_popup: Retained<NSPopUpButton>,
     // Advanced
     streaming_switch: Retained<slate::InkToggle>,
+    streaming_hint: Retained<NSTextField>,
+    processing_detail_switch: Retained<slate::InkToggle>,
+    pill_size_popup: Retained<NSPopUpButton>,
+    waveform_sensitivity_popup: Retained<NSPopUpButton>,
+    feedback_card_y: f64,
     tail_capture_switch: Retained<slate::InkToggle>,
     listen_switch: Retained<slate::InkToggle>,
     wake_field: Retained<NSTextField>,
@@ -210,6 +217,8 @@ pub struct SettingsUi {
     /// The line under the retention row: the stored count, and the last thing
     /// a click did (copied, deleted, cleared).
     history_status: Retained<NSTextField>,
+    audio_usage_label: Retained<NSTextField>,
+    recovery_warning_label: Retained<NSTextField>,
     /// Filters the dictation list live (the field sends its action per
     /// keystroke); an empty query is "everything, newest first".
     history_search: Retained<NSSearchField>,
@@ -305,6 +314,7 @@ define_class!(
             with_pending(|p| {
                 p.preroll_ms = Some(if on { crate::audio::DEFAULT_PREROLL_MS } else { 0 });
             });
+            refresh_live_preview_control();
         }
 
         #[unsafe(method(changeFormat:))]
@@ -342,12 +352,28 @@ define_class!(
         fn change_streaming(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
             with_pending(|p| p.streaming_asr = Some(on));
+            refresh_live_preview_control();
         }
 
         #[unsafe(method(changeTailCapture:))]
         fn change_tail_capture(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
             with_pending(|p| p.tail_capture = Some(on));
+        }
+
+        #[unsafe(method(changeProcessingDetail:))]
+        fn change_processing_detail(&self, sender: *mut AnyObject) {
+            with_pending(|p| p.show_processing_detail = Some(switch_on(sender)));
+        }
+
+        #[unsafe(method(changePillSize:))]
+        fn change_pill_size(&self, sender: *mut AnyObject) {
+            with_pending(|p| p.pill_size = Some(popup_selected_rep(sender)));
+        }
+
+        #[unsafe(method(changeWaveformSensitivity:))]
+        fn change_waveform_sensitivity(&self, sender: *mut AnyObject) {
+            with_pending(|p| p.waveform_sensitivity = Some(popup_selected_rep(sender)));
         }
 
         #[unsafe(method(changeListen:))]
@@ -463,6 +489,13 @@ define_class!(
             if let Some(ui) = SETTINGS_UI.get() {
                 refresh_history_list(ui);
             }
+        }
+
+        #[unsafe(method(openHistoryDetail:))]
+        fn open_history_detail(&self, sender: *mut AnyObject) {
+            let Some(ui) = SETTINGS_UI.get() else { return; };
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            if let Some((id, _)) = history_entry_at(ui, tag) { menubar::show_history_detail(id); }
         }
 
         #[unsafe(method(copyHistoryEntry:))]
@@ -616,6 +649,21 @@ define_class!(
             with_pending(|p| p.history_retention = if rep.is_empty() { None } else { Some(rep) });
         }
 
+        #[unsafe(method(changeAudioHistory:))]
+        fn change_audio_history(&self, sender: *mut AnyObject) {
+            with_pending(|p| p.audio_history_enabled = Some(switch_on(sender)));
+        }
+
+        #[unsafe(method(changeAudioRetention:))]
+        fn change_audio_retention(&self, sender: *mut AnyObject) {
+            with_pending(|p| p.audio_retention = Some(popup_selected_rep(sender)));
+        }
+
+        #[unsafe(method(changeAudioStorageCap:))]
+        fn change_audio_storage_cap(&self, sender: *mut AnyObject) {
+            with_pending(|p| p.audio_storage_cap_mb = popup_selected_rep(sender).parse().ok());
+        }
+
         #[unsafe(method(changeTranslateTargets:))]
         fn change_translate_targets(&self, sender: *mut AnyObject) {
             let s = field_string(sender);
@@ -669,7 +717,7 @@ pub fn show_settings_window() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let ui = SETTINGS_UI.get_or_init(|| build_settings_window(mtm));
+    let ui = SETTINGS_UI.get_or_init(|| build_settings_window(mtm, false));
     ui.window.makeKeyAndOrderFront(None);
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
@@ -678,10 +726,12 @@ pub fn show_settings_window() {
     };
 }
 
+const RENDER_DICTIONARY: &str = "Cohere\nMLX\nkuh here → Cohere\nem el ex → MLX";
+
 /// Build the window without registering it as the process-wide singleton and
 /// without ever ordering it in. Used by `render-ui` to snapshot the shell.
 pub fn build_for_render(mtm: MainThreadMarker) -> SettingsUi {
-    build_settings_window(mtm)
+    build_settings_window(mtm, true)
 }
 
 /// Scroll the visible pane to its bottom so a snapshot shows the cards that sit
@@ -721,6 +771,36 @@ pub fn seed_history_for_render(ui: &SettingsUi, entries: &[crate::history::Entry
     );
     ui.history_status
         .setStringValue(&NSString::from_str(&history_count_line(entries.len())));
+    ui.audio_usage_label
+        .setStringValue(&NSString::from_str(&recovery_usage_summary(
+            0,
+            0,
+            entries.len(),
+        )));
+    ui.recovery_warning_label
+        .setStringValue(&NSString::from_str(""));
+    ui.recovery_warning_label.setHidden(true);
+}
+
+pub fn verify_history_render_fixture(ui: &SettingsUi, entries: usize) -> eyre::Result<()> {
+    eyre::ensure!(
+        ui.audio_usage_label.stringValue().to_string() == recovery_usage_summary(0, 0, entries),
+        "History render read a live audio-usage count"
+    );
+    eyre::ensure!(
+        ui.recovery_warning_label.isHidden(),
+        "History render included a live recovery warning"
+    );
+    eyre::ensure!(
+        ui.original == Settings::default(),
+        "Settings render included live settings"
+    );
+    let dictionary = crate::corrections::Corrections::from_editor_text(RENDER_DICTIONARY);
+    eyre::ensure!(
+        ui.pending_corrections.lock().unwrap().to_editor_lines() == dictionary.to_editor_lines(),
+        "Settings render included live dictionary terms"
+    );
+    Ok(())
 }
 
 /// Light row `idx` of the History list as a copy would, so the render proof
@@ -736,6 +816,16 @@ pub fn set_sidebar_for_render(ui: &SettingsUi, open: bool) {
 
 pub fn scroll_to_top_for_render(ui: &SettingsUi) {
     scroll_render(ui, false);
+}
+
+/// The complete Recording feedback card, regardless of the keyboard card's height.
+pub fn show_recording_feedback_for_render(ui: &SettingsUi) {
+    select_pane_view(ui, 0);
+    if let Some(doc) = ui._scroll.documentView() {
+        doc.scrollPoint(NSPoint::new(0.0, ui.feedback_card_y));
+        ui._scroll.setNeedsDisplay(true);
+        ui._scroll.displayIfNeeded();
+    }
 }
 
 fn scroll_render(ui: &SettingsUi, bottom: bool) {
@@ -755,9 +845,16 @@ fn scroll_render(ui: &SettingsUi, bottom: bool) {
     ui._scroll.displayIfNeeded();
 }
 
-fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
+fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> SettingsUi {
     let controller = SettingsController::new();
-    let loaded = Settings::load();
+    // Rendering is a data source, not merely a hidden production window.
+    // None of the fixture branches open settings, dictionary, prompt, model,
+    // or history stores; in particular they cannot migrate the user's DB.
+    let loaded = if render_fixture {
+        Settings::default()
+    } else {
+        Settings::load()
+    };
 
     // ── Shell: window + rail + pane + footer well ───────────────────────
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WIN_W, WIN_H));
@@ -841,11 +938,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
     rail.addSubview(&mark_name);
     let mark_kind = slate::section_label(mtm, "Settings");
-    slate::place_left(
-        &mark_kind,
-        SPACE_MD + CONTROL_CHIP + SPACE_SM,
-        mark_y + 6.0,
-    );
+    slate::place_left(&mark_kind, SPACE_MD + CONTROL_CHIP + SPACE_SM, mark_y + 6.0);
     rail.addSubview(&mark_kind);
 
     let mut rail_rows = Vec::new();
@@ -1012,7 +1105,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     }
     select_popup_tag(&hotkey_popup, hotkey_active);
     finish_popup(&hotkey_popup);
-    wire_popup(&hotkey_popup, &controller, sel!(changeHotkey:), hotkey_locked);
+    wire_popup(
+        &hotkey_popup,
+        &controller,
+        sel!(changeHotkey:),
+        hotkey_locked,
+    );
     if hotkey_locked {
         env_hint(mtm, &mut card, "DICTATE_HOTKEY_KEYCODE");
     }
@@ -1033,7 +1131,85 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
 
     y = card_end(&card);
 
-    let mut card = card_begin(mtm, &dictation, y, "Cleanup");
+    let feedback_card_y = y;
+    let mut card = card_begin(mtm, &dictation, y, "Recording feedback");
+    let preview = loaded.live_preview_control();
+    let streaming_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Live transcript preview",
+        "Draft while speaking",
+    );
+    streaming_switch.set_on(preview.enabled);
+    wire_switch(
+        &streaming_switch,
+        &controller,
+        sel!(changeStreaming:),
+        !preview.editable,
+    );
+    let streaming_hint = hint_line(mtm, &mut card, preview.hint);
+    unsafe {
+        let _: () =
+            msg_send![&*streaming_switch, setAccessibilityHelp: &*NSString::from_str(preview.hint)];
+    }
+
+    let processing_detail_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Processing detail",
+        "Show each step before paste",
+    );
+    processing_detail_switch.set_on(loaded.resolve_show_processing_detail());
+    wire_switch(
+        &processing_detail_switch,
+        &controller,
+        sel!(changeProcessingDetail:),
+        std::env::var_os("DICTATE_SHOW_PROCESSING_DETAIL").is_some(),
+    );
+    if std::env::var_os("DICTATE_SHOW_PROCESSING_DETAIL").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_SHOW_PROCESSING_DETAIL");
+    }
+
+    let pill_size_popup = popup_row(mtm, &mut card, "Pill size");
+    for (title, value) in [("Compact", "compact"), ("Standard", "standard")] {
+        popup_add_item(&pill_size_popup, title, None, Some(value));
+    }
+    select_popup_rep(&pill_size_popup, loaded.resolve_pill_size().as_str());
+    finish_popup(&pill_size_popup);
+    wire_popup(
+        &pill_size_popup,
+        &controller,
+        sel!(changePillSize:),
+        std::env::var_os("DICTATE_PILL_SIZE").is_some(),
+    );
+    if std::env::var_os("DICTATE_PILL_SIZE").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_PILL_SIZE");
+    }
+
+    let waveform_sensitivity_popup = popup_row(mtm, &mut card, "Waveform sensitivity");
+    for (title, value) in [("Low", "low"), ("Balanced", "balanced"), ("High", "high")] {
+        popup_add_item(&waveform_sensitivity_popup, title, None, Some(value));
+    }
+    select_popup_rep(
+        &waveform_sensitivity_popup,
+        loaded.resolve_waveform_sensitivity().as_str(),
+    );
+    finish_popup(&waveform_sensitivity_popup);
+    wire_popup(
+        &waveform_sensitivity_popup,
+        &controller,
+        sel!(changeWaveformSensitivity:),
+        std::env::var_os("DICTATE_WAVEFORM_SENSITIVITY").is_some(),
+    );
+    if std::env::var_os("DICTATE_WAVEFORM_SENSITIVITY").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_WAVEFORM_SENSITIVITY");
+    }
+    hint_line(mtm, &mut card, WAVEFORM_SENSITIVITY_NOTE);
+    unsafe {
+        let note = NSString::from_str(WAVEFORM_SENSITIVITY_NOTE);
+        let _: () = msg_send![&*waveform_sensitivity_popup, setToolTip: &*note];
+        let _: () = msg_send![&*waveform_sensitivity_popup, setAccessibilityHelp: &*note];
+    }
     let cleanup_switch = toggle_row(
         mtm,
         &mut card,
@@ -1077,6 +1253,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         env_hint(mtm, &mut card, "DICTATE_SHOW_RESULT");
     }
 
+    y = card_end(&card);
+    let mut card = card_begin(mtm, &dictation, y, "Capture");
     let preroll_switch = toggle_row(
         mtm,
         &mut card,
@@ -1114,11 +1292,9 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let dictionary = new_pane();
     let mut card = card_begin(mtm, &dictionary, SPACE_MD, "Add a term");
     let dictionary_heard_field = text_row(mtm, &mut card, "What dictation hears", "");
-    dictionary_heard_field
-        .setPlaceholderString(Some(&NSString::from_str("e.g. exampleco")));
+    dictionary_heard_field.setPlaceholderString(Some(&NSString::from_str("e.g. exampleco")));
     let dictionary_correct_field = text_row(mtm, &mut card, "Correct to", "");
-    dictionary_correct_field
-        .setPlaceholderString(Some(&NSString::from_str("e.g. Example Co")));
+    dictionary_correct_field.setPlaceholderString(Some(&NSString::from_str("e.g. Example Co")));
     action_button_row(
         mtm,
         &mut card,
@@ -1128,8 +1304,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         &controller,
         sel!(addDictionaryEntry:),
     );
-    let loaded_corrections = crate::corrections::Corrections::load_default()
-        .unwrap_or_else(|_| crate::corrections::Corrections::empty());
+    let loaded_corrections = if render_fixture {
+        crate::corrections::Corrections::from_editor_text(RENDER_DICTIONARY)
+    } else {
+        crate::corrections::Corrections::load_default()
+            .unwrap_or_else(|_| crate::corrections::Corrections::empty())
+    };
     let original_correction_lines = loaded_corrections.to_editor_lines();
     let dictionary_status = hint_line(
         mtm,
@@ -1163,13 +1343,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
     card.view.addSubview(&dictionary_body);
     let dictionary_card = card.view.clone();
-    let dictionary_keys = fill_dictionary_body(
-        mtm,
-        &dictionary_body,
-        &controller,
-        &loaded_corrections,
-        "",
-    );
+    let dictionary_keys =
+        fill_dictionary_body(mtm, &dictionary_body, &controller, &loaded_corrections, "");
     let dictionary_pane = dictionary.clone();
     size_list_card(
         &dictionary,
@@ -1188,7 +1363,7 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let mut card = card_begin(mtm, &history_pane_view, SPACE_MD, "Keeping");
 
     let retention_locked = std::env::var_os("DICTATE_HISTORY_RETENTION").is_some();
-    let retention_popup = popup_row(mtm, &mut card, "Keep dictations for");
+    let retention_popup = popup_row(mtm, &mut card, "Keep text for");
     for (label_str, rep) in [
         ("Forever", "forever"),
         ("1 year", "1year"),
@@ -1210,6 +1385,92 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     if retention_locked {
         env_hint(mtm, &mut card, "DICTATE_HISTORY_RETENTION");
     }
+    let audio_history_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Save audio for recovery",
+        "Future recordings",
+    );
+    audio_history_switch.set_on(loaded.resolve_audio_history_enabled());
+    wire_switch(
+        &audio_history_switch,
+        &controller,
+        sel!(changeAudioHistory:),
+        std::env::var_os("DICTATE_AUDIO_HISTORY").is_some(),
+    );
+    if std::env::var_os("DICTATE_AUDIO_HISTORY").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_AUDIO_HISTORY");
+    }
+
+    let audio_retention_popup = popup_row(mtm, &mut card, "Keep audio for");
+    for (title, value) in [
+        ("24 hours", "24hours"),
+        ("1 week", "1week"),
+        ("30 days", "1month"),
+        ("Forever", "forever"),
+    ] {
+        popup_add_item(&audio_retention_popup, title, None, Some(value));
+    }
+    let audio_retention = loaded.resolve_audio_retention();
+    if audio_retention == "1year" {
+        popup_add_item(&audio_retention_popup, "1 year", None, Some("1year"));
+    }
+    if audio_retention == "never" {
+        popup_add_item(&audio_retention_popup, "Never", None, Some("never"));
+    }
+    select_popup_rep(&audio_retention_popup, &audio_retention);
+    finish_popup(&audio_retention_popup);
+    wire_popup(
+        &audio_retention_popup,
+        &controller,
+        sel!(changeAudioRetention:),
+        std::env::var_os("DICTATE_AUDIO_RETENTION").is_some(),
+    );
+    if std::env::var_os("DICTATE_AUDIO_RETENTION").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_AUDIO_RETENTION");
+    }
+
+    let audio_cap_popup = popup_row(mtm, &mut card, "Audio storage limit");
+    let cap_choices = [
+        ("No size limit", 0_u64),
+        ("512 MB", 512),
+        ("1 GB", 1024),
+        ("4 GB", 4096),
+        ("10 GB", 10240),
+    ];
+    for (title, value) in cap_choices {
+        popup_add_item(&audio_cap_popup, title, None, Some(&value.to_string()));
+    }
+    let cap = loaded.resolve_audio_storage_cap_mb();
+    if !cap_choices.iter().any(|(_, value)| *value == cap) {
+        popup_add_item(
+            &audio_cap_popup,
+            &format!("{cap} MB"),
+            None,
+            Some(&cap.to_string()),
+        );
+    }
+    select_popup_rep(&audio_cap_popup, &cap.to_string());
+    finish_popup(&audio_cap_popup);
+    wire_popup(
+        &audio_cap_popup,
+        &controller,
+        sel!(changeAudioStorageCap:),
+        std::env::var_os("DICTATE_AUDIO_STORAGE_CAP_MB").is_some(),
+    );
+    if std::env::var_os("DICTATE_AUDIO_STORAGE_CAP_MB").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_AUDIO_STORAGE_CAP_MB");
+    }
+    hint_line(
+        mtm,
+        &mut card,
+        "A size limit may remove older audio before its retention ends.",
+    );
+    hint_line(
+        mtm,
+        &mut card,
+        "Removing audio keeps its transcript. Delete all removes both.",
+    );
     action_button_row(
         mtm,
         &mut card,
@@ -1219,7 +1480,26 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         &controller,
         sel!(clearHistory:),
     );
-    let history_status = hint_line(mtm, &mut card, &history_count_line(crate::history::count()));
+    let history_count = if render_fixture {
+        0
+    } else {
+        crate::history::count()
+    };
+    let history_status = hint_line(mtm, &mut card, &history_count_line(history_count));
+    let usage = if render_fixture {
+        recovery_usage_summary(0, 0, 0)
+    } else {
+        recovery_usage_line()
+    };
+    let audio_usage_label = hint_line(mtm, &mut card, &usage);
+    let recovery_notice = if render_fixture {
+        None
+    } else {
+        crate::history::recovery_storage_notice()
+    };
+    let recovery_warning_label =
+        hint_line(mtm, &mut card, recovery_notice.as_deref().unwrap_or(""));
+    recovery_warning_label.setHidden(recovery_notice.is_none());
     hint_line(
         mtm,
         &mut card,
@@ -1241,7 +1521,11 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
     card.view.addSubview(&history_body);
     let history_card = card.view.clone();
-    let (initial_history, initial_history_total) = history_query("");
+    let (initial_history, initial_history_total) = if render_fixture {
+        (Vec::new(), 0)
+    } else {
+        history_query("")
+    };
     let initial_history_list = fill_history_body(
         mtm,
         &history_body,
@@ -1261,7 +1545,11 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     // ═══ Pane 2 — Translate ═════════════════════════════════════════════
     let translate = new_pane();
     let mut card = card_begin(mtm, &translate, SPACE_MD, "Targets");
-    let loaded_targets = loaded.resolve_translation_targets();
+    let loaded_targets = if render_fixture {
+        vec!["Spanish".to_string(), "Chinese".to_string()]
+    } else {
+        loaded.resolve_translation_targets()
+    };
     let targets_value = loaded_targets.join(", ");
     let translate_targets_field = text_row(mtm, &mut card, "Translate targets", &targets_value);
     translate_targets_field
@@ -1305,7 +1593,13 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     let output = new_pane();
     let mut card = card_begin(mtm, &output, SPACE_MD, "Format");
     let format_popup = popup_row(mtm, &mut card, "Output format");
-    let format_names = crate::prompts::Prompts::load_quiet().format_names();
+    let format_names = if render_fixture {
+        let mut names: Vec<String> = crate::prompts::default_formats().into_keys().collect();
+        names.sort();
+        names
+    } else {
+        crate::prompts::Prompts::load_quiet().format_names()
+    };
     let format_locked = std::env::var_os("DICTATE_FORMAT").is_some();
     popup_add_item(&format_popup, "Default (no preset)", None, Some(""));
     for name in &format_names {
@@ -1313,7 +1607,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     }
     select_popup_rep(&format_popup, &loaded.resolve_format().unwrap_or_default());
     finish_popup(&format_popup);
-    wire_popup(&format_popup, &controller, sel!(changeFormat:), format_locked);
+    wire_popup(
+        &format_popup,
+        &controller,
+        sel!(changeFormat:),
+        format_locked,
+    );
     if format_locked {
         env_hint(mtm, &mut card, "DICTATE_FORMAT");
     }
@@ -1380,9 +1679,17 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
 
     let model_popup = popup_row(mtm, &mut card, "Cleanup model");
-    let model_env = settings::llm_model_env();
+    let model_env = if render_fixture {
+        None
+    } else {
+        settings::llm_model_env()
+    };
     let model_locked = model_env.is_some();
-    let models = settings::discover_llm_models();
+    let models = if render_fixture {
+        Vec::new()
+    } else {
+        settings::discover_llm_models()
+    };
     if models.is_empty() {
         popup_add_item(
             &model_popup,
@@ -1419,25 +1726,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     // ═══ Pane 5 — Experimental ══════════════════════════════════════════
     let experimental = new_pane();
     let mut card = card_begin(mtm, &experimental, SPACE_MD, "Experimental");
-    let streaming_switch = toggle_row(mtm, &mut card, "Streaming ASR", "Live preview during the hold");
-    streaming_switch.set_on(loaded.resolve_streaming_asr());
-    let streaming_locked =
-        std::env::var_os("DICTATE_STREAMING_ASR").is_some() || loaded.resolve_preroll_ms() > 0;
-    wire_switch(
-        &streaming_switch,
-        &controller,
-        sel!(changeStreaming:),
-        streaming_locked,
+    let listen_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Listen mode",
+        "Hands-free, triggered by a wake word",
     );
-    if loaded.resolve_preroll_ms() > 0 {
-        hint_line(
-            mtm,
-            &mut card,
-            "Off while always-on pre-roll is on (they drain the ring differently).",
-        );
-    }
-
-    let listen_switch = toggle_row(mtm, &mut card, "Listen mode", "Hands-free, triggered by a wake word");
     listen_switch.set_on(loaded.resolve_listen_mode());
     wire_switch(
         &listen_switch,
@@ -1447,7 +1741,12 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
     );
     hint_line(mtm, &mut card, "Needs always-on mic.");
 
-    let wake_field = text_row(mtm, &mut card, "Wake word", &loaded.resolve_wake_word());
+    let wake_word = if render_fixture {
+        "computer".to_string()
+    } else {
+        loaded.resolve_wake_word()
+    };
+    let wake_field = text_row(mtm, &mut card, "Wake word", &wake_word);
     let wake_locked = std::env::var_os("DICTATE_WAKE_WORD").is_some();
     unsafe {
         wake_field.setTarget(Some(&controller));
@@ -1528,7 +1827,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         let _: () = msg_send![&*sidebar_click, setToolTip: &*title];
         let _: () = msg_send![&*sidebar_click, setAccessibilityLabel: &*title];
         let _: () = msg_send![&*sidebar_click, setKeyEquivalent: &*NSString::from_str("s")];
-        let _: () = msg_send![&*sidebar_click, setKeyEquivalentModifierMask: 1_u64 << 20 | 1_u64 << 19];
+        let _: () =
+            msg_send![&*sidebar_click, setKeyEquivalentModifierMask: 1_u64 << 20 | 1_u64 << 19];
     }
     shell.addSubview(&sidebar_click);
 
@@ -1555,6 +1855,11 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         cohere_lang_popup,
         model_popup,
         streaming_switch,
+        streaming_hint,
+        processing_detail_switch,
+        pill_size_popup,
+        waveform_sensitivity_popup,
+        feedback_card_y,
         tail_capture_switch,
         listen_switch,
         wake_field,
@@ -1578,6 +1883,8 @@ fn build_settings_window(mtm: MainThreadMarker) -> SettingsUi {
         active_translate_popup,
         retention_popup,
         history_status,
+        audio_usage_label,
+        recovery_warning_label,
         history_search,
         history_pane: history_pane_view,
         history_card,
@@ -1620,7 +1927,8 @@ fn select_pane_view(ui: &SettingsUi, index: usize) {
     }
     if let Some((title, _, subtitle)) = PANES.get(index) {
         ui.pane_title.setStringValue(&NSString::from_str(title));
-        ui.pane_subtitle.setStringValue(&NSString::from_str(subtitle));
+        ui.pane_subtitle
+            .setStringValue(&NSString::from_str(subtitle));
     }
 }
 
@@ -1636,18 +1944,10 @@ struct Card {
     origin_y: f64,
 }
 
-fn card_begin(
-    mtm: MainThreadMarker,
-    pane: &SettingsFlippedView,
-    y: f64,
-    label_text: &str,
-) -> Card {
+fn card_begin(mtm: MainThreadMarker, pane: &SettingsFlippedView, y: f64, label_text: &str) -> Card {
     let view = slate::SlateView::flipped(
         mtm,
-        NSRect::new(
-            NSPoint::new(PANE_PAD, y),
-            NSSize::new(CARD_W, CARD_LABEL_H),
-        ),
+        NSRect::new(NSPoint::new(PANE_PAD, y), NSSize::new(CARD_W, CARD_LABEL_H)),
         slate::Paint::Card,
         RADIUS_LG,
     );
@@ -1712,13 +2012,7 @@ fn row_label(
     detail: Option<&str>,
 ) -> f64 {
     let mid = y + height / 2.0;
-    let l = slate::label(
-        mtm,
-        title,
-        TYPE_LABEL,
-        WEIGHT_MEDIUM,
-        theme::text_primary(),
-    );
+    let l = slate::label(mtm, title, TYPE_LABEL, WEIGHT_MEDIUM, theme::text_primary());
     let w = place_left_flipped(&l, CARD_PAD_X, mid);
     card.view.addSubview(&l);
     let mut used = CARD_PAD_X + w;
@@ -1751,7 +2045,10 @@ fn popup_row(mtm: MainThreadMarker, card: &mut Card, title: &str) -> Retained<NS
     let shell = slate::SlateView::new(
         mtm,
         NSRect::new(
-            NSPoint::new(CARD_W - CARD_PAD_X - POPUP_MAX_W, (mid - CONTROL_TILE / 2.0).round()),
+            NSPoint::new(
+                CARD_W - CARD_PAD_X - POPUP_MAX_W,
+                (mid - CONTROL_TILE / 2.0).round(),
+            ),
             NSSize::new(POPUP_MAX_W, CONTROL_TILE),
         ),
         slate::Paint::Chip,
@@ -1768,6 +2065,9 @@ fn popup_row(mtm: MainThreadMarker, card: &mut Card, title: &str) -> Retained<NS
     {
         pop.setBordered(false);
         pop.setFont(Some(&slate::font(TYPE_META, WEIGHT_REGULAR)));
+        unsafe {
+            let _: () = msg_send![&*pop, setAccessibilityLabel: &*NSString::from_str(title)];
+        }
     }
     shell.addSubview(&pop);
     card.view.addSubview(&shell);
@@ -1891,6 +2191,10 @@ fn toggle_row(
         ),
     );
     card.view.addSubview(&sw);
+    unsafe {
+        let _: () = msg_send![&*sw, setAccessibilityLabel: &*NSString::from_str(title)];
+        let _: () = msg_send![&*sw, setAccessibilityHelp: &*NSString::from_str(detail)];
+    }
     sw
 }
 
@@ -2387,7 +2691,12 @@ fn dictionary_entry_at(ui: &SettingsUi, tag: isize) -> Option<(String, String)> 
     if tag < 0 {
         return None;
     }
-    let key = ui.dictionary_keys.lock().unwrap().get(tag as usize).cloned()?;
+    let key = ui
+        .dictionary_keys
+        .lock()
+        .unwrap()
+        .get(tag as usize)
+        .cloned()?;
     let value = ui
         .pending_corrections
         .lock()
@@ -2429,7 +2738,13 @@ fn history_search_row(
     let y = card_row(card, CONTROL_ROW);
     let mid = y + CONTROL_ROW / 2.0;
 
-    let chip = slate::chip(mtm, "Copy all", Some("doc.on.doc"), CARD_W - CARD_PAD_X, mid);
+    let chip = slate::chip(
+        mtm,
+        "Copy all",
+        Some("doc.on.doc"),
+        CARD_W - CARD_PAD_X,
+        mid,
+    );
     // A flipped card flips the chip's y, so re-centre it in card space.
     let cf = chip.frame();
     chip.setFrame(NSRect::new(
@@ -2524,8 +2839,7 @@ fn fill_history_body(
         view.removeFromSuperview();
     }
     let needle = filter.trim();
-    let shown: Vec<crate::history::Entry> =
-        matched.iter().take(HISTORY_ROW_CAP).cloned().collect();
+    let shown: Vec<crate::history::Entry> = matched.iter().take(HISTORY_ROW_CAP).cloned().collect();
 
     let mut ids: Vec<i64> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
@@ -2565,7 +2879,8 @@ fn fill_history_body(
             shown.len()
         )
     } else {
-        "Click a row to copy it. The trash chip deletes it.".to_string()
+        "Open a dictation to inspect its audio and text layers. The trash chip deletes it."
+            .to_string()
     };
     y = list_note(mtm, body, y, &note);
 
@@ -2592,12 +2907,7 @@ struct HistoryList {
 
 /// A day band: the date in the uppercase `section` style, the same label the
 /// launcher's history panel uses to break its list.
-fn history_day_header(
-    mtm: MainThreadMarker,
-    body: &slate::SlateView,
-    y: f64,
-    day: &str,
-) -> f64 {
+fn history_day_header(mtm: MainThreadMarker, body: &slate::SlateView, y: f64, day: &str) -> f64 {
     let mut y = y;
     if y > 0.0 {
         let line = slate::SlateView::new(
@@ -2710,11 +3020,11 @@ fn history_row(
         mtm,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(row_w, CONTROL_ROW)),
         controller,
-        sel!(copyHistoryEntry:),
+        sel!(openHistoryDetail:),
         index as isize,
     );
     unsafe {
-        let title = NSString::from_str("Copy this dictation");
+        let title = NSString::from_str("Open audio and text layers");
         let _: () = msg_send![&*copy, setToolTip: &*title];
         let _: () = msg_send![&*copy, setAccessibilityLabel: &*title];
     }
@@ -2743,6 +3053,7 @@ fn refresh_history_list(ui: &SettingsUi) {
         return;
     };
     let filter = ui.history_search.stringValue().to_string();
+    refresh_recovery_usage(ui);
     let (matched, total) = history_query(&filter);
     let list = fill_history_body(
         mtm,
@@ -2780,7 +3091,10 @@ fn set_sidebar_open(ui: &SettingsUi, open: bool) {
     let chrome_h = frame.size.height - content.size.height;
     // Hold the top-left corner: only the right edge moves.
     let new_frame = NSRect::new(
-        NSPoint::new(frame.origin.x, frame.origin.y + frame.size.height - (WIN_H + chrome_h)),
+        NSPoint::new(
+            frame.origin.x,
+            frame.origin.y + frame.size.height - (WIN_H + chrome_h),
+        ),
         NSSize::new(width, WIN_H + chrome_h),
     );
     ui.window.setFrame_display_animate(new_frame, true, true);
@@ -2788,8 +3102,7 @@ fn set_sidebar_open(ui: &SettingsUi, open: bool) {
     // Re-place the toggle against the new right edge, and re-point its glyph.
     let btn = ui.sidebar_btn.frame();
     let x = width - SPACE_SM - btn.size.width;
-    ui.sidebar_btn
-        .setFrameOrigin(NSPoint::new(x, btn.origin.y));
+    ui.sidebar_btn.setFrameOrigin(NSPoint::new(x, btn.origin.y));
     ui.sidebar_click
         .setFrameOrigin(NSPoint::new(x, btn.origin.y));
     let glyph = if open {
@@ -2870,6 +3183,37 @@ fn clear_history_flash(ui: &SettingsUi) {
 fn set_history_status(ui: &SettingsUi, message: &str) {
     let line = format!("{message} {}", history_count_line(crate::history::count()));
     ui.history_status.setStringValue(&NSString::from_str(&line));
+    refresh_recovery_usage(ui);
+}
+
+fn recovery_usage_line() -> String {
+    match crate::history::recovery_usage() {
+        Ok(usage) => {
+            recovery_usage_summary(usage.audio_count, usage.audio_bytes, usage.record_count)
+        }
+        Err(_) => "Audio storage totals are unavailable.".to_string(),
+    }
+}
+
+fn recovery_usage_summary(audio_count: usize, audio_bytes: u64, records: usize) -> String {
+    let (amount, unit) = if audio_bytes >= 1024 * 1024 * 1024 {
+        (audio_bytes as f64 / (1024.0 * 1024.0 * 1024.0), "GB")
+    } else {
+        (audio_bytes as f64 / (1024.0 * 1024.0), "MB")
+    };
+    format!("{audio_count} audio clips · {amount:.1} {unit} · {records} recovery records")
+}
+
+fn refresh_recovery_usage(ui: &SettingsUi) {
+    ui.audio_usage_label
+        .setStringValue(&NSString::from_str(&recovery_usage_line()));
+    let notice = crate::history::recovery_storage_notice();
+    ui.recovery_warning_label
+        .setStringValue(&NSString::from_str(notice.as_deref().unwrap_or("")));
+    ui.recovery_warning_label.setHidden(notice.is_none());
+    unsafe {
+        let _: () = msg_send![&*ui.recovery_warning_label, setAccessibilityHelp: &*NSString::from_str(notice.as_deref().unwrap_or(""))];
+    }
 }
 
 /// A one-line preview of `text` for a status message.
@@ -2901,9 +3245,18 @@ fn history_entry_at(ui: &SettingsUi, tag: isize) -> Option<(i64, String)> {
 /// About facts.
 fn hint_line(mtm: MainThreadMarker, card: &mut Card, text: &str) -> Retained<NSTextField> {
     let y = card_row(card, HINT_H);
-    let l = slate::label(mtm, text, TYPE_CAPTION, WEIGHT_REGULAR, theme::text_tertiary());
+    let l = slate::label(
+        mtm,
+        text,
+        TYPE_CAPTION,
+        WEIGHT_REGULAR,
+        theme::text_tertiary(),
+    );
     l.setFrame(NSRect::new(
-        NSPoint::new(CARD_PAD_X, (y + (HINT_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round()),
+        NSPoint::new(
+            CARD_PAD_X,
+            (y + (HINT_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round(),
+        ),
         NSSize::new(CARD_W - 2.0 * CARD_PAD_X, TYPE_CAPTION + SPACE_XXS),
     ));
     card.view.addSubview(&l);
@@ -3045,6 +3398,19 @@ fn with_pending<F: FnOnce(&mut Settings)>(f: F) {
     }
 }
 
+fn refresh_live_preview_control() {
+    if let Some(ui) = SETTINGS_UI.get() {
+        let state = ui.pending.lock().unwrap().live_preview_control();
+        ui.streaming_switch.set_on(state.enabled);
+        ui.streaming_switch.set_active(state.editable);
+        ui.streaming_hint
+            .setStringValue(&NSString::from_str(state.hint));
+        unsafe {
+            let _: () = msg_send![&*ui.streaming_switch, setAccessibilityHelp: &*NSString::from_str(state.hint)];
+        }
+    }
+}
+
 fn apply_and_restart(ui: &SettingsUi) {
     let pending = ui.pending.lock().unwrap().clone();
     let corrections = ui.pending_corrections.lock().unwrap();
@@ -3072,6 +3438,22 @@ fn apply_and_restart(ui: &SettingsUi) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_totals_keep_counts_separate_from_storage_size() {
+        assert_eq!(
+            recovery_usage_summary(0, 0, 3),
+            "0 audio clips · 0.0 MB · 3 recovery records"
+        );
+        assert_eq!(
+            recovery_usage_summary(2, 1536 * 1024, 4),
+            "2 audio clips · 1.5 MB · 4 recovery records"
+        );
+        assert_eq!(
+            recovery_usage_summary(8, 1024 * 1024 * 1024, 10),
+            "8 audio clips · 1.0 GB · 10 recovery records"
+        );
+    }
 
     #[test]
     fn history_count_line_reads_naturally_at_every_size() {

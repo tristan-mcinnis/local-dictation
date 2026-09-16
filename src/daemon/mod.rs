@@ -157,6 +157,8 @@ enum DaemonEvent {
     /// socket ("retry") or the menu-bar item. A no-op when nothing has been
     /// dictated yet this session.
     Retry,
+    /// Reprocess a saved recording and copy only; never activate or paste.
+    Recover { id: i64 },
     /// Quit is underway: leave the worker loop so the models — and the Metal
     /// buffers they hold — are dropped while Metal is still alive. Sent by the
     /// AppKit delegate's release hook; see `crate::shutdown`.
@@ -375,17 +377,14 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         // sets it at begin and reverts to `Idle`/`Success`/
                         // `Error` at settle, so an idle Escape (no utterance) is
                         // never mistaken for a cancel.
-                        let in_flight = matches!(
-                            ui_channel::state(),
-                            UiState::Recording | UiState::Processing
-                        );
+                        let in_flight = ui_channel::state().is_cancellable();
                         // Only swallow + wake + unwind when a cancel was actually
                         // ACCEPTED. `request_cancel` returns false when idle or when
                         // the utterance already committed to write — in that case the
                         // Escape must pass through untouched, not be silently eaten
                         // (and the PTT latch must not be reset out from under a live
                         // post-commit settle).
-                        if in_flight && crate::cancel::CANCEL.request_cancel() {
+                        if in_flight && ui_channel::request_cancel() {
                             // Wake a worker blocked waiting for an event (recording)
                             // so capture stops now rather than at release. Harmless
                             // if it's already mid-pipeline: the out-of-band gate is
@@ -516,10 +515,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             Command::Cancel => {
                 // Signal the out-of-band cancel gate too, so an IPC cancel lands
                 // even if the worker is blocked mid-pipeline (see `crate::cancel`).
-                crate::cancel::CANCEL.request_cancel();
+                ui_channel::request_cancel();
                 tx_for_ctl.send(DaemonEvent::CancelRecording)
             }
             Command::Retry => tx_for_ctl.send(DaemonEvent::Retry),
+            Command::Recover(id) => tx_for_ctl.send(DaemonEvent::Recover { id }),
             // The server resolves Toggle → Start/Stop before dispatch, so a
             // Toggle reaching here would be a bug; treat it as a no-op.
             Command::Toggle => Ok(()),

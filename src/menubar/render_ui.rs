@@ -30,8 +30,11 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
     slate::set_opaque_materials(true);
 
     let actions = MenuActions::new();
-    let pill = build_pill_window(mtm, &actions)?;
-    let history = build_history_window(mtm);
+    let pill = build_pill_window(mtm, &actions, PillSize::Compact)?;
+    let standard_pill = build_pill_window(mtm, &actions, PillSize::Standard)?;
+    let history = build_history_for_render(mtm);
+    let detail = build_history_detail(mtm);
+    let detail_audio = write_history_audio_fixture(out_dir)?;
     let dictionary = build_dictionary_window(mtm);
     let settings = crate::settings_window::build_for_render(mtm);
 
@@ -41,6 +44,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
     seed_sample_history(mtm, &history);
     let sample_entries = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
     crate::settings_window::seed_history_for_render(&settings, &sample_entries);
+    crate::settings_window::verify_history_render_fixture(&settings, sample_entries.len())?;
     dictionary
         .text_view
         .setString(&NSString::from_str(SAMPLE_DICTIONARY));
@@ -56,29 +60,183 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
         app.setAppearance(Some(&appearance));
         for w in [
             &*pill.window,
+            &*standard_pill.window,
             &*history.window as &NSWindow,
+            &*detail.window as &NSWindow,
             &*dictionary.window,
             &*settings.window,
         ] {
             w.setAppearance(Some(&appearance));
         }
 
-        // Pill: one file per state, each laid out then drawn.
-        for (name, layout, status, hint) in [
-            ("pill-recording", PillLayout::Compact, "Release to finish", "Latch"),
-            ("pill-processing", PillLayout::Compact, "Working…", "Latch"),
-            ("pill-hover", PillLayout::Shelf, "Release to finish", "Latch"),
-            ("pill-success", PillLayout::Success, "Landed · 38 words", "Undo"),
-            ("pill-error", PillLayout::Error, "Couldn’t transcribe", "Retry"),
+        // Pure AppKit snapshots exercise the real control hit regions without
+        // activating a window, recording audio, or sending a cancel command.
+        for (name, layout, state, status, hovered, quiet) in [
+            (
+                "pill-recording",
+                PillLayout::Recording,
+                UiState::Recording,
+                "",
+                false,
+                false,
+            ),
+            (
+                "pill-silence",
+                PillLayout::Recording,
+                UiState::Recording,
+                "",
+                false,
+                true,
+            ),
+            (
+                "pill-hover",
+                PillLayout::Recording,
+                UiState::Recording,
+                "",
+                true,
+                false,
+            ),
+            (
+                "pill-preview",
+                PillLayout::Recording,
+                UiState::Recording,
+                "Please move the meeting to Thursday afternoon.",
+                false,
+                false,
+            ),
+            (
+                "pill-transcribing",
+                PillLayout::Processing,
+                UiState::Transcribing,
+                "Transcribing…",
+                false,
+                false,
+            ),
+            (
+                "pill-cleaning",
+                PillLayout::Processing,
+                UiState::Cleaning,
+                "Cleaning up…",
+                false,
+                false,
+            ),
+            (
+                "pill-processing",
+                PillLayout::Processing,
+                UiState::Processing,
+                "Working…",
+                false,
+                false,
+            ),
+            (
+                "pill-processing-hover",
+                PillLayout::Processing,
+                UiState::Cleaning,
+                "Cleaning up…",
+                true,
+                false,
+            ),
+            (
+                "pill-pasting",
+                PillLayout::Processing,
+                UiState::Pasting,
+                "Pasting…",
+                true,
+                false,
+            ),
+            (
+                "pill-success",
+                PillLayout::Success,
+                UiState::Success,
+                "Landed · 38 words",
+                false,
+                false,
+            ),
+            (
+                "pill-copied",
+                PillLayout::Copied,
+                UiState::Copied,
+                "Copied to clipboard",
+                false,
+                false,
+            ),
+            (
+                "pill-held",
+                PillLayout::Copied,
+                UiState::NoEditableField,
+                "No text field selected · Copy from menu",
+                false,
+                false,
+            ),
+            (
+                "pill-recording-storage-warning",
+                PillLayout::Recording,
+                UiState::Recording,
+                "Recovery warning",
+                false,
+                false,
+            ),
+            (
+                "pill-processing-storage-warning",
+                PillLayout::Processing,
+                UiState::Transcribing,
+                "Transcribing… · Recovery warning",
+                false,
+                false,
+            ),
+            (
+                "pill-error",
+                PillLayout::Error,
+                UiState::Error,
+                "Couldn’t transcribe",
+                false,
+                false,
+            ),
         ] {
+            pill.storage_warning.set(name.ends_with("storage-warning"));
             pill.status.setStringValue(&NSString::from_str(status));
-            pill.hint.setStringValue(&NSString::from_str(hint));
-            pill.waveform.set_muted(name == "pill-processing");
-            pill.waveform.set_heights(sample_levels(name == "pill-processing"));
+            pill.hint
+                .setStringValue(&NSString::from_str(if state == UiState::Error {
+                    "History"
+                } else {
+                    "Undo"
+                }));
+            pill.waveform.set_heights(if quiet {
+                waveform_targets(&[0.006; BAR_COUNT], WaveformSensitivity::Balanced)
+            } else {
+                sample_levels(false)
+            });
             let width = layout_pill(&pill, layout);
-            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, PILL_H));
+            if state.is_active() {
+                set_cancel_hover(&pill, state, hovered);
+            }
+            assert_eq!(pill.cancel.isHidden(), !state.is_cancellable());
+            assert!(!pill.window.canBecomeKeyWindow() && !pill.window.canBecomeMainWindow());
+            if state.is_cancellable() {
+                assert!(pill.cancel.frame().size.width >= 24.0);
+                assert!(pill.cancel.frame().size.height >= 24.0);
+                assert_eq!(pill.cancel.keyEquivalent().to_string(), "\u{1b}");
+                assert!(pill.cancel.keyEquivalentModifierMask().is_empty());
+            }
+            if matches!(state, UiState::Copied | UiState::NoEditableField) {
+                assert!(pill.undo.isHidden());
+            }
+            if state == UiState::Error {
+                assert!(!pill.history.isHidden());
+                assert!(
+                    pill.history.frame().size.width >= 24.0
+                        && pill.history.frame().size.height >= 24.0
+                );
+                let action: Option<objc2::runtime::Sel> =
+                    unsafe { msg_send![&*pill.history, action] };
+                assert_eq!(action, Some(sel!(openHistory:)));
+                assert!(pill.history.keyEquivalent().length() == 0);
+                assert!(pill.caps.iter().all(|cap| cap.isHidden()));
+            }
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, pill.height));
             unsafe {
-                let _: () = msg_send![&*pill.window, setFrame: frame, display: false, animate: false];
+                let _: () =
+                    msg_send![&*pill.window, setFrame: frame, display: false, animate: false];
             }
             pill.glass.setFrame(frame);
             pill.tint.setFrame(frame);
@@ -91,6 +249,39 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 SPACE_XXL,
             )?);
         }
+        standard_pill.status.setStringValue(&NSString::from_str(""));
+        standard_pill.waveform.set_heights(sample_levels(false));
+        let width = layout_pill(&standard_pill, PillLayout::Recording);
+        set_cancel_hover(&standard_pill, UiState::Recording, false);
+        let frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(width, standard_pill.height),
+        );
+        unsafe {
+            let _: () =
+                msg_send![&*standard_pill.window, setFrame: frame, display: false, animate: false];
+        }
+        standard_pill.glass.setFrame(frame);
+        standard_pill.tint.setFrame(frame);
+        written.push(snapshot(
+            mtm,
+            &standard_pill.glass,
+            out_dir,
+            &format!("pill-standard-{suffix}"),
+            Some(BACKDROP),
+            SPACE_XXL,
+        )?);
+
+        crate::settings_window::show_recording_feedback_for_render(&settings);
+        written.push(snapshot(
+            mtm,
+            &settings.window.contentView().expect("settings content"),
+            out_dir,
+            &format!("settings-feedback-{suffix}"),
+            Some(BACKDROP),
+            SPACE_XXL,
+        )?);
+        crate::settings_window::scroll_to_top_for_render(&settings);
 
         for (name, view) in [
             ("history", &*history.panel),
@@ -105,6 +296,26 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 SPACE_LG,
             )?);
         }
+
+        for (name, record) in history_detail_fixtures(&detail_audio) {
+            populate_detail(&detail, record.clone());
+            verify_detail_layers(&detail, &record)?;
+            written.push(snapshot(
+                mtm,
+                &detail.panel,
+                out_dir,
+                &format!("history-detail-{name}-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+
+        // Regression: a live detail loses its record while open. No stale
+        // transcript, layer picker, or enabled recovery action may remain.
+        clear_deleted_detail(&detail);
+        verify_deleted_detail(&detail)?;
+        written.push(snapshot(mtm, &detail.panel, out_dir,
+            &format!("history-detail-deleted-{suffix}"), None, 0.0)?);
 
         if let Some(content) = settings.window.contentView() {
             written.push(snapshot(
@@ -248,7 +459,9 @@ fn snapshot(
     view.cacheDisplayInRect_toBitmapImageRep(bounds, &rep);
 
     let data = match backdrop {
-        None => unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) },
+        None => unsafe {
+            rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new())
+        },
         Some(bg) => {
             let size = NSSize::new(
                 bounds.size.width + 2.0 * margin,
@@ -260,10 +473,19 @@ fn snapshot(
                 canvas.lockFocus();
                 bg.ns_color().setFill();
                 NSBezierPath::fillRect(NSRect::new(NSPoint::new(0.0, 0.0), size));
-                rep.drawInRect(NSRect::new(
-                    NSPoint::new(margin, margin),
-                    bounds.size,
-                ));
+                let destination = NSRect::new(NSPoint::new(margin, margin), bounds.size);
+                // cacheDisplay does not reliably apply the glass layer's
+                // rounded mask offscreen. Match the native pill mask while
+                // compositing its proof; product view geometry is unchanged.
+                let context = objc2_app_kit::NSGraphicsContext::currentContext();
+                if let Some(context) = &context { context.saveGraphicsState(); }
+                if name.starts_with("pill-") {
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                        destination, bounds.size.height / 2.0, bounds.size.height / 2.0,
+                    ).addClip();
+                }
+                rep.drawInRect(destination);
+                if let Some(context) = &context { context.restoreGraphicsState(); }
                 #[allow(deprecated)]
                 canvas.unlockFocus();
             }
@@ -361,4 +583,202 @@ fn seed_sample_history(mtm: MainThreadMarker, ui: &HistoryUi) {
         *all = entries.clone();
     }
     rebuild_history_list(mtm, ui, &entries);
+}
+
+/// One second of silent PCM, created only in the requested render output.
+/// The proof never opens a window, plays audio, or reads private history.
+fn write_history_audio_fixture(out_dir: &str) -> eyre::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = PathBuf::from(out_dir).join("history-proof.wav");
+    let sample_rate = 16_000_u32;
+    let data_bytes = sample_rate * 2;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    wav.resize(wav.len() + data_bytes as usize, 0);
+    std::fs::write(&path, wav)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(path)
+}
+
+fn history_detail_fixtures(
+    audio_path: &std::path::Path,
+) -> Vec<(&'static str, crate::history::RecoveryRecord)> {
+    use crate::history::{AudioRecord, RecoveryRecord, RecoveryStatus, StageKind, TextStage};
+    let now = 1_800_000_000;
+    let stage = |id, ordinal, kind, title: &str, text: &str| TextStage {
+        id,
+        ordinal,
+        kind,
+        title: title.to_string(),
+        text: text.to_string(),
+        metadata: "{}".to_string(),
+        created_at: now,
+    };
+    let audio = || {
+        Some(AudioRecord {
+            path: audio_path.to_path_buf(),
+            duration_ms: 1_000,
+            expires_at: Some(now + 30 * 86_400),
+            byte_count: 32_044,
+        })
+    };
+    vec![
+        (
+            "completed",
+            RecoveryRecord {
+                entry: Entry {
+                    id: 41,
+                    text: "Please send the revised notes tomorrow.".to_string(),
+                    created_at: now,
+                },
+                status: RecoveryStatus::Completed,
+                audio: audio(),
+                error: None,
+                stages: vec![
+                    stage(
+                        1,
+                        0,
+                        StageKind::Raw,
+                        "Raw",
+                        "um please send the revised notes tomorrow",
+                    ),
+                    stage(
+                        2,
+                        1,
+                        StageKind::Cleaned,
+                        "Cleaned",
+                        "Please send the revised notes tomorrow.",
+                    ),
+                ],
+            },
+        ),
+        (
+            "failed",
+            RecoveryRecord {
+                entry: Entry {
+                    id: 42,
+                    text: "A partial transcript".to_string(),
+                    created_at: now,
+                },
+                status: RecoveryStatus::Failed,
+                audio: audio(),
+                error: Some("Cleanup failed. Original audio and raw text are kept.".to_string()),
+                stages: vec![stage(
+                    3,
+                    0,
+                    StageKind::Raw,
+                    "Raw",
+                    "A partial transcript remains available even if a later stage fails.",
+                )],
+            },
+        ),
+        (
+            "cancelled",
+            RecoveryRecord {
+                entry: Entry {
+                    id: 43,
+                    text: String::new(),
+                    created_at: now,
+                },
+                status: RecoveryStatus::Cancelled,
+                audio: audio(),
+                error: None,
+                stages: vec![],
+            },
+        ),
+        (
+            "expired",
+            RecoveryRecord {
+                entry: Entry {
+                    id: 44,
+                    text: "The saved text remains after its audio expires.".to_string(),
+                    created_at: now,
+                },
+                status: RecoveryStatus::Completed,
+                audio: None,
+                error: None,
+                stages: vec![stage(
+                    4,
+                    0,
+                    StageKind::Output,
+                    "Saved text",
+                    "The saved text remains after its audio expires.",
+                )],
+            },
+        ),
+        (
+            "recovered-again",
+            RecoveryRecord {
+                entry: Entry { id: 47, text: "A later cleaned attempt.".to_string(), created_at: now },
+                status: RecoveryStatus::Copied, audio: audio(), error: None,
+                stages: vec![
+                    stage(8, 0, StageKind::Raw, "Raw", "The first raw attempt."),
+                    stage(9, 1, StageKind::Cleaned, "Cleaned", "The first cleaned attempt."),
+                    stage(10, 2, StageKind::Raw, "Raw", "A later raw attempt."),
+                    stage(11, 3, StageKind::Cleaned, "Cleaned", "A later cleaned attempt."),
+                ],
+            },
+        ),
+        (
+            "cancelled-expired",
+            RecoveryRecord {
+                entry: Entry {
+                    id: 46,
+                    text: String::new(),
+                    created_at: now,
+                },
+                status: RecoveryStatus::Cancelled,
+                audio: None,
+                error: None,
+                stages: vec![],
+            },
+        ),
+        (
+            "transform",
+            RecoveryRecord {
+                entry: Entry {
+                    id: 45,
+                    text: "Send the notes tomorrow.".to_string(),
+                    created_at: now,
+                },
+                status: RecoveryStatus::Completed,
+                audio: audio(),
+                error: None,
+                stages: vec![
+                    stage(
+                        5,
+                        0,
+                        StageKind::Raw,
+                        "Raw",
+                        "um please send the revised notes tomorrow",
+                    ),
+                    stage(
+                        6,
+                        1,
+                        StageKind::Cleaned,
+                        "Cleaned",
+                        "Please send the revised notes tomorrow.",
+                    ),
+                    stage(
+                        7,
+                        2,
+                        StageKind::Transform,
+                        "Shorten",
+                        "Send the notes tomorrow.",
+                    ),
+                ],
+            },
+        ),
+    ]
 }

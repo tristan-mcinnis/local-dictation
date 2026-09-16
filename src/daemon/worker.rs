@@ -5,6 +5,7 @@ pub(super) fn worker_loop(
     rx: std::sync::mpsc::Receiver<DaemonEvent>,
     config: DaemonConfig,
 ) -> eyre::Result<()> {
+    crate::history::initialize_recovery();
     cues::preload();
     let t_load = Instant::now();
     let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
@@ -186,6 +187,9 @@ pub(super) fn worker_loop(
     let mut stream: Option<crate::vad::SegmentStream> = None;
     // Cached corrected text of each completed segment (VAD-pause-bounded).
     let mut stream_segs: Vec<String> = Vec::new();
+    // Keep exact ASR words separately; personal corrections must not rewrite
+    // the recoverable Raw layer.
+    let mut stream_raw_segs: Vec<String> = Vec::new();
     // Backup of every drained sample, for the whole-buffer fallback on a poisoned
     // stream / transform / empty result — never lose audio.
     let mut stream_audio: Vec<f32> = Vec::new();
@@ -200,20 +204,21 @@ pub(super) fn worker_loop(
     // The raw PCM of the last transcribed utterance, kept so "retry" can re-run
     // the pipeline on the same audio. Empty until the first dictation.
     let mut last_audio: Vec<f32> = Vec::new();
+    let mut pending_saved_recoveries = std::collections::VecDeque::<i64>::new();
 
     'evloop: loop {
-        // While recording with streaming ASR, wake periodically to transcribe any
-        // sentence a VAD pause has just closed; otherwise block for the next event.
+        // While recording, wake periodically to checkpoint captured PCM and
+        // (when enabled) transcribe sentences closed by a VAD pause.
         // recv_timeout keeps everything on this one thread, which already owns the
         // ASR worker — no shared state.
-        let event = {
-            // Ticks are needed while an engine is alive AND either streaming ASR
-            // is active (to transcribe VAD-closed sentences mid-hold) or the
-            // engine is warm-parked (to expire the warm window and release the
-            // mic once idle past the deadline). A quiet cold-open recording with
-            // no streaming and no warm-window blocks for the next event, exactly
-            // as before.
-            if engine.is_some() && (streaming_asr || warm_parked) {
+        let event = if !session_active && (engine.is_none() || warm_parked)
+            && !pending_saved_recoveries.is_empty() {
+            DaemonEvent::Recover { id: pending_saved_recoveries.pop_front().unwrap() }
+        } else {
+            // Ticks checkpoint every capture mode, including non-streaming and
+            // pre-roll. A warm-parked engine only checks its expiry; its idle
+            // microphone audio never reaches the archive.
+            if engine.is_some() || session_active {
                 match rx.recv_timeout(std::time::Duration::from_millis(120)) {
                     Ok(ev) => ev,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -231,6 +236,10 @@ pub(super) fn worker_loop(
                                     eprintln!("[audio] warm-window expired · mic closed");
                                 }
                             }
+                        } else if session_active {
+                            if let Some((_, cons)) = always.as_mut() {
+                                checkpoint_capture(cons, &mut stream_audio, cur_gen);
+                            }
                         } else if streaming_asr {
                             if let (Some(st), Some(c)) = (stream.as_mut(), consumer.as_mut()) {
                                 stream_process_asr(
@@ -239,13 +248,17 @@ pub(super) fn worker_loop(
                                     st,
                                     c,
                                     &mut stream_segs,
+                                    &mut stream_raw_segs,
                                     &mut stream_audio,
                                     &mut stream_poisoned,
                                     &mut noise_floor,
                                     false,
                                     whisper_mode,
+                                    cur_gen,
                                 );
                             }
+                        } else if let Some(c) = consumer.as_mut() {
+                            checkpoint_capture(c, &mut stream_audio, cur_gen);
                         }
                         continue;
                     }
@@ -271,8 +284,111 @@ pub(super) fn worker_loop(
                 // still alive. The spawning thread then calls
                 // `shutdown::mark_released`, which unblocks the delegate that
                 // is holding `exit()` open.
+                if cur_gen != u64::MAX && crate::cancel::CANCEL.active() {
+                    if let Some(e) = engine.as_mut() { e.stop_capture(); }
+                    if session_active {
+                        if let Some((ao, cons)) = always.as_mut() {
+                            ao.end_session();
+                            let flag = ao.recording_flag();
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(cons), Some(&flag), Some(cur_gen));
+                        }
+                    } else if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r), Some(cur_gen));
+                    }
+                    crate::history::finish_recovery(cur_gen, crate::history::RecoveryStatus::Interrupted);
+                    ui_channel::finish_utterance(cur_gen);
+                }
+                crate::history::flush_recovery(Duration::from_secs(2));
                 eprintln!("[daemon] shutdown · releasing models before exit");
                 return Ok(());
+            }
+            DaemonEvent::Recover { id } => {
+                // Recovery is explicitly copy-only and never interrupts capture.
+                if session_active || (engine.is_some() && !warm_parked) {
+                    if !pending_saved_recoveries.contains(&id) { pending_saved_recoveries.push_back(id); }
+                    eprintln!("[recovery] queued until current recording settles");
+                    continue;
+                }
+                let generation = ui_channel::begin_utterance(UiState::Transcribing, streaming_asr);
+                let _utterance = ui_channel::UtteranceScope(generation);
+                crate::history::resume_recovery(generation, id);
+                let mut recovery = RecoveryFinish::new(generation);
+                let (audio, rate) = match crate::history::read_recovery_audio(id) {
+                    Ok(Some(audio)) => audio,
+                    Ok(None) => {
+                        recovery.error = Some("Saved audio is no longer available".into());
+                        eprintln!("[recovery] saved audio is no longer available for record {id}");
+                        ui_channel::show_transient_for(generation, UiState::Error, Duration::from_millis(900));
+                        continue;
+                    }
+                    Err(error) => {
+                        recovery.error = Some(format!("Could not read saved audio: {error}"));
+                        eprintln!("[recovery] could not read record {id}: {error}");
+                        ui_channel::show_transient_for(generation, UiState::Error, Duration::from_millis(900));
+                        continue;
+                    }
+                };
+                if rate != crate::audio::SAMPLE_RATE {
+                    recovery.error = Some(format!("Unsupported saved sample rate {rate}"));
+                    eprintln!("[recovery] unsupported saved sample rate {rate}");
+                    continue;
+                }
+                #[cfg(feature = "cleaner")]
+                let mut cleanup = |text: &str| {
+                    rt.block_on(cleaner.as_ref().unwrap().process_transcript_with_vocab(text, &[]))
+                };
+                #[cfg(feature = "cleaner")]
+                let cleanup_fn = if cleaner.is_some() {
+                    Some(&mut cleanup as &mut dyn FnMut(&str) -> eyre::Result<String>)
+                } else { None };
+                #[cfg(not(feature = "cleaner"))]
+                let cleanup_fn = None;
+                let outcome = crate::reprocess::to_clipboard(
+                    &crate::cancel::CANCEL, generation, &audio,
+                    |audio| worker.transcribe_pcm(audio), cleanup_fn,
+                    |phase| {
+                        ui_channel::set_phase(generation, match phase {
+                            crate::reprocess::Phase::Transcribing => UiState::Transcribing,
+                            crate::reprocess::Phase::Cleaning => UiState::Cleaning,
+                        });
+                    },
+                    |kind, text| {
+                        let kind = match kind {
+                            crate::reprocess::Version::Raw => crate::history::StageKind::Raw,
+                            crate::reprocess::Version::Cleaned => crate::history::StageKind::Cleaned,
+                        };
+                        crate::history::append_recovery_stage(generation, kind, text, "Saved-audio recovery");
+                        ui_channel::publish_preview(generation, text);
+                    },
+                    |text| {
+                        // The copy claim already won; no cancel affordance while
+                        // clipboard delivery completes, and no Pasting fiction.
+                        ui_channel::set_state(UiState::Idle);
+                        crate::clipboard_paste::copy_only(text)
+                    },
+                );
+                match outcome {
+                    crate::reprocess::Outcome::Copied(text) => {
+                        recovery.status = crate::history::RecoveryStatus::Copied;
+                        crate::history::append_recovery_stage(generation, crate::history::StageKind::Output, &text, "Copied only; not pasted");
+                        ui_channel::set_last_dictation(&text);
+                        ui_channel::show_transient(UiState::Copied, Duration::from_millis(900));
+                    }
+                    crate::reprocess::Outcome::Cancelled => {
+                        recovery.status = crate::history::RecoveryStatus::Cancelled;
+                        cues::play_cancel();
+                    }
+                    crate::reprocess::Outcome::Empty => {
+                        recovery.status = crate::history::RecoveryStatus::Held;
+                        eprintln!("[recovery] no text recovered; original recording kept");
+                        ui_channel::show_transient_for(generation, UiState::Error, Duration::from_millis(900));
+                    }
+                    crate::reprocess::Outcome::Failed(error) => {
+                        eprintln!("[recovery] processing failed: {error}");
+                        recovery.error = Some(error);
+                        ui_channel::show_transient_for(generation, UiState::Error, Duration::from_millis(900));
+                    }
+                }
             }
             DaemonEvent::Retry => {
                 // Re-run the pipeline on the retained "last recording" audio
@@ -288,16 +404,13 @@ pub(super) fn worker_loop(
                     cues::play_error();
                     continue;
                 }
-                ui_channel::set_state(UiState::Processing);
-                let retry_gen = crate::cancel::CANCEL.begin();
+                let retry_gen = ui_channel::begin_utterance(UiState::Transcribing, streaming_asr);
+                let _utterance = ui_channel::UtteranceScope(retry_gen);
                 #[cfg(feature = "cleaner")]
                 retry_last(&rt, &mut worker, cleaner.as_ref(), &refiner, &last_audio, retry_gen);
                 #[cfg(not(feature = "cleaner"))]
                 retry_last(&mut worker, &refiner, &last_audio, retry_gen);
-                crate::cancel::CANCEL.end();
-                if ui_channel::state() == UiState::Processing {
-                    ui_channel::set_state(UiState::Idle);
-                }
+                ui_channel::finish_utterance(retry_gen);
             }
             DaemonEvent::CancelRecording => {
                 // External "cancel" (control socket, or the Escape key): stop
@@ -315,8 +428,6 @@ pub(super) fn worker_loop(
                 if !genuine {
                     continue;
                 }
-                crate::cancel::CANCEL.end();
-                cur_gen = u64::MAX;
                 crate::ipc::DAEMON_RECORDING.store(false, Ordering::SeqCst);
                 let mut on_demand_engine = engine.take();
                 let always_on_session = session_active;
@@ -336,7 +447,7 @@ pub(super) fn worker_loop(
                         // next recording clears this buffer on start).
                         e.park();
                         if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
-                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()), Some(cur_gen));
                         }
                         engine = on_demand_engine.take();
                         warm_parked = true;
@@ -347,7 +458,7 @@ pub(super) fn worker_loop(
                         // Cold cancel: drain + retain the partial recording before
                         // dropping the consumer below.
                         if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
-                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()), Some(cur_gen));
                         }
                     }
                 }
@@ -357,7 +468,7 @@ pub(super) fn worker_loop(
                     if let Some((ao, cons)) = always.as_mut() {
                         ao.end_session();
                         let recflag = ao.recording_flag();
-                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(cons), Some(recflag.as_ref()));
+                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(cons), Some(recflag.as_ref()), Some(cur_gen));
                     }
                 } else if !warm_parked {
                     // Drop the per-utterance consumer + recording flag unread (the
@@ -367,11 +478,14 @@ pub(super) fn worker_loop(
                 }
                 stream = None;
                 stream_segs.clear();
+                stream_raw_segs.clear();
                 stream_audio.clear();
                 stream_poisoned = false;
                 cues::play_cancel();
-                ui_channel::set_state(UiState::Idle);
-                eprintln!("⌫ cancelled · discarded");
+                crate::history::finish_recovery(cur_gen, crate::history::RecoveryStatus::Cancelled);
+                ui_channel::finish_utterance(cur_gen);
+                cur_gen = u64::MAX;
+                eprintln!("⌫ cancelled · retained for recovery");
                 eprintln!();
             }
             DaemonEvent::StartRecording { transform } => {
@@ -409,11 +523,14 @@ pub(super) fn worker_loop(
                             t_press = Some(Instant::now());
                             cues::play_start();
                             crate::audio_duck::mute();
-                            ui_channel::set_state(UiState::Recording);
                             eprintln!("▶ recording (warm reuse)");
                             crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
                             last_audio.clear(); // new recording invalidates the previous buffer
-                            cur_gen = crate::cancel::CANCEL.begin();
+                            cur_gen = begin_recording_feedback(streaming_asr, is_recording.as_ref().unwrap().clone());
+                            stream_segs.clear();
+                            stream_raw_segs.clear();
+                            stream_audio.clear();
+                            stream_poisoned = false;
                             if streaming_asr {
                                 stream = Some(crate::vad::SegmentStream::new(
                                     crate::audio::SAMPLE_RATE,
@@ -423,6 +540,7 @@ pub(super) fn worker_loop(
                                 // a warm-window reuse never carries stale segments
                                 // or a stale poison flag into the new utterance.
                                 stream_segs.clear();
+                                stream_raw_segs.clear();
                                 stream_audio.clear();
                                 stream_poisoned = false;
                             }
@@ -475,12 +593,12 @@ pub(super) fn worker_loop(
                         ao.begin_session();
                         cues::play_start();
                         crate::audio_duck::mute();
-                        ui_channel::set_state(UiState::Recording);
                         eprintln!("▶ recording · pre-roll");
                         session_active = true;
                         crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
                         last_audio.clear(); // new recording invalidates the previous buffer
-                        cur_gen = crate::cancel::CANCEL.begin();
+                        cur_gen = begin_recording_feedback(streaming_asr, ao.recording_flag());
+                        stream_audio.clear();
                         pending_target = Some(spawn_focus_capture());
                     }
                     continue;
@@ -492,6 +610,7 @@ pub(super) fn worker_loop(
                     &mut is_recording,
                     &mut stream,
                     &mut stream_segs,
+                    &mut stream_raw_segs,
                     &mut stream_audio,
                     &mut stream_poisoned,
                     &mut transform_mode,
@@ -504,11 +623,14 @@ pub(super) fn worker_loop(
                 } else {
                     noise_floor.clear();
                     last_audio.clear(); // new recording invalidates the previous buffer
-                    cur_gen = crate::cancel::CANCEL.begin();
+                    cur_gen = begin_recording_feedback(streaming_asr, is_recording.as_ref().unwrap().clone());
                     pending_target = Some(spawn_focus_capture());
                 }
             }
             DaemonEvent::StopRecording => {
+                // A parked warm microphone is not a recording. An idle/duplicate
+                // Stop must not create an empty recovery row or reuse an ended generation.
+                if warm_parked || !crate::cancel::CANCEL.active() { continue; }
                 // Either capture path may be live: open-on-press (`engine`) or
                 // always-on pre-roll (`session_active`). Nothing live ⇒ ignore.
                 crate::ipc::DAEMON_RECORDING.store(false, Ordering::SeqCst);
@@ -518,6 +640,8 @@ pub(super) fn worker_loop(
                 if on_demand_engine.is_none() && !always_on_session {
                     continue;
                 }
+                let _utterance = ui_channel::UtteranceScope(cur_gen);
+                let mut recovery = RecoveryFinish::new(cur_gen);
                 // Capture (and reset) whether this utterance is a transform. Done
                 // up-front so the tail-capture re-press restart can re-set it with
                 // the new gesture.
@@ -592,17 +716,31 @@ pub(super) fn worker_loop(
                                     break;
                                 }
                                 Ok(DaemonEvent::CancelRecording) => {
-                                    grace_outcome = Some(TailGraceOutcome::Cancel);
-                                    break;
+                                    // A delayed cancel belongs only to the generation
+                                    // that accepted it, never a fresh tail-capture.
+                                    if crate::cancel::CANCEL.requested(cur_gen) {
+                                        grace_outcome = Some(TailGraceOutcome::Cancel);
+                                        break;
+                                    }
                                 }
                                 // A duplicate release or a stray latch cue during the
                                 // grace tail is harmless: keep waiting for quiet.
                                 Ok(DaemonEvent::StopRecording)
                                 | Ok(DaemonEvent::LatchArmed)
                                 | Ok(DaemonEvent::Retry) => {}
+                                Ok(DaemonEvent::Recover { id }) => {
+                                    if !pending_saved_recoveries.contains(&id) { pending_saved_recoveries.push_back(id); }
+                                }
                                 // Quit during the tail: abandon this utterance
                                 // and release the models (see `crate::shutdown`).
                                 Ok(DaemonEvent::Shutdown) => {
+                                    recovery.status = crate::history::RecoveryStatus::Interrupted;
+                                    if let Some(e) = on_demand_engine.as_mut() { e.stop_capture(); }
+                                    if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
+                                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r), Some(cur_gen));
+                                    }
+                                    recovery.finish_now();
+                                    crate::history::flush_recovery(Duration::from_secs(2));
                                     eprintln!("[daemon] shutdown · releasing models before exit");
                                     return Ok(());
                                 }
@@ -632,6 +770,7 @@ pub(super) fn worker_loop(
                 // everything). Either way we skip the release pipeline below.
                 match grace_outcome {
                     Some(TailGraceOutcome::RePress { transform }) => {
+                        recovery.status = crate::history::RecoveryStatus::Interrupted;
                         // The engine is still open and capturing during the grace
                         // tail. Reuse it instead of dropping it for a ~120 ms cold
                         // open: park (stop production), drain+discard the abandoned
@@ -639,7 +778,9 @@ pub(super) fn worker_loop(
                         if let Some(e) = on_demand_engine.as_mut() {
                             e.park();
                             if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
-                                let _ = crate::audio::drain_session(c, r);
+                                let tail = crate::audio::drain_session(c, r);
+                                crate::history::append_recovery_audio(cur_gen, tail, crate::audio::SAMPLE_RATE);
+
                             }
                             e.resume();
                         }
@@ -647,6 +788,7 @@ pub(super) fn worker_loop(
                         transform_mode = transform;
                         t_press = Some(Instant::now());
                         stream_segs.clear();
+                        stream_raw_segs.clear();
                         stream_audio.clear();
                         stream_poisoned = false;
                         noise_floor.clear();
@@ -658,26 +800,27 @@ pub(super) fn worker_loop(
                         }
                         cues::play_start();
                         crate::audio_duck::mute();
-                        ui_channel::set_state(UiState::Recording);
                         crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
                         last_audio.clear(); // re-press abandons the old utterance
-                        cur_gen = crate::cancel::CANCEL.begin();
+                        cur_gen = begin_recording_feedback(streaming_asr, is_recording.as_ref().unwrap().clone());
                         eprintln!("  ↻    re-press during tail-capture · reused warm stream");
                         pending_target = Some(spawn_focus_capture());
                         continue 'evloop;
                     }
                     Some(TailGraceOutcome::Cancel) => {
+                        recovery.status = crate::history::RecoveryStatus::Cancelled;
                         on_demand_engine.as_mut().unwrap().stop_capture();
                         // Retain the partial recording (held streaming backup +
                         // the grace-tail samples still in the ring) for retry.
                         if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
-                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()), Some(cur_gen));
                         }
                         consumer.take();
                         is_recording.take();
                         pending_target = None; // discard the orphaned press-time capture
                         stream = None;
                         stream_segs.clear();
+                        stream_raw_segs.clear();
                         stream_audio.clear();
                         stream_poisoned = false;
                         cues::play_cancel();
@@ -724,13 +867,14 @@ pub(super) fn worker_loop(
                 // into `last_audio` yet at this checkpoint, so drain it from the
                 // active capture source first.
                 if cur_gen != u64::MAX && crate::cancel::CANCEL.consume_cancel(cur_gen) {
+                    recovery.status = crate::history::RecoveryStatus::Cancelled;
                     if always_on_session {
                         if let Some((ao, cons)) = always.as_mut() {
                             let recflag = ao.recording_flag();
-                            retain_in_flight_audio(&mut last_audio, &[], Some(cons), Some(recflag.as_ref()));
+                            retain_in_flight_audio(&mut last_audio, &stream_audio, Some(cons), Some(recflag.as_ref()), Some(cur_gen));
                         }
                     } else if let (Some(c), Some(r)) = (consumer.as_mut(), is_recording.as_ref()) {
-                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()));
+                        retain_in_flight_audio(&mut last_audio, &stream_audio, Some(c), Some(r.as_ref()), Some(cur_gen));
                     }
                     cues::play_cancel();
                     ui_channel::set_state(UiState::Idle);
@@ -741,7 +885,7 @@ pub(super) fn worker_loop(
                     continue 'evloop;
                 }
                 cues::play_stop();
-                ui_channel::set_state(UiState::Processing);
+                if !ui_channel::set_phase(cur_gen, UiState::Transcribing) { continue; }
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 let held = press_to_release.unwrap_or_default();
                 eprintln!("⏹ stopped · held {}", secs(held));
@@ -764,6 +908,7 @@ pub(super) fn worker_loop(
                 // open segment; everything else (pre-roll, poisoned / transform
                 // fallback) takes the proven whole-buffer path, byte-for-byte
                 // unchanged.
+                let mut uncorrected_transcript: Option<String> = None;
                 let transcript: String = 'got: {
                     // Always-on pre-roll: drain the warm stream's queued audio
                     // (the pre-roll lookback the callback flushed at press +
@@ -771,7 +916,7 @@ pub(super) fn worker_loop(
                     if always_on_session {
                         if let Some((ao, cons)) = always.as_mut() {
                             let recflag = ao.recording_flag();
-                            let buf = crate::audio::drain_session(cons, &recflag);
+                            let buf = complete_capture(cons, &recflag, &mut stream_audio, cur_gen);
                             let Some(keep) = guarded_transcribe_len(&buf, &noise_floor, whisper_mode) else {
                                 eprintln!(
                                     "  ◌    no speech above noise floor · nothing to transcribe"
@@ -782,6 +927,7 @@ pub(super) fn worker_loop(
                             match worker.transcribe_pcm(&buf[..keep]) {
                                 Ok(t) => break 'got t,
                                 Err(err) => {
+                                    recovery.error = Some(format!("Transcription failed: {err}"));
                                     eprintln!("[err]  transcribe failed: {err:?}");
                                     cues::play_error();
                                     ui_channel::set_state(UiState::Idle);
@@ -818,11 +964,13 @@ pub(super) fn worker_loop(
                                 st,
                                 c,
                                 &mut stream_segs,
+                                &mut stream_raw_segs,
                                 &mut stream_audio,
                                 &mut stream_poisoned,
                                 &mut noise_floor,
                                 true,
                                 whisper_mode,
+                                cur_gen,
                             )
                         } else {
                             0
@@ -860,12 +1008,14 @@ pub(super) fn worker_loop(
                                 stream_segs.len()
                             );
                             last_audio = whole.clone();
+                            uncorrected_transcript = Some(stream_raw_segs.join(" "));
                             Ok(joined)
                         };
                         stream = None;
                         match result {
                             Ok(t) => break 'got t,
                             Err(err) => {
+                                recovery.error = Some(format!("Transcription failed: {err}"));
                                 eprintln!("[err]  transcribe failed: {err:?}");
                                 cues::play_error();
                                 ui_channel::set_state(UiState::Idle);
@@ -878,7 +1028,7 @@ pub(super) fn worker_loop(
                     // consumer synchronously then transcribe, mirroring the
                     // always-on path. Borrowing leaves the consumer in `consumer`
                     // so a warm-window reuse can keep it for the next dictation.
-                    let buf = crate::audio::drain_session(c, r);
+                    let buf = complete_capture(c, r, &mut stream_audio, cur_gen);
                     let Some(keep) = guarded_transcribe_len(&buf, &noise_floor, whisper_mode) else {
                         eprintln!("  ◌    no speech above noise floor · nothing to transcribe");
                         break 'got String::new();
@@ -887,6 +1037,7 @@ pub(super) fn worker_loop(
                     match worker.transcribe_pcm(&buf[..keep]) {
                         Ok(t) => t,
                         Err(err) => {
+                            recovery.error = Some(format!("Transcription failed: {err}"));
                             eprintln!("[err]  transcribe failed: {err:?}");
                             cues::play_error();
                             ui_channel::set_state(UiState::Idle);
@@ -896,6 +1047,9 @@ pub(super) fn worker_loop(
                     }
                 };
                 let t_transcribe = t_pipeline.elapsed();
+                crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Raw,
+                    uncorrected_transcript.as_deref().unwrap_or(&transcript), "ASR, complete");
+                ui_channel::publish_preview(cur_gen, &transcript);
 
                 // Warm-window keeps the drained (now-empty) consumer + flag for the
                 // next reuse; otherwise drop them exactly as the pre-change code
@@ -906,6 +1060,7 @@ pub(super) fn worker_loop(
                 }
 
                 if transcript.trim().is_empty() {
+                    recovery.status = crate::history::RecoveryStatus::Completed;
                     eprintln!("  skip · empty transcript");
                     eprintln!();
                     ui_channel::set_state(UiState::Idle);
@@ -931,7 +1086,7 @@ pub(super) fn worker_loop(
                 #[cfg(feature = "cleaner")]
                 if transform {
                     match cleaner {
-                        Some(ref c) => handle_transform(&rt, c, &transcript),
+                        Some(ref c) => recovery.status = handle_transform(&rt, c, &transcript, cur_gen),
                         None => {
                             eprintln!(
                                 "  ✗    transform needs the cleanup engine (running with --no-cleanup)"
@@ -986,7 +1141,7 @@ pub(super) fn worker_loop(
                 if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript) {
                     match cleaner {
                         Some(ref c) => {
-                            handle_spoken_command(&rt, c, cmd, captured_target);
+                            recovery.status = handle_spoken_command(&rt, c, cmd, captured_target, cur_gen);
                             eprintln!();
                             ui_channel::set_state(UiState::Idle);
                             continue;
@@ -1088,6 +1243,7 @@ pub(super) fn worker_loop(
                                     );
                                     deterministic
                                 } else {
+                                    if !ui_channel::set_phase(cur_gen, UiState::Cleaning) { continue 'evloop; }
                                     let t_clean = Instant::now();
                                     match rt.block_on(c.process_transcript_with_vocab_tone(
                                         &pre_corrected,
@@ -1107,13 +1263,16 @@ pub(super) fn worker_loop(
                                                 eprintln!(
                                                     "  ⚠    cleanup dropped content — using faithful deterministic text instead"
                                                 );
+                                                recovery.error = Some("Model cleanup rejected because it dropped content; deterministic text used".into());
                                                 deterministic
                                             } else {
+                                                crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Cleaned, &cleaned, "Accepted model cleanup");
                                                 cleaned
                                             }
                                         }
                                         Err(err) => {
                                             eprintln!("[warn] cleanup failed, using raw: {err:?}");
+                                            recovery.error = Some(format!("Cleanup failed; deterministic text used: {err}"));
                                             deterministic
                                         }
                                     }
@@ -1140,21 +1299,27 @@ pub(super) fn worker_loop(
                 // in `RefinedDictation::outcome`, unit-tested without audio; the
                 // three non-inject arms log + return to idle, leaving the hot
                 // path below to handle only the inject case.
+                ui_channel::publish_preview(cur_gen, &final_text);
                 let (final_text, action) = match refiner.refine(&final_text).outcome() {
                     DictationOutcome::Discard => {
+                        recovery.status = crate::history::RecoveryStatus::Cancelled;
                         eprintln!("  ⌫    scratch that · discarded");
                         eprintln!();
                         ui_channel::set_state(UiState::Idle);
                         continue;
                     }
                     DictationOutcome::BareAction(action) => {
-                        execute_trailing_action(&action);
+                        if authorize_paste(cur_gen) {
+                            execute_trailing_action(&action);
+                            recovery.status = crate::history::RecoveryStatus::Completed;
+                        }
                         eprintln!("  ↵    bare command (no body)");
                         eprintln!();
                         ui_channel::set_state(UiState::Idle);
                         continue;
                     }
                     DictationOutcome::Skip => {
+                        recovery.status = crate::history::RecoveryStatus::Completed;
                         eprintln!("  skip · cleaned to empty");
                         eprintln!();
                         ui_channel::set_state(UiState::Idle);
@@ -1188,8 +1353,7 @@ pub(super) fn worker_loop(
                         // One authorization claim, exactly once, immediately
                         // before the first side effect (no second claim across
                         // the write ladder's fallbacks).
-                        let authorize =
-                            || cur_gen != u64::MAX && crate::cancel::CANCEL.commit(cur_gen);
+                        let authorize = || authorize_paste(cur_gen);
                         match inject_source {
                             Some(target) => AccessibilityInjector::inject_with_target_cancellable(
                                 target, text, &authorize,
@@ -1198,6 +1362,9 @@ pub(super) fn worker_loop(
                         }
                     },
                 );
+                let finish = if crate::cancel::CANCEL.requested(cur_gen) {
+                    crate::injector::FinalizeResult::Cancelled
+                } else { finish };
                 let t_inject_ms = ms(t_inject.elapsed());
 
                 // ─── per-utterance summary block ───────────────────────
@@ -1250,6 +1417,7 @@ pub(super) fn worker_loop(
                 }
                 match finish {
                     crate::injector::FinalizeResult::Injected => {
+                        recovery.status = crate::history::RecoveryStatus::Completed;
                         eprintln!("  ✓    \"{final_text}\"");
                         cues::play_success();
                         // Remember it for the menu-bar "Copy last dictation" item.
@@ -1259,7 +1427,7 @@ pub(super) fn worker_loop(
                         show_result_pill();
                         // Persist to the browsable dictation history (best-effort;
                         // never blocks or fails the hot path).
-                        crate::history::record(&final_text);
+                        crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Output, &final_text, "Inserted");
                         if !matches!(action, TrailingAction::None) {
                             // Let the field commit the injected text before the key.
                             std::thread::sleep(Duration::from_millis(40));
@@ -1267,6 +1435,7 @@ pub(super) fn worker_loop(
                         }
                     }
                     crate::injector::FinalizeResult::Held => {
+                        recovery.status = crate::history::RecoveryStatus::Held;
                         // No editable field focused: never paste blindly. Keep the
                         // transcript recoverable for the menu's "Copy last
                         // dictation" and surface a clear "No text field selected"
@@ -1275,12 +1444,13 @@ pub(super) fn worker_loop(
                             "  ◌    no text field selected — transcript held (copy from menu)"
                         );
                         ui_channel::set_last_dictation(&final_text);
-                        ui_channel::show_transient(
-                            UiState::NoEditableField,
+                        ui_channel::show_transient_for(
+                            cur_gen, UiState::NoEditableField,
                             Duration::from_millis(900),
                         );
                     }
                     crate::injector::FinalizeResult::Cancelled => {
+                        recovery.status = crate::history::RecoveryStatus::Cancelled;
                         eprintln!("  ⌫    cancelled · discarded");
                         cues::play_cancel();
                         ui_channel::set_state(UiState::Idle);
@@ -1288,7 +1458,7 @@ pub(super) fn worker_loop(
                     crate::injector::FinalizeResult::Failed => {
                         eprintln!("  ✗    inject failed");
                         cues::play_error();
-                        ui_channel::show_transient(UiState::Error, Duration::from_millis(650));
+                        ui_channel::show_transient_for(cur_gen, UiState::Error, Duration::from_millis(650));
                     }
                 }
                 eprintln!();
@@ -1297,7 +1467,7 @@ pub(super) fn worker_loop(
                 // Escape is never swallowed.
                 crate::cancel::CANCEL.end();
                 cur_gen = u64::MAX;
-                if ui_channel::state() == UiState::Processing {
+                if ui_channel::state().is_processing() {
                     ui_channel::set_state(UiState::Idle);
                 }
             }
@@ -1308,6 +1478,7 @@ pub(super) fn worker_loop(
         std::thread::sleep(Duration::from_millis(10));
     }
 
+    crate::history::flush_recovery(Duration::from_secs(2));
     Ok(())
 }
 
@@ -1316,18 +1487,21 @@ pub(super) fn worker_loop(
 /// the selection. Read + replace both go through the clipboard so it works in
 /// AX-blind apps. All failures are logged + cue'd; never fatal.
 #[cfg(feature = "cleaner")]
-pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextCleanupEngine, instruction: &str) {
+pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextCleanupEngine, instruction: &str, generation: u64) -> crate::history::RecoveryStatus {
+    use crate::history::{RecoveryStatus, StageKind};
+    if !crate::cancel::CANCEL.allows_progress(generation) { return RecoveryStatus::Cancelled; }
+    let expected = crate::injector::frontmost_pid();
     let selection = match crate::clipboard_paste::copy_selection_via_clipboard() {
         Ok(Some(s)) => s,
         Ok(None) => {
             eprintln!("  ✗    transform: nothing selected — select text first");
             cues::play_error();
-            return;
+            return RecoveryStatus::Failed;
         }
         Err(e) => {
             eprintln!("  ✗    transform: couldn't read selection: {e:?}");
             cues::play_error();
-            return;
+            return RecoveryStatus::Failed;
         }
     };
     eprintln!(
@@ -1336,38 +1510,44 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
         selection.chars().count()
     );
 
+    if !ui_channel::set_phase(generation, UiState::Cleaning) { return RecoveryStatus::Cancelled; }
     let t = Instant::now();
     let result = match rt.block_on(cleaner.transform(instruction, &selection)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("  ✗    transform failed: {e:?}");
             cues::play_error();
-            return;
+            return RecoveryStatus::Failed;
         }
     };
     let result = result.trim();
     if result.is_empty() {
         eprintln!("  ✗    transform produced no output; selection left unchanged");
         cues::play_error();
-        return;
+        return RecoveryStatus::Failed;
     }
 
     // The transformed text must land in the app the selection came from. Snapshot
     // the frontmost app and require it at the global Cmd+V (fail-closed).
-    let expected = crate::injector::frontmost_pid();
+    crate::history::append_recovery_stage(generation, StageKind::Transform, result, "Selection rewrite");
+    ui_channel::publish_preview(generation, result);
+    if !authorize_paste(generation) { return RecoveryStatus::Cancelled; }
     match crate::clipboard_paste::paste_via_clipboard(result, expected) {
-        Ok(crate::clipboard_paste::PasteOutcome::Delivered) => eprintln!(
-            "  ✓    transformed in {} ms → \"{result}\"",
-            ms(t.elapsed())
-        ),
+        Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
+            eprintln!("  ✓    transformed in {} ms", ms(t.elapsed()));
+            crate::history::append_recovery_stage(generation, StageKind::Output, result, "Selection replaced");
+            RecoveryStatus::Completed
+        },
         Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
             eprintln!(
                 "  ◌    transform refused — target app not frontmost at paste (text held)"
             );
+            RecoveryStatus::Held
         }
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
             cues::play_error();
+            RecoveryStatus::Failed
         }
     }
 }
@@ -1400,11 +1580,16 @@ pub(super) fn retain_in_flight_audio(
     stream_audio: &[f32],
     consumer: Option<&mut crate::audio::HeapAudioConsumer>,
     is_recording: Option<&std::sync::atomic::AtomicBool>,
+    generation: Option<u64>,
 ) {
     let mut retained = Vec::with_capacity(stream_audio.len() + 4096);
     retained.extend_from_slice(stream_audio);
     if let (Some(c), Some(r)) = (consumer, is_recording) {
-        retained.extend(crate::audio::drain_session(c, r));
+        let tail = crate::audio::drain_session(c, r);
+        retained.extend_from_slice(&tail);
+        if let Some(gen) = generation {
+            crate::history::append_recovery_audio(gen, tail, crate::audio::SAMPLE_RATE);
+        }
     }
     *last_audio = retained;
 }
@@ -1430,26 +1615,22 @@ pub(super) fn stream_process_asr(
     st: &mut crate::vad::SegmentStream,
     consumer: &mut crate::audio::HeapAudioConsumer,
     segs_acc: &mut Vec<String>,
+    raw_segs_acc: &mut Vec<String>,
     audio_backup: &mut Vec<f32>,
     poisoned: &mut bool,
     noise_floor: &mut crate::audio::NoiseFloorEstimator,
     final_flush: bool,
     whisper: bool,
+    generation: u64,
 ) -> u128 {
-    let avail = drain_available(consumer);
-    if !avail.is_empty() {
-        st.push(&avail);
-        audio_backup.extend_from_slice(&avail);
-        // Feed the incremental noise-floor estimator with this tick's frames so
-        // the release engage check reads a bounded floor instead of re-sorting
-        // the whole utterance on the hot path.
+    checkpoint_capture_with(consumer, audio_backup, |avail| {
+        st.push(avail);
         let frame_len = (crate::audio::DEFAULT_TAIL_FRAME_MS as f64 / 1000.0
-            * crate::audio::SAMPLE_RATE as f64)
-            as usize;
-        for r in crate::audio::frame_rms(&avail, frame_len) {
-            noise_floor.update(r);
-        }
-    }
+            * crate::audio::SAMPLE_RATE as f64) as usize;
+        for rms in crate::audio::frame_rms(avail, frame_len) { noise_floor.update(rms); }
+    }, |samples| {
+        crate::history::append_recovery_audio(generation, samples, crate::audio::SAMPLE_RATE);
+    });
     let segs = if final_flush {
         st.take_final()
     } else {
@@ -1460,6 +1641,7 @@ pub(super) fn stream_process_asr(
     let frame_len = (frame_ms as f64 / 1000.0 * crate::audio::SAMPLE_RATE as f64) as usize;
     let threshold = crate::audio::speech_threshold_with_mode(noise_floor.floor(0.10), whisper);
     for (s, e) in segs {
+        if !crate::cancel::CANCEL.allows_progress(generation) { break; }
         // A prior failure poisons the stream: keep draining audio into the backup
         // so the release fallback transcribes everything, but stop spending
         // transcribe calls on individual segments.
@@ -1485,6 +1667,7 @@ pub(super) fn stream_process_asr(
                     "[warn] stream seg transcribe: {err:?} — falling back to whole-buffer at release"
                 );
                 *poisoned = true;
+                ui_channel::publish_preview(generation, "");
                 continue;
             }
         };
@@ -1497,13 +1680,23 @@ pub(super) fn stream_process_asr(
         // (e.g. "to do list" → "Todoist"). No per-segment cleanup: the cleanup
         // model runs once on the whole utterance at release, not on partial
         // segments, so accuracy isn't traded for a marginal latency win.
-        let corrected = refiner.apply_corrections(&raw);
         if std::env::var_os("DICTATE_DEBUG_STREAM").is_some() {
             eprintln!("  ⟫ seg · {raw:?}");
         }
-        segs_acc.push(corrected);
+        let (raw_so_far, preview) = cache_stream_segment(refiner, raw, raw_segs_acc, segs_acc);
+        crate::history::append_recovery_stage(generation, crate::history::StageKind::Raw, &raw_so_far, "Streaming ASR, partial");
+        ui_channel::publish_preview(generation, &preview);
     }
     last_seg_ms
+}
+
+/// Raw history is the model's words; preview/delivery may apply personal
+/// corrections and segment-boundary punctuation repair without rewriting Raw.
+fn cache_stream_segment(refiner: &Refiner, raw: String, raw_segments: &mut Vec<String>,
+    corrected_segments: &mut Vec<String>) -> (String, String) {
+    corrected_segments.push(refiner.apply_corrections(&raw));
+    raw_segments.push(raw);
+    (raw_segments.join(" "), crate::text_polish::join_stream_segments(corrected_segments))
 }
 
 /// Pre-transcribe hallucination guard for the whole-buffer paths: trim
@@ -1555,6 +1748,7 @@ pub(super) fn begin_open_capture(
     is_recording: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     stream: &mut Option<crate::vad::SegmentStream>,
     stream_segs: &mut Vec<String>,
+    stream_raw_segs: &mut Vec<String>,
     stream_audio: &mut Vec<f32>,
     stream_poisoned: &mut bool,
     transform_mode: &mut bool,
@@ -1577,17 +1771,21 @@ pub(super) fn begin_open_capture(
     // Mute any other system audio for the duration of capture + processing;
     // restored on every release exit path via the RestoreOnDrop guard.
     crate::audio_duck::mute();
-    ui_channel::set_state(UiState::Recording);
     crate::ipc::DAEMON_RECORDING.store(true, Ordering::SeqCst);
     *engine = Some(e);
     *consumer = Some(c);
     *is_recording = Some(r);
+    stream_segs.clear();
+    stream_raw_segs.clear();
+    stream_audio.clear();
+    *stream_poisoned = false;
     if streaming_asr {
         *stream = Some(crate::vad::SegmentStream::new(
             crate::audio::SAMPLE_RATE,
             vad_config(whisper),
         ));
         stream_segs.clear();
+        stream_raw_segs.clear();
         stream_audio.clear();
         *stream_poisoned = false;
     }
@@ -1608,7 +1806,10 @@ pub(super) fn handle_spoken_command(
     cleaner: &TextCleanupEngine,
     cmd: crate::spoken_command::SpokenCommand,
     captured_target: Option<FocusTarget>,
-) {
+    generation: u64,
+) -> crate::history::RecoveryStatus {
+    use crate::history::{RecoveryStatus, StageKind};
+    if !ui_channel::set_phase(generation, UiState::Cleaning) { return RecoveryStatus::Cancelled; }
     eprintln!("  ⌘    {} · {} chars", cmd.label, cmd.body.chars().count());
     let t = Instant::now();
     let result = match rt.block_on(cleaner.transform(&cmd.instruction, &cmd.body)) {
@@ -1616,47 +1817,53 @@ pub(super) fn handle_spoken_command(
         Err(e) => {
             eprintln!("  ✗    command failed: {e:?}");
             cues::play_error();
-            return;
+            return RecoveryStatus::Failed;
         }
     };
     let result = result.trim();
     if result.is_empty() {
         eprintln!("  ✗    command produced no output");
         cues::play_error();
-        return;
+        return RecoveryStatus::Failed;
     }
 
+    crate::history::append_recovery_stage(generation, StageKind::Transform, result, &cmd.label);
+    ui_channel::publish_preview(generation, result);
+    let authorize = || authorize_paste(generation);
     let inject_result = match captured_target {
-        Some(target) => AccessibilityInjector::inject_with_target(target, result),
-        None => AccessibilityInjector::inject_text(result),
+        Some(target) => AccessibilityInjector::inject_with_target_cancellable(target, result, &authorize),
+        None => AccessibilityInjector::inject_text_cancellable(result, &authorize),
     };
     match inject_result {
         Ok(crate::injector::InjectOutcome::Injected) => {
             eprintln!("  ✓    {} ms → \"{result}\"", ms(t.elapsed()));
             ui_channel::set_last_dictation(result);
-            crate::history::record(result);
+            crate::history::append_recovery_stage(generation, StageKind::Output, result, "Inserted");
+            RecoveryStatus::Completed
         }
         Ok(crate::injector::InjectOutcome::NoEditableField) => {
             eprintln!(
                 "  ◌    no text field selected — result held (copy from menu)"
             );
             ui_channel::set_last_dictation(result);
+            RecoveryStatus::Held
         }
         Ok(crate::injector::InjectOutcome::Cancelled) => {
-            // Unreachable via the non-cancellable entry points used here, kept
-            // for exhaustiveness.
             eprintln!("  ⌫    cancelled · discarded");
             cues::play_cancel();
+            RecoveryStatus::Cancelled
         }
         Ok(crate::injector::InjectOutcome::RefusedForeground) => {
             // Fail-closed: the expected app was not frontmost at the global
             // Cmd+V, so nothing was written. Hold it recoverable.
             eprintln!("  ◌    target not frontmost at paste — result held (copy from menu)");
             ui_channel::set_last_dictation(result);
+            RecoveryStatus::Held
         }
         Err(e) => {
             eprintln!("  ✗    inject failed: {e:?}");
             cues::play_error();
+            RecoveryStatus::Failed
         }
     }
 }
@@ -1664,6 +1871,62 @@ pub(super) fn handle_spoken_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn streaming_raw_layer_keeps_asr_words_before_personal_corrections() {
+        let corrections = Corrections::from_map(std::collections::HashMap::from([
+            ("open eye".into(), "OpenAI".into()),
+        ]));
+        let refiner = Refiner::new(corrections);
+        let mut raw = Vec::new();
+        let mut corrected = Vec::new();
+        let (history, preview) = cache_stream_segment(&refiner, "Ask open eye.".into(), &mut raw, &mut corrected);
+        assert_eq!(history, "Ask open eye.");
+        assert_eq!(preview, "Ask OpenAI.");
+        let (history, _) = cache_stream_segment(&refiner, "Press enter.".into(), &mut raw, &mut corrected);
+        assert_eq!(history, "Ask open eye. Press enter.", "Raw retains spoken actions too");
+    }
+
+    #[test]
+    fn checkpoints_and_final_tail_keep_every_sample_once_in_each_capture_mode() {
+        use ringbuf::{HeapRb, traits::{Split, Producer}};
+        for streaming in [false, true] {
+            for preroll in [false, true] {
+                let (mut producer, mut consumer) = HeapRb::<f32>::new(32).split();
+                let mut backup = Vec::new();
+                let mut archived = Vec::new();
+                let mut segmenter = crate::vad::SegmentStream::new(crate::audio::SAMPLE_RATE, vad_config(false));
+                let mut input = Vec::new();
+                for chunk in [vec![0.1, 0.2], vec![0.3, 0.4]] {
+                    input.extend_from_slice(&chunk);
+                    producer.push_slice(&chunk);
+                    checkpoint_capture_with(&mut consumer, &mut backup, |samples| {
+                        if streaming && !preroll { segmenter.push(samples); }
+                    }, |samples| archived.extend(samples));
+                }
+                let tail = [0.5, 0.6];
+                input.extend_from_slice(&tail);
+                producer.push_slice(&tail);
+                let audio = complete_capture_with(&mut consumer, &AtomicBool::new(false), &mut backup,
+                    |samples| archived.extend(samples));
+                assert_eq!(audio, input, "ASR lost/duplicated samples, streaming={streaming} preroll={preroll}");
+                assert_eq!(archived, input, "archive lost/duplicated samples");
+                assert!(backup.is_empty(), "next recording must not inherit checkpoint audio");
+                assert!(drain_available(&mut consumer).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_retains_checkpoint_audio_and_undrained_tail_without_previous_recording() {
+        use ringbuf::{HeapRb, traits::{Split, Producer}};
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(16).split();
+        producer.push_slice(&[0.3, 0.4]);
+        let mut last = vec![9.0];
+        retain_in_flight_audio(&mut last, &[0.1, 0.2], Some(&mut consumer), Some(&AtomicBool::new(false)), None);
+        assert_eq!(last, vec![0.1, 0.2, 0.3, 0.4]);
+        assert!(drain_available(&mut consumer).is_empty());
+    }
 
     /// Synthetic-audio fixture: the already-drained streaming backup (what the
     /// hold-time ticks moved into `stream_audio`) plus a drained ring tail.
@@ -1674,14 +1937,14 @@ mod tests {
         let mut last = vec![9.0, 9.0, 9.0];
         let stream_audio = vec![1.0, 2.0, 3.0];
         // No live consumer: only the already-drained backup is retained.
-        retain_in_flight_audio(&mut last, &stream_audio, None, None);
+        retain_in_flight_audio(&mut last, &stream_audio, None, None, None);
         assert_eq!(last, vec![1.0, 2.0, 3.0], "must replace, not append, the old buffer");
     }
 
     #[test]
     fn retain_with_no_audio_yields_empty_so_retry_noops() {
         let mut last = vec![5.0];
-        retain_in_flight_audio(&mut last, &[], None, None);
+        retain_in_flight_audio(&mut last, &[], None, None, None);
         assert!(last.is_empty(), "a cancel with nothing captured must not leave a stale buffer");
     }
 
@@ -1690,7 +1953,7 @@ mod tests {
         // A retained buffer is only meaningful when it holds samples; the
         // worker's retry path no-ops on an empty buffer.
         let mut last = Vec::new();
-        retain_in_flight_audio(&mut last, &[], None, None);
+        retain_in_flight_audio(&mut last, &[], None, None, None);
         assert!(last.is_empty());
     }
 }
@@ -1706,4 +1969,74 @@ pub(crate) fn show_result_pill() {
     } else {
         ui_channel::set_state(UiState::Idle);
     }
+}
+
+/// Claim the existing write gate, then publish Pasting at the actual boundary.
+/// A cancellation that beat this claim never presents a late paste stage.
+pub(super) fn authorize_paste(generation: u64) -> bool {
+    ui_channel::authorize_paste(generation)
+}
+
+/// Queue ownership of captured samples to the archive after retaining the ASR
+/// backup. No disk I/O runs here or on the audio callback.
+fn checkpoint_capture(consumer: &mut crate::audio::HeapAudioConsumer, backup: &mut Vec<f32>, generation: u64) {
+    checkpoint_capture_with(consumer, backup, |_| {}, |samples| {
+        crate::history::append_recovery_audio(generation, samples, crate::audio::SAMPLE_RATE);
+    });
+}
+
+/// Shared by streaming, whole-buffer, and pre-roll capture. The observer runs
+/// before ownership of the samples is handed to the archive queue.
+fn checkpoint_capture_with(consumer: &mut crate::audio::HeapAudioConsumer, backup: &mut Vec<f32>,
+    mut observe: impl FnMut(&[f32]), archive: impl FnOnce(Vec<f32>)) {
+    let samples = drain_available(consumer);
+    if samples.is_empty() { return; }
+    observe(&samples);
+    backup.extend_from_slice(&samples);
+    archive(samples);
+}
+
+fn complete_capture(consumer: &mut crate::audio::HeapAudioConsumer,
+    recording: &std::sync::atomic::AtomicBool, backup: &mut Vec<f32>, generation: u64) -> Vec<f32> {
+    complete_capture_with(consumer, recording, backup, |tail| {
+        crate::history::append_recovery_audio(generation, tail, crate::audio::SAMPLE_RATE);
+    })
+}
+
+fn complete_capture_with(consumer: &mut crate::audio::HeapAudioConsumer,
+    recording: &std::sync::atomic::AtomicBool, backup: &mut Vec<f32>, archive: impl FnOnce(Vec<f32>)) -> Vec<f32> {
+    let tail = crate::audio::drain_session(consumer, recording);
+    backup.extend_from_slice(&tail);
+    if !tail.is_empty() { archive(tail); }
+    std::mem::take(backup)
+}
+
+fn begin_recording_feedback(preview: bool, capture: Arc<AtomicBool>) -> u64 {
+    let generation = ui_channel::begin_capturing(preview, capture);
+    crate::history::begin_recovery(generation);
+    generation
+}
+
+struct RecoveryFinish {
+    generation: u64,
+    status: crate::history::RecoveryStatus,
+    error: Option<String>,
+    finished: bool,
+}
+impl RecoveryFinish {
+    fn new(generation: u64) -> Self {
+        Self { generation, status: crate::history::RecoveryStatus::Failed, error: None, finished: false }
+    }
+
+    fn finish_now(&mut self) {
+        if self.finished { return; }
+        self.finished = true;
+        let status = if crate::cancel::CANCEL.requested(self.generation) {
+            crate::history::RecoveryStatus::Cancelled
+        } else { self.status };
+        crate::history::finish_recovery_with_error(self.generation, status, self.error.as_deref());
+    }
+}
+impl Drop for RecoveryFinish {
+    fn drop(&mut self) { self.finish_now(); }
 }

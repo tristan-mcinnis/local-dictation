@@ -16,6 +16,7 @@ pub mod model_fetch;
 pub mod numbers;
 pub mod prompts;
 pub mod recovery;
+pub mod reprocess;
 pub mod refiner;
 pub mod screen_context;
 pub mod settings;
@@ -28,6 +29,7 @@ pub mod ui_channel;
 pub mod vad;
 pub mod voice_commands;
 pub mod wake_word;
+pub mod waveform;
 
 #[cfg(feature = "cleaner")]
 pub mod cleaner;

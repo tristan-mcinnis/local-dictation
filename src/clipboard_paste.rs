@@ -85,6 +85,14 @@ fn paste_settle_ms(text_chars: usize) -> u64 {
 /// this same lock, so the two kinds of write are fully ordered.
 static CLIPBOARD_WRITE_MUTEX: Mutex<()> = Mutex::new(());
 
+/// A deliberate recovery copy: serialize with any pending pasteboard restore,
+/// write plain text, and never synthesize keys or activate a target app.
+pub fn copy_only(text: &str) -> eyre::Result<()> {
+    let _guard = CLIPBOARD_WRITE_MUTEX.lock().map_err(|_| eyre::eyre!("clipboard write lock unavailable"))?;
+    let mut clipboard = Clipboard::new().map_err(|e| eyre::eyre!("clipboard unavailable: {e}"))?;
+    clipboard.set_text(text.to_owned()).map_err(|e| eyre::eyre!("clipboard copy failed: {e}"))
+}
+
 /// True when the pasteboard's `changeCount` advanced past our own write — so we
 /// must NOT restore our snapshot (it would clobber a user's fresh copy). A
 /// `None` on either side keeps the old unconditional-replace behaviour. Pure —

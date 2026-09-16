@@ -76,6 +76,7 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
     "NSView",
     "NSCell",
     "NSWindow",
+    "NSPanel",
     "NSColor",
     "NSScreen",
     "NSTextField",

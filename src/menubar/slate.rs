@@ -180,6 +180,8 @@ pub(crate) enum Paint {
     DotSuccess,
     /// A status dot in `danger`.
     DotDanger,
+    /// An active processing stage, paired with its visible label.
+    DotNeutral,
 }
 
 pub(crate) struct SlateIvars {
@@ -488,13 +490,17 @@ impl SlateView {
                 p.danger.ns_color().setFill();
                 self.rounded(bounds, bounds.size.height / 2.0).fill();
             }
+            Paint::DotNeutral => {
+                p.text_secondary.ns_color().setFill();
+                self.rounded(bounds, bounds.size.height / 2.0).fill();
+            }
         }
     }
 }
 
 // ─── Waveform ────────────────────────────────────────────────────────────
 
-/// The 14 ink bars. One view draws the whole row so the bar colour follows the
+/// The compact live-level bars. One view draws the whole row so the bar colour follows the
 /// appearance for free, and so a redraw is one `setNeedsDisplay` rather than
 /// fourteen frame changes.
 pub(crate) struct WaveIvars {
@@ -550,6 +556,7 @@ impl WaveformView {
     }
 
     pub(crate) fn set_heights(&self, h: [f64; BAR_COUNT]) {
+        if self.ivars().heights.get() == h { return; }
         self.ivars().heights.set(h);
         self.setNeedsDisplay(true);
     }
@@ -591,6 +598,33 @@ define_class!(
     pub(crate) struct InkToggle;
 
     impl InkToggle {
+        #[unsafe(method(isAccessibilityElement))]
+        fn is_accessibility_element(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method_id(accessibilityRole))]
+        fn accessibility_role(&self) -> Retained<NSString> {
+            NSString::from_str("AXCheckBox")
+        }
+
+        #[unsafe(method_id(accessibilityValue))]
+        fn accessibility_value(&self) -> Retained<NSNumber> {
+            NSNumber::new_bool(self.ivars().on.get())
+        }
+
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            if self.ivars().enabled.get() {
+                unsafe {
+                    let _: () = msg_send![self, mouseDown: std::ptr::null_mut::<AnyObject>()];
+                }
+                true
+            } else {
+                false
+            }
+        }
+
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
             let p = palette();

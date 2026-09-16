@@ -78,6 +78,16 @@ pub fn config_file(name: &str) -> Option<PathBuf> {
     Some(config_dir()?.join(name))
 }
 
+/// Private original-audio archive beside the history database.
+pub fn recovery_audio_dir() -> Option<PathBuf> {
+    Some(recovery_audio_dir_at(&config_dir()?))
+}
+
+/// Injectable counterpart used by isolated history stores and tests.
+pub fn recovery_audio_dir_at(config: &std::path::Path) -> PathBuf {
+    config.join("recovery-audio")
+}
+
 /// Base directory containing the `dictation/` and `llm/` model trees.
 /// See the module docs for the resolution order.
 pub fn models_base_dir() -> PathBuf {

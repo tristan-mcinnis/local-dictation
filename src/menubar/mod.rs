@@ -24,11 +24,14 @@
 
 mod dictionary;
 mod history;
+mod history_detail;
 mod pill;
 mod render_ui;
 pub(crate) mod slate;
 use dictionary::*;
 use history::*;
+use history_detail::*;
+pub(crate) use history_detail::show_history_detail;
 // The Settings window's History pane groups rows by day with the same
 // formatter the launcher panel uses — one implementation, two surfaces.
 pub(crate) use history::{history_rows, HistoryRow};
@@ -45,7 +48,7 @@ use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSButton, NSColor, NSControl, NSControlStateValueOff,
     NSControlStateValueOn, NSEvent, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSGraphicsContext, NSImage, NSImageSymbolConfiguration, NSImageView, NSKernAttributeName, NSLineBreakMode, NSMenu,
-    NSMenuDelegate, NSMenuItem, NSScreen, NSScrollView, NSSearchField, NSShadow, NSStatusBar, NSStatusItem,
+    NSMenuDelegate, NSMenuItem, NSPanel, NSScreen, NSScrollView, NSSearchField, NSShadow, NSStatusBar, NSStatusItem,
     NSTextAlignment, NSTextField, NSTextView, NSTrackingArea, NSView, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindow,
     NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask, NSWindowTitleVisibility,
@@ -62,10 +65,10 @@ use objc2_foundation::{
 use crate::history::Entry;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::settings::{self, Settings};
+use crate::settings::{self, PillSize, Settings, WaveformSensitivity};
 use crate::ui_channel::{self, UiState};
 
 use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
@@ -73,8 +76,8 @@ use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 // ─── Slate geometry ──────────────────────────────────────────────────────
 //
 // Every number here is either a house token or a value derived from one. The
-// pill is `CONTROL_PILL` high at `RADIUS_PILL`, and its waveform sits in a
-// sunken well; the bar block width falls out of the bar count, width and gap.
+// pill is Compact (32) or Standard (36), with a stable cancel slot; its
+// geometry falls out of the control and spacing tokens and ten live bars.
 
 /// House palette (design-system/tokens.json via the generated `house_theme.rs`).
 /// Both appearances live in the file; `slate::palette()` picks one per draw and
@@ -84,36 +87,32 @@ use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 pub(crate) mod house_theme;
 
 use house_theme::{
-    CONTROL_CHIP, CONTROL_FOOTER, CONTROL_INPUT, CONTROL_KEYCAP, CONTROL_PILL, CONTROL_ROW, CONTROL_STATUSGLYPH, CONTROL_TILE, HAIRLINE, LAYOUT_PANEL_WIDTH, MOTION_HOVER, RADIUS_LG, RADIUS_MD, RADIUS_PILL,
+    CONTROL_CHIP, CONTROL_FOOTER, CONTROL_INPUT, CONTROL_KEYCAP, CONTROL_PILL, CONTROL_ROW, CONTROL_STATUSGLYPH, CONTROL_TILE, HAIRLINE, LAYOUT_PANEL_WIDTH, RADIUS_LG, RADIUS_MD,
     RADIUS_ROW, RADIUS_SM, RADIUS_TILE, RADIUS_XL, RADIUS_XS, SHADOW_SELECTION, SPACE_LG, SPACE_MD,
     SPACE_SM, SPACE_XS, SPACE_XXL, SPACE_XXS, TRACKING_SECTION, TYPE_BODY_SMALL, TYPE_CAPTION, TYPE_INPUT,
     TYPE_KEY_CAP, TYPE_META, TYPE_SECTION, WEIGHT_MEDIUM, WEIGHT_REGULAR,
     WEIGHT_SEMIBOLD,
 };
 
-/// The pill is `CONTROL_PILL` tall at `RADIUS_PILL`.
-const PILL_H: f64 = CONTROL_PILL;
-/// Horizontal padding between the pill's edge and the waveform well.
-const PILL_PAD: f64 = SPACE_XXS + 2.0;
-/// Padding between the pill edge and a text/dot run (the status states).
-const PILL_TEXT_PAD: f64 = SPACE_SM + 2.0;
-/// Gap between items on the hover shelf and in the status states.
-const PILL_GAP: f64 = SPACE_XS + 2.0;
-/// The sunken well the waveform sits in.
-const WELL_H: f64 = CONTROL_TILE - 2.0;
-const WELL_PAD: f64 = SPACE_XS + 2.0;
+/// Compact is one House spacing step shorter than Standard.
+const PILL_H: f64 = CONTROL_PILL - SPACE_XXS;
+const PILL_PAD: f64 = SPACE_XS;
+const PILL_TEXT_PAD: f64 = SPACE_SM;
+const PILL_GAP: f64 = SPACE_XS;
+const CANCEL_HIT: f64 = CONTROL_TILE;
+const WELL_H: f64 = CONTROL_TILE - SPACE_XXS;
+const WELL_PAD: f64 = 0.0;
 const WELL_RADIUS: f64 = RADIUS_LG;
 
-const BAR_COUNT: usize = 14;
-const BAR_W: f64 = 3.0;
-const BAR_GAP: f64 = 2.0;
-/// Tallest bar. The well is `WELL_H` high, so the peak sits just inside it.
-const BAR_MAX_H: f64 = 14.0;
-const BAR_MIN_H: f64 = 2.0;
-
-/// Compact pill width: two paddings, the well, and the bar block inside it.
-const PILL_W: f64 = 2.0 * PILL_PAD + 2.0 * WELL_PAD + BAR_BLOCK_W;
+const BAR_COUNT: usize = 10;
+const BAR_W: f64 = HAIRLINE * 3.0;
+const BAR_GAP: f64 = SPACE_XXS / 2.0;
+const BAR_MAX_H: f64 = CONTROL_KEYCAP;
+const BAR_MIN_H: f64 = HAIRLINE * 2.0;
 const BAR_BLOCK_W: f64 = BAR_COUNT as f64 * BAR_W + (BAR_COUNT as f64 - 1.0) * BAR_GAP;
+const PILL_W: f64 = 2.0 * PILL_PAD + CANCEL_HIT + SPACE_XXS + BAR_BLOCK_W;
+const PREVIEW_W: f64 = LAYOUT_PANEL_WIDTH / 4.0;
+const PROCESSING_TEXT_W: f64 = CONTROL_INPUT * 2.0;
 
 /// Dynamic colours for the parts AppKit paints for us (text fields, popup
 /// titles, placeholders). Each one re-resolves per appearance, so a window
@@ -199,9 +198,11 @@ struct UiGlobals {
     status_item: Retained<NSStatusItem>,
     pill_window: Retained<NSWindow>,
     pill: PillBuild,
-    /// 0 = compact, 1 = expanded. The timer eases this value so hover can be
-    /// interrupted without a second animation system or a bounce.
-    pill_expanded: Mutex<f64>,
+    pill_hovered: AtomicBool,
+    pill_feedback: Mutex<Option<PillFeedback>>,
+    recovery_enabled: bool,
+    waveform_sensitivity: WaveformSensitivity,
+    show_processing_detail: bool,
     reduced_motion: bool,
     last_state: AtomicU8,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
@@ -273,6 +274,33 @@ define_class!(
         fn copy_history_entry(&self, sender: *mut AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
             copy_history_entry_at(tag);
+        }
+
+        #[unsafe(method(openHistoryEntry:))]
+        fn open_history_entry(&self, sender: *mut AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            open_history_entry_at(tag);
+        }
+
+        #[unsafe(method(control:textView:doCommandBySelector:))]
+        fn history_search_command(&self, control: *mut AnyObject, _text: *mut AnyObject,
+                                  command: objc2::runtime::Sel) -> bool {
+            HISTORY_UI.get().is_some_and(|ui| {
+                if control != (&*ui.search as *const NSSearchField).cast_mut().cast() {
+                    false
+                } else if command == sel!(moveUp:) {
+                    move_history_selection(-1);
+                    true
+                } else if command == sel!(moveDown:) {
+                    move_history_selection(1);
+                    true
+                } else if command == sel!(insertNewline:) {
+                    open_selected_history_entry();
+                    true
+                } else {
+                    false
+                }
+            })
         }
 
         // The history search field changed. Re-filter the cached entries by
@@ -378,7 +406,9 @@ define_class!(
         /// cancelling never reaches into the audio worker from AppKit.
         #[unsafe(method(cancelPill:))]
         fn cancel_pill(&self, _sender: *mut AnyObject) {
-            let _ = crate::ipc::send(crate::ipc::Command::Cancel);
+            if ui_channel::state().is_cancellable() {
+                let _ = crate::ipc::send(crate::ipc::Command::Cancel);
+            }
         }
 
         // The success pill's Undo: send ⌘Z to the app that just received the
@@ -613,7 +643,8 @@ pub fn init_and_run() -> eyre::Result<()> {
     install_main_menu(mtm, &app);
 
     // Dark is the default; the setting can pin Light or follow the system.
-    apply_app_appearance(mtm, &Settings::load().resolve_appearance());
+    let settings = Settings::load();
+    apply_app_appearance(mtm, &settings.resolve_appearance());
 
     // Install before anything can quit: the delegate is what releases the
     // models ahead of the process-exit teardown (see `AppDelegate`).
@@ -622,13 +653,17 @@ pub fn init_and_run() -> eyre::Result<()> {
 
     let actions = MenuActions::new();
     let built = build_status_item(mtm, &actions)?;
-    let pill = build_pill_window(mtm, &actions)?;
+    let pill = build_pill_window(mtm, &actions, settings.resolve_pill_size())?;
 
     let globals = UiGlobals {
         status_item: built.status_item,
         pill_window: pill.window.clone(),
         pill,
-        pill_expanded: Mutex::new(0.0),
+        pill_hovered: AtomicBool::new(false),
+        pill_feedback: Mutex::new(None),
+        recovery_enabled: settings.resolve_audio_history_enabled(),
+        waveform_sensitivity: settings.resolve_waveform_sensitivity(),
+        show_processing_detail: settings.resolve_show_processing_detail(),
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
@@ -910,7 +945,7 @@ fn build_more_submenu(
     // Re-run the last recording (including a cancelled one): the pipeline
     // replays the retained in-memory audio and injects the fresh transcript at
     // the current cursor, obeying the same Escape + focus guard.
-    submenu.addItem(&action_item(mtm, "Retry last recording", sel!(retryLast:), "r", actions));
+    submenu.addItem(&action_item(mtm, "Retry and paste last recording", sel!(retryLast:), "r", actions));
 
     // Pick the active Translate-mode target (only meaningful when targets are
     // configured; reads settings per utterance, so no relaunch).

@@ -192,15 +192,20 @@ pub(super) fn retry_last(
         eprintln!("  ↻    retry: empty transcript");
         return;
     }
+    ui_channel::publish_preview(retry_gen, &transcript);
+    if !crate::cancel::CANCEL.allows_progress(retry_gen) { return; }
     let cleaned = match cleaner {
-        Some(c) => rt
-            .block_on(c.process_transcript_with_vocab(&transcript, &[]))
-            .unwrap_or_else(|_| transcript.clone()),
+        Some(c) => {
+            if !ui_channel::set_phase(retry_gen, UiState::Cleaning) { return; }
+            rt.block_on(c.process_transcript_with_vocab(&transcript, &[]))
+                .unwrap_or_else(|_| transcript.clone())
+        },
         None => transcript,
     };
     // Same cancel gate + focus guard as a live utterance: claim the write
     // commit at the last moment, immediately before the first side effect.
-    let authorize = || crate::cancel::CANCEL.commit(retry_gen);
+    ui_channel::publish_preview(retry_gen, &cleaned);
+    let authorize = || authorize_paste(retry_gen);
     inject_refined_authorized(refiner, &cleaned, &authorize);
 }
 
@@ -226,7 +231,8 @@ pub(super) fn retry_last(
             return;
         }
     };
-    let authorize = || crate::cancel::CANCEL.commit(retry_gen);
+    ui_channel::publish_preview(retry_gen, &transcript);
+    let authorize = || authorize_paste(retry_gen);
     inject_refined_authorized(refiner, &transcript, &authorize);
 }
 
@@ -249,7 +255,7 @@ pub(super) fn inject_refined_authorized(
         DictationOutcome::Discard => eprintln!("  ⌫    scratch that · discarded"),
         DictationOutcome::Skip => eprintln!("  skip · empty after cleanup"),
         DictationOutcome::BareAction(action) => {
-            execute_trailing_action(&action);
+            if authorize() { execute_trailing_action(&action); }
             eprintln!("  ↵    bare command");
         }
         DictationOutcome::Inject { text, action } => {

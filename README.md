@@ -34,7 +34,7 @@ subscription, or runtime telemetry.
 7. **Voice commands.** End an utterance with "press enter", "new line", or "press tab" to emit the keystroke. Say "scratch that" to cancel, or "undo that" to revert the last dictation.
 8. **Transform selected text by voice.** Select a passage, hold Shift plus the key, speak an instruction ("make this concise", "translate to Spanish"), and it rewrites in place.
 9. **Output formats.** Numbered, bullets, email, and code presets reshape a dictation when you want structure. Off by default, picked from the menu bar.
-10. **Searchable history.** Every dictation is kept on-device in SQLite. Settings → History lists them by day, newest first: search, click a row to copy it, trash a row to delete it, copy everything a search matched, or set how long dictations are kept (forever down to never).
+10. **Recovery history.** Completed, cancelled, failed, and interrupted captures keep their available audio and text versions locally. Open a history row to play the audio, compare raw/cleaned/output versions, copy a version, or Recover to Clipboard. Audio stays for 30 days by default; text has its own retention setting.
 
 Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first word is never clipped, release tail-capture and a warm mic window on by default, a live waveform pill at the cursor, a menu-bar app with searchable history, a control socket so Shortcuts / Raycast / a foot pedal can trigger it, and editable system prompts in plain JSON.
 
@@ -43,11 +43,7 @@ Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first w
 This personal build expects the locally installed Superwhisper Cohere Q4 and
 S1-mini checkpoints. Model bytes are never committed.
 
-Because the app is ad-hoc signed, clear the Gatekeeper quarantine once:
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/Local Dictation.app"
-```
+Local builds use an available Apple Development signing identity. Keep the same identity across updates to preserve macOS permission grants.
 
 Launch it, then grant Microphone and Accessibility in System Settings → Privacy
 & Security. The menu-bar mic icon means it is ready.
@@ -63,7 +59,7 @@ cd local-dictation
 `install.sh` checks prerequisites, prepares the personal model links/conversion,
 builds the native MLX helper and Rust app, installs it, and starts it.
 
-The app is ad-hoc signed, so after a rebuild macOS may re-ask for those two permissions. A real Developer ID would make the grants stick.
+If no signing identity is available, the build script falls back to ad-hoc signing; that fallback can require Microphone and Accessibility permission again.
 
 <details>
 <summary><b>Run from a terminal, or build the app yourself</b></summary>
@@ -116,7 +112,38 @@ For hands-free, hold Right Option and tap **Space** (a short pop confirms), let 
 
 To edit existing text, select it, hold **Shift plus Right Option**, speak an instruction, and release.
 
-The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON, above a searchable list of every term: click a row to edit it, use the trash chip to remove it. Settings → History is the same list for what you have said: every dictation grouped by day, newest first, with a search field, click-to-copy, a trash chip per row, "Copy all" for everything currently shown, and the retention window that prunes the store.
+The menu-bar app holds the cleanup-model, hotkey, output-format, and cleanup pickers, dictation history, and prompt and log tools. Settings → Dictionary provides a plain-language form for adding personal terms and deterministic heard→correct replacements without editing JSON, above a searchable list of every term: click a row to edit it, use the trash chip to remove it. Settings → History groups dictations by day and opens each record for playback, text versions, and recovery. Copy all copies the saved text in the current search; deleting a record removes its saved audio and versions.
+
+## Recording feedback and recovery
+
+The compact pill is 94 × 32 points; Standard keeps a 36-point height. Its red
+recording dot changes to an X on hover. Click it or press Escape to cancel
+before insertion begins. The pill stays out of the target app's keyboard focus.
+
+Live transcript preview shows recognized phrases as you pause. The stages are
+Recording → Transcribing → Cleaning up (when cleanup actually runs) → Pasting.
+Fast stages pass without an artificial delay. Settings → Dictation controls
+preview, processing detail, size, waveform sensitivity, cleanup, and optional
+completion feedback. Waveform sensitivity changes only the visual response.
+Always-on pre-roll disables live preview; the saved preview choice is retained.
+
+Settings → History controls audio recovery, its **30-day** default retention,
+and separate text retention. Audio has no additional size cap by default; an
+optional cap can remove older audio sooner. These choices apply with Apply &
+Restart. Saving failures produce a recovery warning in the pill and History.
+
+Open a record to play/stop its audio, inspect each text version, and copy it.
+**Recover to Clipboard** (`⌘R` in the detail window, or `recover <id>` in the CLI)
+uses saved audio with the warm transcription and optional cleanup models. It
+appends new versions and copies the result. It does not replay spoken commands
+or paste into the current app. The separately named **Retry and paste last
+recording** retains the older in-memory retry behavior.
+
+Audio is checkpointed off the capture thread and finalized on stop/cancel.
+Graceful shutdown drains queued writes. An abrupt crash can lose the newest
+uncheckpointed tail; an existing synchronous ASR call can delay a checkpoint.
+Recovery includes recordings made after this feature is installed, not audio
+from older text-only history.
 
 ## Performance
 

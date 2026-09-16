@@ -1,42 +1,16 @@
-//! Lightweight SQLite-backed dictation history.
-//!
-//! This is the friendly counterpart to the daemon log at
-//! `/tmp/dictate-daemon.log`: the log records every timing, app target and
-//! pipeline decision (useful for debugging, far too noisy for browsing),
-//! whereas this stores just the *injected text* and *when* — the one thing a
-//! user actually wants to skim later.
-//!
-//! Storage lives next to `settings.json` at
-//! `~/.config/local-dictation/history.db`. A single table:
-//!
-//! ```sql
-//! CREATE TABLE dictations (
-//!     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-//!     text       TEXT    NOT NULL,
-//!     created_at INTEGER NOT NULL   -- unix seconds, UTC
-//! );
-//! ```
-//!
-//! Writes are best-effort: a failure to persist history must never break the
-//! dictation hot path, so `record` logs and swallows errors. Connections are
-//! opened per-call — dictation happens at human speed, so the open cost is
-//! irrelevant and we sidestep sharing a `Connection` across threads.
-//!
-//! Every store is keyed by a retention window (see [`Retention`]) resolved from
-//! `settings.json` / the `DICTATE_HISTORY_RETENTION` env var. After each insert
-//! we prune rows older than the window so the DB doesn't grow without bound.
-//! Pruning is also best-effort: any error is logged, never propagated.
-//!
-//! This module is just the data layer. Presentation (the native history
-//! window's date grouping + local-time formatting) lives in `menubar`, where
-//! AppKit's `NSDateFormatter` gives correct locale/timezone output for free.
+//! Local dictation history and restart-safe recovery. Legacy text rows remain
+//! readable; new records preserve original audio and ordered transcript versions.
+//! The recovery writer owns disk work off the audio callback and ASR pipeline.
 
 use rusqlite::Connection;
+
+mod recovery;
+pub use recovery::*;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// One stored dictation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     /// The row's primary key. Stable across list rebuilds, so the settings
     /// window can delete the row a click meant even after a re-query moved it.
@@ -126,9 +100,12 @@ fn unix_now() -> i64 {
 /// schema as needed. This is the injectable core that [`open`] delegates to.
 fn open_at(path: &Path) -> eyre::Result<Connection> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| eyre::eyre!("create {}: {e}", dir.display()))?;
+        recovery::private_directory(dir)?;
     }
+    recovery::private_file(path)?;
     let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))?;
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS dictations (
              id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +115,7 @@ fn open_at(path: &Path) -> eyre::Result<Connection> {
          CREATE INDEX IF NOT EXISTS idx_dictations_created_at
              ON dictations (created_at DESC);",
     )?;
+    recovery::migrate(&conn)?;
     Ok(conn)
 }
 
@@ -173,7 +151,8 @@ fn try_record(text: &str) -> eyre::Result<()> {
 
     // Resolve and apply the retention window. `Retention::parse` defaults
     // unknown/blank values to `Forever`, so a misconfiguration keeps history.
-    let retention = Retention::parse(&crate::settings::Settings::load().resolve_history_retention());
+    let retention =
+        Retention::parse(&crate::settings::Settings::load().resolve_history_retention());
     prune(retention.cutoff_secs())?;
     Ok(())
 }
@@ -212,22 +191,33 @@ fn prune(window_secs: Option<i64>) -> eyre::Result<()> {
 /// - `Some(0)` deletes every row (`Never`).
 /// - `Some(win)` deletes rows older than `now - win`.
 fn prune_at(path: &Path, window_secs: Option<i64>) -> eyre::Result<()> {
+    let Some(window) = window_secs else {
+        return Ok(());
+    };
     let conn = open_at(path)?;
-    match window_secs {
-        None => Ok(()),
-        Some(0) => {
-            conn.execute("DELETE FROM dictations", [])?;
-            Ok(())
-        }
-        Some(win) => {
-            let now = unix_now();
+    let cutoff = if window == 0 {
+        i64::MAX
+    } else {
+        unix_now() - window
+    };
+    let ids = conn
+        .prepare("SELECT id FROM dictations WHERE created_at < ?1")?
+        .query_map([cutoff], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for id in ids {
+        // Text and audio have independent retention. Keep a recoverable clip
+        // when the user elects to expire transcripts sooner than audio.
+        if recovery::audio_path_at(path, id)?.is_some() {
+            conn.execute("DELETE FROM dictation_stages WHERE dictation_id=?1", [id])?;
             conn.execute(
-                "DELETE FROM dictations WHERE created_at < ?1",
-                rusqlite::params![now - win],
+                "UPDATE dictations SET text='(Audio retained; transcript expired)' WHERE id=?1",
+                [id],
             )?;
-            Ok(())
+        } else {
+            delete_at(path, id)?;
         }
     }
+    Ok(())
 }
 
 /// Most-recent-first dictations, capped at `limit`. Returns an empty vec on
@@ -298,7 +288,7 @@ fn try_search_at(path: &Path, needle: &str, limit: usize) -> eyre::Result<Vec<En
     let pattern = format!("%{}%", like_escape(needle));
     let mut stmt = conn.prepare(
         r"SELECT id, text, created_at FROM dictations
-          WHERE text LIKE ?1 ESCAPE '\'
+          WHERE text LIKE ?1 ESCAPE '\' OR EXISTS(SELECT 1 FROM dictation_stages WHERE dictation_id=dictations.id AND text LIKE ?1 ESCAPE '\')
           ORDER BY created_at DESC, id DESC
           LIMIT ?2",
     )?;
@@ -338,7 +328,7 @@ fn try_match_count_at(path: &Path, needle: &str) -> eyre::Result<usize> {
     } else {
         let pattern = format!("%{}%", like_escape(needle));
         conn.query_row(
-            r"SELECT COUNT(*) FROM dictations WHERE text LIKE ?1 ESCAPE '\'",
+            r"SELECT COUNT(*) FROM dictations WHERE text LIKE ?1 ESCAPE '\' OR EXISTS(SELECT 1 FROM dictation_stages WHERE dictation_id=dictations.id AND text LIKE ?1 ESCAPE '\')",
             rusqlite::params![pattern],
             |row| row.get(0),
         )?
@@ -363,6 +353,7 @@ pub fn delete(id: i64) -> bool {
 
 fn delete_at(path: &Path, id: i64) -> eyre::Result<usize> {
     let conn = open_at(path)?;
+    recovery::remove_audio_at(path, id)?;
     Ok(conn.execute(
         "DELETE FROM dictations WHERE id = ?1",
         rusqlite::params![id],
@@ -386,6 +377,13 @@ pub fn clear() -> usize {
 
 fn clear_at(path: &Path) -> eyre::Result<usize> {
     let conn = open_at(path)?;
+    let ids = conn
+        .prepare("SELECT id FROM dictations")?
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for id in ids {
+        recovery::remove_audio_at(path, id)?;
+    }
     Ok(conn.execute("DELETE FROM dictations", [])?)
 }
 

@@ -103,7 +103,7 @@ pub fn paste_last_dictation(recorded_pid: Option<i32>) {
 
     // Never run alongside a live dictation — the paste would race the pipeline's
     // own injection / clipboard write.
-    if matches!(ui_channel::state(), UiState::Recording | UiState::Processing) {
+    if ui_channel::state().is_active() || crate::cancel::CANCEL.active() {
         eprintln!("[recovery] a dictation is in flight — refusing to paste now");
         return;
     }
@@ -121,7 +121,7 @@ pub fn paste_last_dictation(recorded_pid: Option<i32>) {
     std::thread::spawn(move || {
         let _busy = RecoveryBusy;
         // Re-check: a dictation may have started between the menu click and now.
-        if matches!(ui_channel::state(), UiState::Recording | UiState::Processing) {
+        if ui_channel::state().is_active() || crate::cancel::CANCEL.active() {
             eprintln!("[recovery] dictation started mid-recovery — abandoning paste");
             return;
         }

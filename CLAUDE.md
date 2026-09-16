@@ -83,6 +83,12 @@ Never commit model bytes, API keys, personal dictionary or corrections
 content, dictation history, logs, or `~/.config/local-dictation` data.
 Example files (`*.example.json`) are the only config in the tree.
 
+Recovery audio and transcript versions are user data: private local files only,
+30-day audio retention by default, independent text retention. Render proofs
+use invented settings/history/dictionary/audio fixtures and must not query the
+user stores. Saved-audio recovery copies to the clipboard; it never replays
+spoken actions or injects into the current app.
+
 ## Workflow
 
 Work on `main`. Commit after each change; push to `origin/main` when asked

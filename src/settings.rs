@@ -26,6 +26,137 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillSize {
+    Compact,
+    Standard,
+}
+
+impl PillSize {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Standard => "standard",
+        }
+    }
+
+    fn resolve(saved: Option<&str>, override_value: Option<&str>) -> Self {
+        match override_value
+            .or(saved)
+            .unwrap_or("compact")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "standard" => Self::Standard,
+            _ => Self::Compact,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaveformSensitivity {
+    Low,
+    Balanced,
+    High,
+}
+
+impl WaveformSensitivity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Balanced => "balanced",
+            Self::High => "high",
+        }
+    }
+
+    fn resolve(saved: Option<&str>, override_value: Option<&str>) -> Self {
+        match override_value
+            .or(saved)
+            .unwrap_or("balanced")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "low" => Self::Low,
+            "high" => Self::High,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+/// Derived UI state; the saved streaming preference remains unchanged when
+/// always-on capture temporarily makes preview unavailable.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LivePreviewControl {
+    pub enabled: bool,
+    pub editable: bool,
+    pub hint: &'static str,
+}
+
+impl LivePreviewControl {
+    fn resolve(saved: Option<bool>, override_value: Option<&str>, preroll_ms: u32) -> Self {
+        let enabled = resolve_enabled_flag(saved, override_value, true);
+        if preroll_ms > 0 {
+            Self {
+                enabled: false,
+                editable: false,
+                hint: "Turn off Always-on mic to use live preview.",
+            }
+        } else if override_value.is_some() {
+            Self {
+                enabled,
+                editable: false,
+                hint: "Controlled by DICTATE_STREAMING_ASR.",
+            }
+        } else {
+            Self {
+                enabled,
+                editable: true,
+                hint: "Draft phrases appear as you pause.",
+            }
+        }
+    }
+}
+
+fn resolve_enabled_flag(saved: Option<bool>, override_value: Option<&str>, default: bool) -> bool {
+    override_value
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(saved.unwrap_or(default))
+}
+
+fn resolve_audio_retention_value(
+    saved: Option<&str>,
+    override_value: Option<&str>,
+) -> &'static str {
+    let raw = override_value
+        .or(saved)
+        .unwrap_or("1month")
+        .trim()
+        .to_ascii_lowercase();
+    match raw.as_str() {
+        "24hours" | "24 hours" | "1day" | "1 day" | "day" => "24hours",
+        "1week" | "1 week" | "week" => "1week",
+        "1month" | "1 month" | "month" => "1month",
+        "1year" | "1 year" | "year" => "1year",
+        "never" => "never",
+        // Invalid values must not silently shorten an existing retention choice.
+        _ => "forever",
+    }
+}
+
+fn resolve_audio_cap(saved: Option<u64>, override_value: Option<&str>) -> u64 {
+    override_value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .or(saved)
+        .unwrap_or(0)
+}
+
 /// Push-to-talk hotkey options offered in the menu, as (label, keycode).
 /// Each must be a modifier key handled by `keycode_to_modifier_flag` in the
 /// daemon, so the press/release edge is detected correctly.
@@ -101,6 +232,27 @@ pub struct Settings {
     /// differently). Override: `DICTATE_STREAMING_ASR=0`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streaming_asr: Option<bool>,
+    /// Recording pill size. Defaults to compact; DICTATE_PILL_SIZE overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pill_size: Option<String>,
+    /// Visual waveform response, never microphone gain or recognition volume.
+    /// Defaults to balanced; DICTATE_WAVEFORM_SENSITIVITY overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform_sensitivity: Option<String>,
+    /// Name the current processing stage in the pill (default true).
+    /// DICTATE_SHOW_PROCESSING_DETAIL overrides; this never gates processing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_processing_detail: Option<bool>,
+    /// Preserve recordings locally for recovery. Enabled by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_history_enabled: Option<bool>,
+    /// Audio retention is independent of text history. Default: 30 days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_retention: Option<String>,
+    /// Optional budget for recovery audio in MiB. Default: 0 (retention only).
+    /// An explicit cap can remove older audio before its time window expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_storage_cap_mb: Option<u64>,
     /// Release tail-capture (default ON): on key release, keep the mic open for a
     /// brief adaptive grace loop so the last word of an utterance isn't clipped,
     /// then stop. `None`/true ⇒ enabled. Override: `DICTATE_TAIL_CAPTURE`.
@@ -344,6 +496,65 @@ impl Settings {
             return !matches!(v.as_str(), "0" | "false" | "off" | "no");
         }
         self.streaming_asr.unwrap_or(true)
+    }
+
+    pub fn live_preview_control(&self) -> LivePreviewControl {
+        LivePreviewControl::resolve(
+            self.streaming_asr,
+            std::env::var("DICTATE_STREAMING_ASR").ok().as_deref(),
+            self.resolve_preroll_ms(),
+        )
+    }
+
+    pub fn resolve_pill_size(&self) -> PillSize {
+        PillSize::resolve(
+            self.pill_size.as_deref(),
+            std::env::var("DICTATE_PILL_SIZE").ok().as_deref(),
+        )
+    }
+
+    pub fn resolve_waveform_sensitivity(&self) -> WaveformSensitivity {
+        WaveformSensitivity::resolve(
+            self.waveform_sensitivity.as_deref(),
+            std::env::var("DICTATE_WAVEFORM_SENSITIVITY")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    pub fn resolve_show_processing_detail(&self) -> bool {
+        resolve_enabled_flag(
+            self.show_processing_detail,
+            std::env::var("DICTATE_SHOW_PROCESSING_DETAIL")
+                .ok()
+                .as_deref(),
+            true,
+        )
+    }
+
+    pub fn resolve_audio_history_enabled(&self) -> bool {
+        resolve_enabled_flag(
+            self.audio_history_enabled,
+            std::env::var("DICTATE_AUDIO_HISTORY").ok().as_deref(),
+            true,
+        )
+    }
+
+    pub fn resolve_audio_retention(&self) -> String {
+        resolve_audio_retention_value(
+            self.audio_retention.as_deref(),
+            std::env::var("DICTATE_AUDIO_RETENTION").ok().as_deref(),
+        )
+        .to_string()
+    }
+
+    pub fn resolve_audio_storage_cap_mb(&self) -> u64 {
+        resolve_audio_cap(
+            self.audio_storage_cap_mb,
+            std::env::var("DICTATE_AUDIO_STORAGE_CAP_MB")
+                .ok()
+                .as_deref(),
+        )
     }
 
     /// Resolve the pre-roll lookback in ms: `DICTATE_PREROLL_MS` env > settings
@@ -1084,6 +1295,108 @@ mod tests {
             s.preroll_ms = Some(400);
             assert!(!s.resolve_streaming_asr());
         }
+    }
+
+    #[test]
+    fn live_preview_ui_preserves_saved_choice_while_preroll_blocks_it() {
+        let blocked = LivePreviewControl::resolve(Some(true), None, 400);
+        assert!(!blocked.enabled && !blocked.editable);
+        assert!(blocked.hint.contains("Always-on mic"));
+        let restored = LivePreviewControl::resolve(Some(true), None, 0);
+        assert!(restored.enabled && restored.editable);
+        assert!(!LivePreviewControl::resolve(Some(false), None, 0).enabled);
+        let overridden = LivePreviewControl::resolve(Some(false), Some("true"), 0);
+        assert!(overridden.enabled && !overridden.editable);
+        assert!(overridden.hint.contains("DICTATE_STREAMING_ASR"));
+    }
+
+    #[test]
+    fn live_preview_control_matches_runtime_without_clearing_preferences() {
+        for preference in [None, Some(false), Some(true)] {
+            for preroll in [0, 400] {
+                let mut settings = Settings::default();
+                settings.streaming_asr = preference;
+                settings.preroll_ms = Some(preroll);
+                assert_eq!(
+                    settings.live_preview_control().enabled,
+                    settings.resolve_streaming_asr()
+                );
+                assert_eq!(settings.streaming_asr, preference);
+                assert_eq!(settings.preroll_ms, Some(preroll));
+            }
+        }
+    }
+
+    #[test]
+    fn feedback_defaults_and_environment_precedence_are_explicit() {
+        assert_eq!(PillSize::resolve(None, None), PillSize::Compact);
+        assert_eq!(
+            PillSize::resolve(Some("standard"), None),
+            PillSize::Standard
+        );
+        assert_eq!(
+            PillSize::resolve(Some("standard"), Some("compact")),
+            PillSize::Compact
+        );
+        assert_eq!(PillSize::resolve(Some("unknown"), None), PillSize::Compact);
+        assert_eq!(
+            WaveformSensitivity::resolve(None, None),
+            WaveformSensitivity::Balanced
+        );
+        assert_eq!(
+            WaveformSensitivity::resolve(Some("high"), None),
+            WaveformSensitivity::High
+        );
+        assert_eq!(
+            WaveformSensitivity::resolve(Some("high"), Some("low")),
+            WaveformSensitivity::Low
+        );
+        assert_eq!(
+            WaveformSensitivity::resolve(Some("unknown"), None),
+            WaveformSensitivity::Balanced
+        );
+        assert!(resolve_enabled_flag(None, None, true));
+        assert!(!resolve_enabled_flag(Some(true), Some("off"), true));
+        assert!(resolve_enabled_flag(Some(false), Some("1"), true));
+    }
+
+    #[test]
+    fn recording_feedback_choices_survive_save_and_reload() {
+        let dir = std::env::temp_dir().join(format!("fd-feedback-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let mut saved = Settings::default();
+        saved.streaming_asr = Some(false);
+        saved.pill_size = Some("standard".into());
+        saved.waveform_sensitivity = Some("high".into());
+        saved.show_processing_detail = Some(false);
+        saved.audio_history_enabled = Some(false);
+        saved.audio_retention = Some("1week".into());
+        saved.audio_storage_cap_mb = Some(4096);
+        saved.show_result = Some(true);
+        saved.cleanup_enabled = Some(false);
+        saved.preroll_ms = Some(400);
+        saved.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path), saved);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn audio_recovery_defaults_to_thirty_days_without_shortening_text_history() {
+        assert_eq!(resolve_audio_retention_value(None, None), "1month");
+        assert_eq!(
+            resolve_audio_retention_value(Some("forever"), Some("1 week")),
+            "1week"
+        );
+        assert_eq!(
+            resolve_audio_retention_value(Some("unknown"), None),
+            "forever"
+        );
+        assert_eq!(resolve_audio_cap(None, None), 0);
+        assert_eq!(resolve_audio_cap(Some(4096), Some("2048")), 2048);
+        assert_eq!(resolve_audio_cap(Some(4096), Some("0")), 0);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.audio_history_enabled, None);
+        assert_eq!(old.history_retention, None);
     }
 
     #[test]

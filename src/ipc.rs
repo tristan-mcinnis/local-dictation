@@ -44,6 +44,9 @@ pub enum Command {
     /// cleanup + inject at the current cursor). No-op when nothing has been
     /// dictated yet in this daemon session.
     Retry,
+    /// Recover a stored dictation by database id. Re-transcribe and clean
+    /// locally, then copy to the clipboard; never paste or execute commands.
+    Recover(i64),
     /// Report live state as one line of JSON. Answered by the socket thread
     /// itself — it never reaches the daemon's dispatch closure, so asking is
     /// free and cannot touch the audio path. See the house command contract
@@ -55,7 +58,19 @@ impl Command {
     /// Parse a single wire word (case-insensitive, surrounding whitespace
     /// ignored). Unknown words → `None`.
     pub fn parse(word: &str) -> Option<Command> {
-        match word.trim().to_ascii_lowercase().as_str() {
+        let normalized = word.trim().to_ascii_lowercase();
+        let fields: Vec<&str> = normalized.split_whitespace().collect();
+        if let ["recover", id] = fields.as_slice() {
+            if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return id
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .map(Command::Recover);
+            }
+            return None;
+        }
+        match normalized.as_str() {
             "start" => Some(Command::Start),
             "stop" => Some(Command::Stop),
             "toggle" => Some(Command::Toggle),
@@ -74,7 +89,16 @@ impl Command {
             Command::Toggle => "toggle",
             Command::Cancel => "cancel",
             Command::Retry => "retry",
+            Command::Recover(_) => "recover",
             Command::Status => "status",
+        }
+    }
+
+    /// Wire form carries only a positive database id, never a file path.
+    pub fn wire(self) -> String {
+        match self {
+            Command::Recover(id) => format!("recover {id}"),
+            other => other.as_str().to_string(),
         }
     }
 }
@@ -269,10 +293,16 @@ fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
     }
     let reply = match Command::parse(&line) {
         Some(Command::Status) => format!("{}\n", status_json()),
+        Some(Command::Recover(id)) => recovery_reply(
+            id,
+            DAEMON_RECORDING.load(Ordering::SeqCst),
+            crate::history::recovery_audio_path,
+            dispatch,
+        ),
         Some(cmd) => {
             let resolved = resolve(cmd);
             dispatch(resolved);
-            format!("ok {}\n", resolved.as_str())
+            format!("ok {}\n", resolved.wire())
         }
         None => format!("err unknown command {:?}\n", line.trim()),
     };
@@ -280,13 +310,43 @@ fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
     let _ = stream.write_all(reply.as_bytes());
 }
 
+fn recovery_reply(
+    id: i64,
+    recording: bool,
+    lookup: impl FnOnce(i64) -> eyre::Result<Option<PathBuf>>,
+    dispatch: impl FnOnce(Command),
+) -> String {
+    if recording {
+        return "err Finish the current recording before recovering saved audio.\n".to_string();
+    }
+    match lookup(id) {
+        Ok(Some(_)) => {
+            dispatch(Command::Recover(id));
+            format!("ok recover {id}\n")
+        }
+        Ok(None) => {
+            "err Original audio is unavailable. It may have been deleted, expired, or never saved.\n"
+                .to_string()
+        }
+        Err(_) => "err Could not read the original audio.\n".to_string(),
+    }
+}
+
 /// Send one command to a running daemon and return its reply line (without the
 /// trailing newline). Errors if no daemon is listening — the CLI surfaces that
 /// as a friendly "is the daemon running?" message.
 pub fn send(cmd: Command) -> std::io::Result<String> {
+    if matches!(cmd, Command::Recover(id) if id <= 0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Recovery needs a positive dictation id",
+        ));
+    }
     let path = socket_path();
     let mut stream = UnixStream::connect(&path)?;
-    stream.write_all(cmd.as_str().as_bytes())?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.write_all(cmd.wire().as_bytes())?;
     stream.write_all(b"\n")?;
     let _ = stream.flush();
     // Half-close our write side so the server's read_line sees EOF promptly.
@@ -333,6 +393,62 @@ mod tests {
         ] {
             assert_eq!(Command::parse(c.as_str()), Some(c));
         }
+    }
+
+    #[test]
+    fn recovery_accepts_only_a_positive_database_id() {
+        assert_eq!(Command::parse(" RECOVER 42\n"), Some(Command::Recover(42)));
+        assert_eq!(Command::Recover(42).wire(), "recover 42");
+        assert_eq!(
+            Command::parse(&Command::Recover(i64::MAX).wire()),
+            Some(Command::Recover(i64::MAX))
+        );
+        for invalid in [
+            "recover",
+            "recover 0",
+            "recover -1",
+            "recover +1",
+            "recover /tmp/audio.wav",
+            "recover ../audio.wav",
+            "recover 42 extra",
+            "recover 9223372036854775808",
+        ] {
+            assert_eq!(Command::parse(invalid), None, "{invalid}");
+        }
+        assert_eq!(
+            send(Command::Recover(-1)).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_busy_or_missing_audio_before_dispatch() {
+        let reply = recovery_reply(
+            42,
+            true,
+            |_| panic!("busy must not read audio"),
+            |_| panic!("busy must not dispatch"),
+        );
+        assert!(reply.starts_with("err Finish"));
+        let reply = recovery_reply(
+            42,
+            false,
+            |_| Ok(None),
+            |_| panic!("missing audio must not dispatch"),
+        );
+        assert!(reply.contains("unavailable"));
+        let mut dispatched = None;
+        let reply = recovery_reply(
+            42,
+            false,
+            |id| {
+                assert_eq!(id, 42);
+                Ok(Some(PathBuf::from("/tmp/owned-audio.wav")))
+            },
+            |command| dispatched = Some(command),
+        );
+        assert_eq!(reply, "ok recover 42\n");
+        assert_eq!(dispatched, Some(Command::Recover(42)));
     }
 
     #[test]

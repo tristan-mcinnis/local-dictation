@@ -281,6 +281,23 @@ fn push_resampled(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cancelled_capture_drops_later_microphone_samples_while_worker_is_busy() {
+        use super::*;
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(128).split();
+        let recording = AtomicBool::new(true);
+        let mut pos = 0.0;
+        let mut last = 0.0;
+        push_resampled(&[0.2; 8], 1, 1.0, &mut pos, &mut last, &mut producer, &recording);
+        let before = consumer.occupied_len();
+        recording.store(false, Ordering::SeqCst); // accepted out-of-band Cancel
+        push_resampled(&[0.9; 32], 1, 1.0, &mut pos, &mut last, &mut producer, &recording);
+        assert_eq!(consumer.occupied_len(), before, "waiting for ASR must not capture post-cancel speech");
+        let samples = drain_session(&mut consumer, &recording);
+        assert_eq!(samples.len(), before);
+        assert!(samples.iter().all(|sample| *sample <= 0.2));
+    }
+
     use super::*;
 
     #[test]
@@ -897,16 +914,18 @@ impl AlwaysOnCapture {
                     // Rising edge: flush the lookback captured *before* the press.
                     if rec && !prev_recording {
                         for s in preroll.snapshot() {
+                            if !recording.load(Ordering::SeqCst) { break; }
                             let _ = producer.try_push(s);
                         }
                     }
                     preroll.push(&chunk);
                     if rec {
                         for &s in &chunk {
+                            if !recording.load(Ordering::SeqCst) { break; }
                             let _ = producer.try_push(s);
                         }
                     }
-                    prev_recording = rec;
+                    prev_recording = recording.load(Ordering::SeqCst);
                 }
             };
         }

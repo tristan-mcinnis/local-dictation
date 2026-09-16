@@ -184,7 +184,7 @@ waveform in all three states, matching the app icon: template ink when idle, the
 tinted `danger` while recording, and the template at 40 % while the pipeline works.
 
 `fast-dictate-backend render-ui <dir>` snapshots the whole design offscreen. It builds the pill in
-each of its five layouts, the history panel with sample rows, the dictionary editor and the
+each recording, processing, completion, warning, and recovery layout, the history panel with sample rows, the dictionary editor and the
 settings shell (its Dictation, Dictionary and History panes, the last two seeded with the same
 sample rows so the proof never depends on what this Mac dictated today), draws each straight into a bitmap with `cacheDisplay(in:to:)` under both
 `NSAppearanceNameDarkAqua` and `NSAppearanceNameAqua`, writes PNGs and exits. No window is ever
@@ -230,7 +230,7 @@ there is no silence or duration auto-stop in the push-to-talk daemon path.
 
 Escape *while idle* passes through untouched (normal Escape use); only an in-flight utterance swallows it. Inference is never hard-interrupted — a mid-ASR/cleanup cancel lets that compute finish, but the text is never written (compute-cancel vs. write-commit are distinct: one discards later, the other suppresses the actual write).
 
-**Cancel retains audio + Retry last recording**: a cancel no longer throws the audio away — the daemon drains the in-flight recording (the already-drained streaming backup plus the still-queued ring tail) into an **in-memory** `last_audio` buffer, replacing whatever was there. Only the most-recent recording is kept; it is cleared when a new recording starts and on app quit, never written to disk. The menu "Retry last recording" re-transcribes that buffer through the same pipeline, beginning a fresh cancel generation and claiming `commit` through the same write-authorizer, so retry obeys the identical Escape-cancel and current-editable-focus/no-blind-paste guard as a live utterance. A cancelled retry keeps the retained audio until the next recording start.
+**Cancellation and retry:** accepted cancellation immediately clears the pill and flips the active generation's capture flag, so queued inference cannot admit more audio or write later. The complete captured buffer is retained for the legacy **Retry and paste last recording** action. Durable recovery is separate: completed/cancelled/failed captures use the archive described below, and **Recover to Clipboard** never invokes voice actions, target replacement, or injection.
 
 **No-blind-paste focus gate** (`src/injector.rs`): before any write, the injector classifies the focused surface from *positive, focus-level evidence* — never an app name — into `FocusEditability`:
   * `Editable` — hard AX evidence: a text-entry role (`AXTextField`/`AXTextArea`/`AXComboBox`, or the `AXSearchField`/`AXFullScreenSearchField`/`AXTextArea` subroles) **and** a writable `AXValue`/`AXSelectedText`. Native apps write via the AX ladder.
@@ -285,14 +285,51 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
 - A **diff-guard** (`text_polish::cleanup_dropped_content`): if the model rewrote away real content
   (dropped a clause), the faithful deterministic result wins.
 
-`ui_channel.rs` carries worker→UI state (recording/processing, last dictation, audio levels) to
-`menubar/` (`mod.rs` status item + menu actions, `pill.rs` waveform pill, `history.rs` history window, `dictionary.rs` dictionary editor) plus `settings_window.rs`. `history.rs` writes
-every injected dictation to SQLite at `~/.config/local-dictation/history.db` and is the only
-module that reads it back: `recent`, `search`, `count`, `delete` and `clear` serve both the
-launcher's history panel and the Settings History pane. Retention is a pending setting applied on
-Apply & Restart; a row delete and Delete all land immediately, because history is a store rather
-than a setting. The Settings pane re-queries on every visit, since the daemon keeps appending
-while the window is open. `screen_context.rs`
+`ui_channel.rs` carries a generation/revision-guarded snapshot: recording state,
+bounded draft preview, capture flag, last output, and audio levels. States include
+Transcribing, Cleaning, Pasting, and Copied. Only actual model/injection boundaries
+publish these phases; Pasting is beyond the cancellation commit point. Old
+completion timers and cancelled inference cannot clear or revive a newer pill.
+The preview uses existing sentence-based ASR results, capped at 320 Unicode
+characters; it adds no decode calls. The UI displays a bounded recent-text tail.
+
+`menubar/pill.rs` uses a nonactivating, non-key panel with a fixed cancel target.
+Compact/Standard geometry, waveform sensitivity, processing detail and preview
+come from Settings. `waveform.rs` maps real RMS levels with a quiet gate and
+fast release. Reduced Motion is read from NSWorkspace; no decorative processing
+wave pretends to be microphone activity.
+
+### Durable recovery
+
+`history.rs` retains the existing SQLite database and legacy row IDs.
+`history/recovery.rs` adds capture status/audio metadata and append-only
+`dictation_stages` (raw, cleaned, transform, correction, output). Raw is ASR text
+before personal corrections; a cleaned version appears only when cleanup ran.
+One capture has one record, and explicit recovery appends versions to it.
+
+The audio directory is resolved by `app_paths::recovery_audio_dir()` under the
+config directory as `recovery-audio/`. Private directories/files are 0700/0600.
+The worker sends delta PCM chunks to a bounded background writer; no SQLite,
+file I/O, or recovery queue work runs on the audio callback. WAV checkpoints
+are attempted at the existing 120 ms worker cadence, which synchronous ASR can
+delay. Stop/cancel flushes the remaining ring tail into the ordered queue;
+shutdown waits up to two seconds for its barrier. Startup repairs partial WAV
+headers and marks interrupted captures. Write/queue failures surface a warning.
+
+Audio defaults to 30 days, independently of text retention; zero size cap means
+retention only. Automatic text expiry preserves retained audio; audio expiry
+preserves retained text. Explicit record deletion/clear removes both. Active
+captures are protected from size-cap eviction. Historical text-only rows remain
+readable and correctly report that no original audio was saved.
+
+`reprocess::to_clipboard` is the recovery seam: it transcribes and optionally
+cleans with the existing warm models, records versions, then claims cancellation
+authorization immediately before copying. It has no voice-command parser or
+injector. IPC `recover <positive database id>` resolves only owned archive audio.
+`menubar/history_detail.rs` offers playback, ordered versions, copy, and recovery;
+its refresh never steals focus, and playback stops on close or selection change.
+
+`screen_context.rs`
 harvests proper nouns from the focused window and feeds them to
 `cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. Normal
 cleanup never infers numbered-list structure from words such as "first" or "second"; structural
@@ -314,7 +351,9 @@ re-joining the path:
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
-  `double_tap_latch`, `show_result`, `appearance`.
+  `double_tap_latch`, `show_result`, `appearance`, `pill_size`, `waveform_sensitivity`,
+  `show_processing_detail`, `audio_history_enabled`, `audio_retention`,
+  `audio_storage_cap_mb`.
   `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
   `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
   silently ignored by serde — an old settings file still parses.
@@ -375,6 +414,13 @@ stack:
 | `DICTATE_PROMPTS_PATH` / `DICTATE_CLEANUP_PROMPT` / `DICTATE_TRANSFORM_PROMPT` | Override the prompts file / cleanup prompt / transform prompt |
 | `DICTATE_CONTROL_SOCK` | Override the daemon control-socket path |
 | `DICTATE_CORRECTIONS_PATH` / `DICTATE_DICTIONARY_PATH` | Override the corrections / dictionary file paths |
+
+| `DICTATE_PILL_SIZE` | `compact` (default) or `standard` |
+| `DICTATE_WAVEFORM_SENSITIVITY` | Visual response: `low`, `balanced` (default), `high` |
+| `DICTATE_SHOW_PROCESSING_DETAIL` | Show distinct processing labels, default on |
+| `DICTATE_AUDIO_HISTORY` | Save captured audio for recovery, default on |
+| `DICTATE_AUDIO_RETENTION` | Audio retention, default `1month` (30 days) |
+| `DICTATE_AUDIO_STORAGE_CAP_MB` | Optional audio cap in MiB; default 0 means retention only |
 
 The old multi-backend selector env vars (`DICTATE_ASR_BACKEND`, `DICTATE_COHERE_QUANT`,
 `DICTATE_MOONSHINE_VARIANT`, `PARAKEET_MODEL_DIR`, `DICTATE_COHERE_MODEL_DIR`,

@@ -53,6 +53,13 @@ async fn main() -> eyre::Result<()> {
         "stop" => run_control(fast_dictate_backend::ipc::Command::Stop),
         "cancel" => run_control(fast_dictate_backend::ipc::Command::Cancel),
         "retry" => run_control(fast_dictate_backend::ipc::Command::Retry),
+        "recover" => {
+            let id = args.get(2).ok_or_else(|| eyre::eyre!("Usage: recover <dictation-id> — recover saved audio to the clipboard"))?;
+            let command = fast_dictate_backend::ipc::Command::parse(&format!("recover {id}"))
+                .filter(|_| args.len() == 3)
+                .ok_or_else(|| eyre::eyre!("Recovery needs one positive dictation id, not an audio path"))?;
+            run_control(command)
+        },
         // Ask a running daemon what it is doing, as one line of JSON.
         "status" => run_status(),
         "synth-press" => run_synth_press(
@@ -66,7 +73,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, recover <dictation-id>, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
         )),
     }
 }
@@ -78,7 +85,10 @@ async fn main() -> eyre::Result<()> {
 fn run_control(cmd: fast_dictate_backend::ipc::Command) -> eyre::Result<()> {
     match fast_dictate_backend::ipc::send(cmd) {
         Ok(reply) => {
-            println!("[ctl] {} → {reply}", cmd.as_str());
+            if reply.starts_with("err ") {
+                return Err(eyre::eyre!("{reply}"));
+            }
+            println!("[ctl] {} → {reply}", cmd.wire());
             Ok(())
         }
         Err(e) => Err(eyre::eyre!(
@@ -165,7 +175,9 @@ fn run_inject_test(text: Option<String>) -> eyre::Result<()> {
 /// If FOCUS_APP is set, ensure that app has a writable doc and inject into
 /// its AXUIElement by PID (works even when cargo's terminal is OS-frontmost).
 /// Otherwise inject via the system-wide focused element (production path).
-fn inject_with_optional_focus(text: &str) -> eyre::Result<fast_dictate_backend::injector::InjectOutcome> {
+fn inject_with_optional_focus(
+    text: &str,
+) -> eyre::Result<fast_dictate_backend::injector::InjectOutcome> {
     let Ok(app) = std::env::var("FOCUS_APP") else {
         return AccessibilityInjector::inject_text(text);
     };

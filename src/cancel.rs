@@ -93,6 +93,25 @@ impl CancelGate {
         self.state.store(pack(0, PHASE_IDLE), Ordering::SeqCst);
     }
 
+    /// Whether this exact generation may still publish progress. A committed
+    /// write remains visible until it settles, but cancellation and rollover
+    /// reject late ASR/cleanup updates.
+    pub fn allows_progress(&self, gen: u64) -> bool {
+        let state = self.state.load(Ordering::SeqCst);
+        (state >> PHASE_BITS) == gen
+            && matches!(state & PHASE_MASK, PHASE_ACTIVE | PHASE_COMMITTED)
+    }
+
+    /// End only the specified generation; a delayed scope cannot end its successor.
+    pub fn end_generation(&self, gen: u64) {
+        let state = self.state.load(Ordering::SeqCst);
+        if state >> PHASE_BITS == gen {
+            let _ = self.state.compare_exchange(
+                state, pack(0, PHASE_IDLE), Ordering::SeqCst, Ordering::SeqCst,
+            );
+        }
+    }
+
     /// True while an utterance is in flight (begin called, end not yet).
     pub fn active(&self) -> bool {
         (self.state.load(Ordering::SeqCst) & PHASE_MASK) != PHASE_IDLE

@@ -11,6 +11,10 @@
 //! the launcher contract, so a panel with no title bar is never stranded.
 
 use super::*;
+use std::sync::atomic::AtomicUsize;
+
+static HISTORY_VISIBLE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+static HISTORY_SELECTED: AtomicUsize = AtomicUsize::new(0);
 
 // ─── Panel window ────────────────────────────────────────────────────────
 
@@ -55,6 +59,17 @@ define_class!(
             unsafe {
                 let flags: usize = msg_send![event, modifierFlags];
                 let chars: Retained<NSString> = msg_send![event, charactersIgnoringModifiers];
+                if HISTORY_UI.get().is_some_and(|ui| std::ptr::eq(self, &*ui.window)) {
+                    let modifiers = flags & ((1 << 20) | (1 << 19) | (1 << 18) | (1 << 17));
+                    if modifiers == (1 << 20) && chars.to_string().eq_ignore_ascii_case("o") {
+                        open_selected_history_entry();
+                        return objc2::runtime::Bool::YES;
+                    }
+                    if modifiers == ((1 << 20) | (1 << 17)) && chars.to_string().eq_ignore_ascii_case("c") {
+                        copy_history_entry_at(HISTORY_SELECTED.load(Ordering::SeqCst) as isize);
+                        return objc2::runtime::Bool::YES;
+                    }
+                }
                 // NSEventModifierFlagCommand
                 if flags & (1 << 20) != 0 && chars.to_string() == "w" {
                     self.orderOut(None);
@@ -125,9 +140,18 @@ const PANEL_H: f64 = 480.0;
 /// of the panel edge.
 const LIST_PAD: f64 = 10.0;
 /// The footer's right-hand key hints, and the status shown before any copy.
-const FOOTER_READY: &str = "Ready · Cohere Q4 · S1-mini cleanup";
+const FOOTER_READY: &str = "Audio and text layers";
 
 pub(super) fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
+    let keycode = Settings::load().hotkey_keycode.unwrap_or(crate::hotkeys::DEFAULT_KEYCODE);
+    build_history_with_hotkey(mtm, keycode)
+}
+
+pub(super) fn build_history_for_render(mtm: MainThreadMarker) -> HistoryUi {
+    build_history_with_hotkey(mtm, crate::hotkeys::DEFAULT_KEYCODE)
+}
+
+fn build_history_with_hotkey(mtm: MainThreadMarker, keycode: i64) -> HistoryUi {
     let win_w = LAYOUT_PANEL_WIDTH;
     let window = panel_window(mtm, NSSize::new(win_w, PANEL_H));
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(win_w, PANEL_H));
@@ -153,11 +177,7 @@ pub(super) fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
     // "🎙 Right ⌥ · hold" — the chip that says how to start a dictation.
     let hotkey_label = format!(
         "{} · hold",
-        settings::hotkey_name(
-            Settings::load()
-                .hotkey_keycode
-                .unwrap_or(crate::hotkeys::DEFAULT_KEYCODE)
-        )
+        settings::hotkey_name(keycode)
     );
     let chip = slate::chip(
         mtm,
@@ -203,6 +223,7 @@ pub(super) fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
         if let Some(actions) = GLOBALS.get().map(|g| &g._actions) {
             let _: () = msg_send![&*search, setTarget: &**actions];
             let _: () = msg_send![&*search, setAction: sel!(searchHistory:)];
+            let _: () = msg_send![&*search, setDelegate: &**actions];
         }
     }
     glass.addSubview(&search);
@@ -278,7 +299,7 @@ pub(super) fn build_history_window(mtm: MainThreadMarker) -> HistoryUi {
 
     // Right side: "Copy ↩ · Actions ⌘ K", outlined key caps.
     let mut right = win_w - SPACE_SM;
-    for (text, caps) in [("Actions", &["⌘", "K"][..]), ("Copy", &["↩"][..])] {
+    for (text, caps) in [("Copy", &["⇧", "⌘", "C"][..]), ("Open", &["↩"][..])] {
         let (views, width) = slate::key_hint(mtm, text, caps, 0.0, fmid);
         let x = right - width;
         for v in &views {
@@ -328,6 +349,8 @@ pub(super) fn show_history_window() {
     if let Ok(mut store) = HISTORY_ENTRIES.lock() {
         *store = entries.iter().map(|e| e.text.clone()).collect();
     }
+    *HISTORY_VISIBLE.lock().unwrap() = entries.clone();
+    HISTORY_SELECTED.store(0, Ordering::SeqCst);
     rebuild_history_list(mtm, ui, &entries);
 
     // Reset the footer status and clear any prior search query for the fresh open.
@@ -376,7 +399,30 @@ pub(super) fn apply_history_filter(query: &str) {
     if let Ok(mut store) = HISTORY_ENTRIES.lock() {
         *store = filtered.iter().map(|e| e.text.clone()).collect();
     }
+    *HISTORY_VISIBLE.lock().unwrap() = filtered.clone();
+    HISTORY_SELECTED.store(0, Ordering::SeqCst);
     rebuild_history_list(mtm, ui, &filtered);
+}
+
+pub(super) fn open_history_entry_at(tag: isize) {
+    let id = usize::try_from(tag).ok().and_then(|index| HISTORY_VISIBLE.lock().ok()?.get(index).map(|entry| entry.id));
+    if let Some(id) = id {
+        HISTORY_SELECTED.store(tag as usize, Ordering::SeqCst);
+        if let Some(ui) = HISTORY_UI.get() { select_row(ui, tag); }
+        show_history_detail(id);
+    }
+}
+
+pub(super) fn open_selected_history_entry() {
+    open_history_entry_at(HISTORY_SELECTED.load(Ordering::SeqCst) as isize);
+}
+
+pub(super) fn move_history_selection(delta: isize) {
+    let count = HISTORY_VISIBLE.lock().map(|entries| entries.len()).unwrap_or(0);
+    if count == 0 { return; }
+    let next = (HISTORY_SELECTED.load(Ordering::SeqCst) as isize + delta).clamp(0, count as isize - 1) as usize;
+    HISTORY_SELECTED.store(next, Ordering::SeqCst);
+    if let Some(ui) = HISTORY_UI.get() { select_row(ui, next as isize); }
 }
 
 /// Copy the stored history text at `tag` (its index in HISTORY_ENTRIES) to the
@@ -425,6 +471,7 @@ fn select_row(ui: &HistoryUi, tag: isize) {
             unsafe { &*(&*view as *const NSView as *const slate::SlateView) };
         let row_tag: isize = unsafe { msg_send![row, tag] };
         row.set_selected(row_tag == tag);
+        if row_tag == tag { ui.doc.scrollRectToVisible(row.frame()); }
     }
 }
 
@@ -614,7 +661,7 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
                         mtm,
                         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(row_w, CONTROL_ROW)),
                         a,
-                        sel!(copyHistoryEntry:),
+                        sel!(openHistoryEntry:),
                         index as isize,
                     );
                     btn.setToolTip(Some(&NSString::from_str(full)));
