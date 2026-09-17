@@ -124,13 +124,15 @@ is_terminal)` maps a focused surface to `FocusEditability`:
 
 `finalize_utterance(cancel, editability, text, inject)` is the single tested seam;
 the worker calls it right before the write, **passing `None` editability** so the
-injector re-resolves and gates on the CURRENT focus (freshness). The injector
-(`imp` module) reads role/subrole + settability at capture for diagnostics, but
-at write time it **re-resolves the current focused element** and gates in
-`write_padded`/`inject_through`/`inject_via_target` — so a same-app field change
-never writes into a stale element, and a failed initial capture still reaches the
-fresh resolver. The old `is_clipboard_only_pid` short-circuit (which pasted
-blindly for any Electron app) was replaced by a focus-evidence gate.
+injector re-resolves and gates on the CURRENT focus (freshness). Capture now uses
+the frontmost application's own AX root instead of the less reliable system-wide
+proxy. At write time `write_padded`/`inject_through`/`inject_via_target` still
+prefer a fresh element, so a real same-app field change wins. If and only if the
+fresh query returns no element, a retained positively-editable capture may be
+used while it still reports focused and its PID equals the OS-frontmost PID. This targets the logged
+`-25212` sequence without reviving a field after an app switch; the retained-element probe still needs live verification in the affected app. The old
+`is_clipboard_only_pid` short-circuit (which pasted blindly for any Electron app)
+remains replaced by a focus-evidence gate.
 
 ### UI "No text field selected" — `src/ui_channel.rs`, `src/menubar/pill.rs`
 New `UiState::NoEditableField`. On a held transcript the daemon records it to
@@ -144,35 +146,22 @@ The status menu is now recovery-first: the top level is the last dictation
 (preview + Copy + an explicit **"Paste last dictation"**), Settings, a single
 **"More"** submenu (history / retranscribe / config / diagnostics), and Quit.
 `Paste last dictation` is NOT a re-transcribe — it re-inserts the already-captured
-text into the app that was frontmost *before* the menu opened. A menu delegate's
-`menuWillOpen:` snapshots that app; the action restores (activates) + **verifies**
-it via `injector::activate_app`, then injects through `inject_into_pid` through the
-SAME focus-editability gate (a non-input target holds, never a blind paste). The
-pure guard `recovery::decide_recovery_target` refuses a self PID (settings / the
-menu app) and any missing recorded target, so a recovery paste cannot land in
-Local Dictation itself. The path is also fail-closed on the target PID: the
-by-PID `inject_into_pid` no-focused-element fallback classifies the *explicit*
-PID (never the live frontmost), and the global Cmd+V is verified — via
-`injector::clipboard_target_is_frontmost` — immediately before posting that the
-target is the OS-frontmost app, else refused and held. The same guard is applied
-to the automatic systemwide dictation path (which keeps its fresh
-frontmost-PID app resolver, Escape-cancel gate, and noneditable hold). The live
-resolver no longer relies on the systemwide AX proxy: `injector::plan_live_inject`
-snapshots the OS-frontmost app via `NSWorkspace` and resolves ITS focused element
-per-app (`AXUIElementCreateApplication(pid)`), which the reproduced red loop
-proved works where the systemwide proxy returned `kAXErrorCannotComplete`
-(-25204) with an empty TextEdit readback. Recovery work runs on a background
-thread. Recovery refuses while dictation is recording/processing and serializes
-recovery requests. All clipboard pastes hold the shared write lock through the
-consume window, including when a live dictation starts during recovery. The
-foreground guard runs both before clipboard mutation and just before Cmd+V;
-a late refusal leaves the dictation on the clipboard for manual recovery.
-`error`/`success`/`no-editable-field` outcomes are mirrored to the existing UI
-transients. Unit coverage: 3 tests in `recovery.rs` (recorded-foreign target,
-refuse-self, refuse-no-recorded-app) plus 3 in `injector.rs` (fail-closed
-`clipboard_target_is_frontmost`, `RefusedForeground` → `Held`, and
-`plan_live_inject` → current-frontmost / hold-with-none). The full featureless
-suite is now **329** passed and `--features full` **354** passed.
+text into the app that was frontmost *before* the menu opened. `menuWillOpen:`
+takes a lightweight snapshot of the app, focused field and editability under a
+short AX timeout; caret context and screen text are deferred to the recovery
+worker. The action restores + verifies the PID, resolves focus fresh, and uses
+the retained field only when the fresh query has no element, the retained field
+still reports focused, and that PID is still frontmost. A real fresh field or
+non-input surface wins. Both native AX writes and global Cmd+V verify the target
+PID again at the actual write boundary. A recovery write-authorizer checks on
+entry, after activation, and at write commit that no live utterance has started;
+if one has, recovery abandons the write. Recovery UI feedback is published only
+when no live generation owns the presentation, so it cannot discard a concurrent
+dictation. Success always flashes the result pill even when ordinary feedback is
+off. The pure guards refuse self/missing targets, app switches, non-editable or
+no-longer-focused captures, and every live pipeline phase. Recovery remains
+serialized, and clipboard work retains its shared write lock and foreground
+check.
 
 ### 2026-09-07 parent verification
 
@@ -341,10 +330,13 @@ the signature hash changed; only the user can do that.
   clipboard route share the guard), so a cancel that lands during a slow (up to
   1.5s) AX lookup is still honored. One claim, exactly once; the existing write
   ladder's fallbacks proceed without a second claim.
-- **Freshness costs the key-press capture.** The write always re-resolves the
-  current focused element rather than writing to the retained key-press target,
-  so a same-app field change is honoured. The trade-off is the AX `get_focused_element`
-  cost moves back onto the release/inject path (still re-used for cleanup vocab).
+- **Freshness remains primary; retained focus is only a rescue.** The write
+  always re-resolves the current focused element first, so a same-app field
+  change is honoured. A retained key-press/menu target is used only when that
+  fresh query returns no element, the capture was positively editable, the
+  element still reports focused, and its PID matches the OS-frontmost app. The AX query cost remains on the
+  release/inject path; capture still supplies cleanup vocabulary and the narrow
+  transient-focus fallback.
 - **Focus evidence is best-effort for black-holed apps.** `PasteSafe` is the narrow
   terminal-only fallback; there is no editor/compose blanket. A genuinely unknown
   or black-holed non-terminal focus reads `NotEditable` (held), which is the safe

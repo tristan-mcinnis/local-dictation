@@ -138,6 +138,13 @@ impl Presentation {
         self.revision
     }
 
+    fn set_state_if_unowned(&mut self, state: UiState) -> Option<u64> {
+        if self.state.is_active() || self.generation.is_some() {
+            return None;
+        }
+        Some(self.set_state(state))
+    }
+
     fn begin(&mut self, gate: &crate::cancel::CancelGate, state: UiState, preview: bool) -> u64 {
         let generation = gate.begin();
         self.set_state(state);
@@ -316,6 +323,24 @@ pub fn show_transient(state: UiState, duration: std::time::Duration) {
         Ok(mut p) => p.set_state(state),
         Err(_) => return,
     };
+    expire_transient_after(revision, duration);
+}
+
+/// Show recovery/menu feedback only when no utterance owns the presentation.
+/// This can never clear a live generation or make its write authorization fail.
+pub fn show_transient_if_unowned(state: UiState, duration: std::time::Duration) -> bool {
+    let revision = match PRESENTATION.lock() {
+        Ok(mut p) => match p.set_state_if_unowned(state) {
+            Some(revision) => revision,
+            None => return false,
+        },
+        Err(_) => return false,
+    };
+    expire_transient_after(revision, duration);
+    true
+}
+
+fn expire_transient_after(revision: u64, duration: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(duration);
         if let Ok(mut p) = PRESENTATION.lock() {
@@ -447,6 +472,20 @@ mod tests {
             assert_eq!(ui.state, UiState::Idle);
             assert!(!gate.active());
         }
+    }
+
+    #[test]
+    fn unowned_feedback_never_clears_a_live_generation() {
+        let gate = CancelGate::new();
+        let mut ui = Presentation::new();
+        assert!(ui.set_state_if_unowned(UiState::Success).is_some());
+        assert!(ui.set_state_if_unowned(UiState::NoEditableField).is_some());
+        ui.set_state(UiState::Idle);
+
+        let generation = ui.begin(&gate, UiState::Recording, true);
+        assert!(ui.set_state_if_unowned(UiState::Success).is_none());
+        assert_eq!(ui.generation, Some(generation));
+        assert!(ui.authorize_paste(&gate, generation));
     }
 
     #[test]

@@ -46,6 +46,12 @@ pub fn decide_recovery_target(recorded_pid: Option<i32>, self_pid: i32) -> Recov
     }
 }
 
+/// Recovery may write only while no live utterance owns the pipeline. Checked
+/// on entry, after app activation, and again by the injector at write commit.
+pub fn recovery_may_write(state: crate::ui_channel::UiState, cancel_active: bool) -> bool {
+    !state.is_active() && !cancel_active
+}
+
 /// Serializes recovery pastes so two "Paste last dictation" clicks can't run
 /// concurrently and trip over the same AX / clipboard path. Set true before the
 /// worker thread is spawned; the worker clears it on drop.
@@ -77,7 +83,10 @@ impl Drop for RecoveryBusy {
 /// holds it). A global Cmd+V is additionally fail-closed on the explicit target
 /// PID (see `clipboard_target_is_frontmost`).
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-pub fn paste_last_dictation(recorded_pid: Option<i32>) {
+pub fn paste_last_dictation(
+    recorded_pid: Option<i32>,
+    retained_focus: Option<crate::injector::FocusTarget>,
+) {
     use crate::injector::{self, AccessibilityInjector, InjectOutcome};
     use crate::ui_channel::{self, UiState};
     use std::time::Duration;
@@ -103,7 +112,7 @@ pub fn paste_last_dictation(recorded_pid: Option<i32>) {
 
     // Never run alongside a live dictation — the paste would race the pipeline's
     // own injection / clipboard write.
-    if ui_channel::state().is_active() || crate::cancel::CANCEL.active() {
+    if !recovery_may_write(ui_channel::state(), crate::cancel::CANCEL.active()) {
         eprintln!("[recovery] a dictation is in flight — refusing to paste now");
         return;
     }
@@ -121,7 +130,7 @@ pub fn paste_last_dictation(recorded_pid: Option<i32>) {
     std::thread::spawn(move || {
         let _busy = RecoveryBusy;
         // Re-check: a dictation may have started between the menu click and now.
-        if ui_channel::state().is_active() || crate::cancel::CANCEL.active() {
+        if !recovery_may_write(ui_channel::state(), crate::cancel::CANCEL.active()) {
             eprintln!("[recovery] dictation started mid-recovery — abandoning paste");
             return;
         }
@@ -133,37 +142,60 @@ pub fn paste_last_dictation(recorded_pid: Option<i32>) {
             eprintln!(
                 "[recovery] could not restore app pid {target} to frontmost — refusing to paste"
             );
-            ui_channel::show_transient(UiState::NoEditableField, Duration::from_millis(900));
+            ui_channel::show_transient_if_unowned(
+                UiState::NoEditableField,
+                Duration::from_millis(900),
+            );
+            return;
+        }
+        if !recovery_may_write(ui_channel::state(), crate::cancel::CANCEL.active()) {
+            eprintln!("[recovery] dictation started while restoring target — abandoning paste");
             return;
         }
 
-        // Inject into *that* app's focused field, through the same
-        // focus-editability gate as a live utterance: an editable/PasteSafe
-        // surface writes; a positively non-input surface is held, never pasted
-        // blindly.
-        match AccessibilityInjector::inject_into_pid(target, &text) {
+        // Final race gate: a live utterance that starts after activation but
+        // before the first AX/clipboard write wins. Recovery then performs no
+        // side effect and publishes no unscoped UI transient.
+        let authorize = || recovery_may_write(ui_channel::state(), crate::cancel::CANCEL.active());
+        let injection = match retained_focus {
+            Some(focus) => AccessibilityInjector::inject_into_pid_with_target_cancellable(
+                target, focus, &text, &authorize,
+            ),
+            None => AccessibilityInjector::inject_into_pid_cancellable(target, &text, &authorize),
+        };
+        match injection {
             Ok(InjectOutcome::Injected) => {
                 eprintln!("[recovery] pasted last dictation into pid {target}");
-                crate::daemon::show_result_pill();
+                // A menu action needs explicit feedback even when the normal
+                // post-dictation result pill is disabled (the default).
+                ui_channel::show_transient_if_unowned(UiState::Success, Duration::from_millis(900));
             }
             Ok(InjectOutcome::NoEditableField) => {
                 eprintln!(
                     "[recovery] target pid {target} has no editable field — held (never paste blindly)"
                 );
                 ui_channel::set_last_dictation(&text);
-                ui_channel::show_transient(UiState::NoEditableField, Duration::from_millis(900));
+                ui_channel::show_transient_if_unowned(
+                    UiState::NoEditableField,
+                    Duration::from_millis(900),
+                );
             }
             Ok(InjectOutcome::RefusedForeground) => {
                 eprintln!(
                     "[recovery] target pid {target} not frontmost at paste — held (not pasted)"
                 );
                 ui_channel::set_last_dictation(&text);
-                ui_channel::show_transient(UiState::NoEditableField, Duration::from_millis(900));
+                ui_channel::show_transient_if_unowned(
+                    UiState::NoEditableField,
+                    Duration::from_millis(900),
+                );
             }
-            Ok(InjectOutcome::Cancelled) => {}
+            Ok(InjectOutcome::Cancelled) => {
+                eprintln!("[recovery] live dictation won the write boundary — paste abandoned");
+            }
             Err(e) => {
                 eprintln!("[recovery] injection into pid {target} failed: {e}");
-                ui_channel::show_transient(UiState::Error, Duration::from_millis(650));
+                ui_channel::show_transient_if_unowned(UiState::Error, Duration::from_millis(650));
             }
         }
     });
@@ -207,5 +239,21 @@ mod tests {
         // No pre-menu app recorded → there is nothing to restore; pasting into
         // whatever happens to be frontmost is the "wrong target" case.
         assert_eq!(decide_recovery_target(None, 100), RecoveryTarget::NoTarget);
+    }
+
+    #[test]
+    fn recovery_write_gate_refuses_every_live_phase() {
+        use crate::ui_channel::UiState;
+        for state in [
+            UiState::Recording,
+            UiState::Processing,
+            UiState::Transcribing,
+            UiState::Cleaning,
+            UiState::Pasting,
+        ] {
+            assert!(!recovery_may_write(state, false), "{state:?}");
+        }
+        assert!(!recovery_may_write(UiState::Idle, true));
+        assert!(recovery_may_write(UiState::Idle, false));
     }
 }

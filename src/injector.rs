@@ -2,8 +2,8 @@
 //! fallback.
 //!
 //! Strategy (in order):
-//!   1. Locate the focused UI element — either via the system-wide
-//!      AXUIElement (production hotkey path) or by PID (test path).
+//!   1. Snapshot the OS-frontmost PID, then locate its focused UI element
+//!      through that application's own AX root.
 //!   2. Read its current value + caret position to discover what character
 //!      sits immediately before and after the caret.
 //!   3. Run `smart_pad::smart_pad` to decide on a leading space, trailing
@@ -31,11 +31,10 @@ use std::sync::Mutex;
 // Evidence is layered, never guessed:
 //   * `Editable`  — hard AX evidence: the focused element reports a text-entry
 //     role/subrole AND a writable value/selected-text attribute. Native apps.
-//   * `PasteSafe` — the focused element belongs to a known terminal and is not
-//     a positively non-input control. A terminal text grid may report a text
-//     role without writable AX attributes; clipboard paste is its input path.
-//     There is no editor/compose allowlist exception. Other apps require the
-//     positive writable-text evidence above.
+//   * `PasteSafe` — the focused element belongs to a known terminal or the
+//     AX-blind WeChat message surface and is not a positively non-input control.
+//     Clipboard paste is its input path. There is no general editor/compose
+//     allowlist exception. Other apps require positive writable-text evidence.
 //   * `NotEditable` — nothing positive. Do NOT inject or paste. Hold + copy.
 //
 // The daemon combines this with the OOB cancel gate (`crate::cancel`) at the
@@ -127,6 +126,22 @@ pub fn plan_live_inject(current_frontmost: Option<i32>) -> LiveInjectPlan {
         Some(pid) => LiveInjectPlan::ResolveApp { pid },
         None => LiveInjectPlan::Hold,
     }
+}
+
+/// Whether a retained, positively-editable focus target may rescue a failed
+/// fresh AX lookup. The fallback is deliberately narrow: the retained element
+/// must belong to the app that is still frontmost. A real fresh element always
+/// wins; this decision is consulted only after that lookup returned no element.
+pub fn retained_focus_can_fallback(
+    captured_pid: Option<i32>,
+    current_frontmost: Option<i32>,
+    editability: FocusEditability,
+    captured_still_focused: bool,
+) -> bool {
+    captured_still_focused
+        && matches!(editability, FocusEditability::Editable | FocusEditability::PasteSafe)
+        && captured_pid.is_some()
+        && captured_pid == current_frontmost
 }
 
 /// The pure decision: what to do with a finished transcript. This is the seam
@@ -609,15 +624,15 @@ pub fn activate_app(pid: i32) -> bool {
 mod imp {
     use super::*;
     use accessibility_sys::{
-        kAXErrorSuccess, kAXFocusedUIElementAttribute, kAXRoleAttribute, kAXSelectedTextAttribute,
+        kAXErrorSuccess, kAXFocusedAttribute, kAXFocusedUIElementAttribute, kAXRoleAttribute, kAXSelectedTextAttribute,
         kAXSelectedTextRangeAttribute, kAXSubroleAttribute, kAXTrustedCheckOptionPrompt,
         kAXValueAttribute, kAXValueTypeCFRange, AXIsProcessTrustedWithOptions,
-        AXUIElementCopyAttributeValue, AXUIElementCreateApplication, AXUIElementCreateSystemWide,
+        AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
         AXUIElementGetPid, AXUIElementIsAttributeSettable, AXUIElementSetMessagingTimeout,
         AXUIElementRef, AXUIElementSetAttributeValue, AXValueGetValue, AXValueRef,
     };
     use core_foundation::base::{CFRange, CFTypeRef, TCFType};
-    use core_foundation::boolean::CFBoolean;
+    use core_foundation::boolean::{CFBoolean, CFBooleanRef};
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::string::{CFString, CFStringRef};
     use libc::pid_t;
@@ -630,13 +645,20 @@ mod imp {
     /// inject ladder demotes to the clipboard-paste fallback (see
     /// `write_padded`), exactly as it does for any other non-success error.
     const AX_MESSAGING_TIMEOUT_SECS: f32 = 1.5;
+    /// Menu opening runs on AppKit's main thread. Keep its focus snapshot
+    /// bounded; any deeper context reads happen later on the recovery worker.
+    const MENU_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.2;
 
     /// Best-effort: set the AX messaging timeout on an element so a slow or hung
     /// target app can't pin the daemon on an AX call. Ignores the AXError — if
     /// the OS declines the bound we just fall back to the unbounded default for
     /// that element.
+    unsafe fn set_messaging_timeout(el: AXUIElementRef, seconds: f32) {
+        let _ = AXUIElementSetMessagingTimeout(el, seconds);
+    }
+
     unsafe fn bound_messaging_timeout(el: AXUIElementRef) {
-        let _ = AXUIElementSetMessagingTimeout(el, AX_MESSAGING_TIMEOUT_SECS);
+        set_messaging_timeout(el, AX_MESSAGING_TIMEOUT_SECS);
     }
 
     pub fn ensure_trusted_or_prompt() -> bool {
@@ -659,6 +681,25 @@ mod imp {
             return None;
         }
         Some(CFString::wrap_under_create_rule(value_ref as CFStringRef).to_string())
+    }
+
+    /// Positive check that a retained element is still the focused field. This
+    /// preserves same-app field-change safety when the application root's fresh
+    /// `AXFocusedUIElement` query transiently returns no value.
+    unsafe fn element_reports_focused(element: AXUIElementRef) -> bool {
+        let mut value_ref: CFTypeRef = ptr::null();
+        let attr = CFString::new(kAXFocusedAttribute);
+        let err = AXUIElementCopyAttributeValue(
+            element,
+            attr.as_concrete_TypeRef(),
+            &mut value_ref,
+        );
+        if err != kAXErrorSuccess || value_ref.is_null() {
+            return false;
+        }
+        bool::from(CFBoolean::wrap_under_create_rule(
+            value_ref as CFBooleanRef,
+        ))
     }
 
     /// True when AX reports an attribute as writable on the element. A settable
@@ -731,7 +772,7 @@ mod imp {
                     ));
                 }
                 bound_messaging_timeout(app);
-                let result = inject_through(app, text, authorize, Some(pid));
+                let result = inject_through(app, text, authorize, Some(pid), None);
                 cf_release(app as CFTypeRef);
                 result
             },
@@ -739,6 +780,23 @@ mod imp {
     }
 
     pub fn inject_into_pid(pid: pid_t, text: &str) -> eyre::Result<InjectOutcome> {
+        inject_into_pid_with(pid, text, None, None)
+    }
+
+    pub fn inject_into_pid_cancellable(
+        pid: pid_t,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        inject_into_pid_with(pid, text, Some(authorize), None)
+    }
+
+    fn inject_into_pid_with(
+        pid: pid_t,
+        text: &str,
+        authorize: Option<&dyn Fn() -> bool>,
+        retained: Option<FocusTargetInner>,
+    ) -> eyre::Result<InjectOutcome> {
         if !ensure_trusted_or_prompt() {
             return Err(eyre::eyre!("Accessibility permission not granted"));
         }
@@ -750,7 +808,13 @@ mod imp {
                 ));
             }
             bound_messaging_timeout(app);
-            let result = inject_through(app, text, None, Some(pid));
+            let result = inject_through(
+                app,
+                text,
+                authorize,
+                Some(pid),
+                retained.as_ref(),
+            );
             cf_release(app as CFTypeRef);
             result
         }
@@ -771,6 +835,7 @@ mod imp {
         text: &str,
         authorize: Option<&dyn Fn() -> bool>,
         expected_app: Option<i32>,
+        retained: Option<&FocusTargetInner>,
     ) -> eyre::Result<InjectOutcome> {
         let prof = std::env::var("INJECT_PROFILE").is_ok();
 
@@ -787,6 +852,56 @@ mod imp {
             eprintln!("[inject-prof] get_focused_element: {:?}", t.elapsed());
         }
         if err != kAXErrorSuccess || focused_ref.is_null() {
+            // AX can transiently lose the focused element while a status menu
+            // is tracking or while Electron reshuffles its accessibility tree.
+            // A retained target is usable only when it carried positive
+            // editability evidence and its owning app is STILL frontmost. This
+            // rescues that exact false-negative without reviving a stale field
+            // after an app switch. A real fresh element always wins above.
+            if let Some(target) = retained {
+                // Menu snapshots use a short main-thread timeout. Restore the
+                // normal worker-thread bound before probing or reading context.
+                bound_messaging_timeout(target.focused);
+                if retained_focus_can_fallback(
+                    target.pid,
+                    super::frontmost_pid(),
+                    target.editability,
+                    element_reports_focused(target.focused),
+                ) {
+                    eprintln!(
+                        "[inject] fresh focus unavailable (AXError {err}); reusing same-app captured field"
+                    );
+                    let (immediate_before, last_nws_before, char_after) =
+                        if target.context_captured {
+                            (
+                                target.immediate_before,
+                                target.last_nws_before,
+                                target.char_after,
+                            )
+                        } else {
+                            read_context_with_blind(target.focused, target.pid)
+                        };
+                    let padded = smart_pad(
+                        text,
+                        immediate_before,
+                        last_nws_before,
+                        char_after,
+                    );
+                    if padded.is_empty() {
+                        return Ok(InjectOutcome::Injected);
+                    }
+                    return write_padded(
+                        target.focused,
+                        target.pid,
+                        &padded,
+                        prof,
+                        target.editability,
+                        authorize,
+                        expected_app,
+                    );
+                }
+            }
+
             // No focused field exposed. This is NOT a green light to paste
             // blindly: only a genuine terminal or an AX-blind native chat app
             // (WeChat) gets the narrow clipboard fallback. Anything else — a
@@ -920,6 +1035,15 @@ mod imp {
                 editability
             );
             return Ok(InjectOutcome::NoEditableField);
+        }
+
+        // Both AX writes and global clipboard pastes are fail-closed on the
+        // intended foreground app at the actual write boundary.
+        if !clipboard_target_is_frontmost(expected_pid, super::frontmost_pid()) {
+            eprintln!(
+                "[inject] expected app {expected_pid:?} not frontmost at write — holding (not written)"
+            );
+            return Ok(InjectOutcome::RefusedForeground);
         }
 
         // Write authorization: claimed exactly once, after the focus/context/
@@ -1258,6 +1382,10 @@ mod imp {
         pub immediate_before: Option<char>,
         pub last_nws_before: Option<char>,
         pub char_after: Option<char>,
+        /// Whether caret context was read during capture. Menu snapshots skip
+        /// it to keep AppKit's main thread responsive and read it only if the
+        /// retained field is actually needed later on the recovery worker.
+        pub context_captured: bool,
         /// Visible text near the focus (field value + window title), harvested
         /// at capture time for screen-context vocabulary. `None` in AX-blind apps.
         pub screen_text: Option<String>,
@@ -1273,105 +1401,155 @@ mod imp {
         }
     }
 
-    /// Resolve the currently-focused UI element from the system-wide AX
-    /// proxy + read its caret context. Suitable to call on a background
-    /// thread in parallel with inference. Retains the focused element so
-    /// the caller can use it later from any thread.
+    /// Build an owned focus target from an application AX root. `expected_pid`
+    /// is retained when the focused child does not disclose its owner.
+    unsafe fn capture_focus_target_from_root(
+        root: AXUIElementRef,
+        expected_pid: Option<i32>,
+        capture_context: bool,
+        messaging_timeout_secs: f32,
+    ) -> eyre::Result<FocusTargetInner> {
+        let mut focused_ref: CFTypeRef = ptr::null();
+        let focused_attr = CFString::new(kAXFocusedUIElementAttribute);
+        let err = AXUIElementCopyAttributeValue(
+            root,
+            focused_attr.as_concrete_TypeRef(),
+            &mut focused_ref,
+        );
+        if err != kAXErrorSuccess || focused_ref.is_null() {
+            return Err(eyre::eyre!(
+                "no focused UI element (AXError {err}); click into a text field first"
+            ));
+        }
+        let focused = focused_ref as AXUIElementRef;
+        set_messaging_timeout(focused, messaging_timeout_secs);
+
+        let focused_pid = expected_pid.or_else(|| focused_pid_of(focused));
+        let (immediate_before, last_nws_before, char_after, screen_text) =
+            if capture_context {
+                let (immediate, last_nws, after) =
+                    read_context_with_blind(focused, focused_pid);
+                (immediate, last_nws, after, harvest_screen_text(focused))
+            } else {
+                (None, None, None, None)
+            };
+        let editability = focused_editability(focused, focused_pid);
+
+        if std::env::var("INJECT_DIAG").is_ok() {
+            let mut role_ref: CFTypeRef = ptr::null();
+            let role_attr = CFString::new(kAXRoleAttribute);
+            let r_err = AXUIElementCopyAttributeValue(
+                focused,
+                role_attr.as_concrete_TypeRef(),
+                &mut role_ref,
+            );
+            let role = if r_err == kAXErrorSuccess && !role_ref.is_null() {
+                CFString::wrap_under_create_rule(role_ref as CFStringRef).to_string()
+            } else {
+                format!("<unknown AXError {r_err}>")
+            };
+            eprintln!("[inject-diag] focus capture: pid={focused_pid:?} role={role} editability={editability:?}");
+        }
+
+        Ok(FocusTargetInner {
+            focused,
+            pid: focused_pid,
+            immediate_before,
+            last_nws_before,
+            char_after,
+            context_captured: capture_context,
+            screen_text,
+            editability,
+        })
+    }
+
+    /// Capture through the frontmost application's own AX root. The old
+    /// system-wide proxy intermittently returned no value even when the app
+    /// root could resolve the focused field.
     pub fn capture_focus_target() -> eyre::Result<FocusTargetInner> {
+        let pid = super::frontmost_pid()
+            .ok_or_else(|| eyre::eyre!("no frontmost application"))?;
+        capture_focus_target_for_pid_mode(pid, true, AX_MESSAGING_TIMEOUT_SECS)
+    }
+
+    /// Lightweight menu snapshot: retain the field and positive editability
+    /// evidence, but defer caret context and screen text to the recovery worker.
+    pub fn capture_focus_target_for_pid(pid: i32) -> eyre::Result<FocusTargetInner> {
+        capture_focus_target_for_pid_mode(pid, false, MENU_AX_MESSAGING_TIMEOUT_SECS)
+    }
+
+    fn capture_focus_target_for_pid_mode(
+        pid: i32,
+        capture_context: bool,
+        messaging_timeout_secs: f32,
+    ) -> eyre::Result<FocusTargetInner> {
         if !ensure_trusted_or_prompt() {
             return Err(eyre::eyre!("Accessibility permission not granted"));
         }
         unsafe {
-            let root = AXUIElementCreateSystemWide();
-            if root.is_null() {
-                return Err(eyre::eyre!("AXUIElementCreateSystemWide returned null"));
-            }
-            bound_messaging_timeout(root);
-            let mut focused_ref: CFTypeRef = ptr::null();
-            let focused_attr = CFString::new(kAXFocusedUIElementAttribute);
-            let err = AXUIElementCopyAttributeValue(
-                root,
-                focused_attr.as_concrete_TypeRef(),
-                &mut focused_ref,
-            );
-            cf_release(root as CFTypeRef);
-            if err != kAXErrorSuccess || focused_ref.is_null() {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
                 return Err(eyre::eyre!(
-                    "no focused UI element (AXError {err}); click into a text field first"
+                    "AXUIElementCreateApplication({pid}) returned null"
                 ));
             }
-            let focused = focused_ref as AXUIElementRef;
-            bound_messaging_timeout(focused);
-
-            // Read context immediately while we have the element handy. In
-            // AX-blind apps this returns (None, None, None) quickly.
-            let focused_pid = focused_pid_of(focused);
-            let (immediate_before, last_nws_before, char_after) =
-                read_context_with_blind(focused, focused_pid);
-            // Classify editability from the AX role/subrole + writability and
-            // the app type, so the write ladder can gate on positive evidence.
-            let editability = focused_editability(focused, focused_pid);
-            // Harvest visible text for screen-context vocabulary while we hold
-            // the element. AX-blind apps return None here, same as the caret read.
-            let screen_text = harvest_screen_text(focused);
-
-            // Diagnostic: log what we're about to write into. Enable with
-            // INJECT_DIAG=1. Helps explain "no text appears" when an
-            // element accepts the AX call but doesn't actually render.
-            if std::env::var("INJECT_DIAG").is_ok() {
-                let mut role_ref: CFTypeRef = ptr::null();
-                let role_attr = CFString::new(kAXRoleAttribute);
-                let r_err = AXUIElementCopyAttributeValue(
-                    focused,
-                    role_attr.as_concrete_TypeRef(),
-                    &mut role_ref,
-                );
-                let role = if r_err == kAXErrorSuccess && !role_ref.is_null() {
-                    let s = CFString::wrap_under_create_rule(role_ref as CFStringRef).to_string();
-                    s
-                } else {
-                    format!("<unknown AXError {r_err}>")
-                };
-                eprintln!("[inject-diag] focus capture: pid={focused_pid:?} role={role} editability={editability:?}");
-            }
-
-            // Retain — focused_ref was returned by AXUIElementCopyAttributeValue
-            // under the Create rule, so it's already +1. We just hold it.
-            Ok(FocusTargetInner {
-                focused,
-                pid: focused_pid,
-                immediate_before,
-                last_nws_before,
-                char_after,
-                screen_text,
-                editability,
-            })
+            set_messaging_timeout(app, messaging_timeout_secs);
+            let result = capture_focus_target_from_root(
+                app,
+                Some(pid),
+                capture_context,
+                messaging_timeout_secs,
+            );
+            cf_release(app as CFTypeRef);
+            result
         }
     }
 
-    /// Write `text` at the CURRENT focused element, not the press-time capture.
-    ///
-    /// The retained `target` (and its caret context / editability) is a
-    /// key-press snapshot; by write time the user may have moved focus to a
-    /// different field in the SAME app, or the frontmost app changed. Writing
-    /// into the stale element would be wrong. So we RE-RESOLVE the current
-    /// focused element just before the write and gate there — "use fresh focused
-    /// field not stale original". The captured target still feeds the cleanup
-    /// vocabulary (screen_text) and the daemon's summary log, but never the
-    /// write target.
-    pub fn inject_via_target(_target: FocusTargetInner, text: &str) -> eyre::Result<InjectOutcome> {
-        // Re-resolve the current focus fresh via the system-wide proxy.
-        inject_systemwide(text)
+    /// Re-resolve the current field first. If AX transiently returns no focused
+    /// element, `inject_through` may use the retained field only when the same
+    /// app remains frontmost and the capture was positively editable.
+    pub fn inject_via_target(target: FocusTargetInner, text: &str) -> eyre::Result<InjectOutcome> {
+        inject_via_target_with(target, text, None)
     }
 
-    /// Cancellable variant of [`inject_via_target`]: same fresh re-resolve, but
-    /// with a write authorizer polled immediately before the first side effect.
     pub fn inject_via_target_with(
-        _target: FocusTargetInner,
+        target: FocusTargetInner,
         text: &str,
         authorize: Option<&dyn Fn() -> bool>,
     ) -> eyre::Result<InjectOutcome> {
-        inject_systemwide_with(text, authorize)
+        let pid = match plan_live_inject(super::frontmost_pid()) {
+            LiveInjectPlan::ResolveApp { pid } => pid,
+            LiveInjectPlan::Hold => return Ok(InjectOutcome::NoEditableField),
+        };
+        unsafe {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return Err(eyre::eyre!(
+                    "AXUIElementCreateApplication({pid}) returned null"
+                ));
+            }
+            bound_messaging_timeout(app);
+            let result = inject_through(app, text, authorize, Some(pid), Some(&target));
+            cf_release(app as CFTypeRef);
+            result
+        }
+    }
+
+    pub fn inject_into_pid_with_target(
+        pid: i32,
+        target: FocusTargetInner,
+        text: &str,
+    ) -> eyre::Result<InjectOutcome> {
+        inject_into_pid_with(pid, text, None, Some(target))
+    }
+
+    pub fn inject_into_pid_with_target_cancellable(
+        pid: i32,
+        target: FocusTargetInner,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        inject_into_pid_with(pid, text, Some(authorize), Some(target))
     }
 }
 
@@ -1400,6 +1578,15 @@ impl FocusTarget {
             inner: imp::capture_focus_target()?,
         })
     }
+
+    /// Capture from one explicit application's AX root. Used by status-menu
+    /// recovery before menu tracking can make the field disappear.
+    pub fn capture_for_pid(pid: i32) -> eyre::Result<Self> {
+        Ok(Self {
+            inner: imp::capture_focus_target_for_pid(pid)?,
+        })
+    }
+
     /// PID of the process that owns the captured focused element, if AX
     /// disclosed it. Used by the daemon for log output.
     pub fn inner_pid(&self) -> Option<i32> {
@@ -1435,6 +1622,9 @@ pub struct FocusTarget;
 #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
 impl FocusTarget {
     pub fn capture() -> eyre::Result<Self> {
+        Ok(Self)
+    }
+    pub fn capture_for_pid(_pid: i32) -> eyre::Result<Self> {
         Ok(Self)
     }
     pub fn inner_pid(&self) -> Option<i32> {
@@ -1530,6 +1720,43 @@ impl AccessibilityInjector {
         imp::inject_into_pid(pid, text)
     }
 
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    pub fn inject_into_pid_with_target(
+        pid: i32,
+        target: FocusTarget,
+        text: &str,
+    ) -> eyre::Result<InjectOutcome> {
+        if text.trim().is_empty() {
+            return Ok(InjectOutcome::Injected);
+        }
+        imp::inject_into_pid_with_target(pid, target.inner, text)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    pub fn inject_into_pid_cancellable(
+        pid: i32,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if text.trim().is_empty() {
+            return Ok(InjectOutcome::Injected);
+        }
+        imp::inject_into_pid_cancellable(pid, text, authorize)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    pub fn inject_into_pid_with_target_cancellable(
+        pid: i32,
+        target: FocusTarget,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if text.trim().is_empty() {
+            return Ok(InjectOutcome::Injected);
+        }
+        imp::inject_into_pid_with_target_cancellable(pid, target.inner, text, authorize)
+    }
+
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
     pub fn inject_text(text: &str) -> eyre::Result<InjectOutcome> {
         let padded = smart_pad(text, None, None, None);
@@ -1548,6 +1775,40 @@ impl AccessibilityInjector {
         }
         println!("[INJECT-FALLBACK-PID] {padded}");
         Ok(InjectOutcome::Injected)
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+    pub fn inject_into_pid_with_target(
+        pid: i32,
+        _target: FocusTarget,
+        text: &str,
+    ) -> eyre::Result<InjectOutcome> {
+        Self::inject_into_pid(pid, text)
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+    pub fn inject_into_pid_cancellable(
+        pid: i32,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if !authorize() {
+            return Ok(InjectOutcome::Cancelled);
+        }
+        Self::inject_into_pid(pid, text)
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+    pub fn inject_into_pid_with_target_cancellable(
+        pid: i32,
+        _target: FocusTarget,
+        text: &str,
+        authorize: &dyn Fn() -> bool,
+    ) -> eyre::Result<InjectOutcome> {
+        if !authorize() {
+            return Ok(InjectOutcome::Cancelled);
+        }
+        Self::inject_into_pid(pid, text)
     }
 
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
@@ -1796,6 +2057,52 @@ mod tests {
         assert_eq!(plan_live_inject(Some(555)), LiveInjectPlan::ResolveApp { pid: 555 });
         // No frontmost app → no live field → hold (never invent a target).
         assert_eq!(plan_live_inject(None), LiveInjectPlan::Hold);
+    }
+
+    #[test]
+    fn missing_fresh_focus_reuses_only_same_frontmost_editable_capture() {
+        // Exact logged failure: press/menu capture found an editable field, but
+        // the write-time AX query returned -25212. If the same app is still
+        // frontmost, the retained positive evidence is the safe fallback.
+        assert!(retained_focus_can_fallback(
+            Some(32975),
+            Some(32975),
+            FocusEditability::Editable,
+            true,
+        ));
+        assert!(retained_focus_can_fallback(
+            Some(11476),
+            Some(11476),
+            FocusEditability::PasteSafe,
+            true,
+        ));
+
+        // Never revive a field after an app switch, with an unknown PID, or
+        // when the captured element was positively non-editable.
+        assert!(!retained_focus_can_fallback(
+            Some(32975),
+            Some(4659),
+            FocusEditability::Editable,
+            true,
+        ));
+        assert!(!retained_focus_can_fallback(
+            None,
+            Some(32975),
+            FocusEditability::Editable,
+            true,
+        ));
+        assert!(!retained_focus_can_fallback(
+            Some(32975),
+            Some(32975),
+            FocusEditability::NotEditable,
+            true,
+        ));
+        assert!(!retained_focus_can_fallback(
+            Some(32975),
+            Some(32975),
+            FocusEditability::Editable,
+            false,
+        ));
     }
 
     #[test]

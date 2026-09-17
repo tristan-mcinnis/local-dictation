@@ -438,8 +438,21 @@ define_class!(
         // paste or the target is unsafe (self / unknown / no editable field).
         #[unsafe(method(pasteLast:))]
         fn paste_last(&self, _sender: *mut AnyObject) {
-            let recorded = RECOVERY_TARGET_PID.lock().ok().and_then(|g| *g);
-            crate::recovery::paste_last_dictation(recorded);
+            // Keep the captured field available when the user clicks while a
+            // live utterance still owns the pipeline; reopening the menu can
+            // retry once that visible activity settles.
+            if !crate::recovery::recovery_may_write(
+                crate::ui_channel::state(),
+                crate::cancel::CANCEL.active(),
+            ) {
+                eprintln!("[recovery] dictation is still settling — paste deferred");
+                return;
+            }
+            let (recorded, retained_focus) = match RECOVERY_TARGET.lock() {
+                Ok(mut target) => (target.0, target.1.take()),
+                Err(_) => (None, None),
+            };
+            crate::recovery::paste_last_dictation(recorded, retained_focus);
         }
 
         // Pick the active Translate-mode target. representedObject holds the
@@ -530,8 +543,19 @@ define_class!(
             // the recovery-paste target (the guard refuses Local Dictation
             // itself / an unknown target).
             let pid = crate::injector::frontmost_pid();
-            if let Ok(mut g) = RECOVERY_TARGET_PID.lock() {
-                *g = pid;
+            let retained_focus = pid.and_then(|target_pid| {
+                match crate::injector::FocusTarget::capture_for_pid(target_pid) {
+                    Ok(target) => Some(target),
+                    Err(e) => {
+                        eprintln!(
+                            "[recovery] menu focus snapshot unavailable for pid {target_pid}: {e}"
+                        );
+                        None
+                    }
+                }
+            });
+            if let Ok(mut target) = RECOVERY_TARGET.lock() {
+                *target = (pid, retained_focus);
             }
         }
     }
@@ -627,12 +651,12 @@ static HISTORY_ENTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// so clearing the query restores the full list without re-querying the DB.
 static HISTORY_ALL: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 
-/// The app (PID) that was frontmost just before the status menu opened. This is
-/// the recovery-paste target — the foreign app the user was dictating into.
-/// Written by the menu delegate's `menuWillOpen:`, read by the
-/// "Paste last dictation" action. `None` = nothing recorded yet (or the recorded
-/// app was Local Dictation itself, which the guard refuses).
-static RECOVERY_TARGET_PID: Mutex<Option<i32>> = Mutex::new(None);
+/// The app and positively-editable field captured just before the status menu
+/// opened. The PID remains the fail-closed destination; the retained field is a
+/// fallback only if the fresh AX query loses focus while that same app remains
+/// frontmost. The action consumes the field, and the next menu open refreshes it.
+static RECOVERY_TARGET: Mutex<(Option<i32>, Option<crate::injector::FocusTarget>)> =
+    Mutex::new((None, None));
 
 pub fn init_and_run() -> eyre::Result<()> {
     let mtm = MainThreadMarker::new()

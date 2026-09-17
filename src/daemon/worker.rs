@@ -1105,9 +1105,9 @@ pub(super) fn worker_loop(
                 // cost is the same as the old release-time spawn, and usually
                 // strictly less because the AX wake happened during speech, not
                 // after. We need the target app *before* cleanup so we can skip
-                // Gemma when the destination is a terminal — and we reuse this
-                // same target for injection, keeping get_focused_element off the
-                // critical path.
+                // Gemma when the destination is a terminal. The injector still
+                // resolves the current field at write time; this capture is the
+                // same-app fallback only if that fresh lookup loses focus.
                 let press_target: Option<FocusTarget> = match pending_target.take() {
                     Some(rx) => rx.recv().ok().and_then(|r| r.ok()),
                     None => None,
@@ -1124,9 +1124,9 @@ pub(super) fn worker_loop(
                     .filter(crate::injector::focus_target_still_current);
                 let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
                 if captured_target.is_some() {
-                    eprintln!("  ⌖    reuse press-time focus target");
+                    eprintln!("  ⌖    press-time focus ready · fresh check at write");
                 } else {
-                    eprintln!("  ⌖    fresh focus capture (press target failed/stale)");
+                    eprintln!("  ⌖    press-time focus unavailable/stale · fresh check at write");
                 }
 
                 // ─── Spoken prefix command (e.g. "translate to Chinese …") ──

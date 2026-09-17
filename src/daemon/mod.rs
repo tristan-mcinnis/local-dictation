@@ -19,7 +19,6 @@ mod listen;
 use ptt::*;
 use worker::*;
 pub use listen::run_listen;
-pub(crate) use worker::show_result_pill;
 use listen::*;
 
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
