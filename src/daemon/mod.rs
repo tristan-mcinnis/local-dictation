@@ -143,8 +143,10 @@ impl DaemonConfig {
         #[cfg(feature = "cleaner")] llm_model_path: String,
         no_cleanup: bool,
     ) -> Self {
-        let hotkey_keycode =
-            crate::settings::Settings::load().resolve_hotkey(crate::hotkeys::DEFAULT_KEYCODE);
+        // Through `Hotkey::from_settings` so an unusable configured key (a
+        // plain typing key with no modifier) falls back the same way here as
+        // in the event tap.
+        let hotkey_keycode = crate::hotkeys::Hotkey::from_settings().keycode;
         Self {
             asr,
             #[cfg(feature = "cleaner")]
@@ -239,12 +241,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     } else {
         modifiers_from_mask(hotkey.modifiers)
     };
-
-    // Warn (but do not block) when another app has already registered the same
-    // combo system-wide — the hotkey may not fire reliably.
-    if let Some(msg) = crate::hotkeys::detect_conflict(&hotkey) {
-        eprintln!("[hotkey] ⚠ conflict: {msg}");
-    }
 
     // Hands-free latch state shared with the callback. `state` is the ST_*
     // machine driven by `ptt_transition`; `space_down` lets us swallow the
@@ -477,8 +473,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         // Chord hotkey: the non-modifier key went down with the
                         // required modifiers held. Swallow it so the keystroke
                         // never reaches the app (no stray character / menu).
+                        // The four modifier bits must EQUAL the chord's (an
+                        // extra Shift is the transform gesture), so ⌘⇧D does
+                        // not also swallow another app's ⌘⇧⌥D.
                         let flags = event.get_flags();
-                        if flags.contains(required_mask) {
+                        if crate::hotkeys::chord_modifiers_match(flags.bits(), hotkey.modifiers) {
                             // Key repeat is still the same physical press. In
                             // double-tap hands-free, treating it as a fresh tap
                             // would immediately stop capture before release.

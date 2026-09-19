@@ -1117,7 +1117,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     // Custom hotkey (chord) — an arbitrary modifiers + key combo, e.g.
     // cmd+shift+d. The popup above only offers bare modifier keys; this field
     // is where a chord is declared. A live hint below reports the parsed
-    // result plus any system-wide conflict.
+    // result, or why the key cannot be used (a plain key with no modifier).
     let (initial_custom_hotkey, initial_hotkey_hint) = initial_custom_hotkey();
     let custom_hotkey_field = text_row(mtm, &mut card, "Custom hotkey", &initial_custom_hotkey);
     custom_hotkey_field.setPlaceholderString(Some(&NSString::from_str("e.g. cmd+shift+d or f5")));
@@ -3309,29 +3309,12 @@ fn popup_selected_rep(sender: *mut AnyObject) -> String {
 // ─── State plumbing ──────────────────────────────────────────────────────
 
 /// Render a keycode as a parseable key name ("d", "f5", "space", …) so a
-/// configured chord can be round-tripped back through `Hotkey::parse`.
+/// configured chord can be round-tripped back through `Hotkey::parse`. The
+/// table lives in `hotkeys.rs`; macOS keycodes are not alphabetical.
 fn key_name_from_keycode(code: i64) -> String {
-    match code {
-        0x31 => "space".into(),
-        0x24 => "return".into(),
-        0x30 => "tab".into(),
-        0x35 => "escape".into(),
-        0x7B => "left".into(),
-        0x7C => "right".into(),
-        0x7D => "down".into(),
-        0x7E => "up".into(),
-        _ => {
-            if (0x7A..=0x8D).contains(&code) {
-                format!("f{}", code - 0x7A + 1)
-            } else if (0x00..=0x19).contains(&code) {
-                ((b'a' + code as u8) as char).to_string()
-            } else if (0x1D..=0x26).contains(&code) {
-                ((b'0' + (code - 0x1D) as u8) as char).to_string()
-            } else {
-                format!("key 0x{code:x}")
-            }
-        }
-    }
+    crate::hotkeys::key_name_for_keycode(code)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("key 0x{code:x}"))
 }
 
 /// Render a `Hotkey` as a parseable shorthand ("cmd+shift+d", "f5", …).
@@ -3354,16 +3337,15 @@ fn hotkey_to_parseable(h: &crate::hotkeys::Hotkey) -> String {
 }
 
 /// Parse a custom-hotkey field string. Returns the hint line to display and,
-/// on a valid parse, the `(keycode, modifiers)` to write into `pending`.
+/// on a valid AND usable hotkey, the `(keycode, modifiers)` to write into
+/// `pending`. A plain typing key with no modifier is refused: the event tap
+/// would swallow that key in every app.
 fn parse_custom_hotkey(s: &str) -> (String, Option<(i64, u64)>) {
     match crate::hotkeys::Hotkey::parse(s) {
-        Some(hk) => {
-            let hint = match crate::hotkeys::detect_conflict(&hk) {
-                Some(msg) => format!("{} — {msg}", hk.display()),
-                None => format!("{} — no conflict detected", hk.display()),
-            };
-            (hint, Some((hk.keycode, hk.modifiers)))
-        }
+        Some(hk) => match hk.problem() {
+            Some(why) => (format!("{} — {why}", hk.display()), None),
+            None => (hk.display(), Some((hk.keycode, hk.modifiers))),
+        },
         None => ("unrecognized hotkey".to_string(), None),
     }
 }
@@ -3382,11 +3364,7 @@ fn initial_custom_hotkey() -> (String, String) {
         )
     } else {
         let text = hotkey_to_parseable(&hk);
-        let hint = match crate::hotkeys::detect_conflict(&hk) {
-            Some(msg) => format!("{} — {msg}", hk.display()),
-            None => format!("{} — no conflict detected", hk.display()),
-        };
-        (text, hint)
+        (text, hk.display())
     }
 }
 

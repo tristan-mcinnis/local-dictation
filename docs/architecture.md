@@ -211,6 +211,13 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
   → injector.rs (AX direct, or clipboard paste for Electron) + trailing-action keystroke
 ```
 
+**Keycodes** are the real macOS virtual keycodes (`kVK_*`), which are not alphabetical; the one
+name↔code table is `hotkeys::KEY_TABLE`. Before 2026-09 the table was arithmetic, so a typed chord
+bound a different physical key than it displayed (`cmd+shift+d` watched F). A keycode already saved
+in `settings.json` still names the same physical key; only its label is now honest, so there is no
+migration. There is no "chord already taken" probe: the Carbon check it used was unreliable and was
+removed rather than reassure falsely.
+
 **Hotkey stop boundary:** only a new physical key edge reaches the hold/latch
 state machine. Autorepeated chord key-downs and duplicate modifier events do
 not count as another tap. Modifier events use the SDK's left/right device
@@ -403,7 +410,7 @@ stack:
 | `DICTATE_COHERE_LANG` | Decoder language hint (default `en`) |
 | `DICTATE_LLM_MODEL_PATH` | Cleanup-LLM GGUF path. `S1_MODEL_PATH` is an accepted alias; `GEMMA_MODEL_PATH` is deprecated (still honoured, warns once). New name wins when several are set |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `hotkeys::DEFAULT_KEYCODE` = `0x3D` Right Option; decimal or `0x` hex) |
-| `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key) |
+| `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key). The held modifiers must equal the mask (an extra Shift is the transform gesture). A plain typing key with no modifier is refused (`Hotkey::problem`) and falls back to the default; only a modifier key or F1–F20 may stand alone |
 | `DICTATE_DOUBLE_TAP_LATCH` | Double-tap the hotkey to latch hands-free (`0`/`false`/`off` disables) |
 | `DICTATE_WHISPER_MODE` | Lower VAD speech threshold for quiet speech |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
