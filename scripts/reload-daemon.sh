@@ -32,4 +32,4 @@ else
 fi
 
 open "$APP"
-echo "✓ relaunched ${APP##*/} — config reloaded. Logs: tail -f /tmp/dictate-daemon.log"
+echo "✓ relaunched ${APP##*/} — config reloaded. Logs: tail -f \"$HOME/Library/Logs/Local Dictation/daemon.log\""

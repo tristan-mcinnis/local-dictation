@@ -7,6 +7,7 @@ pub mod audio_duck;
 pub mod cohere_mlx;
 pub mod corrections;
 pub mod cues;
+pub mod daemon_log;
 pub mod dictionary;
 pub mod history;
 pub mod hotkeys;

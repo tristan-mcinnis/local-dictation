@@ -92,7 +92,7 @@ signed, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
 Accessibility to the app itself (granted once), instead of to whatever terminal launched it.
 Ad-hoc signing means a *rebuild* changes the signature hash and macOS may re-ask — a real
 Developer ID would make grants stick. When bundled, the daemon redirects stdout/stderr to
-`/tmp/dictate-daemon.log` (no terminal to print to).
+`~/Library/Logs/Local Dictation/daemon.log` (no terminal to print to; see Debugging).
 
 **Model resolution** (`src/app_paths.rs`). The *base* directory, in order:
 `DICTATE_MODELS_DIR` env > `<app>/Contents/Resources/models` (shipped, self-contained) >
@@ -420,6 +420,7 @@ stack:
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_DEBUG_STREAM` | Per-segment `⟫ seg` stream logging (default off) |
+| `DICTATE_LOG_TEXT` | Debug only: log dictated text, spoken instructions and screen terms verbatim. Default off — the log carries lengths and timings only |
 | `DICTATE_NO_MUTE` | Do not duck other audio during capture |
 | `DICTATE_NO_NORMALIZE` | Skip ASR amplitude normalization |
 | `DICTATE_PROMPTS_PATH` / `DICTATE_CLEANUP_PROMPT` / `DICTATE_TRANSFORM_PROMPT` | Override the prompts file / cleanup prompt / transform prompt |
@@ -441,8 +442,18 @@ on Cohere MLX Q4. Only `DICTATE_COHERE_LANG` (decoder language) is honored. `FOC
 
 ## Debugging
 
-Structured per-utterance logs (asr/cleanup/inject timings, target app, injected text, screen-vocab)
-go to `app_paths::DAEMON_LOG_PATH` (`/tmp/dictate-daemon.log`) — `tail -f` it, or `fast-dictate-backend logs` to open it. First
+Structured per-utterance logs (asr/cleanup/inject timings, target app, text and screen-vocab
+*sizes*) go to `app_paths::daemon_log_path()` (`~/Library/Logs/Local Dictation/daemon.log`) —
+`tail -f` it, or `fast-dictate-backend logs` to open it. `src/daemon_log.rs` owns the file: the
+directory is `0700`, the file `0600`, the open refuses a symlink (`O_NOFOLLOW`), and a file past
+5 MB is renamed to `daemon.log.1` (one generation kept) at boot and again at the end of a
+recording. The log does **not** contain dictated text, spoken instructions or harvested on-screen
+terms: those sites go through `daemon_log::text` / `daemon_log::terms`, which print lengths
+(`<42 chars · 8 words>`, `<5 terms>`). History retention and "Delete all" cannot reach the log, so
+text must never land there by default. `DICTATE_LOG_TEXT=1` is the debug switch that logs the
+text verbatim; new log lines that carry user text must use the same helpers. (Until 2026-09 the
+log was the shared, world-readable `/tmp/dictate-daemon.log`; that file is no longer written and
+can be deleted.) First
 daemon run needs Microphone + Accessibility permissions granted in System Settings; macOS ties
 Accessibility permission to the launching terminal, so the daemon must be started from a real
 terminal (an agent can't grant it). `ax-check` surfaces the permission prompt.

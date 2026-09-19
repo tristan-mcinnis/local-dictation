@@ -38,7 +38,6 @@ use crate::settings::{self, Settings};
 
 use std::sync::{Mutex, OnceLock};
 
-use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
 use crate::menubar::house_theme::{
     CONTROL_CHIP, CONTROL_FOOTER, CONTROL_RAILROW, CONTROL_ROW, CONTROL_TILE, HAIRLINE,
@@ -623,7 +622,7 @@ define_class!(
 
         #[unsafe(method(openLog:))]
         fn open_log(&self, _sender: *mut AnyObject) {
-            let _ = std::process::Command::new("open").args(["-t", LOG_PATH]).status();
+            menubar::open_log_in_editor();
         }
 
         #[unsafe(method(exportLog:))]

@@ -115,7 +115,7 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
                 Some(m) => m.body,            // wake word heard → its body
                 None if armed => raw.clone(), // armed continuation → whole segment
                 None => {
-                    eprintln!("  ·    (ignored) {raw:?}");
+                    eprintln!("  ·    (ignored) {}", crate::daemon_log::text(&raw));
                     continue;
                 }
             };
@@ -266,7 +266,7 @@ pub(super) fn inject_refined_authorized(
             };
             match res {
                 Ok(crate::injector::InjectOutcome::Injected) => {
-                    eprintln!("  ✓    \"{text}\"");
+                    eprintln!("  ✓    {}", crate::daemon_log::text(&text));
                     ui_channel::set_last_dictation(&text);
                     crate::history::record(&text);
                     if !matches!(action, TrailingAction::None) {

@@ -49,7 +49,7 @@ makes macOS re-ask. Only the user can grant the permission.
 
 - Paths: every per-user location resolves through `src/app_paths.rs`
   (`home_dir`, `config_dir`, `config_file`, `cache_dir`, `app_support_dir`,
-  `models_base_dir`, `DAEMON_LOG_PATH`). Never re-join `$HOME` elsewhere.
+  `models_base_dir`, `daemon_log_path`). Never re-join `$HOME` elsewhere.
 - Precedence is always env var > JSON file > built-in default, resolved in
   `settings.rs` `resolve_*` methods. Read config once at boot; relaunch to
   apply.
@@ -59,8 +59,11 @@ makes macOS re-ask. Only the user can grant the permission.
 - `daemon/` and `menubar/` are module directories (`mod.rs` + one file per
   concern). Child files start with `use super::*;` and expose cross-file items
   as `pub(super)`; only `mod.rs` re-exports the crate-public API.
-- Logging is `eprintln!` with a `[tag]` prefix to the daemon log. No logging
-  crate.
+- Logging is `eprintln!` with a `[tag]` prefix to the daemon log
+  (`~/Library/Logs/Local Dictation/daemon.log`, `0600`, rotated at 5 MB by
+  `src/daemon_log.rs`). No logging crate. User text never goes in a log line
+  raw: wrap it in `daemon_log::text` / `daemon_log::terms`, which print
+  lengths unless `DICTATE_LOG_TEXT=1`.
 - Child processes use `std::process::Command` with argument arrays. No
   shell interpolation.
 - User data on disk (`~/.config/local-dictation/*.json`, `history.db`) keeps

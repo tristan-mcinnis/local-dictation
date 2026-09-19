@@ -34,15 +34,25 @@ pub fn running_in_bundle() -> bool {
     bundle_resources_dir().is_some()
 }
 
-/// The daemon's structured log. A bundled app redirects stdout/stderr here
-/// (no terminal to print to); the menu bar, the settings window and the
-/// `logs` subcommand all open this same file.
-pub const DAEMON_LOG_PATH: &str = "/tmp/dictate-daemon.log";
-
 /// `$HOME` as a path (None when unset). Every per-user location below is
 /// derived from this one accessor rather than re-reading the env var.
 pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `~/Library/Logs/Local Dictation` — the per-user log directory (created
+/// `0700` by `daemon_log::open`). `None` if `$HOME` is unset.
+pub fn logs_dir() -> Option<PathBuf> {
+    Some(home_dir()?.join("Library/Logs/Local Dictation"))
+}
+
+/// The daemon's structured log, `~/Library/Logs/Local Dictation/daemon.log`.
+/// A bundled app redirects stdout/stderr here (no terminal to print to); the
+/// menu bar, the settings window and the `logs` subcommand all open this same
+/// file. Opening, permissions and rotation live in `daemon_log.rs`. It used
+/// to be the shared, world-readable `/tmp/dictate-daemon.log`.
+pub fn daemon_log_path() -> Option<PathBuf> {
+    Some(logs_dir()?.join("daemon.log"))
 }
 
 /// `~/Library/Application Support/Local Dictation` (None if `$HOME` is unset).
@@ -157,6 +167,15 @@ pub fn llm_models_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_log_is_per_user_and_never_in_tmp() {
+        if let Some(log) = daemon_log_path() {
+            assert!(log.ends_with("Library/Logs/Local Dictation/daemon.log"));
+            assert!(log.starts_with(home_dir().unwrap()));
+            assert!(!log.starts_with("/tmp"));
+        }
+    }
 
     #[test]
     fn config_file_lives_under_config_dir() {

@@ -212,7 +212,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | `toggle`, `start`, `stop`, `cancel` | Drive a running daemon over its control socket (Shortcuts, Raycast, a foot pedal) |
 | `fetch-models [dir]` | Verify the fixed local model stack |
 | `bench [wav]` | Transcribe and clean a WAV, report timings |
-| `logs` | Open the daemon log |
+| `logs` | Open the daemon log (`~/Library/Logs/Local Dictation/daemon.log`, readable only by you; it records timings and text lengths, never what you said) |
 | `ax-check` | Surface the Accessibility permission prompt |
 | `context-probe` | Print the proper nouns harvested from the focused window |
 

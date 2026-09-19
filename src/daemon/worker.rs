@@ -888,6 +888,7 @@ pub(super) fn worker_loop(
                 if !ui_channel::set_phase(cur_gen, UiState::Transcribing) { continue; }
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 let held = press_to_release.unwrap_or_default();
+                crate::daemon_log::rotate_stdio_if_needed();
                 eprintln!("⏹ stopped · held {}", secs(held));
 
                 // Focus capturing now starts at key-press (StartRecording), not
@@ -1202,7 +1203,7 @@ pub(super) fn worker_loop(
                         match cleaner {
                             Some(ref c) if !is_terminal => {
                                 if !screen_vocab.is_empty() {
-                                    eprintln!("  ⌕    screen vocab: {}", screen_vocab.join(", "));
+                                    eprintln!("  ⌕    screen vocab: {}", crate::daemon_log::terms(&screen_vocab));
                                 }
                                 // Fix known proper nouns in the *raw* transcript
                                 // before cleanup, so the small model sees the
@@ -1401,7 +1402,7 @@ pub(super) fn worker_loop(
                 // the fact. One line to the /tmp log, well off the hot path.
                 #[cfg(feature = "cleaner")]
                 if cleaner.is_some() && raw_transcript.trim() != final_text.trim() {
-                    eprintln!("  ⟫ raw · \"{raw_transcript}\"");
+                    eprintln!("  ⟫ raw · {}", crate::daemon_log::text(&raw_transcript));
                 }
                 // Truncation watchdog: if the cleaned text is dramatically
                 // shorter than the raw transcript (>40% dropped), the cleanup
@@ -1412,13 +1413,14 @@ pub(super) fn worker_loop(
                 let final_chars = final_text.chars().count();
                 if raw_chars > 40 && final_chars * 5 < raw_chars * 3 {
                     eprintln!(
-                        "  ⚠    cleanup shrank text {raw_chars} → {final_chars} chars · raw: \"{raw_transcript}\""
+                        "  ⚠    cleanup shrank text {raw_chars} → {final_chars} chars · raw: {}",
+                        crate::daemon_log::text(&raw_transcript)
                     );
                 }
                 match finish {
                     crate::injector::FinalizeResult::Injected => {
                         recovery.status = crate::history::RecoveryStatus::Completed;
-                        eprintln!("  ✓    \"{final_text}\"");
+                        eprintln!("  ✓    {}", crate::daemon_log::text(&final_text));
                         cues::play_success();
                         // Remember it for the menu-bar "Copy last dictation" item.
                         // Stored BEFORE the pill shows so the word count is this
@@ -1505,8 +1507,8 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
         }
     };
     eprintln!(
-        "  ✎    \"{}\"  ·  {} chars selected",
-        instruction.trim(),
+        "  ✎    {}  ·  {} chars selected",
+        crate::daemon_log::text(instruction.trim()),
         selection.chars().count()
     );
 
@@ -1681,7 +1683,7 @@ pub(super) fn stream_process_asr(
         // model runs once on the whole utterance at release, not on partial
         // segments, so accuracy isn't traded for a marginal latency win.
         if std::env::var_os("DICTATE_DEBUG_STREAM").is_some() {
-            eprintln!("  ⟫ seg · {raw:?}");
+            eprintln!("  ⟫ seg · {}", crate::daemon_log::text(&raw));
         }
         let (raw_so_far, preview) = cache_stream_segment(refiner, raw, raw_segs_acc, segs_acc);
         crate::history::append_recovery_stage(generation, crate::history::StageKind::Raw, &raw_so_far, "Streaming ASR, partial");
@@ -1836,7 +1838,7 @@ pub(super) fn handle_spoken_command(
     };
     match inject_result {
         Ok(crate::injector::InjectOutcome::Injected) => {
-            eprintln!("  ✓    {} ms → \"{result}\"", ms(t.elapsed()));
+            eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
             ui_channel::set_last_dictation(result);
             crate::history::append_recovery_stage(generation, StageKind::Output, result, "Inserted");
             RecoveryStatus::Completed

@@ -263,19 +263,25 @@ fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
 /// Open the daemon log in the user's default text editor / Console.app.
 /// Same path the menu-bar "Open Log" item uses.
 fn run_logs() -> eyre::Result<()> {
-    let log_path = fast_dictate_backend::app_paths::DAEMON_LOG_PATH;
-    if !std::path::Path::new(log_path).exists() {
-        eprintln!("[logs] {log_path} doesn't exist yet — start the daemon first with `daemon`.");
+    let Some(log_path) = fast_dictate_backend::app_paths::daemon_log_path() else {
+        return Err(eyre::eyre!("HOME is unset; cannot locate the daemon log"));
+    };
+    if !log_path.exists() {
+        eprintln!(
+            "[logs] {} doesn't exist yet — start the daemon first with `daemon`.",
+            log_path.display()
+        );
         return Ok(());
     }
     // `open -t` uses the default .txt editor (Console.app on most setups).
     let status = std::process::Command::new("open")
-        .args(["-t", log_path])
+        .arg("-t")
+        .arg(&log_path)
         .status()?;
     if !status.success() {
         return Err(eyre::eyre!("`open` exited with {status}"));
     }
-    println!("[logs] opened {log_path}");
+    println!("[logs] opened {}", log_path.display());
     Ok(())
 }
 
@@ -556,22 +562,11 @@ async fn run_transform(_i: Option<String>, _t: Option<String>) -> eyre::Result<(
 /// from the very first launch. No-op when not bundled (keep terminal output).
 #[cfg(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject"))]
 fn redirect_stdio_to_log_if_bundled() {
-    use std::os::unix::io::AsRawFd;
     if !fast_dictate_backend::app_paths::running_in_bundle() {
         return;
     }
-    if let Ok(f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(fast_dictate_backend::app_paths::DAEMON_LOG_PATH)
-    {
-        unsafe {
-            libc::dup2(f.as_raw_fd(), 1);
-            libc::dup2(f.as_raw_fd(), 2);
-        }
-        // Leak the handle so the fd stays valid for the process's lifetime.
-        std::mem::forget(f);
-    }
+    // Private (0600) per-user file, rotated at the size cap; see daemon_log.rs.
+    fast_dictate_backend::daemon_log::redirect_stdio();
 }
 
 /// EXPERIMENTAL: run the hands-free wake-word listener instead of the

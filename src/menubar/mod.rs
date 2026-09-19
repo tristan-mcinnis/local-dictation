@@ -71,7 +71,6 @@ use std::sync::{Mutex, OnceLock};
 use crate::settings::{self, PillSize, Settings, WaveformSensitivity};
 use crate::ui_channel::{self, UiState};
 
-use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
 // ─── Slate geometry ──────────────────────────────────────────────────────
 //
@@ -244,9 +243,7 @@ define_class!(
     impl MenuActions {
         #[unsafe(method(openLog:))]
         fn open_log(&self, _sender: *mut AnyObject) {
-            let _ = std::process::Command::new("open")
-                .args(["-t", LOG_PATH])
-                .status();
+            open_log_in_editor();
         }
 
         #[unsafe(method(exportLog:))]
@@ -1350,12 +1347,7 @@ pub(crate) fn relaunch_daemon() {
         }
     };
 
-    let open_log = || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(LOG_PATH)
-    };
+    let open_log = crate::daemon_log::open;
     let (stdout, stderr) = match (open_log(), open_log()) {
         (Ok(a), Ok(b)) => (Stdio::from(a), Stdio::from(b)),
         _ => (Stdio::inherit(), Stdio::inherit()),
@@ -1394,11 +1386,22 @@ pub(crate) fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Open the daemon log in the default text editor ("Open Log").
+pub(crate) fn open_log_in_editor() {
+    let Some(log) = crate::app_paths::daemon_log_path() else {
+        return;
+    };
+    let _ = std::process::Command::new("open").arg("-t").arg(log).status();
+}
+
 pub(crate) fn export_log_to_downloads() {
     let Some(home) = crate::app_paths::home_dir() else {
         return;
     };
-    if !std::path::Path::new(LOG_PATH).exists() {
+    let Some(log) = crate::app_paths::daemon_log_path() else {
+        return;
+    };
+    if !log.exists() {
         return;
     }
     let ts = std::time::SystemTime::now()
@@ -1408,7 +1411,7 @@ pub(crate) fn export_log_to_downloads() {
     let dest = home
         .join("Downloads")
         .join(format!("dictate-log-{ts}.txt"));
-    if std::fs::copy(LOG_PATH, &dest).is_ok() {
+    if std::fs::copy(&log, &dest).is_ok() {
         // Reveal it in Finder so the user sees where it landed.
         let _ = std::process::Command::new("open")
             .arg("-R")
