@@ -71,12 +71,56 @@ struct Job {
     /// Force a full prefill (ignore the resident KV prefix). Used only by the
     /// parity test to prove cached output == uncached output.
     no_reuse: bool,
+    /// Fail instead of returning text when generation stops at `max_tokens`
+    /// rather than at the model's end-of-generation token. Transform sets it:
+    /// its output REPLACES the user's selection, so a cut-off rewrite must never
+    /// be returned as if it were complete.
+    fail_on_truncation: bool,
     reply: oneshot::Sender<eyre::Result<String>>,
 }
 
 /// Longest common prefix length of two token slices.
-fn common_prefix_len(a: &[LlamaToken], b: &[LlamaToken]) -> usize {
+fn common_prefix_len<T: PartialEq>(a: &[T], b: &[T]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
+/// How many leading tokens of `tokens` may be reused from the KV cache that
+/// `resident` describes. Capped at `len - 1` so at least one prompt token is
+/// (re)decoded — fresh logits are needed to sample from even when the prompt
+/// is identical to the previous one.
+fn plan_reuse<T: PartialEq>(tokens: &[T], resident: &[T], no_reuse: bool) -> usize {
+    if no_reuse {
+        0
+    } else {
+        common_prefix_len(tokens, resident).min(tokens.len().saturating_sub(1))
+    }
+}
+
+/// Largest selection (in chars) transform will take. Its output budget is 1536
+/// tokens (~6000 chars of English); a longer selection could only come back
+/// cut off, and a far longer one overflows the context window mid-decode.
+pub const MAX_TRANSFORM_CHARS: usize = 6000;
+
+/// Why `selection` cannot be transformed, or `None` when it can.
+pub fn transform_input_problem(selection: &str) -> Option<String> {
+    let n = selection.chars().count();
+    (n > MAX_TRANSFORM_CHARS).then(|| {
+        format!(
+            "selection is too long to rewrite safely ({n} characters, limit {MAX_TRANSFORM_CHARS}); it was left unchanged"
+        )
+    })
+}
+
+/// Headroom kept free in the context window for generation.
+const MIN_GENERATION_ROOM: usize = 64;
+
+/// Why a prompt of `prompt_len` tokens cannot run, or `None`. Checked BEFORE
+/// the KV cache is touched, so an oversize prompt fails cleanly instead of
+/// overflowing the batch half-way through a decode.
+fn prompt_len_problem(prompt_len: usize) -> Option<String> {
+    let limit = (MAX_CTX as usize).saturating_sub(MIN_GENERATION_ROOM);
+    (prompt_len > limit)
+        .then(|| format!("prompt is {prompt_len} tokens; the cleanup model's limit is {limit}"))
 }
 
 /// True when cleanup output looks like a model runaway and the caller should
@@ -592,17 +636,23 @@ impl TextCleanupEngine {
         if instruction.is_empty() || selection.is_empty() {
             return Ok(selection.to_string());
         }
+        if let Some(problem) = transform_input_problem(selection) {
+            return Err(eyre::eyre!(problem));
+        }
         let user_msg = format!("Instruction: {instruction}\n\nText:\n{selection}");
         // Give the output room for a rewrite that's somewhat longer than the
         // input (e.g. "expand this"), capped to keep within the context window.
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
         // Preserve line structure: transforms may legitimately be lists/paras.
-        self.run_chat(
+        // The result replaces the selection, so a rewrite that stopped at the
+        // token budget (not at the model's own end) is an error, not a result.
+        self.run_chat_with(
             self.prompts.transform.clone(),
             user_msg,
             budget,
             true,
             false,
+            true,
         )
         .await
     }
@@ -618,6 +668,21 @@ impl TextCleanupEngine {
         preserve_newlines: bool,
         no_reuse: bool,
     ) -> eyre::Result<String> {
+        self.run_chat_with(system_msg, user_msg, max_tokens, preserve_newlines, no_reuse, false)
+            .await
+    }
+
+    /// [`Self::run_chat`] with the truncation policy explicit (see
+    /// `Job::fail_on_truncation`).
+    async fn run_chat_with(
+        &self,
+        system_msg: String,
+        user_msg: String,
+        max_tokens: i32,
+        preserve_newlines: bool,
+        no_reuse: bool,
+        fail_on_truncation: bool,
+    ) -> eyre::Result<String> {
         let prompt =
             Self::template_messages(&self.model, &self.chat_template, &system_msg, &user_msg)?;
         let (reply, rx) = oneshot::channel();
@@ -629,6 +694,7 @@ impl TextCleanupEngine {
                 max_tokens,
                 preserve_newlines,
                 no_reuse,
+                fail_on_truncation,
                 reply,
             })
             .map_err(|_| eyre::eyre!("cleanup worker is gone"))?;
@@ -700,6 +766,7 @@ fn run_worker(
             job.max_tokens,
             job.preserve_newlines,
             job.no_reuse,
+            job.fail_on_truncation,
         );
         let _ = job.reply.send(res);
     }
@@ -714,6 +781,7 @@ fn run_job(
     max_tokens: i32,
     preserve_newlines: bool,
     no_reuse: bool,
+    fail_on_truncation: bool,
 ) -> eyre::Result<String> {
     let tokens = model
         .str_to_token(&prompt, AddBos::Always)
@@ -722,6 +790,9 @@ fn run_job(
         return Ok(String::new());
     }
     let prompt_len = tokens.len();
+    if let Some(problem) = prompt_len_problem(prompt_len) {
+        return Err(eyre::eyre!(problem)); // KV cache and `resident` untouched
+    }
     // Never ask for more output tokens than the fixed window can hold.
     let max_tokens = max_tokens
         .min((MAX_CTX as usize).saturating_sub(prompt_len + 16) as i32)
@@ -730,17 +801,18 @@ fn run_job(
     // Reuse the KV prefix shared with the last prompt. Cap at prompt_len-1 so at
     // least one prompt token is (re)decoded — we need fresh logits to sample
     // from even when the prompt is byte-identical to the previous one.
-    let reuse = if no_reuse {
-        0
-    } else {
-        common_prefix_len(&tokens, resident).min(prompt_len.saturating_sub(1))
-    };
+    let reuse = plan_reuse(&tokens, resident, no_reuse);
 
     // Wipe everything from `reuse` onward (the divergent tail of the previous
     // prompt plus whatever it generated). KV [0, reuse) holds identical tokens
     // at identical positions, so it stays valid.
     ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
         .map_err(|e| eyre::eyre!("clear_kv_cache_seq failed: {e:?}"))?;
+    // Bookkeeping follows the cache at every step. `resident` used to be
+    // updated only on success, so a job that failed after this wipe left it
+    // describing tokens that were gone, and the NEXT job reused a prefix the
+    // cache no longer held (silently wrong output until relaunch).
+    resident.truncate(reuse);
 
     let mut batch = LlamaBatch::new(MAX_CTX as usize, 1);
     let new = &tokens[reuse..];
@@ -751,7 +823,15 @@ fn run_job(
             .map_err(|e| eyre::eyre!("batch.add prompt token failed: {e:?}"))?;
     }
     ctx.decode(&mut batch)
-        .map_err(|e| eyre::eyre!("decode prompt failed: {e:?}"))?;
+        .map_err(|e| {
+            // A failed decode may have written any part of the new tail.
+            // Forget everything; the next job clears the cache from 0.
+            resident.clear();
+            eyre::eyre!("decode prompt failed: {e:?}")
+        })?;
+    // The whole prompt is resident from here on, whatever generation does.
+    // Generated tokens sit beyond it and are wiped by the next job's clear.
+    *resident = tokens;
 
     // Low-temperature fixed-seed sampling is deterministic while avoiding the
     // immediate EOG produced by greedy/default Qwen sampling on S1-mini.
@@ -765,10 +845,12 @@ fn run_job(
     let mut n_cur = prompt_len as i32;
     let mut decoded_count = 0i32;
 
+    let mut finished = false;
     while decoded_count < max_tokens {
         let tok = sampler.sample(ctx, batch.n_tokens() - 1);
         sampler.accept(tok);
         if model.is_eog_token(tok) {
+            finished = true;
             break;
         }
         let piece = model
@@ -786,9 +868,11 @@ fn run_job(
         decoded_count += 1;
     }
 
-    // The prompt tokens are now resident at [0, prompt_len); generated tokens
-    // sit beyond and will be wiped by the next job's `clear_kv_cache_seq`.
-    *resident = tokens;
+    if fail_on_truncation && !finished {
+        return Err(eyre::eyre!(
+            "the rewrite was cut off at the {max_tokens}-token limit, so it was discarded"
+        ));
+    }
 
     // Defensive polish: strip preamble, peel wrapping quotes, collapse
     // whitespace, drop chat-template artefacts. Transform / list presets keep
@@ -803,6 +887,48 @@ fn run_job(
 #[cfg(test)]
 mod tests {
     use super::cleanup_ran_away;
+    use super::{plan_reuse, prompt_len_problem, transform_input_problem, MAX_CTX, MAX_TRANSFORM_CHARS};
+
+    #[test]
+    fn reuse_never_exceeds_what_a_failed_job_left_in_the_cache() {
+        // Job A ran: its prompt is resident.
+        let mut resident = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        // Job B shares 3 tokens, wipes the cache from 3, then FAILS.
+        let job_b = [1, 2, 3, 40, 50, 60];
+        let reuse_b = plan_reuse(&job_b, &resident, false);
+        assert_eq!(reuse_b, 3);
+        resident.truncate(reuse_b); // what run_job now does right after the wipe
+        // Job C is job A's prompt again. Before the fix `resident` still held
+        // all 8 tokens, so C "reused" 7 that the cache no longer contained.
+        let job_c = [1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(plan_reuse(&job_c, &resident, false), 3);
+    }
+
+    #[test]
+    fn reuse_always_leaves_one_token_to_decode() {
+        let resident = vec![1, 2, 3];
+        assert_eq!(plan_reuse(&[1, 2, 3], &resident, false), 2);
+        assert_eq!(plan_reuse(&[1, 2, 3, 4], &resident, false), 3);
+        assert_eq!(plan_reuse(&[9], &resident, false), 0);
+        assert_eq!(plan_reuse(&[1, 2, 3], &resident, true), 0);
+        assert_eq!(plan_reuse::<i32>(&[], &resident, false), 0);
+    }
+
+    #[test]
+    fn oversize_prompts_are_rejected_before_the_cache_is_touched() {
+        assert!(prompt_len_problem(400).is_none());
+        assert!(prompt_len_problem(MAX_CTX as usize - 64).is_none());
+        assert!(prompt_len_problem(MAX_CTX as usize - 63).is_some());
+        assert!(prompt_len_problem(20_000).is_some());
+    }
+
+    #[test]
+    fn transform_refuses_a_selection_it_could_only_truncate() {
+        assert!(transform_input_problem("short selection").is_none());
+        assert!(transform_input_problem(&"a".repeat(MAX_TRANSFORM_CHARS)).is_none());
+        let msg = transform_input_problem(&"é".repeat(MAX_TRANSFORM_CHARS + 1)).unwrap();
+        assert!(msg.contains("left unchanged"), "{msg}");
+    }
 
     #[test]
     fn runaway_guard() {
