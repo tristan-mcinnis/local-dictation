@@ -13,18 +13,33 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Write `body` to `path` atomically, keeping the existing file's permissions.
+/// Write `body` to `path` atomically, keeping the existing file's permissions
+/// (a new file is created `0600`: these files hold the user's own words).
+///
+/// A `path` that is a symlink (dotfile managers link `settings.json` into a
+/// repo) is written THROUGH: the temp file and the rename happen beside the
+/// link's target, so the link survives. A plain rename onto `path` would
+/// replace the link with a regular file and silently detach the user's
+/// dotfiles copy.
 pub fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir)?;
         }
     }
+    let target = resolve_symlink(path);
+    let path = target.as_path();
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(format!(".tmp-{}", std::process::id()));
     let tmp = path.with_file_name(tmp_name);
     let result = (|| {
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
         f.write_all(body)?;
         f.sync_all()?;
         if let Ok(meta) = std::fs::metadata(path) {
@@ -36,6 +51,21 @@ pub fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+/// The file a write to `path` should land in: the link's target when `path`
+/// is a symlink whose target resolves, else `path` itself (a dangling link is
+/// replaced, as before).
+fn resolve_symlink(path: &Path) -> PathBuf {
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        if let Ok(real) = std::fs::canonicalize(path) {
+            return real;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Copy `path` to `<name>.bak` beside it (or `<name>.<unix secs>.bak` when a
@@ -112,6 +142,34 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         write_atomic(&path, b"{\"a\":\"b\"}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_goes_through_a_symlink_and_keeps_it() {
+        // Regression: rename-over-path replaced a dotfiles symlink with a
+        // regular file, so the user's linked copy silently stopped updating.
+        let dir = scratch("symlink");
+        let real = dir.join("dotfiles").join("settings.json");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "old").unwrap();
+        let link = dir.join("settings.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_atomic(&link, b"new").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("newperm");
+        let path = dir.join("corrections.json");
+        write_atomic(&path, b"{}").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_dir_all(&dir);

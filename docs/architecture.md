@@ -363,7 +363,10 @@ its refresh never steals focus, and playback stops on close or selection change.
 harvests proper nouns from the focused window and feeds them to
 `cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. The prompt's
 vocabulary block holds at most 64 terms: the curated terms (corrections + dictionary) are capped
-once at boot to 48 (`prompts::cap_static_vocab`) and stay FIRST, so that block is byte-identical
+once at boot to 48 (`prompts::curated_vocabulary`: `dictionary.json` terms first, then the
+correction targets in sorted order, so the cut is the same on every launch and never falls on a
+dictionary term while a correction target, which the refiner enforces anyway, could go) and stay
+FIRST, so that block is byte-identical
 on every utterance and its KV prefix is reused; the last 16 slots are reserved for screen terms
 (`prompts::combined_vocabulary`), so a large dictionary can no longer evict them. The extractor
 ranks mid-sentence capitals above sentence-start ones, rewards repeats rather than length, drops
@@ -423,13 +426,15 @@ re-joining the path:
   manages `corrections.json`, not this file.
 
 **File safety** (`src/config_io.rs`). Every writer of these files writes atomically (temp file in
-the same directory, fsync, rename). `settings.json` is parsed one key at a time: a single bad value
+the same directory, fsync, rename; a new file is `0600`; a symlinked file is written through the
+link, so a dotfiles link survives). `settings.json` is parsed one key at a time: a single bad value
 falls back to that key's default with a `[warn]` line and the other keys survive; a document that
 is not a JSON object loads as defaults and is copied to `settings.json.bak` before the next save.
 `corrections.json` and `dictionary.json` cannot be rebuilt from anything, so a file that does not
 parse is never overwritten: `save_to` returns an error, the Dictionary window disables Add and
 Save, and the Settings pane refuses Add and says why. `_`-prefixed comment keys in
-`corrections.json` survive a save. CSV import strips a UTF-8 BOM.
+`corrections.json` survive a save. A blank `corrections.json` is an empty dictionary, not a
+corrupt one. CSV import strips a UTF-8 BOM.
 
 Precedence is always **env var > JSON file > built-in default**. The active env knobs on the fixed
 stack:

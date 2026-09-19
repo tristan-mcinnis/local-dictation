@@ -83,8 +83,9 @@ impl Corrections {
     /// The distinct replacement values — i.e. the *target* spellings the user
     /// cares about (`Lumen`, `macOS`, `GitHub`, …). Feeding these to the
     /// cleanup model as a "known vocabulary" hint stops it from "correcting"
-    /// them away before the post-cleanup substitution even runs. Order is
-    /// unspecified; duplicates are collapsed.
+    /// them away before the post-cleanup substitution even runs. Sorted
+    /// (case-insensitive) so the result is stable across launches; duplicates
+    /// are collapsed.
     pub fn replacement_values(&self) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut out = Vec::new();
@@ -93,6 +94,10 @@ impl Corrections {
                 out.push(v.clone());
             }
         }
+        // Sorted, so the list is the same on every launch. It feeds a capped
+        // prompt block: with HashMap order, WHICH terms survived the cap
+        // changed from one launch to the next.
+        out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
         out
     }
 
@@ -321,6 +326,11 @@ impl Corrections {
     pub fn load_from(path: &Path) -> eyre::Result<Self> {
         let body = std::fs::read_to_string(path)
             .map_err(|e| eyre::eyre!("read {}: {e}", path.display()))?;
+        // A blank file is an empty dictionary, not a corrupt one: `save_to`
+        // will write over it, so the editors must not lock the user out.
+        if body.trim().is_empty() {
+            return Ok(Self::empty());
+        }
         let raw: RawMap = serde_json::from_str(&body)
             .map_err(|e| eyre::eyre!("parse {}: {e}", path.display()))?;
         // Filter `_`-prefixed keys — convention for JSON-comment fields
@@ -642,6 +652,18 @@ mod tests {
         assert!(body.contains("names from the Q3 project"), "{body}");
         let back = Corrections::load_from(&path).unwrap();
         assert_eq!(back.len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_blank_file_is_an_empty_dictionary_and_can_be_saved_over() {
+        // Regression: a zero-byte corrections.json failed to load, so both
+        // editors refused every edit, although save would have accepted it.
+        let path = scratch_file("blank");
+        std::fs::write(&path, " \n").unwrap();
+        assert_eq!(Corrections::load_from(&path).unwrap().len(), 0);
+        Corrections::from_editor_text("Jenifer").save_to(&path).unwrap();
+        assert_eq!(Corrections::load_from(&path).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

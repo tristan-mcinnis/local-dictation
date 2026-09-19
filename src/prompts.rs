@@ -153,6 +153,19 @@ pub fn cap_static_vocab(terms: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The curated block in priority order, before the cap: `dictionary.json`
+/// terms FIRST, then the corrections' target spellings. When the two together
+/// pass the cap, something is cut. A correction target is still enforced after
+/// cleanup by the deterministic substitution; a dictionary term has no such
+/// second chance, so it must not be the one evicted. Both inputs keep their
+/// own (stable) order, so the block is identical on every launch.
+pub fn curated_vocabulary(dictionary: &[String], correction_targets: &[String]) -> Vec<String> {
+    let mut all = Vec::with_capacity(dictionary.len() + correction_targets.len());
+    all.extend_from_slice(dictionary);
+    all.extend_from_slice(correction_targets);
+    cap_static_vocab(&all)
+}
+
 /// Curated terms first (constant prefix), then up to [`SCREEN_VOCAB_SLOTS`]
 /// screen terms that are not already curated. `static_capped` must come from
 /// [`cap_static_vocab`]. Screen terms go LAST on purpose: the cleaner reuses
@@ -390,6 +403,20 @@ mod tests {
         assert_eq!(combined.last().unwrap(), "Screen15");
         let suffix = vocabulary_suffix(&combined).unwrap();
         assert!(suffix.contains("Screen15") && !suffix.contains("Screen16"));
+    }
+
+    #[test]
+    fn dictionary_terms_survive_the_cap_before_correction_targets() {
+        // Regression: corrections came first in HashMap order, so a big
+        // corrections file evicted every dictionary.json term, and which
+        // corrections survived changed per launch.
+        let targets: Vec<String> = (0..100).map(|i| format!("Target{i:03}")).collect();
+        let dictionary = vec!["Okafor".to_string(), "Lumen".to_string()];
+        let block = curated_vocabulary(&dictionary, &targets);
+        assert_eq!(block.len(), MAX_VOCAB_TERMS - SCREEN_VOCAB_SLOTS);
+        assert_eq!(&block[..2], &dictionary[..]);
+        assert_eq!(block[2], "Target000");
+        assert_eq!(block, curated_vocabulary(&dictionary, &targets), "stable");
     }
 
     #[test]

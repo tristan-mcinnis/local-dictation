@@ -258,14 +258,16 @@ impl TextCleanupEngine {
         // from corrections.json (from→to fixes) plus the flat dictionary.json
         // list (known words to preserve as-is). Both are soft hints; dedup +
         // cap happen in `vocabulary_suffix`.
-        let mut static_vocab = crate::corrections::Corrections::load_default()
+        let correction_targets = crate::corrections::Corrections::load_default()
             .map(|c| c.replacement_values())
             .unwrap_or_default();
-        static_vocab.extend(crate::dictionary::load_default());
+        let dictionary = crate::dictionary::load_default();
         // Cap once, at boot: the curated block is then byte-identical on every
         // utterance (KV prefix reuse) and always leaves room for screen terms.
-        let curated_total = static_vocab.len();
-        let static_vocab = crate::prompts::cap_static_vocab(&static_vocab);
+        // Dictionary terms go first so the cap cannot evict them (see
+        // `prompts::curated_vocabulary`).
+        let curated_total = dictionary.len() + correction_targets.len();
+        let static_vocab = crate::prompts::curated_vocabulary(&dictionary, &correction_targets);
         if curated_total > 0 {
             eprintln!(
                 "[boot] vocab       {} of {curated_total} curated term(s) in the prompt + up to {} screen terms per utterance",
