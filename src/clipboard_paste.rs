@@ -33,10 +33,10 @@ pub enum PasteOutcome {
     RefusedForeground,
 }
 
-// US ANSI virtual key codes.
-const KEY_C: CGKeyCode = 8;
-const KEY_V: CGKeyCode = 9;
-const KEY_Z: CGKeyCode = 6;
+// ⌘C / ⌘V / ⌘Z are posted at the key that types the letter in the CURRENT
+// layout (`crate::key_layout`), not at the US-ANSI position: on Dvorak the
+// ANSI V position is ⌘K, and on AZERTY the ANSI Z position is ⌘W.
+// Return, Tab and Escape sit at the same keycode on every layout.
 const KEY_RETURN: CGKeyCode = 36;
 const KEY_TAB: CGKeyCode = 48;
 const KEY_ESCAPE: CGKeyCode = 53;
@@ -386,13 +386,14 @@ pub fn copy_selection_via_clipboard() -> eyre::Result<Option<String>> {
 
 fn synthesize_cmd_c() -> eyre::Result<()> {
     let source = clean_event_source()?;
+    let key_c: CGKeyCode = crate::key_layout::copy_key();
 
-    let down = CGEvent::new_keyboard_event(source.clone(), KEY_C, true)
+    let down = CGEvent::new_keyboard_event(source.clone(), key_c, true)
         .map_err(|_| eyre::eyre!("Cmd+C keydown create failed"))?;
     down.set_flags(CGEventFlags::CGEventFlagCommand);
     down.post(CGEventTapLocation::HID);
 
-    let up = CGEvent::new_keyboard_event(source, KEY_C, false)
+    let up = CGEvent::new_keyboard_event(source, key_c, false)
         .map_err(|_| eyre::eyre!("Cmd+C keyup create failed"))?;
     up.set_flags(CGEventFlags::CGEventFlagNull);
     up.post(CGEventTapLocation::HID);
@@ -402,13 +403,14 @@ fn synthesize_cmd_c() -> eyre::Result<()> {
 
 fn synthesize_cmd_v() -> eyre::Result<()> {
     let source = clean_event_source()?;
+    let key_v: CGKeyCode = crate::key_layout::paste_key();
 
-    let key_down = CGEvent::new_keyboard_event(source.clone(), KEY_V, true)
+    let key_down = CGEvent::new_keyboard_event(source.clone(), key_v, true)
         .map_err(|_| eyre::eyre!("CGEvent keydown create failed"))?;
     key_down.set_flags(CGEventFlags::CGEventFlagCommand);
     key_down.post(CGEventTapLocation::HID);
 
-    let key_up = CGEvent::new_keyboard_event(source, KEY_V, false)
+    let key_up = CGEvent::new_keyboard_event(source, key_v, false)
         .map_err(|_| eyre::eyre!("CGEvent keyup create failed"))?;
     // Clear the command flag on key-up so we don't leave a dangling modifier.
     key_up.set_flags(CGEventFlags::CGEventFlagNull);
@@ -462,13 +464,14 @@ pub fn synthesize_escape() -> eyre::Result<()> {
 /// so a held push-to-talk modifier can't turn it into a different chord.
 pub fn synthesize_undo() -> eyre::Result<()> {
     let source = clean_event_source()?;
+    let key_z: CGKeyCode = crate::key_layout::undo_key();
 
-    let down = CGEvent::new_keyboard_event(source.clone(), KEY_Z, true)
+    let down = CGEvent::new_keyboard_event(source.clone(), key_z, true)
         .map_err(|_| eyre::eyre!("Cmd+Z keydown create failed"))?;
     down.set_flags(CGEventFlags::CGEventFlagCommand);
     down.post(CGEventTapLocation::HID);
 
-    let up = CGEvent::new_keyboard_event(source, KEY_Z, false)
+    let up = CGEvent::new_keyboard_event(source, key_z, false)
         .map_err(|_| eyre::eyre!("Cmd+Z keyup create failed"))?;
     up.set_flags(CGEventFlags::CGEventFlagNull);
     up.post(CGEventTapLocation::HID);

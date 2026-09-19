@@ -14,6 +14,7 @@ pub mod history;
 pub mod hotkeys;
 pub mod injector;
 pub mod ipc;
+pub mod key_layout;
 pub mod model_fetch;
 pub mod numbers;
 pub mod prompts;
