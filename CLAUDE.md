@@ -44,6 +44,10 @@ makes macOS re-ask. Only the user can grant the permission.
   before adding anything on the critical path. No OCR, vision LLMs, or
   whole-window scraping.
 - The cleanup model gets the tightest relevant context only.
+- One macOS floor: 14.0, set by the Swift helper (`Package.swift`
+  `.macOS(.v14)`). `scripts/build-app.sh` `MIN_MACOS` (plist +
+  `MACOSX_DEPLOYMENT_TARGET`) and the `install.sh` check follow it; change
+  them together.
 
 ## One way of doing things
 

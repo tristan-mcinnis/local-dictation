@@ -75,9 +75,9 @@ launches. The app itself is built by `scripts/build-app.sh`:
 ```bash
 ./scripts/build-app.sh                  # dev: tiny app; models shared from ./models via a symlink
 ./scripts/build-app.sh --bundle-models  # ship: copy ONLY the fixed stack (cohere-mlx-q4 + s1-mini, ~1.7 GB) into the app
-./scripts/build-app.sh --slim           # ship: NO models bundled; app verifies/errors on the fixed stack at first run
+./scripts/build-app.sh --slim           # ship: NO models bundled; the app never downloads, it logs what is missing at first run
 ./scripts/build-app.sh --install        # also copy to /Applications, add a Login Item, launch it
-./scripts/build-app.sh --dmg            # wrap in a distributable dist/Local-Dictation-<ver>.dmg (defaults to --bundle-models; --slim --dmg = fetch-on-first-run DMG)
+./scripts/build-app.sh --dmg            # wrap in a distributable dist/Local-Dictation-<ver>.dmg (defaults to --bundle-models; --slim --dmg = a small DMG with no models in it)
 ```
 
 `build-app.sh` builds the native MLX helper first (`native/cohere-mlx/build.sh`), then the Rust
@@ -85,13 +85,15 @@ release binary, then assembles the bundle: helper copied to `Contents/Resources/
 with `Contents/Resources/mlx.metallib` beside it (MLX looks for `mlx.metallib` next to its
 executable before bundle lookup).
 
-The bundle is `dist/Local Dictation.app` — `LSUIElement` menu-bar agent (no Dock icon), ad-hoc
-signed, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
+The bundle is `dist/Local Dictation.app` — `LSUIElement` menu-bar agent (no Dock icon), signed
+with the first Apple Development identity in the login keychain (ad-hoc only when there is none,
+or with `SIGN_IDENTITY=-`), `LSMinimumSystemVersion` 14.0, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
 (`com.tristanmcinnis.local-dictation`). Icon is rendered from an SF Symbol by
 `resources/AppIcon.icns` (rendered by design-system/icons/make-icon.py --glyph waveform). Because it's a stable signed bundle, macOS attributes Microphone +
 Accessibility to the app itself (granted once), instead of to whatever terminal launched it.
-Ad-hoc signing means a *rebuild* changes the signature hash and macOS may re-ask — a real
-Developer ID would make grants stick. When bundled, the daemon redirects stdout/stderr to
+With a development identity the grants survive rebuilds. An *ad-hoc* signature changes on every
+rebuild, so macOS re-asks. Neither is notarized, so a copy sent to another Mac is blocked by
+Gatekeeper until a Developer ID + notarization step exists. When bundled, the daemon redirects stdout/stderr to
 `~/Library/Logs/Local Dictation/daemon.log` (no terminal to print to; see Debugging).
 
 **Model resolution** (`src/app_paths.rs`). The *base* directory, in order:
@@ -122,11 +124,11 @@ there are two very different loops, and only one needs a rebuild:
    corpus; see `prompts-lab/`), or `--example s1_mini_eval`. This is the right loop for prompt work.
 
 2. **Changing code or built-in defaults** (`src/**`, the `DEFAULT_*` consts in `prompts.rs`).
-   Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. Because the bundle is
-   *ad-hoc* signed, a rebuild changes the signature hash and **macOS may revoke + re-prompt for
-   Accessibility/Microphone** — the daemon will exit at boot (`daemon/mod.rs` permission check) until
+   Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. When the bundle is
+   *ad-hoc* signed (no Apple Development identity, or `SIGN_IDENTITY=-`), a rebuild changes the
+   signature hash and **macOS may revoke + re-prompt for Accessibility/Microphone** — the daemon will exit at boot (`daemon/mod.rs` permission check) until
    you re-grant it in System Settings → Privacy & Security. An agent cannot grant this; it requires
-   the user. (A real Developer ID signature would make the grant stick across rebuilds.)
+   the user. (A stable signing identity makes the grant stick across rebuilds.)
 
 Gotcha: `build-app.sh --install` runs `open`, which only *activates* an already-running instance
 rather than replacing it — so after an `--install` you still need a real relaunch
@@ -450,7 +452,7 @@ stack:
 | `DICTATE_PROMPTS_PATH` / `DICTATE_CLEANUP_PROMPT` / `DICTATE_TRANSFORM_PROMPT` | Override the prompts file / cleanup prompt / transform prompt |
 | `DICTATE_CONTROL_SOCK` | Override the daemon control-socket path |
 | `DICTATE_CORRECTIONS_PATH` / `DICTATE_DICTIONARY_PATH` | Override the corrections / dictionary file paths |
-
+| `DICTATE_APPEARANCE` | `dark` (default), `light` or `system` |
 | `DICTATE_PILL_SIZE` | `compact` (default) or `standard` |
 | `DICTATE_WAVEFORM_SENSITIVITY` | Visual response: `low`, `balanced` (default), `high` |
 | `DICTATE_SHOW_PROCESSING_DETAIL` | Show distinct processing labels, default on |

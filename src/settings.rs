@@ -10,18 +10,22 @@
 //! `DICTATE_HOTKEY_KEYCODE`) authoritative for power users / scripted
 //! launches: if one of those is set, the matching menu item is ignored.
 //!
-//! File format (all fields optional):
+//! File format (all fields optional; the full key list is in
+//! `docs/architecture.md`):
 //!
 //! ```json
 //! {
-//!     "gemma_model": "/abs/path/to/models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+//!     "llm_model": "/abs/path/to/models/llm/s1-mini/s1-mini.gguf",
 //!     "hotkey_keycode": 61,
 //!     "cleanup_enabled": true
 //! }
-//!
-//! (The `gemma_model` key name is historical — it holds the path to whatever
-//! cleanup model is selected; the recommended default is now Qwen 2.5 1.5B.)
 //! ```
+//!
+//! `llm_model` is the path to whichever cleanup model is selected (the name is
+//! model-neutral on purpose; the shipped default is S1-mini). The pre-2026-09
+//! key `gemma_model` is still read once and migrated; see
+//! `migrate_legacy_keys`. A single malformed value only resets that key
+//! (`parse_lenient`), and writes are atomic (`config_io`).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

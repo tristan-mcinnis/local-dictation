@@ -40,6 +40,9 @@ echo
 
 # ── 0. platform sanity ───────────────────────────────────────────────────────
 [ "$(uname -s)" = "Darwin" ] || die "This app is macOS-only."
+# One floor everywhere: the MLX helper and the bundle both require macOS 14.
+OS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
+[ "$OS_MAJOR" -ge 14 ] || die "Local Dictation needs macOS 14 or later (this Mac runs $(sw_vers -productVersion))."
 if [ "$(uname -m)" != "arm64" ]; then
   warn "This is built for Apple Silicon (M-series). Intel Macs are untested."
 fi
@@ -120,7 +123,7 @@ cat <<'EOT'
 
   Then you're set. How to use it:
     • Hold  Right Option , speak, release — text appears at your cursor.
-    • Look for the 🎤 in your menu bar. It launches automatically at login.
+    • Look for the waveform icon in your menu bar. It launches automatically at login.
 EOT
 echo
 ok "Installed: /Applications/Local Dictation.app"

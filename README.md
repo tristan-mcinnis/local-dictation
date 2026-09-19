@@ -40,13 +40,14 @@ Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first w
 
 ## Install
 
-This personal build expects the locally installed Superwhisper Cohere Q4 and
-S1-mini checkpoints. Model bytes are never committed.
+Requires macOS 14 or later on Apple Silicon. This personal build expects the
+locally installed Superwhisper Cohere Q4 and S1-mini checkpoints; the app itself
+never downloads anything. Model bytes are never committed.
 
 Local builds use an available Apple Development signing identity. Keep the same identity across updates to preserve macOS permission grants.
 
 Launch it, then grant Microphone and Accessibility in System Settings → Privacy
-& Security. The menu-bar mic icon means it is ready.
+& Security. The waveform icon in the menu bar means it is ready.
 
 **Build from source.**
 
@@ -203,6 +204,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_NO_MUTE` | Do not mute other audio during capture |
+| `DICTATE_LOG_TEXT` | Debug only: write dictated text into the log. Off by default; the log holds timings and lengths |
 
 ## Subcommands
 
@@ -222,7 +224,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 * S1-mini is guarded; failed quality checks fall back to deterministic text.
 * Electron apps add about 185 ms (clipboard paste settle time). Native apps inject in about 5 ms.
 * Recording is bounded by key hold, not silence detection.
-* macOS and Apple Silicon only.
+* macOS 14 or later, Apple Silicon only.
 
 ## Tests
 

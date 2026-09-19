@@ -12,7 +12,9 @@
 #
 # NOTE: this reuses the already-installed bundle, so the code signature is
 # unchanged and macOS keeps the existing Microphone + Accessibility grants.
-# (A build-app.sh rebuild re-signs ad-hoc, which can make macOS re-prompt.)
+# (A build-app.sh rebuild re-signs the bundle. With an Apple Development
+# identity in the keychain the grants survive; an ad-hoc signature,
+# SIGN_IDENTITY=-, changes on every build and makes macOS re-prompt.)
 set -euo pipefail
 
 APP="/Applications/Local Dictation.app"

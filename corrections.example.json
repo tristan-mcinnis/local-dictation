@@ -1,16 +1,16 @@
 {
     "_comment": "Copy to ~/.config/local-dictation/corrections.json and edit. Keys lowercase, values verbatim. Case-insensitive word-boundary match. Underscore-prefixed keys are ignored.",
 
-    "_dev_context_overrides": "Common single-word substitutions for dev contexts. The 'maine' entry corrects a frequent ASR/Gemma misfire on 'push to main'. If you actually talk about the US state, delete that line — corrections beat the cleaner.",
+    "_dev_context_overrides": "Common single-word substitutions for dev contexts. The 'maine' entry corrects a frequent speech-recognition misfire on 'push to main'. If you actually talk about the US state, delete that line — corrections beat the cleaner.",
     "maine": "main",
     "master": "master",
     "prod": "prod",
     "dev": "dev",
     "api": "API",
 
-    "_personal_proper_nouns": "Names Parakeet doesn't know. Add yours.",
-    "lings": "Lumen",
-    "tristan": "Tristan",
+    "_personal_proper_nouns": "Names the speech model doesn't know. Replace these invented examples with yours.",
+    "jennifer okafor": "Jenifer Okafor",
+    "to twist": "Todoist",
 
     "_brand_and_product_casing": "Cleaner usually gets these but corrections are insurance.",
     "github": "GitHub",

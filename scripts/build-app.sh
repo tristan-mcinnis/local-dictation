@@ -9,15 +9,16 @@
 #   ./scripts/build-app.sh --bundle-models  # ship build: copy the recommended
 #                                           #   model stack into the app (~1.7 GB)
 #   ./scripts/build-app.sh --slim           # ship build: NO models bundled; the
-#                                           #   app downloads the defaults on
-#                                           #   first run (few-MB app / DMG)
+#                                           #   app never downloads anything, so
+#                                           #   the user must supply the model
+#                                           #   stack (it logs what is missing)
 #   ./scripts/build-app.sh --install        # also copy to /Applications, add a
 #                                           #   Login Item, and launch it
 #   ./scripts/build-app.sh --dmg            # wrap the app in a distributable
 #                                           #   dist/Local-Dictation-<ver>.dmg.
 #                                           #   Defaults to --bundle-models (self-
 #                                           #   contained); pair with --slim for a
-#                                           #   fetch-on-first-run DMG instead.
+#                                           #   small DMG with no models in it.
 #
 # Flags combine, e.g.  ./scripts/build-app.sh --slim --dmg
 #
@@ -35,7 +36,11 @@ set -euo pipefail
 APP_NAME="Local Dictation"
 BUNDLE_ID="com.tristanmcinnis.local-dictation"
 EXEC_NAME="local-dictation"        # Contents/MacOS/<EXEC_NAME>
-MIN_MACOS="13.0"
+# One macOS floor for the whole app. The Swift MLX helper requires 14.0
+# (native/cohere-mlx/Package.swift `.macOS(.v14)`), so the bundle declares the
+# same floor and the Rust binary is compiled for it. Change all three together.
+MIN_MACOS="14.0"
+export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"

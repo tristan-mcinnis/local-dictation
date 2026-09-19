@@ -9,9 +9,12 @@ let package = Package(
         .executable(name: "cohere-mlx-bridge", targets: ["cohere-mlx-bridge"]),
     ],
     dependencies: [
-        // Cohere Transcribe support is maintained upstream. Keep this as a
-        // source dependency so model/runtime fixes are picked up together.
-        .package(url: "https://github.com/Blaizzy/mlx-audio-swift.git", branch: "main"),
+        // Cohere Transcribe support is maintained upstream, which publishes no
+        // tags, so this pins an exact revision: a fresh clone builds the same
+        // code the release was tested with. To update, change the revision
+        // here, run `swift package resolve`, commit Package.resolved with it.
+        .package(url: "https://github.com/Blaizzy/mlx-audio-swift.git",
+                 revision: "cae704f53bc32a3d0b606823828fbc5bedaaf388"),
         // MLX is imported directly for constructing the f32 audio array.
         .package(url: "https://github.com/ml-explore/mlx-swift.git", .upToNextMajor(from: "0.30.6")),
     ],
