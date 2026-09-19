@@ -254,6 +254,12 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let space_down = Arc::new(AtomicBool::new(false));
     let state_cb = state.clone();
     let space_down_cb = space_down.clone();
+    // When Space was last pressed. The keyboard scans keys in hardware order,
+    // so the Space half of Option+Space can reach the tap before the Option
+    // edge; the press handler consults this to still recognise the chord
+    // (see `CHORD_WINDOW`).
+    let last_space_down = Arc::new(Mutex::new(None::<Instant>));
+    let last_space_down_cb = last_space_down.clone();
     // Track physical edges separately from latch state. Repeated key-downs
     // must never be mistaken for a new tap that stops hands-free capture.
     let hotkey_down = Arc::new(AtomicBool::new(false));
@@ -351,18 +357,20 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     // otherwise indistinguishable from a real tap:
                     //   pid/state/uid — who posted it (0 = the HID system)
                     //   read          — device bit (side known) vs aggregate
-                    //   hw            — the live hardware flags, not the event's
-                    //   HW-DISAGREE   — event and hardware disagree ⇒ synthesized
-                    // A Bluetooth gadget re-asserting a modifier looks exactly
-                    // like a keyboard press until this line separates them.
+                    //   hw            — the HID system's flags for the same key
+                    // `hw` trails the event by a few milliseconds as a rule: the
+                    // tap sits at the head of the stream, so it sees each edge
+                    // before the HID state commits it. A mismatch is therefore
+                    // expected on every edge and is NOT evidence of injection.
+                    // What it does prove is that the key really was down for the
+                    // interval the tap believed it was.
                     let src_pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
                     let src_state = event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
                     let src_uid = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_ID);
                     let hw = hid_modifier_flags();
                     let down = crate::hotkeys::modifier_key_is_down(hotkey_keycode, raw);
-                    let hw_down = crate::hotkeys::modifier_key_is_down(hotkey_keycode, hw);
                     eprintln!(
-                        "[hotkey] {} edge · key {hotkey_keycode:#x} · {} · flags {raw:#x} · read {} · hw {hw:#x} · src pid {src_pid} state {src_state} uid {src_uid}{}",
+                        "[hotkey] {} edge · key {hotkey_keycode:#x} · {} · flags {raw:#x} · read {} · hw {hw:#x} · src pid {src_pid} state {src_state} uid {src_uid}",
                         stamp(),
                         if down { "DOWN" } else { "UP" },
                         if crate::hotkeys::modifier_key_read_via_aggregate(hotkey_keycode, raw) {
@@ -370,17 +378,15 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         } else {
                             "device-bit"
                         },
-                        if down == hw_down { "" } else { " · HW-DISAGREE" },
                     );
                     // Only a physical key controls the session. A FlagsChanged
                     // posted by another process (AppleScript, an automation
                     // tool, a remote's companion app) carries that process's
-                    // PID here; a physical keyboard carries 0. The hardware
-                    // comparison above is the stronger signal, since a poster
-                    // can leave the PID unset.
+                    // PID here; a physical keyboard carries 0.
                     // Without this guard, any app posting Right Option ends a
                     // hands-free session and pastes the transcript wherever
-                    // focus is.
+                    // focus is. A poster that leaves the PID unset still slips
+                    // through, so `src pid 0` is a weak signal, not a strong one.
                     if src_pid != 0 {
                         eprintln!(
                             "[hotkey] {} ignored synthesized hotkey event from pid {src_pid} (flags {raw:#x})",
@@ -405,10 +411,27 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         let press = Instant::now();
                         let double_tap = double_tap_latch
                             && detector_cb.lock().unwrap().on_press(press);
-                        drive(PttInput::HotkeyPress {
-                            shift: flags.contains(CGEventFlags::CGEventFlagShift),
-                            double_tap,
-                        });
+                        // Did a Space just precede this edge? The keyboard scans
+                        // keys in hardware order, so the chord can arrive
+                        // Space-first; without this the press reads as a bare
+                        // hold and the session dies the moment the keys come up.
+                        let space_first = last_space_down_cb
+                            .lock()
+                            .unwrap()
+                            .map(|t| t.elapsed() <= CHORD_WINDOW)
+                            .unwrap_or(false);
+                        if space_first {
+                            eprintln!(
+                                "[hotkey] {} space landed before the press · reading it as the hands-free chord",
+                                stamp()
+                            );
+                            drive(PttInput::HotkeyChordSpace);
+                        } else {
+                            drive(PttInput::HotkeyPress {
+                                shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                                double_tap,
+                            });
+                        }
                     } else {
                         detector_cb.lock().unwrap().on_release(Instant::now());
                         drive(PttInput::HotkeyRelease);
@@ -473,21 +496,38 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         return CallbackResult::Keep;
                     }
                     if modifier_only && keycode == SPACE_KEYCODE {
-                        let (next, decision) =
-                            ptt_transition(state_cb.load(Ordering::SeqCst), PttInput::SpaceDown);
+                        // Half of the Option+Space chord. Remember when it landed
+                        // so the modifier edge that follows can still recognise
+                        // the pair if the hardware sent Space first.
+                        *last_space_down_cb.lock().unwrap() = Some(Instant::now());
+                        let prev = state_cb.load(Ordering::SeqCst);
+                        let (next, decision) = ptt_transition(prev, PttInput::SpaceDown);
                         state_cb.store(next, Ordering::SeqCst);
+                        let swallowed = matches!(
+                            decision,
+                            PttDecision::ArmLatch | PttDecision::SwallowSpace
+                        );
+                        if swallowed {
+                            space_down_cb.store(true, Ordering::SeqCst);
+                        }
+                        // Space used to be invisible in this log, so a chord that
+                        // never armed left no trace of why. Only dictation-relevant
+                        // Spaces are logged; ordinary typing would flood the file.
+                        if swallowed || prev != ST_IDLE {
+                            eprintln!(
+                                "[hotkey] {} space DOWN · state {prev}→{next} · {decision:?} · {}",
+                                stamp(),
+                                if swallowed { "swallowed" } else { "passed through" }
+                            );
+                        }
                         match decision {
                             PttDecision::ArmLatch => {
                                 // Chord recognised: cue + swallow so the
                                 // Option+Space character never reaches the field.
                                 let _ = tx_for_callback.send(DaemonEvent::LatchArmed);
-                                space_down_cb.store(true, Ordering::SeqCst);
                                 return CallbackResult::Drop;
                             }
-                            PttDecision::SwallowSpace => {
-                                space_down_cb.store(true, Ordering::SeqCst);
-                                return CallbackResult::Drop;
-                            }
+                            PttDecision::SwallowSpace => return CallbackResult::Drop,
                             _ => {}
                         }
                     }
@@ -503,9 +543,19 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                         }
                         return CallbackResult::Keep;
                     }
-                    if modifier_only && keycode == SPACE_KEYCODE && space_down_cb.swap(false, Ordering::SeqCst) {
+                    if modifier_only && keycode == SPACE_KEYCODE {
+                        let was_swallowed = space_down_cb.swap(false, Ordering::SeqCst);
+                        if was_swallowed || state_cb.load(Ordering::SeqCst) != ST_IDLE {
+                            eprintln!(
+                                "[hotkey] {} space UP · {}",
+                                stamp(),
+                                if was_swallowed { "swallowed" } else { "passed through" }
+                            );
+                        }
                         // Swallow the key-up matching a swallowed key-down.
-                        return CallbackResult::Drop;
+                        if was_swallowed {
+                            return CallbackResult::Drop;
+                        }
                     }
                 }
                 _ => {}
@@ -729,6 +779,26 @@ mod tests {
             PttInput::HotkeyRelease
         };
         assert_eq!(ptt_transition(ST_LATCHED, input), (ST_LATCHED, PttDecision::Nothing));
+    }
+
+    #[test]
+    fn space_landing_before_the_modifier_edge_still_arms_hands_free() {
+        // The keyboard put Space on the wire before the Option edge, so the pair
+        // arrives in that order. It is still the chord and must arm.
+        let (state, decision) = ptt_transition(ST_IDLE, PttInput::HotkeyChordSpace);
+        assert_eq!(state, ST_LATCHED);
+        assert_eq!(decision, PttDecision::StartLatched { transform: false });
+        // Releasing the keys leaves hands-free running, which is exactly what
+        // the chord promises and what hold-to-talk would break.
+        assert_eq!(
+            ptt_transition(state, PttInput::HotkeyRelease),
+            (ST_LATCHED, PttDecision::Nothing)
+        );
+        // A recent Space must never swallow a deliberate stop tap.
+        assert_eq!(
+            ptt_transition(state, PttInput::HotkeyChordSpace),
+            (ST_STOPPING_TAP, PttDecision::Stop)
+        );
     }
 
     /// Drive the state machine through a sequence of inputs, returning the

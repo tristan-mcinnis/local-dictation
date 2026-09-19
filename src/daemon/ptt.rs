@@ -14,6 +14,12 @@ pub(super) fn hotkey_edge(down: &AtomicBool, is_down: bool) -> bool {
 pub(super) const TAP_MAX_HOLD: Duration = Duration::from_millis(300);
 pub(super) const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(350);
 
+/// How long a Space key-down stays eligible to form the hands-free chord across
+/// a following PTT edge. The keyboard scans keys in hardware order, not finger
+/// order, so Option+Space can arrive Space-first; inside this window the pair is
+/// still the chord, and outside it that Space was ordinary typing.
+pub(super) const CHORD_WINDOW: Duration = Duration::from_millis(150);
+
 // Hands-free latch state machine, shared with the event-tap callback:
 //
 //   ST_IDLE ─PTT press─▶ ST_HOLDING ─release─▶ ST_IDLE              (normal PTT)
@@ -41,6 +47,11 @@ pub(super) enum PttInput {
     /// `double_tap` = this is the second press of a quick double-tap (set by the
     /// event-tap callback; only meaningful from IDLE, where it latches).
     HotkeyPress { shift: bool, double_tap: bool },
+    /// The PTT modifier transitioned to held with a Space key-down immediately
+    /// before it — the same chord, in the order the hardware happened to send
+    /// it. From idle this arms hands-free straight away; from latched it is
+    /// still a stop tap, so a real tap is never swallowed by a recent Space.
+    HotkeyChordSpace,
     /// The PTT modifier transitioned to released.
     HotkeyRelease,
     /// Space went down (only meaningful while the PTT key is held).
@@ -78,6 +89,12 @@ pub(super) fn ptt_transition(state: u8, input: PttInput) -> (u8, PttDecision) {
         (ST_IDLE, PttInput::HotkeyPress { double_tap: true, .. }) => {
             (ST_LATCHED, PttDecision::StartLatched { transform: false })
         }
+        // Space landed marginally before the modifier edge: the chord, not a
+        // bare hold. Arming here is what keeps Option+Space from silently
+        // degrading into hold-to-talk and ending the moment the keys come up.
+        (ST_IDLE, PttInput::HotkeyChordSpace) => {
+            (ST_LATCHED, PttDecision::StartLatched { transform: false })
+        }
         (ST_IDLE, PttInput::HotkeyPress { shift, double_tap: false }) => {
             (ST_HOLDING, PttDecision::Start { transform: shift })
         }
@@ -88,6 +105,8 @@ pub(super) fn ptt_transition(state: u8, input: PttInput) -> (u8, PttDecision) {
         (ST_HOLDING_ARMED, PttInput::HotkeyRelease) => (ST_LATCHED, PttDecision::Nothing),
         // A PTT tap ends a hands-free session.
         (ST_LATCHED, PttInput::HotkeyPress { .. }) => (ST_STOPPING_TAP, PttDecision::Stop),
+        // A recent Space must not swallow a deliberate stop tap.
+        (ST_LATCHED, PttInput::HotkeyChordSpace) => (ST_STOPPING_TAP, PttDecision::Stop),
         (ST_STOPPING_TAP, PttInput::HotkeyRelease) => (ST_IDLE, PttDecision::Nothing),
         // Any other combination is a no-op (e.g. stray Space when not holding,
         // re-press while already holding, release in IDLE).
