@@ -153,6 +153,9 @@ struct CohereMLXBridgeMain {
                                  sampleRate: 16_000))
             while let line = readLine(strippingNewline: true) {
                 guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                // Read the id before anything can throw, so every error reply
+                // names the request it answers.
+                let requestID = BridgeProtocol.requestID(fromLine: line)
                 do {
                     let request = try JSONDecoder().decode(BridgeRequest.self, from: Data(line.utf8))
                     if request.op == "health" {
@@ -167,7 +170,7 @@ struct CohereMLXBridgeMain {
                         write(failure(BridgeError.protocolError("unknown op: \(request.op)"), requestID: request.requestID))
                     }
                 } catch {
-                    write(failure(error))
+                    write(failure(error, requestID: requestID))
                 }
             }
         } catch {
