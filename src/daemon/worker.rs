@@ -180,7 +180,10 @@ pub(super) fn worker_loop(
     // dictation must go through the LLM to be reshaped — so the short-utterance
     // deterministic shortcut is disabled. Default cleanup has no such need.
     #[cfg(feature = "cleaner")]
-    let format_active = crate::settings::Settings::load().resolve_format().is_some();
+    // Asked of the engine, which validated the name against prompts.json: an
+    // unknown or deleted preset name must not force every utterance through
+    // the model with the default prompt.
+    let format_active = cleaner.as_ref().is_some_and(|c| c.format_active());
     // Per-utterance streaming accumulators (only used when `streaming_asr`). These
     // are the whole incremental-ASR state, independent of the cleaner feature:
     // transcribe_pcm + SegmentStream + corrections need no LLM.

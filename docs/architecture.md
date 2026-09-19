@@ -349,7 +349,15 @@ its refresh never steals focus, and playback stops on close or selection change.
 
 `screen_context.rs`
 harvests proper nouns from the focused window and feeds them to
-`cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. Normal
+`cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. The prompt's
+vocabulary block holds at most 64 terms: the curated terms (corrections + dictionary) are capped
+once at boot to 48 (`prompts::cap_static_vocab`) and stay FIRST, so that block is byte-identical
+on every utterance and its KV prefix is reused; the last 16 slots are reserved for screen terms
+(`prompts::combined_vocabulary`), so a large dictionary can no longer evict them. The extractor
+ranks mid-sentence capitals above sentence-start ones, rewards repeats rather than length, drops
+ALL-CAPS runs and email boilerplate, and handles `’s`, `Name/Name` and markdown links.
+`app_tones.rs` adds a per-app tone word; it matches whole segments of the bundle id or app name
+(`com.apple.TextEdit` → `com`, `apple`, `textedit`), never substrings. Normal
 cleanup never infers numbered-list structure from words such as "first" or "second"; structural
 formatting requires an explicit `numbered` or `bullets` output-format preset.
 `audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. `numbers.rs`
@@ -384,7 +392,7 @@ re-joining the path:
   (`numbered`/`bullets`/`email`/`code` in `DEFAULT_FORMATS`); a user's `formats` overlays them (same
   key overrides, new key adds). The active preset (`active_format` / `DICTATE_FORMAT`) replaces the
   cleanup prompt for normal dictation, and list presets keep their line breaks (cleanup preserves
-  newlines when a preset is active); unknown/blank falls back to default. A deterministic
+  newlines when a preset is active); unknown/blank falls back to default — everywhere: `Prompts::format_is_defined` is the one test, and the daemon asks the engine (`TextCleanupEngine::format_active`), so a stale or mistyped name cannot switch off the deterministic fast path while the default prompt runs. A deterministic
   `text_polish::fix_speech_mechanics` pass handles leftover filler + lone "i" so the prompt doesn't
   have to.
 - `corrections.json` (`corrections.rs`) — the user's single personal vocabulary, a word→replacement

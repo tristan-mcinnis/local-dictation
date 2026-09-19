@@ -133,6 +133,46 @@ pub fn default_formats() -> HashMap<String, String> {
 /// large corrections dictionary can't balloon the prompt (and the KV cache).
 pub const MAX_VOCAB_TERMS: usize = 64;
 
+/// Slots of [`MAX_VOCAB_TERMS`] reserved for per-utterance screen terms, so a
+/// large dictionary (CSV import makes 64+ terms easy) cannot evict them all.
+pub const SCREEN_VOCAB_SLOTS: usize = 16;
+
+/// The curated (corrections + dictionary) terms that go in the prompt: trimmed,
+/// de-duplicated case-insensitively, first-seen order, capped at
+/// `MAX_VOCAB_TERMS - SCREEN_VOCAB_SLOTS`. Computed ONCE at boot so this block
+/// of the prompt is byte-identical on every utterance and its KV-cache prefix
+/// is reused.
+pub fn cap_static_vocab(terms: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    terms
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty() && seen.insert(t.to_lowercase()))
+        .take(MAX_VOCAB_TERMS - SCREEN_VOCAB_SLOTS)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Curated terms first (constant prefix), then up to [`SCREEN_VOCAB_SLOTS`]
+/// screen terms that are not already curated. `static_capped` must come from
+/// [`cap_static_vocab`]. Screen terms go LAST on purpose: the cleaner reuses
+/// the longest common token prefix, and a per-utterance term placed first
+/// would force the whole vocabulary to be re-decoded on every dictation.
+pub fn combined_vocabulary(static_capped: &[String], screen: &[String]) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> =
+        static_capped.iter().map(|t| t.to_lowercase()).collect();
+    let mut out = static_capped.to_vec();
+    out.extend(
+        screen
+            .iter()
+            .map(|t| t.trim())
+            .filter(|t| !t.is_empty() && seen.insert(t.to_lowercase()))
+            .take(SCREEN_VOCAB_SLOTS)
+            .map(str::to_string),
+    );
+    out
+}
+
 /// Build a "known vocabulary" suffix for the cleanup system prompt from the
 /// user's personal vocabulary (the target spellings in `corrections.json`).
 /// Returns `None` when there's nothing worth adding.
@@ -301,6 +341,15 @@ impl Prompts {
         &self.cleanup
     }
 
+    /// True when `format` names a preset that exists, by the same rule
+    /// [`Prompts::cleanup_for`] uses to pick its prompt. This is the ONE
+    /// definition of "a format is active": an unknown, deleted or mistyped
+    /// name falls back to no format everywhere, instead of switching off the
+    /// deterministic fast path while the default prompt runs.
+    pub fn format_is_defined(&self, format: Option<&str>) -> bool {
+        format.is_some_and(|name| self.formats.contains_key(&name.trim().to_lowercase()))
+    }
+
     /// Sorted list of defined preset names, for the menu-bar picker.
     pub fn format_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.formats.keys().cloned().collect();
@@ -324,6 +373,51 @@ mod tests {
 
     fn no_formats() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    #[test]
+    fn a_big_dictionary_cannot_evict_the_screen_terms() {
+        // Regression: 64+ curated terms filled the cap and no screen term was
+        // ever sent, while the log still printed them.
+        let curated: Vec<String> = (0..100).map(|i| format!("Curated{i}")).collect();
+        let screen: Vec<String> = (0..20).map(|i| format!("Screen{i}")).collect();
+        let capped = cap_static_vocab(&curated);
+        assert_eq!(capped.len(), MAX_VOCAB_TERMS - SCREEN_VOCAB_SLOTS);
+        let combined = combined_vocabulary(&capped, &screen);
+        assert_eq!(combined.len(), MAX_VOCAB_TERMS);
+        assert_eq!(&combined[..capped.len()], &capped[..], "curated block stays first");
+        assert_eq!(combined[capped.len()], "Screen0");
+        assert_eq!(combined.last().unwrap(), "Screen15");
+        let suffix = vocabulary_suffix(&combined).unwrap();
+        assert!(suffix.contains("Screen15") && !suffix.contains("Screen16"));
+    }
+
+    #[test]
+    fn the_curated_prefix_is_identical_across_utterances() {
+        // KV prefix reuse depends on this: only the tail may vary.
+        let capped = cap_static_vocab(&["Todoist".into(), " todoist ".into(), "Lumen".into(), "".into()]);
+        assert_eq!(capped, vec!["Todoist".to_string(), "Lumen".to_string()]);
+        let a = vocabulary_suffix(&combined_vocabulary(&capped, &["Jenifer".into()])).unwrap();
+        let b = vocabulary_suffix(&combined_vocabulary(&capped, &["Okafor".into(), "LUMEN".into()])).unwrap();
+        let none = vocabulary_suffix(&combined_vocabulary(&capped, &[])).unwrap();
+        let prefix = none.trim_end_matches('.');
+        assert!(a.starts_with(prefix), "{a}");
+        assert!(b.starts_with(prefix), "{b}");
+        assert!(!b.contains("LUMEN"), "a screen term already curated is not repeated");
+    }
+
+    #[test]
+    fn only_a_defined_preset_counts_as_an_active_format() {
+        let p = Prompts::resolve(None, None, None, None, no_formats());
+        assert!(p.format_is_defined(Some("numbered")));
+        assert!(p.format_is_defined(Some("  Bullets ")));
+        // Regression: a stale or mistyped name used to read as "active".
+        assert!(!p.format_is_defined(Some("my-deleted-preset")));
+        assert!(!p.format_is_defined(Some("")));
+        assert!(!p.format_is_defined(None));
+        // …and it agrees with the prompt that is actually picked.
+        assert_eq!(p.cleanup_for(Some("my-deleted-preset")), p.cleanup_for(None));
+        assert_ne!(p.cleanup_for(Some("numbered")), p.cleanup_for(None));
     }
 
     #[test]

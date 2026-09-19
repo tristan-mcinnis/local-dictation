@@ -194,12 +194,8 @@ impl TextCleanupEngine {
         // just yields the default cleanup — see `Prompts::cleanup_for`.
         let active_format = crate::settings::Settings::load().resolve_format();
         let base_cleanup = prompts.cleanup_for(active_format.as_deref()).to_string();
-        let mut format_active = false;
+        let format_active = prompts.format_is_defined(active_format.as_deref());
         if let Some(name) = &active_format {
-            format_active = prompts
-                .format_names()
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case(name));
             eprintln!(
                 "[boot] format      {name} ({})",
                 if format_active {
@@ -222,10 +218,15 @@ impl TextCleanupEngine {
             .map(|c| c.replacement_values())
             .unwrap_or_default();
         static_vocab.extend(crate::dictionary::load_default());
-        if !static_vocab.is_empty() {
+        // Cap once, at boot: the curated block is then byte-identical on every
+        // utterance (KV prefix reuse) and always leaves room for screen terms.
+        let curated_total = static_vocab.len();
+        let static_vocab = crate::prompts::cap_static_vocab(&static_vocab);
+        if curated_total > 0 {
             eprintln!(
-                "[boot] vocab       {} curated term(s) + per-utterance screen terms",
-                static_vocab.len().min(crate::prompts::MAX_VOCAB_TERMS)
+                "[boot] vocab       {} of {curated_total} curated term(s) in the prompt + up to {} screen terms per utterance",
+                static_vocab.len(),
+                crate::prompts::SCREEN_VOCAB_SLOTS
             );
         }
         let cleanup_prompt = base_cleanup;
@@ -293,6 +294,13 @@ impl TextCleanupEngine {
         Ok(prompt)
     }
 
+    /// True when a DEFINED output-format preset is applied. The daemon reads
+    /// this (not the raw setting) to decide whether clean speech may skip the
+    /// model, so the two can never disagree about an unknown preset name.
+    pub fn format_active(&self) -> bool {
+        self.format_active
+    }
+
     /// Clean a raw dictation transcript for readability. Runs on the persistent
     /// cleanup worker thread (llama.cpp's decode loop is sync and CPU/GPU bound).
     pub async fn process_transcript(&self, raw_text: &str) -> eyre::Result<String> {
@@ -335,13 +343,10 @@ impl TextCleanupEngine {
             return Ok(String::new());
         }
         let mut prompt_body = self.cleanup_prompt.clone();
-        // Curated corrections first (high-trust), then screen-harvested terms.
-        // `vocabulary_suffix` dedups case-insensitively (first-seen casing wins)
-        // and caps the total, so a noisy screen can't balloon the prompt.
+        // Curated corrections first (high-trust, constant → cached prefix), then
+        // the screen-harvested terms in their reserved tail slots.
         if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
-            let mut combined = Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
-            combined.extend_from_slice(&self.static_vocab);
-            combined.extend_from_slice(screen_vocab);
+            let combined = crate::prompts::combined_vocabulary(&self.static_vocab, screen_vocab);
             if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
                 prompt_body.push_str(&suffix);
             }
@@ -428,9 +433,7 @@ impl TextCleanupEngine {
         }
         let mut prompt_body = self.cleanup_prompt.clone();
         if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
-            let mut combined = Vec::with_capacity(self.static_vocab.len() + screen_vocab.len());
-            combined.extend_from_slice(&self.static_vocab);
-            combined.extend_from_slice(screen_vocab);
+            let combined = crate::prompts::combined_vocabulary(&self.static_vocab, screen_vocab);
             if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
                 prompt_body.push_str(&suffix);
             }
