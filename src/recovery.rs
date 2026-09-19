@@ -168,6 +168,7 @@ pub fn paste_last_dictation(
                 eprintln!("[recovery] pasted last dictation into pid {target}");
                 // A menu action needs explicit feedback even when the normal
                 // post-dictation result pill is disabled (the default).
+                ui_channel::set_last_inject_pid(Some(target));
                 ui_channel::show_transient_if_unowned(UiState::Success, Duration::from_millis(900));
             }
             Ok(InjectOutcome::NoEditableField) => {

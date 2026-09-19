@@ -525,7 +525,7 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
     // the template at 40 %, which is the rule's "busy" treatment.
     let icon = if state == UiState::Recording {
         &globals.icon_recording
-    } else if state.is_processing() || matches!(state, UiState::Error | UiState::NoEditableField) {
+    } else if state.is_processing() || matches!(state, UiState::Error | UiState::PasteFailed | UiState::NoEditableField) {
         &globals.icon_processing
     } else {
         &globals.icon_idle
@@ -538,7 +538,7 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 "●"
             } else if state.is_processing() {
                 "◌"
-            } else if matches!(state, UiState::Error | UiState::NoEditableField) {
+            } else if matches!(state, UiState::Error | UiState::PasteFailed | UiState::NoEditableField) {
                 "!"
             } else {
                 "◯"
@@ -636,6 +636,21 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
+        UiState::PasteFailed => {
+            // The words exist; only the write failed. Same layout as Error (it
+            // carries the History button), with text that says what happened
+            // and where the transcript is.
+            globals
+                .pill
+                .status
+                .setStringValue(&NSString::from_str(PASTE_FAILED_TEXT));
+            globals
+                .pill
+                .hint
+                .setStringValue(&NSString::from_str("History"));
+            set_pill_layout(globals, PillLayout::Error);
+            show_pill(globals);
+        }
         UiState::NoEditableField => {
             // The transcript was held (not pasted) because no editable field was
             // focused. Say so plainly and point at the one real recovery path:
@@ -649,6 +664,9 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         }
     }
 }
+
+/// Pill text for a failed write (transcription succeeded).
+pub(super) const PASTE_FAILED_TEXT: &str = "Couldn’t paste · Copy from menu";
 
 /// The menu-bar glyph's alpha while the pipeline works.
 const PROCESSING_ALPHA: f64 = 0.4;
@@ -818,6 +836,7 @@ pub(super) fn pill_status(state: UiState, details: bool) -> &'static str {
         UiState::Copied => "Copied to clipboard",
         UiState::Success => "Landed",
         UiState::Error => "Couldn’t transcribe",
+        UiState::PasteFailed => "Couldn’t paste",
         UiState::NoEditableField => "No text field selected",
         UiState::Idle => "Ready",
     }

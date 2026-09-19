@@ -413,7 +413,15 @@ define_class!(
         // useful after the text had already landed.)
         #[unsafe(method(undoPill:))]
         fn undo_pill(&self, _sender: *mut AnyObject) {
-            if let Err(e) = crate::clipboard_paste::synthesize_undo() {
+            // ⌘Z is global: only send it while the app that received the text
+            // is still frontmost, the same rule the paste itself follows.
+            let injected = crate::ui_channel::last_inject_pid();
+            let frontmost = crate::injector::frontmost_pid();
+            if !crate::ui_channel::undo_target_is_current(injected, frontmost) {
+                eprintln!(
+                    "[pill] undo skipped: text went to pid {injected:?}, frontmost is {frontmost:?}"
+                );
+            } else if let Err(e) = crate::clipboard_paste::synthesize_undo() {
                 eprintln!("[pill] undo failed: {e}");
             }
             crate::ui_channel::set_state(crate::ui_channel::UiState::Idle);

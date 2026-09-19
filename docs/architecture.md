@@ -283,6 +283,12 @@ the default input changed since it was built. `DICTATE_WARM_WINDOW_MS=0` restore
 cold-open behaviour; no-op under always-on pre-roll. No pre-press lookback (the plain SPSC ring isn't
 a rolling lookback; the win is skipping the open).
 
+Transform output replaces the user's selection, so it has two extra guards: a selection over
+`cleaner::MAX_TRANSFORM_CHARS` (6000) is refused up front, and a rewrite that stops at the token
+budget instead of the model's own end is an error, never pasted. `run_job` keeps its `resident`
+token bookkeeping in step with the KV cache at every step (truncate after the wipe, set once the
+prompt is decoded), so a failed job cannot leave the next one reusing a prefix the cache lost.
+
 `cleaner.rs` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
 `LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in a
 struct). The worker tracks the resident token sequence and **reuses the shared KV-cache prefix**
@@ -307,7 +313,11 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
 
 `ui_channel.rs` carries a generation/revision-guarded snapshot: recording state,
 bounded draft preview, capture flag, last output, and audio levels. States include
-Transcribing, Cleaning, Pasting, and Copied. Only actual model/injection boundaries
+Transcribing, Cleaning, Pasting, and Copied. `PasteFailed` is the write-failed result: the words are kept
+as the last dictation and as a "Not inserted" Output stage, and the pill says "Couldn’t paste ·
+Copy from menu" for 4 s with the History button ("Couldn’t transcribe" is for real ASR
+failures only). The success pill's Undo posts ⌘Z only while the app that received the text
+(`ui_channel::last_inject_pid`) is still frontmost. Only actual model/injection boundaries
 publish these phases; Pasting is beyond the cancellation commit point. Old
 completion timers and cancelled inference cannot clear or revive a newer pill.
 The preview uses existing sentence-based ASR results, capped at 320 Unicode

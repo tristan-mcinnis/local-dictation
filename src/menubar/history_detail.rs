@@ -443,10 +443,13 @@ pub(super) fn populate_detail(ui: &HistoryDetailUi, record: RecoveryRecord) {
     status(ui, &note);
 }
 
+/// Stored ordinals are already 1-based (`COALESCE(MAX(ordinal),0)+1`), so they
+/// are shown as they are. Adding one made every real record start at
+/// "2. Raw transcript"; the 0-based render fixtures hid it.
 fn layer_menu_titles(stages: &[crate::history::TextStage]) -> Vec<String> {
     stages
         .iter()
-        .map(|stage| format!("{}. {}", stage.ordinal + 1, stage.title))
+        .map(|stage| format!("{}. {}", stage.ordinal, stage.title))
         .collect()
 }
 
@@ -894,7 +897,7 @@ mod tests {
             created_at: 0,
         };
         assert_eq!(
-            layer_menu_titles(&[stage(1, 0), stage(2, 2)]),
+            layer_menu_titles(&[stage(1, 1), stage(2, 3)]),
             ["1. Raw", "3. Raw"]
         );
     }

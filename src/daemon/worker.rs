@@ -1147,7 +1147,11 @@ pub(super) fn worker_loop(
                         Some(ref c) => {
                             recovery.status = handle_spoken_command(&rt, c, cmd, captured_target, cur_gen);
                             eprintln!();
-                            ui_channel::set_state(UiState::Idle);
+                            // Leave a result pill ("Couldn’t paste") on screen;
+                            // only a still-working state is reset.
+                            if ui_channel::state().is_processing() {
+                                ui_channel::set_state(UiState::Idle);
+                            }
                             continue;
                         }
                         None => {
@@ -1429,6 +1433,9 @@ pub(super) fn worker_loop(
                         // Stored BEFORE the pill shows so the word count is this
                         // dictation's, not the previous one's.
                         ui_channel::set_last_dictation(&final_text);
+                        // The write was just verified against the frontmost app;
+                        // the pill's Undo is only valid while that app stays in front.
+                        ui_channel::set_last_inject_pid(crate::injector::frontmost_pid());
                         show_result_pill();
                         // Persist to the browsable dictation history (best-effort;
                         // never blocks or fails the hot path).
@@ -1461,9 +1468,15 @@ pub(super) fn worker_loop(
                         ui_channel::set_state(UiState::Idle);
                     }
                     crate::injector::FinalizeResult::Failed => {
-                        eprintln!("  ✗    inject failed");
+                        eprintln!("  ✗    inject failed — transcript kept (copy from menu)");
                         cues::play_error();
-                        ui_channel::show_transient_for(cur_gen, UiState::Error, Duration::from_millis(650));
+                        // The words exist; only the write failed. Keep them
+                        // reachable (they used to be dropped, so "Copy last
+                        // dictation" returned the PREVIOUS text) and say what
+                        // really happened instead of "Couldn’t transcribe".
+                        ui_channel::set_last_dictation(&final_text);
+                        crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Output, &final_text, "Not inserted");
+                        ui_channel::show_transient_for(cur_gen, UiState::PasteFailed, PASTE_FAILED_PILL);
                     }
                 }
                 eprintln!();
@@ -1866,12 +1879,19 @@ pub(super) fn handle_spoken_command(
             RecoveryStatus::Held
         }
         Err(e) => {
-            eprintln!("  ✗    inject failed: {e:?}");
+            eprintln!("  ✗    inject failed: {e:?} — result kept (copy from menu)");
             cues::play_error();
+            ui_channel::set_last_dictation(result);
+            crate::history::append_recovery_stage(generation, StageKind::Output, result, "Not inserted");
+            ui_channel::show_transient_for(generation, UiState::PasteFailed, PASTE_FAILED_PILL);
             RecoveryStatus::Failed
         }
     }
 }
+
+/// How long the "Couldn’t paste" pill stays up. It carries a History button;
+/// the old 650 ms was gone before anyone could click it.
+const PASTE_FAILED_PILL: Duration = Duration::from_millis(4000);
 
 #[cfg(test)]
 mod tests {

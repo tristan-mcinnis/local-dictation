@@ -56,6 +56,10 @@ pub enum UiState {
     Pasting = 8,
     /// Saved-audio recovery copied text; no target was activated or pasted into.
     Copied = 9,
+    /// Transcription worked but the write into the app failed. Not `Error`
+    /// (whose pill says "Couldn’t transcribe"): the words exist, are kept as
+    /// the last dictation and in History, and the pill says where to get them.
+    PasteFailed = 10,
 }
 
 impl UiState {
@@ -91,6 +95,7 @@ impl UiState {
             7 => UiState::Cleaning,
             8 => UiState::Pasting,
             9 => UiState::Copied,
+            10 => UiState::PasteFailed,
             _ => UiState::Idle,
         }
     }
@@ -363,6 +368,31 @@ pub fn show_transient_for(generation: u64, state: UiState, duration: std::time::
     });
 }
 
+/// PID of the app the last dictation was written into; 0 = unknown. The
+/// success pill's Undo posts a global ⌘Z, so it must only fire while that app
+/// is still frontmost.
+static LAST_INJECT_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Remember (or forget, with `None`) which app received the last dictation.
+pub fn set_last_inject_pid(pid: Option<i32>) {
+    LAST_INJECT_PID.store(pid.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The app that received the last dictation, if known.
+pub fn last_inject_pid() -> Option<i32> {
+    match LAST_INJECT_PID.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
+
+/// May the pill's Undo send ⌘Z now? Only when the app that received the text
+/// is known and is still the frontmost app. If the user switched apps while the
+/// result pill was up, ⌘Z would revert an unrelated edit somewhere else.
+pub fn undo_target_is_current(injected: Option<i32>, frontmost: Option<i32>) -> bool {
+    matches!((injected, frontmost), (Some(a), Some(b)) if a == b)
+}
+
 /// Record the most recent injected text.
 pub fn set_last_dictation(text: &str) {
     if let Ok(mut g) = LAST_DICTATION.lock() {
@@ -430,6 +460,25 @@ mod tests {
     use super::*;
     use crate::cancel::CancelGate;
     use std::sync::Arc;
+
+    #[test]
+    fn paste_failed_is_a_result_state_not_a_working_one() {
+        assert_eq!(UiState::from_u8(UiState::PasteFailed as u8), UiState::PasteFailed);
+        // Not "processing", so the worker's settle step leaves the pill up…
+        assert!(!UiState::PasteFailed.is_processing());
+        // …and not cancellable, so an Escape passes through to the app.
+        assert!(!UiState::PasteFailed.is_cancellable());
+    }
+
+    #[test]
+    fn pill_undo_only_fires_into_the_app_that_received_the_text() {
+        assert!(undo_target_is_current(Some(412), Some(412)));
+        // Regression: Undo used to post ⌘Z blind, into whatever was frontmost.
+        assert!(!undo_target_is_current(Some(412), Some(977)));
+        assert!(!undo_target_is_current(None, Some(412)));
+        assert!(!undo_target_is_current(Some(412), None));
+        assert!(!undo_target_is_current(None, None));
+    }
 
     #[test]
     fn pipeline_stages_follow_work_and_cleanup_can_be_skipped() {
