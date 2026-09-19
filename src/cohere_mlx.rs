@@ -128,7 +128,19 @@ fn read_response(reader: &mut BufReader<ChildStdout>) -> eyre::Result<Response> 
     if reader.read_line(&mut line)? == 0 {
         return Err(eyre::eyre!("Cohere MLX helper exited unexpectedly"));
     }
-    serde_json::from_str(&line).map_err(|e| eyre::eyre!("invalid Cohere MLX response: {e}: {line}"))
+    parse_response_line(&line, crate::daemon_log::text_logging_enabled())
+}
+
+/// Decode one reply line. A line that does not decode may still hold a
+/// transcript, and this error is printed to the daemon log, so the line is
+/// shown by the log's text rule: its size only, unless `DICTATE_LOG_TEXT=1`.
+fn parse_response_line(line: &str, log_text: bool) -> eyre::Result<Response> {
+    serde_json::from_str(line).map_err(|e| {
+        eyre::eyre!(
+            "invalid Cohere MLX response: {e}: {}",
+            crate::daemon_log::render_text(log_text, line.trim())
+        )
+    })
 }
 
 /// Validate a transcribe reply. The helper's own error is reported FIRST: an
@@ -186,6 +198,18 @@ mod tests {
         let err = check_response(&reply, "7").unwrap_err().to_string();
         assert!(err.contains("model") && err.contains("audio too short"), "{err}");
         assert!(!err.contains("mismatch"), "{err}");
+    }
+
+    #[test]
+    fn an_undecodable_reply_does_not_put_its_text_in_the_error() {
+        // Regression: the raw line (which can hold the transcript) was pasted
+        // into the error, and the error is printed to the daemon log.
+        let line = r#"{"ok":true,"text":"call Dr. Okafor about the biopsy""#;
+        let err = parse_response_line(line, false).unwrap_err().to_string();
+        assert!(err.contains("invalid Cohere MLX response"), "{err}");
+        assert!(!err.contains("Okafor"), "{err}");
+        let debug = parse_response_line(line, true).unwrap_err().to_string();
+        assert!(debug.contains("Okafor"), "{debug}");
     }
 
     #[test]

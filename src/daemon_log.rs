@@ -52,7 +52,8 @@ pub fn terms(list: &[String]) -> String {
     render_terms(text_logging_enabled(), list)
 }
 
-fn render_text(enabled: bool, s: &str) -> String {
+/// [`text`] with the switch explicit, for callers that must be testable.
+pub(crate) fn render_text(enabled: bool, s: &str) -> String {
     if enabled {
         format!("{s:?}")
     } else {
