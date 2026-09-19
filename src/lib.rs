@@ -1,6 +1,7 @@
 pub mod app_paths;
 pub mod app_tones;
 pub mod cancel;
+pub mod config_io;
 pub mod audio;
 pub mod audio_duck;
 #[cfg(feature = "cohere-mlx")]

@@ -402,14 +402,48 @@ impl Settings {
     /// caller can decide to rewrite the file).
     fn load_from_migrating(path: &Path) -> (Self, bool) {
         let mut settings: Self = match std::fs::read_to_string(path) {
-            Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
-                eprintln!("[warn] settings parse failed ({}): {e}", path.display());
-                Self::default()
-            }),
+            Ok(body) => Self::parse_lenient(&body, &path.display().to_string()),
             Err(_) => Self::default(), // missing file is the common case
         };
         let migrated = settings.migrate_legacy_keys();
         (settings, migrated)
+    }
+
+    /// Parse a settings document one key at a time. A single bad value (for
+    /// example `"preroll_ms": "400"` or `-1`) used to fail the whole document
+    /// and reset EVERY setting; now only that key falls back to its default,
+    /// with a warning, and the rest survive. A document that is not a JSON
+    /// object at all still degrades to defaults (and `save_to` keeps a `.bak`
+    /// of it before writing).
+    fn parse_lenient(body: &str, origin: &str) -> Self {
+        if let Ok(s) = serde_json::from_str::<Self>(body) {
+            return s;
+        }
+        let map = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => {
+                eprintln!("[warn] settings ignored ({origin}): not a JSON object");
+                return Self::default();
+            }
+            Err(e) => {
+                eprintln!("[warn] settings parse failed ({origin}): {e}");
+                return Self::default();
+            }
+        };
+        let mut good = serde_json::Map::new();
+        for (key, value) in map {
+            let mut one = serde_json::Map::new();
+            one.insert(key.clone(), value.clone());
+            match serde_json::from_value::<Self>(serde_json::Value::Object(one)) {
+                Ok(_) => {
+                    good.insert(key, value);
+                }
+                Err(e) => eprintln!(
+                    "[warn] settings: ignoring \"{key}\" ({origin}): {e}; using its default"
+                ),
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(good)).unwrap_or_default()
     }
 
     /// Fold renamed keys into their current fields. Returns true when
@@ -438,8 +472,32 @@ impl Settings {
             std::fs::create_dir_all(dir)
                 .map_err(|e| eyre::eyre!("create {}: {e}", dir.display()))?;
         }
+        // A file that is not a JSON object loaded as defaults, so this save
+        // would replace whatever the user had. Keep a copy first.
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            let is_object = matches!(
+                serde_json::from_str::<serde_json::Value>(&existing),
+                Ok(serde_json::Value::Object(_))
+            );
+            if !existing.trim().is_empty() && !is_object {
+                match crate::config_io::backup(path) {
+                    Ok(bak) => eprintln!(
+                        "[settings] {} was unreadable; kept a copy at {}",
+                        path.display(),
+                        bak.display()
+                    ),
+                    Err(e) => {
+                        return Err(eyre::eyre!(
+                            "{} is unreadable and could not be backed up ({e}); not overwriting it",
+                            path.display()
+                        ))
+                    }
+                }
+            }
+        }
         let body = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, body).map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
+        crate::config_io::write_atomic(path, body.as_bytes())
+            .map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
         Ok(())
     }
 
@@ -1146,6 +1204,84 @@ mod tests {
             s2.wake_word = Some("jarvis".into());
             assert_eq!(s2.resolve_wake_word(), "jarvis");
         }
+    }
+
+    #[test]
+    fn one_bad_value_does_not_reset_the_other_settings() {
+        // Regression: any single type error failed the whole document and
+        // every setting silently reverted to its default.
+        let dir = std::env::temp_dir().join(format!("fd-settings-lenient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "hotkey_keycode": 54,
+                "preroll_ms": "400",
+                "warm_window_ms": -1,
+                "tail_capture_cap_ms": 400.5,
+                "cleanup_enabled": "yes",
+                "appearance": "light",
+                "cohere_language": "de",
+                "translation_targets": ["Spanish", 7],
+                "history_retention": "1week",
+                "some_future_key": {"nested": true}
+            }"#,
+        )
+        .unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.hotkey_keycode, Some(54));
+        assert_eq!(s.appearance.as_deref(), Some("light"));
+        assert_eq!(s.cohere_language.as_deref(), Some("de"));
+        assert_eq!(s.history_retention.as_deref(), Some("1week"));
+        // The bad ones fall back to "unset" (their built-in default).
+        assert_eq!(s.preroll_ms, None);
+        assert_eq!(s.warm_window_ms, None);
+        assert_eq!(s.tail_capture_cap_ms, None);
+        assert_eq!(s.cleanup_enabled, None);
+        assert_eq!(s.translation_targets, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lenient_parse_still_migrates_the_legacy_model_key() {
+        let s = {
+            let mut s = Settings::parse_lenient(
+                r#"{ "gemma_model": "/tmp/legacy.gguf", "preroll_ms": "bad" }"#,
+                "test",
+            );
+            s.migrate_legacy_keys();
+            s
+        };
+        assert_eq!(s.llm_model.as_deref(), Some("/tmp/legacy.gguf"));
+        assert_eq!(s.preroll_ms, None);
+    }
+
+    #[test]
+    fn unparseable_settings_are_backed_up_before_the_first_save() {
+        let dir = std::env::temp_dir().join(format!("fd-settings-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let broken = "{ \"hotkey_keycode\": 54,, }";
+        std::fs::write(&path, broken).unwrap();
+        // Unparseable → defaults, as before.
+        let mut s = Settings::load_from(&path);
+        assert_eq!(s, Settings::default());
+        // The menu's load → mutate → save must not destroy the user's file.
+        s.cleanup_enabled = Some(false);
+        s.save_to(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("settings.json.bak")).unwrap(), broken);
+        assert_eq!(Settings::load_from(&path).cleanup_enabled, Some(false));
+        // A healthy file is not backed up again.
+        s.save_to(&path).unwrap();
+        let baks = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert_eq!(baks, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

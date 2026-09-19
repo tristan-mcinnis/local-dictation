@@ -217,7 +217,9 @@ impl Corrections {
     /// parsed rows, and rebuilding through [`Self::build`] so the phrase index
     /// can't drift.
     pub fn import_csv(&mut self, csv_body: &str) -> eyre::Result<usize> {
-        let records = parse_csv(csv_body);
+        // Excel writes a UTF-8 BOM; without this the header cell reads
+        // "\u{feff}from" and is imported as a term.
+        let records = parse_csv(csv_body.trim_start_matches('\u{feff}'));
         let mut map: HashMap<String, String> = self.map.clone();
         let mut added = 0usize;
         let mut first_data_row = true;
@@ -276,15 +278,35 @@ impl Corrections {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        // A corrections file this build cannot parse is the user's whole
+        // dictionary. It loads as "empty", so saving would replace it with
+        // whatever little the editor holds. Refuse instead.
+        crate::config_io::refuse_if_unreadable(path, |body| {
+            serde_json::from_str::<RawMap>(body).is_ok()
+        })?;
+        // `_`-prefixed keys are the user's JSON comments; carry them over.
+        let comments: Vec<(String, String)> = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|body| serde_json::from_str::<RawMap>(&body).ok())
+            .map(|raw| {
+                let mut c: Vec<_> = raw.0.into_iter().filter(|(k, _)| k.starts_with('_')).collect();
+                c.sort();
+                c
+            })
+            .unwrap_or_default();
         let mut keys: Vec<&String> = self.map.keys().collect();
         keys.sort();
-        let obj: serde_json::Map<String, serde_json::Value> = keys
+        let obj: serde_json::Map<String, serde_json::Value> = comments
             .into_iter()
-            .map(|k| (k.clone(), serde_json::Value::String(self.map[k].clone())))
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .chain(
+                keys.into_iter()
+                    .map(|k| (k.clone(), serde_json::Value::String(self.map[k].clone()))),
+            )
             .collect();
         let body = serde_json::to_string_pretty(&serde_json::Value::Object(obj))
             .map_err(|e| eyre::eyre!("serialize corrections: {e}"))?;
-        std::fs::write(path, format!("{body}\n"))
+        crate::config_io::write_atomic(path, format!("{body}\n").as_bytes())
             .map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
         Ok(())
     }
@@ -581,6 +603,63 @@ fn finish_field(field: &str, quoted: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("fd-corr-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("corrections.json")
+    }
+
+    #[test]
+    fn a_corrupt_corrections_file_is_never_overwritten() {
+        // Regression: a parse error opened the editor empty, and Save replaced
+        // the user's whole dictionary with the one term they had just added.
+        let path = scratch_file("corrupt");
+        let broken = "{ \"to twist\": \"Todoist\",, \"lumen\": \"Lumen\" }";
+        std::fs::write(&path, broken).unwrap();
+        assert!(Corrections::load_from(&path).is_err());
+        let one = Corrections::from_editor_text("Jenifer");
+        let err = one.save_to(&path).unwrap_err().to_string();
+        assert!(err.contains("could not be read"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_keeps_comment_keys_and_round_trips() {
+        let path = scratch_file("comments");
+        std::fs::write(
+            &path,
+            r#"{ "_comment": "names from the Q3 project", "to twist": "Todoist" }"#,
+        )
+        .unwrap();
+        let mut c = Corrections::load_from(&path).unwrap();
+        assert_eq!(c.len(), 1);
+        c.import_csv("lumen,Lumen\n").unwrap();
+        c.save_to(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("names from the Q3 project"), "{body}");
+        let back = Corrections::load_from(&path).unwrap();
+        assert_eq!(back.len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_creates_a_missing_file() {
+        let path = scratch_file("fresh");
+        Corrections::from_editor_text("Jenifer").save_to(&path).unwrap();
+        assert_eq!(Corrections::load_from(&path).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn csv_import_strips_a_utf8_bom() {
+        let mut c = Corrections::empty();
+        let added = c.import_csv("\u{feff}from,to\nto twist,Todoist\n").unwrap();
+        assert_eq!(added, 1);
+        assert!(!c.to_editor_lines().iter().any(|l| l.contains('\u{feff}')));
+    }
 
     fn dict(pairs: &[(&str, &str)]) -> Corrections {
         let map = pairs

@@ -303,13 +303,29 @@ pub(super) fn show_dictionary_window(actions: &MenuActions) {
     // Load the user's vocabulary from corrections.json, rendered as editor lines
     // (bare word = keep spelling; "from → to" = fix). The footer well carries
     // the hint, so the title bar stays empty.
-    let joined = crate::corrections::Corrections::load_default()
+    // A file that cannot be parsed is NOT shown as an empty dictionary with a
+    // working Save: that is how a whole dictionary got replaced by one term.
+    let loaded = crate::corrections::Corrections::load_default();
+    let unreadable = loaded.is_err();
+    if let Err(e) = &loaded {
+        eprintln!("[menu] dictionary not loaded: {e}");
+    }
+    let joined = loaded
         .map(|c| c.to_editor_lines())
         .unwrap_or_default()
         .join("\n");
     {
         ui.text_view.setString(&NSString::from_str(&joined));
-        set_footer(ui, DICT_HINT);
+        ui.save_button.setEnabled(!unreadable);
+        ui.add_button.setEnabled(!unreadable);
+        set_footer(
+            ui,
+            if unreadable {
+                "corrections.json could not be read. It was left untouched; fix or remove it."
+            } else {
+                DICT_HINT
+            },
+        );
         ui.window.makeKeyAndOrderFront(None);
     }
     // Accessory app: explicitly activate so the window comes to the front.
@@ -342,7 +358,7 @@ pub(super) fn save_dictionary_from_view() {
         }
         Err(e) => {
             eprintln!("[menu] dictionary save failed: {e}");
-            set_footer(ui, "Save failed — see log");
+            set_footer(ui, &format!("Not saved. {e}"));
         }
     }
 }

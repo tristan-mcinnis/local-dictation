@@ -67,9 +67,13 @@ pub fn save_to(path: &Path, terms: &[String]) -> eyre::Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && !s.starts_with('_'))
         .collect();
+    // Never replace a dictionary this build cannot parse (see config_io.rs).
+    crate::config_io::refuse_if_unreadable(path, |body| {
+        serde_json::from_str::<Vec<String>>(body).is_ok()
+    })?;
     let body = serde_json::to_string_pretty(&cleaned)
         .map_err(|e| eyre::eyre!("serialize dictionary: {e}"))?;
-    std::fs::write(path, format!("{body}\n"))
+    crate::config_io::write_atomic(path, format!("{body}\n").as_bytes())
         .map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
     Ok(())
 }
@@ -101,6 +105,20 @@ pub fn load_from(path: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_corrupt_dictionary_file_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("dict-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dictionary.json");
+        let broken = "[\"Parakeet\", \"Lumen\"";
+        std::fs::write(&path, broken).unwrap();
+        assert!(load_from(&path).is_empty());
+        assert!(save_to(&path, &["Todoist".to_string()]).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_array_trims_and_drops_blanks_and_comments() {

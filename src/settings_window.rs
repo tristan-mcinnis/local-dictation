@@ -206,6 +206,9 @@ pub struct SettingsUi {
     /// The key a row click pulled into the fields, so Add replaces that entry
     /// instead of leaving the old spelling behind beside the new one.
     dictionary_editing: Mutex<Option<String>>,
+    /// Set when corrections.json exists but could not be parsed. The pane then
+    /// refuses edits: saving would replace the user's whole dictionary.
+    dictionary_load_error: Option<String>,
     pending_corrections: Mutex<crate::corrections::Corrections>,
     original_correction_lines: Vec<String>,
     // Translate
@@ -395,6 +398,10 @@ define_class!(
             let Some(ui) = SETTINGS_UI.get() else {
                 return;
             };
+            if let Some(why) = &ui.dictionary_load_error {
+                ui.dictionary_status.setStringValue(&NSString::from_str(why));
+                return;
+            }
             let heard = ui.dictionary_heard_field.stringValue().to_string();
             let correct = ui.dictionary_correct_field.stringValue().to_string();
             let Some(line) = crate::corrections::quick_add_line(&heard, &correct) else {
@@ -1303,20 +1310,27 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         &controller,
         sel!(addDictionaryEntry:),
     );
-    let loaded_corrections = if render_fixture {
-        crate::corrections::Corrections::from_editor_text(RENDER_DICTIONARY)
+    let (loaded_corrections, dictionary_load_error) = if render_fixture {
+        (crate::corrections::Corrections::from_editor_text(RENDER_DICTIONARY), None)
     } else {
-        crate::corrections::Corrections::load_default()
-            .unwrap_or_else(|_| crate::corrections::Corrections::empty())
+        match crate::corrections::Corrections::load_default() {
+            Ok(c) => (c, None),
+            Err(e) => {
+                eprintln!("[settings] dictionary not loaded: {e}");
+                (crate::corrections::Corrections::empty(), Some(DICTIONARY_UNREADABLE.to_string()))
+            }
+        }
     };
     let original_correction_lines = loaded_corrections.to_editor_lines();
     let dictionary_status = hint_line(
         mtm,
         &mut card,
-        &format!(
-            "{} terms. Replacements run before and after cleanup, including raw terminal dictation.",
-            loaded_corrections.len()
-        ),
+        &dictionary_load_error.clone().unwrap_or_else(|| {
+            format!(
+                "{} terms. Replacements run before and after cleanup, including raw terminal dictation.",
+                loaded_corrections.len()
+            )
+        }),
     );
     hint_line(
         mtm,
@@ -1876,6 +1890,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         dictionary_body_y,
         dictionary_keys: Mutex::new(dictionary_keys),
         dictionary_editing: Mutex::new(None),
+        dictionary_load_error,
         pending_corrections: Mutex::new(loaded_corrections),
         original_correction_lines,
         translate_targets_field,
@@ -3388,6 +3403,10 @@ fn refresh_live_preview_control() {
     }
 }
 
+/// Shown in the Dictionary pane when corrections.json cannot be parsed.
+const DICTIONARY_UNREADABLE: &str = "corrections.json could not be read, so it was left untouched. \
+     Open the Corrections folder in About, fix or remove the file, then reopen Settings.";
+
 fn apply_and_restart(ui: &SettingsUi) {
     let pending = ui.pending.lock().unwrap().clone();
     let corrections = ui.pending_corrections.lock().unwrap();
@@ -3406,6 +3425,8 @@ fn apply_and_restart(ui: &SettingsUi) {
     if corrections_changed {
         if let Err(e) = corrections.save() {
             eprintln!("[settings] failed to save dictionary: {e}");
+            ui.dictionary_status
+                .setStringValue(&NSString::from_str(&format!("Not saved. {e}")));
             return;
         }
     }

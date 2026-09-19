@@ -399,6 +399,15 @@ re-joining the path:
   `dictionary.example.json` shows the format). It is a plain-list input for power users; the menu bar
   manages `corrections.json`, not this file.
 
+**File safety** (`src/config_io.rs`). Every writer of these files writes atomically (temp file in
+the same directory, fsync, rename). `settings.json` is parsed one key at a time: a single bad value
+falls back to that key's default with a `[warn]` line and the other keys survive; a document that
+is not a JSON object loads as defaults and is copied to `settings.json.bak` before the next save.
+`corrections.json` and `dictionary.json` cannot be rebuilt from anything, so a file that does not
+parse is never overwritten: `save_to` returns an error, the Dictionary window disables Add and
+Save, and the Settings pane refuses Add and says why. `_`-prefixed comment keys in
+`corrections.json` survive a save. CSV import strips a UTF-8 BOM.
+
 Precedence is always **env var > JSON file > built-in default**. The active env knobs on the fixed
 stack:
 
