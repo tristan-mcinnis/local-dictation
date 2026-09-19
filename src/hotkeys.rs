@@ -166,8 +166,11 @@ impl Hotkey {
 /// Option while Left Option is held still carries OPTION. Device masks come
 /// from the macOS SDK's IOKit/hidsystem/IOLLEvent.h. Fall back to the aggregate
 /// bit for keyboards that provide no side-specific bits for this modifier.
-pub fn modifier_key_is_down(keycode: i64, flags: u64) -> bool {
-    let (own, pair, aggregate) = match keycode {
+/// `(own, pair, aggregate)` masks for a physical modifier: the side-specific
+/// device bit, both sides' device bits, and the aggregate flag. `None` for a
+/// keycode that is not a modifier.
+pub fn modifier_key_masks(keycode: i64) -> Option<(u64, u64, u64)> {
+    Some(match keycode {
         0x3A => (0x20, 0x60, OPTION),
         0x3D => (0x40, 0x60, OPTION),
         0x37 => (0x08, 0x18, COMMAND),
@@ -176,13 +179,29 @@ pub fn modifier_key_is_down(keycode: i64, flags: u64) -> bool {
         0x3E => (0x2000, 0x2001, CONTROL),
         0x38 => (0x02, 0x06, SHIFT),
         0x3C => (0x04, 0x06, SHIFT),
-        _ => return false,
-    };
-    if flags & pair != 0 {
-        flags & own != 0
-    } else {
-        flags & aggregate != 0
+        _ => return None,
+    })
+}
+
+pub fn modifier_key_is_down(keycode: i64, flags: u64) -> bool {
+    match modifier_key_masks(keycode) {
+        Some((own, pair, aggregate)) => {
+            if flags & pair != 0 {
+                flags & own != 0
+            } else {
+                flags & aggregate != 0
+            }
+        }
+        None => false,
     }
+}
+
+/// True when an event carried no side-specific device bit for this modifier, so
+/// its state had to be read from the aggregate flag — where Left and Right are
+/// indistinguishable. A stop diagnosed through this path cannot be attributed
+/// to the configured side with certainty, only to "an Option of some side".
+pub fn modifier_key_read_via_aggregate(keycode: i64, flags: u64) -> bool {
+    matches!(modifier_key_masks(keycode), Some((_, pair, _)) if flags & pair == 0)
 }
 
 /// Map a modifier keycode to its human name (used for `display` of a
@@ -392,6 +411,19 @@ mod tests {
             assert!(modifier_key_is_down(right, aggregate)); // aggregate-only keyboard
             assert!(!modifier_key_is_down(right, 0));
         }
+    }
+
+    #[test]
+    fn aggregate_read_is_flagged_only_when_device_bits_are_absent() {
+        // A keyboard that reports device bits: the side is knowable.
+        assert!(!modifier_key_read_via_aggregate(0x3D, OPTION | 0x40));
+        assert!(!modifier_key_read_via_aggregate(0x3D, OPTION | 0x20));
+        // No device bit at all: the aggregate decides, so Left Option would read
+        // as Right Option and the read is marked aggregate.
+        assert!(modifier_key_read_via_aggregate(0x3D, OPTION));
+        assert!(modifier_key_read_via_aggregate(0x3D, 0));
+        // Not a modifier keycode.
+        assert!(!modifier_key_read_via_aggregate(0x00, OPTION));
     }
 
     #[test]

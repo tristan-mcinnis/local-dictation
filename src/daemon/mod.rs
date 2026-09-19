@@ -36,8 +36,9 @@ use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CallbackResult, EventField,
 };
+use core_graphics::event_source::CGEventSourceStateID;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -99,10 +100,28 @@ const ESCAPE_KEYCODE: i64 = 0x35;
 // hotkey would silently die. Null until the tap exists.
 static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
+/// How many times macOS has disabled the event tap. A disabled tap drops every
+/// key event until it is re-armed, so this count is the difference between
+/// "nothing was pressed" and "we were not listening".
+static TAP_DISABLES: AtomicU64 = AtomicU64::new(0);
+
 extern "C" {
     /// CoreGraphics: enable or disable a previously-created event tap.
     /// `void CGEventTapEnable(CFMachPortRef tap, bool enable);`
     fn CGEventTapEnable(tap: *const c_void, enable: bool);
+
+    /// CoreGraphics: the live modifier state for a source.
+    /// `CGEventFlags CGEventSourceFlagsState(CGEventSourceStateID stateID);`
+    /// Read with `kCGEventSourceStateHIDSystemState` this is what the hardware
+    /// reports right now, independent of the flags a single event carries.
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
+}
+
+/// The hardware's live modifier flags, bypassing the event under inspection.
+/// A physical key press shows up here; a state change another process injected
+/// into the event stream does not.
+fn hid_modifier_flags() -> u64 {
+    unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState as i32) }
 }
 
 /// Configuration for the daemon. Built from CLI args / env vars in main.rs.
@@ -300,7 +319,16 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         move |_proxy, etype, event| {
             match etype {
                 CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
-                    // macOS disabled the tap — re-arm it so the hotkey lives on.
+                    // macOS disabled the tap. Every key event in the disabled
+                    // window is dropped, so this must be visible in the log: a
+                    // dropped release leaves the hold state stale and the next
+                    // edge is then read against the wrong physical state.
+                    // Re-arm immediately; the callback stays short.
+                    let n = TAP_DISABLES.fetch_add(1, Ordering::SeqCst) + 1;
+                    eprintln!(
+                        "[hotkey] {} TAP DISABLED ({etype:?}) · #{n} · re-arming",
+                        stamp()
+                    );
                     let p = TAP_PORT.load(Ordering::SeqCst);
                     if !p.is_null() {
                         unsafe { CGEventTapEnable(p, true) };
@@ -316,50 +344,75 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     if keycode != hotkey_keycode {
                         return CallbackResult::Keep;
                     }
+                    let flags = event.get_flags();
+                    let raw = flags.bits();
+                    // Provenance probe. Every edge is logged with where it came
+                    // from, because a stop with no finger behind it is
+                    // otherwise indistinguishable from a real tap:
+                    //   pid/state/uid — who posted it (0 = the HID system)
+                    //   read          — device bit (side known) vs aggregate
+                    //   hw            — the live hardware flags, not the event's
+                    //   HW-DISAGREE   — event and hardware disagree ⇒ synthesized
+                    // A Bluetooth gadget re-asserting a modifier looks exactly
+                    // like a keyboard press until this line separates them.
+                    let src_pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
+                    let src_state = event.get_integer_value_field(EventField::EVENT_SOURCE_STATE_ID);
+                    let src_uid = event.get_integer_value_field(EventField::EVENT_SOURCE_USER_ID);
+                    let hw = hid_modifier_flags();
+                    let down = crate::hotkeys::modifier_key_is_down(hotkey_keycode, raw);
+                    let hw_down = crate::hotkeys::modifier_key_is_down(hotkey_keycode, hw);
+                    eprintln!(
+                        "[hotkey] {} edge · key {hotkey_keycode:#x} · {} · flags {raw:#x} · read {} · hw {hw:#x} · src pid {src_pid} state {src_state} uid {src_uid}{}",
+                        stamp(),
+                        if down { "DOWN" } else { "UP" },
+                        if crate::hotkeys::modifier_key_read_via_aggregate(hotkey_keycode, raw) {
+                            "aggregate"
+                        } else {
+                            "device-bit"
+                        },
+                        if down == hw_down { "" } else { " · HW-DISAGREE" },
+                    );
                     // Only a physical key controls the session. A FlagsChanged
                     // posted by another process (AppleScript, an automation
                     // tool, a remote's companion app) carries that process's
-                    // PID here; a physical keyboard carries 0.
+                    // PID here; a physical keyboard carries 0. The hardware
+                    // comparison above is the stronger signal, since a poster
+                    // can leave the PID unset.
                     // Without this guard, any app posting Right Option ends a
                     // hands-free session and pastes the transcript wherever
                     // focus is.
-                    let src_pid = event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID);
-                    let flags = event.get_flags();
                     if src_pid != 0 {
                         eprintln!(
-                            "[hotkey] {} ignored synthesized hotkey event from pid {src_pid} (flags {:#x})",
-                            stamp(),
-                            flags.bits()
+                            "[hotkey] {} ignored synthesized hotkey event from pid {src_pid} (flags {raw:#x})",
+                            stamp()
                         );
                         return CallbackResult::Keep;
                     }
-                    let input = {
-                        if crate::hotkeys::modifier_key_is_down(hotkey_keycode, flags.bits()) {
-                            if !hotkey_edge(&hotkey_down_cb, true) {
-                                return CallbackResult::Keep;
-                            }
-                            // Shift co-held at press → transform mode (rewrite the
-                            // selection). The user holds Shift *before* the PTT key.
-                            let press = Instant::now();
-                            let double_tap = double_tap_latch
-                                && detector_cb.lock().unwrap().on_press(press);
-                            PttInput::HotkeyPress {
-                                shift: flags.contains(CGEventFlags::CGEventFlagShift),
-                                double_tap,
-                            }
-                        } else {
-                            if !hotkey_edge(&hotkey_down_cb, false) {
-                                return CallbackResult::Keep;
-                            }
-                            detector_cb.lock().unwrap().on_release(Instant::now());
-                            PttInput::HotkeyRelease
-                        }
-                    };
-                    eprintln!(
-                        "[hotkey] {} modifier edge · key {hotkey_keycode:#x} · flags {:#x}",
-                        stamp(), flags.bits()
-                    );
-                    drive(input);
+                    // One physical edge only. Repeated key-downs must never be
+                    // mistaken for a fresh tap that stops hands-free capture;
+                    // log the repeats so a stuck or bouncing device is visible.
+                    if !hotkey_edge(&hotkey_down_cb, down) {
+                        eprintln!(
+                            "[hotkey] {} duplicate {} edge ignored · flags {raw:#x} · hw {hw:#x}",
+                            stamp(),
+                            if down { "down" } else { "up" }
+                        );
+                        return CallbackResult::Keep;
+                    }
+                    if down {
+                        // Shift co-held at press → transform mode (rewrite the
+                        // selection). The user holds Shift *before* the PTT key.
+                        let press = Instant::now();
+                        let double_tap = double_tap_latch
+                            && detector_cb.lock().unwrap().on_press(press);
+                        drive(PttInput::HotkeyPress {
+                            shift: flags.contains(CGEventFlags::CGEventFlagShift),
+                            double_tap,
+                        });
+                    } else {
+                        detector_cb.lock().unwrap().on_release(Instant::now());
+                        drive(PttInput::HotkeyRelease);
+                    }
                     // FlagsChanged is never swallowed — let the modifier through.
                 }
                 CGEventType::KeyDown => {
