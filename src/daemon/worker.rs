@@ -125,7 +125,7 @@ pub(super) fn worker_loop(
     // release we join this receiver (usually instant) and reuse the target; a
     // failed or stale press-time capture re-resolves fresh. `None` means no
     // capture is in flight (between utterances / after a cancel).
-    let mut pending_target: Option<std::sync::mpsc::Receiver<eyre::Result<FocusTarget>>> = None;
+    let mut pending_target: Option<std::sync::mpsc::Receiver<PressCapture>> = None;
 
     // ── Capture mode (release tail-capture + warm-window reuse) ──────────
     // Tail capture: on key release, keep the mic open for a brief adaptive grace
@@ -1143,10 +1143,11 @@ pub(super) fn worker_loop(
                 // Gemma when the destination is a terminal. The injector still
                 // resolves the current field at write time; this capture is the
                 // same-app fallback only if that fresh lookup loses focus.
-                let press_target: Option<FocusTarget> = match pending_target.take() {
-                    Some(rx) => rx.recv().ok().and_then(|r| r.ok()),
-                    None => None,
-                };
+                let (press_app, press_target): (Option<crate::injector::TargetApp>, Option<FocusTarget>) =
+                    match pending_target.take().and_then(|rx| rx.recv().ok()) {
+                        Some((app, focus)) => (app, focus.ok()),
+                        None => (None, None),
+                    };
                 // Stale-target fallback: if the press-time capture failed, or
                 // the frontmost app changed since the key was pressed (a long
                 // hold or hands-free can out-last the user's focus), the retained
@@ -1157,7 +1158,16 @@ pub(super) fn worker_loop(
                 // code did — correctness over speed.
                 let captured_target: Option<FocusTarget> = press_target
                     .filter(crate::injector::focus_target_still_current);
-                let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
+                // One app identity for every per-app decision below (terminal
+                // raw mode, tone, the log line): the press-time app while it is
+                // still in front, else the app the text will actually go to.
+                // Resolved once here; nothing re-reads the frontmost app later.
+                let target_app = crate::injector::resolve_target_app(
+                    press_app,
+                    crate::injector::frontmost_pid(),
+                    crate::injector::bundle_id_for_pid,
+                );
+                let target_pid = target_app.as_ref().map(|a| a.pid);
                 if captured_target.is_some() {
                     eprintln!("  ⌖    press-time focus ready · fresh check at write");
                 } else {
@@ -1225,9 +1235,9 @@ pub(super) fn worker_loop(
                 // whole-utterance cleanup prompt as the vocabulary block.
                 #[cfg(feature = "cleaner")]
                 let tone: Option<&'static str> = {
-                    let bundle = crate::audio_duck::frontmost_bundle_id();
+                    let bundle = target_app.as_ref().and_then(|a| a.bundle_id.as_deref());
                     let name = target_pid.map(app_name).unwrap_or_default();
-                    let t = crate::app_tones::tone_for(&name, bundle.as_deref());
+                    let t = crate::app_tones::tone_for(&name, bundle);
                     if let Some(t) = t {
                         eprintln!("  ♪    tone: {t}");
                     }
@@ -1775,13 +1785,22 @@ pub(super) fn guarded_transcribe_len(
 /// result is joined (usually instantly) at release. A very short hold simply
 /// blocks on the join — the same cost the old release-time spawn paid, and
 /// usually strictly less because the resolve happened during speech, not after.
-pub(super) fn spawn_focus_capture() -> std::sync::mpsc::Receiver<eyre::Result<FocusTarget>> {
-    let (tx, rx) = std::sync::mpsc::channel::<eyre::Result<FocusTarget>>();
+///
+/// The app identity (PID + bundle id) is read first and travels with the
+/// result even when the AX capture fails: terminals and other AX-blind apps
+/// expose no focused element, and they are exactly the apps whose identity
+/// decides raw-vs-cleaned text.
+pub(super) fn spawn_focus_capture() -> std::sync::mpsc::Receiver<PressCapture> {
+    let (tx, rx) = std::sync::mpsc::channel::<PressCapture>();
     std::thread::spawn(move || {
-        let _ = tx.send(FocusTarget::capture());
+        let app = crate::injector::frontmost_target_app();
+        let _ = tx.send((app, FocusTarget::capture()));
     });
     rx
 }
+
+/// What the press-time capture thread hands back: the app, and its focus.
+pub(super) type PressCapture = (Option<crate::injector::TargetApp>, eyre::Result<FocusTarget>);
 
 /// Start a fresh open-on-press recording: build a new engine, open the mic,
 /// arm the streaming segment stream, and set the per-utterance state (engine,

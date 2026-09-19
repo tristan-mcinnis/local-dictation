@@ -106,6 +106,37 @@ pub fn clipboard_target_is_frontmost(
     }
 }
 
+/// The app a dictation is for: the PID and bundle id read together, once, when
+/// the key goes down. Every per-app decision in the release pipeline (raw text
+/// for a terminal, the cleanup tone, the log line) reads this one value, so
+/// they cannot disagree with each other or drift to whatever app is in front
+/// by the time cleanup runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetApp {
+    pub pid: i32,
+    pub bundle_id: Option<String>,
+}
+
+/// Which app's rules apply at release. The text is written into the app that
+/// is frontmost at write time (a deliberate, tested rule), so:
+///   * the press-time app, when it is still in front, or when the frontmost
+///     app cannot be read;
+///   * the app now in front, when the user switched during the hold. Its
+///     bundle id is looked up once here, by PID, not re-read later.
+/// A failed AX focus capture no longer loses the app: a terminal that exposes
+/// no focused element still counts as a terminal.
+pub fn resolve_target_app(
+    press: Option<TargetApp>,
+    frontmost_now: Option<i32>,
+    bundle_id_for: impl FnOnce(i32) -> Option<String>,
+) -> Option<TargetApp> {
+    match (press, frontmost_now) {
+        (Some(app), Some(now)) if app.pid == now => Some(app),
+        (_, Some(now)) => Some(TargetApp { pid: now, bundle_id: bundle_id_for(now) }),
+        (press, None) => press,
+    }
+}
+
 /// What a live (systemwide) injection should do, planned from the current
 /// OS-frontmost app at write time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -669,6 +700,25 @@ pub fn frontmost_pid() -> Option<i32> {
     NSWorkspace::sharedWorkspace()
         .frontmostApplication()
         .map(|app| app.processIdentifier())
+}
+
+/// Bundle identifier of a running app, by PID.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn bundle_id_for_pid(pid: i32) -> Option<String> {
+    use objc2_app_kit::NSRunningApplication;
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        .and_then(|app| app.bundleIdentifier())
+        .map(|s| s.to_string())
+}
+
+/// The frontmost app's PID and bundle id, from one `NSRunningApplication`.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn frontmost_target_app() -> Option<TargetApp> {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace().frontmostApplication().map(|app| TargetApp {
+        pid: app.processIdentifier(),
+        bundle_id: app.bundleIdentifier().map(|s| s.to_string()),
+    })
 }
 
 /// True when a press-time [`FocusTarget`] still points at the OS-frontmost app
@@ -1903,6 +1953,41 @@ impl AccessibilityInjector {
 
 #[cfg(test)]
 mod tests {
+    fn app(pid: i32, bundle: &str) -> TargetApp {
+        TargetApp { pid, bundle_id: Some(bundle.to_string()) }
+    }
+
+    #[test]
+    fn the_press_time_app_is_used_while_it_is_still_in_front() {
+        let got = resolve_target_app(Some(app(10, "com.mitchellh.ghostty")), Some(10), |_| {
+            panic!("no second lookup when the app did not change")
+        });
+        assert_eq!(got, Some(app(10, "com.mitchellh.ghostty")));
+    }
+
+    #[test]
+    fn an_app_switch_during_the_hold_uses_the_app_the_text_goes_to() {
+        // Regression (INJ:TGT-01): the old app's raw/cleanup choice was applied
+        // to the new app, while the tone was read from yet another moment.
+        let got = resolve_target_app(Some(app(10, "com.mitchellh.ghostty")), Some(22), |pid| {
+            assert_eq!(pid, 22);
+            Some("com.apple.mail".to_string())
+        });
+        assert_eq!(got, Some(app(22, "com.apple.mail")));
+    }
+
+    #[test]
+    fn a_failed_press_capture_still_identifies_the_app() {
+        // Regression: a terminal with no focused AX element had no target PID,
+        // so LLM-cleaned prose was pasted into the shell.
+        let got = resolve_target_app(None, Some(31), |_| Some("com.googlecode.iterm2".into()));
+        assert_eq!(got, Some(app(31, "com.googlecode.iterm2")));
+        // Nothing readable at all: no target, and no invented one.
+        assert_eq!(resolve_target_app(None, None, |_| None), None);
+        // Frontmost unreadable at release: keep what the press saw.
+        assert_eq!(resolve_target_app(Some(app(5, "a.b")), None, |_| None), Some(app(5, "a.b")));
+    }
+
     use super::*;
 
     #[test]
