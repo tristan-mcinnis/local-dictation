@@ -162,9 +162,41 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             ),
             (
                 "pill-held",
-                PillLayout::Copied,
+                PillLayout::Error,
                 UiState::NoEditableField,
-                "No text field selected · Copy from menu",
+                crate::last_dictation::kept_pill_text(UiState::NoEditableField).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-held-copied",
+                PillLayout::Error,
+                UiState::HeldCopied,
+                crate::last_dictation::kept_pill_text(UiState::HeldCopied).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-paste-failed-copied",
+                PillLayout::Error,
+                UiState::PasteFailedCopied,
+                crate::last_dictation::kept_pill_text(UiState::PasteFailedCopied).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-limit-copied",
+                PillLayout::Error,
+                UiState::LimitReachedCopied,
+                crate::last_dictation::kept_pill_text(UiState::LimitReachedCopied).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-nothing-to-copy",
+                PillLayout::Copied,
+                UiState::NothingToCopy,
+                super::pill::NOTHING_TO_COPY_TEXT,
                 false,
                 false,
             ),
@@ -188,7 +220,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 "pill-paste-failed",
                 PillLayout::Error,
                 UiState::PasteFailed,
-                super::pill::PASTE_FAILED_TEXT,
+                crate::last_dictation::kept_pill_text(UiState::PasteFailed).unwrap(),
                 false,
                 false,
             ),
@@ -204,7 +236,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             pill.storage_warning.set(name.ends_with("storage-warning"));
             pill.status.setStringValue(&NSString::from_str(status));
             pill.hint
-                .setStringValue(&NSString::from_str(if matches!(state, UiState::Error | UiState::PasteFailed) {
+                .setStringValue(&NSString::from_str(if state == UiState::Error || state.is_kept_result() {
                     "History"
                 } else {
                     "Undo"
@@ -226,10 +258,10 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 assert_eq!(pill.cancel.keyEquivalent().to_string(), "\u{1b}");
                 assert!(pill.cancel.keyEquivalentModifierMask().is_empty());
             }
-            if matches!(state, UiState::Copied | UiState::NoEditableField) {
+            if matches!(state, UiState::Copied | UiState::NothingToCopy) {
                 assert!(pill.undo.isHidden());
             }
-            if matches!(state, UiState::Error | UiState::PasteFailed) {
+            if state == UiState::Error || state.is_kept_result() {
                 assert!(!pill.history.isHidden());
                 assert!(
                     pill.history.frame().size.width >= 24.0

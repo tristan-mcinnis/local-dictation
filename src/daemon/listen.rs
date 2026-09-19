@@ -242,6 +242,13 @@ pub(super) fn inject_refined(refiner: &Refiner, text: &str) {
     inject_refined_authorized(refiner, text, &|| true);
 }
 
+/// Retry and listen mode have no recovery record of their own: keep the text
+/// (last dictation + clipboard) and show the kept-result pill unscoped.
+fn keep_unscoped(text: &str, cause: crate::last_dictation::KeptCause) {
+    let state = crate::recovery::keep_transcript(text, cause);
+    ui_channel::show_transient(state, ui_channel::KEPT_PILL);
+}
+
 /// Cancellable form of [`inject_refined`]: `authorize` is polled once by the
 /// injector immediately before the first write/clipboard side effect, so retry
 /// obeys the same Escape + focus/no-blind-paste guard as a live utterance.
@@ -275,10 +282,8 @@ pub(super) fn inject_refined_authorized(
                     }
                 }
                 Ok(crate::injector::InjectOutcome::NoEditableField) => {
-                    eprintln!(
-                        "  ◌    no text field selected — text held (copy from menu)"
-                    );
-                    ui_channel::set_last_dictation(&text);
+                    eprintln!("  ◌    no text field selected — text kept");
+                    keep_unscoped(&text, crate::last_dictation::KeptCause::NoEditableField);
                 }
                 Ok(crate::injector::InjectOutcome::Cancelled) => {
                     // A cancel landed during retry: suppress the write. The
@@ -289,12 +294,13 @@ pub(super) fn inject_refined_authorized(
                 Ok(crate::injector::InjectOutcome::RefusedForeground) => {
                     // Fail-closed: the expected app was not frontmost at the
                     // global Cmd+V, so nothing was written. Hold it recoverable.
-                    eprintln!("  ◌    target not frontmost at paste — text held (copy from menu)");
-                    ui_channel::set_last_dictation(&text);
+                    eprintln!("  ◌    target not frontmost at paste — text kept");
+                    keep_unscoped(&text, crate::last_dictation::KeptCause::NoEditableField);
                 }
                 Err(e) => {
-                    eprintln!("  ✗    inject failed: {e:?}");
-                    cues::play_error();
+                    // Regression: a failed write here used to drop the text.
+                    eprintln!("  ✗    inject failed: {e:?} — text kept");
+                    keep_unscoped(&text, crate::last_dictation::KeptCause::PasteFailed);
                 }
             }
         }

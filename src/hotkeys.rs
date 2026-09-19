@@ -80,7 +80,12 @@ impl Hotkey {
     /// key. See [`crate::settings::Settings::resolve_hotkey`] and
     /// [`crate::settings::Settings::resolve_hotkey_modifiers`].
     pub fn from_settings() -> Hotkey {
-        let settings = crate::settings::Settings::load();
+        Hotkey::from_loaded(&crate::settings::Settings::load())
+    }
+
+    /// As [`Hotkey::from_settings`], for settings already in hand (the
+    /// Settings window validates against its unsaved edits).
+    pub fn from_loaded(settings: &crate::settings::Settings) -> Hotkey {
         Hotkey {
             keycode: settings.resolve_hotkey(DEFAULT_KEYCODE),
             modifiers: settings.resolve_hotkey_modifiers(),
@@ -353,9 +358,223 @@ pub fn chord_modifiers_match(flags: u64, required: u64) -> bool {
     held == required || (required & SHIFT == 0 && held == required | SHIFT)
 }
 
+// ─── The second hotkey: "Copy last dictation" ───────────────────────────
+
+/// Built-in chords for "Copy last dictation", tried in order; the first one
+/// that does not collide with the dictation hotkey is used. `⌃⌘V` reads as
+/// "paste" and avoids Option, the default dictation key's family.
+pub const COPY_LAST_DEFAULTS: &[&str] = &["ctrl+cmd+v", "ctrl+option+v", "shift+option+v"];
+
+const SPACE_KEYCODE: i64 = 0x31;
+const FOUR_MODIFIERS: u64 = SHIFT | CONTROL | OPTION | COMMAND;
+
+/// Why `copy` cannot be the "Copy last dictation" chord next to the dictation
+/// hotkey `ptt`, or `None` when it is fine. The event tap swallows a matching
+/// key-down system-wide, so the rules are stricter than for an app shortcut.
+pub fn copy_last_problem(ptt: &Hotkey, copy: &Hotkey) -> Option<String> {
+    if copy.is_modifier_only() {
+        return Some("use a key with modifiers, for example ctrl+cmd+v".into());
+    }
+    if let Some(why) = copy.problem() {
+        return Some(why.into());
+    }
+    if copy.keycode == SPACE_KEYCODE {
+        return Some("Space is part of the hands-free gesture".into());
+    }
+    let held = copy.modifiers & FOUR_MODIFIERS;
+    if held == COMMAND {
+        return Some("⌘ plus one key belongs to the app in front; add ctrl or option".into());
+    }
+    if !ptt.is_modifier_only() && ptt.keycode == copy.keycode {
+        let ptt_held = ptt.modifiers & FOUR_MODIFIERS;
+        // Shift + the dictation chord is the transform gesture.
+        if held == ptt_held || held == ptt_held | SHIFT {
+            return Some(format!("{} is the dictation hotkey", ptt.display()));
+        }
+    }
+    if let Some((_, _, family)) = modifier_key_masks(ptt.keycode) {
+        if held & family != 0 {
+            return Some(format!(
+                "it uses the same modifier as the dictation key ({}), so pressing it would start a recording",
+                ptt.display()
+            ));
+        }
+    }
+    None
+}
+
+/// Resolve the "Copy last dictation" chord. `configured` is the raw string from
+/// [`crate::settings::Settings::resolve_copy_last_hotkey`]: `None` picks the
+/// first usable built-in default, blank / `off` / `none` turns the hotkey off,
+/// anything else must parse and pass [`copy_last_problem`].
+pub fn copy_last_hotkey(configured: Option<&str>, ptt: &Hotkey) -> Result<Option<Hotkey>, String> {
+    match configured.map(str::trim) {
+        None => Ok(COPY_LAST_DEFAULTS
+            .iter()
+            .filter_map(|s| Hotkey::parse(s))
+            .find(|h| copy_last_problem(ptt, h).is_none())),
+        Some(s) if s.is_empty() || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") => Ok(None),
+        Some(s) => {
+            let hotkey = Hotkey::parse(s).ok_or_else(|| format!("\"{s}\" is not a hotkey"))?;
+            match copy_last_problem(ptt, &hotkey) {
+                None => Ok(Some(hotkey)),
+                Some(why) => Err(why),
+            }
+        }
+    }
+}
+
+/// What the Settings field should show and store for a typed copy-last chord:
+/// `(hint line, value to store)`. `None` for the value means "not usable, keep
+/// what was there". Blank is a deliberate "off" and is stored as `""`.
+pub fn copy_last_field(text: &str, ptt: &Hotkey) -> (String, Option<String>) {
+    match copy_last_hotkey(Some(text), ptt) {
+        Ok(None) => ("Off. Copy from the menu bar instead.".to_string(), Some(String::new())),
+        Ok(Some(h)) => (
+            format!("{} copies the last dictation from anywhere.", h.display()),
+            Some(to_parseable(&h)),
+        ),
+        Err(why) => (format!("Not used: {why}."), None),
+    }
+}
+
+/// The chord the running app should watch, from settings. A bad configured
+/// value turns the hotkey off (with a log line) rather than guessing another.
+pub fn copy_last_from_settings() -> Option<Hotkey> {
+    let configured = crate::settings::Settings::load().resolve_copy_last_hotkey();
+    match copy_last_hotkey(configured.as_deref(), &Hotkey::from_settings()) {
+        Ok(hotkey) => hotkey,
+        Err(why) => {
+            eprintln!("[hotkey] copy-last hotkey ignored ({why}); it is off");
+            None
+        }
+    }
+}
+
+/// True when a key-down with `flags` is the copy-last chord. The four modifier
+/// bits must be EQUAL: no extra-Shift allowance, and our own synthesized ⌘V
+/// (Command only) can never match a chord that needs a second modifier.
+pub fn copy_last_matches(copy: &Hotkey, keycode: i64, flags: u64) -> bool {
+    keycode == copy.keycode && flags & FOUR_MODIFIERS == copy.modifiers & FOUR_MODIFIERS
+}
+
+/// A parseable shorthand for a hotkey (`"ctrl+cmd+v"`, `"f5"`), the inverse of
+/// [`Hotkey::parse`] for every key in the table.
+pub fn to_parseable(h: &Hotkey) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if h.modifiers & COMMAND != 0 {
+        parts.push("cmd");
+    }
+    if h.modifiers & SHIFT != 0 {
+        parts.push("shift");
+    }
+    if h.modifiers & CONTROL != 0 {
+        parts.push("ctrl");
+    }
+    if h.modifiers & OPTION != 0 {
+        parts.push("option");
+    }
+    let key = key_name_for_keycode(h.keycode)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("key{}", h.keycode));
+    let mut out = parts.join("+");
+    if !out.is_empty() {
+        out.push('+');
+    }
+    out.push_str(&key);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RIGHT_OPTION: Hotkey = Hotkey { keycode: DEFAULT_KEYCODE, modifiers: 0 };
+
+    fn parsed(s: &str) -> Hotkey {
+        Hotkey::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_default_copy_last_chord_is_ctrl_cmd_v_next_to_right_option() {
+        let h = copy_last_hotkey(None, &RIGHT_OPTION).unwrap().unwrap();
+        assert_eq!(h, Hotkey { keycode: 0x09, modifiers: CONTROL | COMMAND });
+        assert_eq!(h.display(), "⌘⌃V");
+    }
+
+    #[test]
+    fn the_default_steps_aside_for_a_command_or_control_dictation_key() {
+        let right_cmd = Hotkey { keycode: 0x36, modifiers: 0 };
+        assert_eq!(copy_last_hotkey(None, &right_cmd).unwrap(), Some(parsed("ctrl+option+v")));
+        let right_ctrl = Hotkey { keycode: 0x3E, modifiers: 0 };
+        assert_eq!(copy_last_hotkey(None, &right_ctrl).unwrap(), Some(parsed("shift+option+v")));
+        // Every built-in default parses and is a legal chord on its own.
+        for s in COPY_LAST_DEFAULTS {
+            assert!(parsed(s).problem().is_none(), "{s}");
+        }
+    }
+
+    #[test]
+    fn blank_or_off_turns_the_copy_last_hotkey_off() {
+        for s in ["", "  ", "off", "OFF", "none"] {
+            assert_eq!(copy_last_hotkey(Some(s), &RIGHT_OPTION), Ok(None), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn copy_last_is_validated_against_the_dictation_hotkey() {
+        // Same family as a modifier-only dictation key: pressing the chord
+        // would start a recording on the way.
+        assert!(copy_last_hotkey(Some("option+v"), &RIGHT_OPTION).is_err());
+        assert!(copy_last_hotkey(Some("ctrl+option+cmd+v"), &RIGHT_OPTION).is_err());
+        // The dictation chord itself, and its Shift (transform) form.
+        let chord = parsed("cmd+shift+d");
+        assert!(copy_last_hotkey(Some("cmd+shift+d"), &chord).is_err());
+        let chord = parsed("ctrl+option+d");
+        assert!(copy_last_hotkey(Some("ctrl+option+shift+d"), &chord).is_err());
+        assert!(copy_last_hotkey(Some("ctrl+cmd+d"), &chord).is_ok());
+        // Not a chord, a bare typing key, Escape, Space, plain ⌘V, garbage.
+        for bad in ["v", "escape", "ctrl+escape", "ctrl+space", "cmd+v", "cmd+c", "ctrl+cmd+nope", "ctrl+"] {
+            assert!(copy_last_hotkey(Some(bad), &RIGHT_OPTION).is_err(), "{bad}");
+        }
+        assert!(copy_last_problem(&RIGHT_OPTION, &Hotkey { keycode: 0x36, modifiers: 0 }).is_some());
+        // Fine: a function key alone, or a two-modifier chord.
+        assert!(copy_last_hotkey(Some("f6"), &RIGHT_OPTION).unwrap().is_some());
+        assert!(copy_last_hotkey(Some("ctrl+shift+c"), &RIGHT_OPTION).unwrap().is_some());
+    }
+
+    #[test]
+    fn copy_last_matches_exact_modifiers_only() {
+        let h = parsed("ctrl+cmd+v");
+        assert!(copy_last_matches(&h, 0x09, CONTROL | COMMAND));
+        // Device bits, Caps Lock and Fn do not matter.
+        assert!(copy_last_matches(&h, 0x09, CONTROL | COMMAND | CAPS_LOCK | 0x08 | 0x01));
+        // Our own synthesized ⌘V must never trigger it; nor may a superset.
+        assert!(!copy_last_matches(&h, 0x09, COMMAND));
+        assert!(!copy_last_matches(&h, 0x09, CONTROL | COMMAND | SHIFT));
+        assert!(!copy_last_matches(&h, 0x08, CONTROL | COMMAND));
+    }
+
+    #[test]
+    fn the_settings_field_stores_only_usable_chords() {
+        let (hint, value) = copy_last_field(" Ctrl+Cmd+V ", &RIGHT_OPTION);
+        assert_eq!(value.as_deref(), Some("cmd+ctrl+v"));
+        assert!(hint.starts_with("⌘⌃V"));
+        let (hint, value) = copy_last_field("", &RIGHT_OPTION);
+        assert_eq!(value.as_deref(), Some(""), "blank is a stored, deliberate off");
+        assert!(hint.starts_with("Off"));
+        let (hint, value) = copy_last_field("option+v", &RIGHT_OPTION);
+        assert_eq!(value, None, "a bad chord never replaces the saved one");
+        assert!(hint.starts_with("Not used:"), "{hint}");
+    }
+
+    #[test]
+    fn to_parseable_round_trips() {
+        for s in ["ctrl+cmd+v", "cmd+shift+d", "f5", "ctrl+option+space", "shift+option+v"] {
+            let h = parsed(s);
+            assert_eq!(Hotkey::parse(&to_parseable(&h)), Some(h), "{s}");
+        }
+    }
 
     #[test]
     fn modifier_state_distinguishes_each_physical_side() {

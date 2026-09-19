@@ -7,6 +7,12 @@ pub(super) fn hotkey_edge(down: &AtomicBool, is_down: bool) -> bool {
     down.swap(is_down, Ordering::SeqCst) != is_down
 }
 
+/// Has a recording run past the user's limit? `limit_minutes == 0` means no
+/// limit. Checked on the worker's 120 ms tick.
+pub(super) fn recording_limit_reached(elapsed: Duration, limit_minutes: u32) -> bool {
+    limit_minutes > 0 && elapsed >= Duration::from_secs(u64::from(limit_minutes) * 60)
+}
+
 // Double-tap-to-latch gesture timing. A quick tap (press+release within
 // TAP_MAX_HOLD) followed by a second press within DOUBLE_TAP_WINDOW of that
 // release arms hands-free — the no-Spacebar route into latch. Detected in the

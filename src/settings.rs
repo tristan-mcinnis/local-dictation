@@ -344,6 +344,27 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_result: Option<bool>,
 
+    /// Put the text on the clipboard when a finished dictation could not be
+    /// inserted (no text field, a failed paste, the recording limit), so ⌘V
+    /// works at once. A plain clipboard write: clipboard managers keep it.
+    /// `None`/true ⇒ on. Override: `DICTATE_COPY_ON_PASTE_FAILURE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_on_paste_failure: Option<bool>,
+
+    /// Global "Copy last dictation" chord as a parseable string
+    /// (`"ctrl+cmd+v"`). Absent ⇒ the built-in default
+    /// ([`crate::hotkeys::COPY_LAST_DEFAULTS`]); `""` or `"off"` ⇒ no hotkey.
+    /// Override: `DICTATE_COPY_LAST_HOTKEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_last_hotkey: Option<String>,
+
+    /// Stop a recording that has run this many minutes, so a lost key-up or a
+    /// forgotten hands-free session cannot record without end. 0 ⇒ no limit.
+    /// `None` ⇒ [`DEFAULT_MAX_RECORDING_MINUTES`]. Override:
+    /// `DICTATE_MAX_RECORDING_MINUTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_recording_minutes: Option<u32>,
+
     /// Window appearance: `"system"`, `"light"`, or `"dark"`. `None` ⇒
     /// [`DEFAULT_APPEARANCE`] (dark — the house design's default). Applied with
     /// `NSApplication.setAppearance`, so every window follows it; nothing is
@@ -355,6 +376,19 @@ pub struct Settings {
 /// How long the optional "Landed · N words" result pill stays on screen. Long
 /// enough to read; the old 420 ms vanished before the eye reached it.
 pub const RESULT_PILL_MS: u64 = 2000;
+
+/// Default recording limit. Long enough for any real dictation; short enough
+/// that a stuck key is caught the same morning.
+pub const DEFAULT_MAX_RECORDING_MINUTES: u32 = 10;
+
+/// Recording-limit choices offered in Settings, as `(minutes, label)`.
+pub const MAX_RECORDING_CHOICES: &[(u32, &str)] = &[
+    (5, "5 minutes"),
+    (10, "10 minutes"),
+    (30, "30 minutes"),
+    (60, "1 hour"),
+    (0, "No limit"),
+];
 
 /// Appearance choices offered in the menu and the Settings window, as
 /// `(on-disk value, label)`.
@@ -827,6 +861,40 @@ impl Settings {
         self.show_result.unwrap_or(false)
     }
 
+    /// Resolve copy-on-failure: `DICTATE_COPY_ON_PASTE_FAILURE` env >
+    /// settings > on.
+    pub fn resolve_copy_on_paste_failure(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_COPY_ON_PASTE_FAILURE") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.copy_on_paste_failure.unwrap_or(true)
+    }
+
+    /// The configured "Copy last dictation" chord string:
+    /// `DICTATE_COPY_LAST_HOTKEY` env > settings. `None` means nothing was
+    /// configured, so the caller applies the built-in default; an empty string
+    /// means the user turned the hotkey off. Parsing and validation against the
+    /// dictation hotkey live in [`crate::hotkeys::copy_last_hotkey`].
+    pub fn resolve_copy_last_hotkey(&self) -> Option<String> {
+        if let Ok(v) = std::env::var("DICTATE_COPY_LAST_HOTKEY") {
+            return Some(v.trim().to_string());
+        }
+        self.copy_last_hotkey.as_ref().map(|s| s.trim().to_string())
+    }
+
+    /// Resolve the recording limit in minutes: `DICTATE_MAX_RECORDING_MINUTES`
+    /// env > settings > [`DEFAULT_MAX_RECORDING_MINUTES`]. 0 = no limit.
+    pub fn resolve_max_recording_minutes(&self) -> u32 {
+        if let Ok(v) = std::env::var("DICTATE_MAX_RECORDING_MINUTES") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                return n;
+            }
+        }
+        self.max_recording_minutes
+            .unwrap_or(DEFAULT_MAX_RECORDING_MINUTES)
+    }
+
     /// Resolve double-tap-to-latch (hands-free from a hotkey double-tap):
     /// `DICTATE_DOUBLE_TAP_LATCH` env > settings > enabled.
     pub fn resolve_double_tap_latch(&self) -> bool {
@@ -1107,6 +1175,52 @@ mod tests {
             s.whisper_mode = Some(true);
             assert!(s.resolve_whisper_mode());
         }
+    }
+
+    #[test]
+    fn copy_on_paste_failure_is_on_by_default() {
+        if std::env::var_os("DICTATE_COPY_ON_PASTE_FAILURE").is_none() {
+            assert!(Settings::default().resolve_copy_on_paste_failure());
+            let mut s = Settings::default();
+            s.copy_on_paste_failure = Some(false);
+            assert!(!s.resolve_copy_on_paste_failure());
+        }
+    }
+
+    #[test]
+    fn copy_last_hotkey_distinguishes_unset_from_off() {
+        if std::env::var_os("DICTATE_COPY_LAST_HOTKEY").is_none() {
+            assert_eq!(Settings::default().resolve_copy_last_hotkey(), None);
+            let mut s = Settings::default();
+            s.copy_last_hotkey = Some("".into());
+            assert_eq!(s.resolve_copy_last_hotkey().as_deref(), Some(""));
+            s.copy_last_hotkey = Some(" ctrl+cmd+v ".into());
+            assert_eq!(s.resolve_copy_last_hotkey().as_deref(), Some("ctrl+cmd+v"));
+        }
+    }
+
+    #[test]
+    fn max_recording_defaults_to_ten_minutes_and_zero_means_no_limit() {
+        if std::env::var_os("DICTATE_MAX_RECORDING_MINUTES").is_none() {
+            assert_eq!(Settings::default().resolve_max_recording_minutes(), 10);
+            let mut s = Settings::default();
+            s.max_recording_minutes = Some(0);
+            assert_eq!(s.resolve_max_recording_minutes(), 0);
+            assert!(MAX_RECORDING_CHOICES.iter().any(|(m, _)| *m == DEFAULT_MAX_RECORDING_MINUTES));
+        }
+    }
+
+    #[test]
+    fn an_old_settings_file_without_the_new_keys_still_loads() {
+        let s = Settings::parse_lenient(r#"{"hotkey_keycode": 61, "show_result": true}"#, "test");
+        assert_eq!(s.hotkey_keycode, Some(61));
+        assert_eq!(s.copy_last_hotkey, None);
+        assert_eq!(s.copy_on_paste_failure, None);
+        assert_eq!(s.max_recording_minutes, None);
+        // A bad value in a new key costs only that key.
+        let s = Settings::parse_lenient(r#"{"max_recording_minutes": "ten", "show_result": true}"#, "test");
+        assert_eq!(s.max_recording_minutes, None);
+        assert_eq!(s.show_result, Some(true));
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub enum Command {
     /// Recover a stored dictation by database id. Re-transcribe and clean
     /// locally, then copy to the clipboard; never paste or execute commands.
     Recover(i64),
+    /// Copy the most recent finished transcript to the clipboard. Copy only:
+    /// nothing is pasted and no app is activated. Same code path as the global
+    /// hotkey and the menu item.
+    CopyLast,
     /// Report live state as one line of JSON. Answered by the socket thread
     /// itself — it never reaches the daemon's dispatch closure, so asking is
     /// free and cannot touch the audio path. See the house command contract
@@ -76,6 +80,7 @@ impl Command {
             "toggle" => Some(Command::Toggle),
             "cancel" => Some(Command::Cancel),
             "retry" => Some(Command::Retry),
+            "copy-last" => Some(Command::CopyLast),
             "status" => Some(Command::Status),
             _ => None,
         }
@@ -90,6 +95,7 @@ impl Command {
             Command::Cancel => "cancel",
             Command::Retry => "retry",
             Command::Recover(_) => "recover",
+            Command::CopyLast => "copy-last",
             Command::Status => "status",
         }
     }
@@ -112,13 +118,28 @@ pub const APP_ID: &str = "dictation";
 /// clauses name (here: `recording`). `busy` mirrors `recording` — capturing an
 /// utterance is the only thing this daemon is ever busy with from outside.
 pub fn status_json() -> String {
-    let recording = DAEMON_RECORDING.load(Ordering::SeqCst);
+    status_json_for(
+        DAEMON_RECORDING.load(Ordering::SeqCst),
+        crate::secure_input::query(),
+    )
+}
+
+/// `hotkeyPaused` is true while another app holds Secure Input: macOS then
+/// delivers no key events, so the hotkeys are silent and this socket is the
+/// way to dictate. The detail line says so in words.
+fn status_json_for(recording: bool, hotkey_paused: bool) -> String {
+    let detail = match (recording, hotkey_paused) {
+        (true, _) => "Listening",
+        (false, true) => crate::secure_input::PAUSED_TEXT,
+        (false, false) => "Idle",
+    };
     serde_json::json!({
         "app": APP_ID,
         "ok": true,
         "busy": recording,
         "recording": recording,
-        "detail": if recording { "Listening" } else { "Idle" },
+        "hotkeyPaused": hotkey_paused,
+        "detail": detail,
     })
     .to_string()
 }
@@ -163,6 +184,10 @@ fn manifest_for(endpoint: &str) -> serde_json::Value {
             // makes sense between utterances.
             {"id": "dictation.retry", "title": "Retry Last Dictation", "verb": "retry",
              "needs": null, "unavailableWhen": "recording"},
+            // Copy only; never pastes. Offered at any time: it does not touch
+            // the recording in flight.
+            {"id": "dictation.copy-last", "title": "Copy Last Dictation", "verb": "copy-last",
+             "needs": null, "unavailableWhen": null},
         ],
     })
 }
@@ -299,6 +324,10 @@ fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
             crate::history::recovery_audio_path,
             dispatch,
         ),
+        Some(Command::CopyLast) => copy_last_reply(
+            crate::ui_channel::last_dictation().trim().is_empty(),
+            dispatch,
+        ),
         Some(cmd) => {
             let resolved = resolve(cmd);
             dispatch(resolved);
@@ -308,6 +337,16 @@ fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
     };
     let mut stream = reader.into_inner();
     let _ = stream.write_all(reply.as_bytes());
+}
+
+/// `copy-last` answers honestly: with nothing dictated yet there is nothing to
+/// copy, and the daemon is not bothered.
+fn copy_last_reply(nothing_yet: bool, dispatch: impl FnOnce(Command)) -> String {
+    if nothing_yet {
+        return "err No dictation to copy yet.\n".to_string();
+    }
+    dispatch(Command::CopyLast);
+    "ok copy-last\n".to_string()
 }
 
 fn recovery_reply(
@@ -369,6 +408,44 @@ mod tests {
 
     fn lock_flag() -> std::sync::MutexGuard<'static, ()> {
         FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn status_says_when_secure_input_has_paused_the_hotkey() {
+        let v: serde_json::Value = serde_json::from_str(&status_json_for(false, true)).unwrap();
+        assert_eq!(v["hotkeyPaused"], true);
+        assert!(v["detail"].as_str().unwrap().contains("Secure Input"));
+        let v: serde_json::Value = serde_json::from_str(&status_json_for(true, true)).unwrap();
+        assert_eq!(v["detail"], "Listening");
+        let v: serde_json::Value = serde_json::from_str(&status_json_for(false, false)).unwrap();
+        assert_eq!(v["hotkeyPaused"], false);
+        assert_eq!(v["detail"], "Idle");
+    }
+
+    #[test]
+    fn copy_last_parses_and_replies_honestly() {
+        assert_eq!(Command::parse(" Copy-Last\n"), Some(Command::CopyLast));
+        assert_eq!(Command::CopyLast.wire(), "copy-last");
+        let mut sent = None;
+        assert_eq!(copy_last_reply(false, |c| sent = Some(c)), "ok copy-last\n");
+        assert_eq!(sent, Some(Command::CopyLast));
+        let mut sent = None;
+        let reply = copy_last_reply(true, |c| sent = Some(c));
+        assert!(reply.starts_with("err No dictation"));
+        assert_eq!(sent, None, "nothing to copy never reaches the daemon");
+    }
+
+    #[test]
+    fn the_manifest_offers_copy_last_at_any_time() {
+        let m = manifest_for("/tmp/x.sock");
+        let cmd = m["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["verb"] == "copy-last")
+            .expect("copy-last is published");
+        assert_eq!(cmd["id"], "dictation.copy-last");
+        assert!(cmd["unavailableWhen"].is_null());
     }
 
     #[test]
@@ -583,7 +660,7 @@ mod tests {
 
         let cmds = m["commands"].as_array().expect("commands is an array");
         let verbs: Vec<&str> = cmds.iter().map(|c| c["verb"].as_str().unwrap()).collect();
-        assert_eq!(verbs, ["toggle", "start", "stop", "cancel", "retry"]);
+        assert_eq!(verbs, ["toggle", "start", "stop", "cancel", "retry", "copy-last"]);
 
         for c in cmds {
             // Every advertised verb must actually be one we parse…
@@ -617,6 +694,7 @@ mod tests {
         assert_eq!(when("stop"), serde_json::json!("!recording"));
         assert_eq!(when("cancel"), serde_json::json!("!recording"));
         assert_eq!(when("retry"), serde_json::json!("recording"));
+        assert_eq!(when("copy-last"), serde_json::Value::Null);
     }
 
     #[test]
@@ -630,7 +708,7 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_str(&text).expect("manifest is valid JSON");
         assert_eq!(doc["app"], serde_json::json!("dictation"));
         assert_eq!(doc["schema"], serde_json::json!(1));
-        assert_eq!(doc["commands"].as_array().unwrap().len(), 5);
+        assert_eq!(doc["commands"].as_array().unwrap().len(), 6);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

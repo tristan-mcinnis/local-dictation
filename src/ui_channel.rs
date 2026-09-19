@@ -60,6 +60,17 @@ pub enum UiState {
     /// (whose pill says "Couldn’t transcribe"): the words exist, are kept as
     /// the last dictation and in History, and the pill says where to get them.
     PasteFailed = 10,
+    /// Held (no text field), and the words were put on the clipboard.
+    HeldCopied = 11,
+    /// The write failed, and the words were put on the clipboard.
+    PasteFailedCopied = 12,
+    /// The recording hit the maximum length and was stopped. The text is kept,
+    /// never pasted: nobody may still be at the keyboard.
+    LimitReached = 13,
+    /// As `LimitReached`, with the words on the clipboard.
+    LimitReachedCopied = 14,
+    /// "Copy last dictation" was asked for and there is nothing to copy.
+    NothingToCopy = 15,
 }
 
 impl UiState {
@@ -83,6 +94,20 @@ impl UiState {
         self == Self::Recording || self.is_processing()
     }
 
+    /// The transcript exists but was not inserted: the pill says where the
+    /// words are, stays about four seconds, and the next key press dismisses it.
+    pub fn is_kept_result(self) -> bool {
+        matches!(
+            self,
+            Self::NoEditableField
+                | Self::PasteFailed
+                | Self::HeldCopied
+                | Self::PasteFailedCopied
+                | Self::LimitReached
+                | Self::LimitReachedCopied
+        )
+    }
+
     /// Reconstruct from the raw atomic byte. Unknown values map to `Idle`.
     pub fn from_u8(v: u8) -> Self {
         match v {
@@ -96,6 +121,11 @@ impl UiState {
             8 => UiState::Pasting,
             9 => UiState::Copied,
             10 => UiState::PasteFailed,
+            11 => UiState::HeldCopied,
+            12 => UiState::PasteFailedCopied,
+            13 => UiState::LimitReached,
+            14 => UiState::LimitReachedCopied,
+            15 => UiState::NothingToCopy,
             _ => UiState::Idle,
         }
     }
@@ -119,6 +149,8 @@ struct Presentation {
     capture: Option<Arc<AtomicBool>>,
     preview: String,
     revision: u64,
+    /// When a kept-result pill went up; `None` in every other state.
+    kept_since: Option<std::time::Instant>,
 }
 
 impl Presentation {
@@ -130,11 +162,13 @@ impl Presentation {
             capture: None,
             preview: String::new(),
             revision: 0,
+            kept_since: None,
         }
     }
 
     fn set_state(&mut self, state: UiState) -> u64 {
         self.state = state;
+        self.kept_since = state.is_kept_result().then(std::time::Instant::now);
         self.generation = None;
         self.preview.clear();
         self.preview_enabled = false;
@@ -235,6 +269,21 @@ impl Presentation {
         }
     }
 
+    /// A key press dismisses a kept-result pill, but not one that only just
+    /// appeared: a keystroke already on its way must not hide it unread.
+    fn dismiss_kept_on_key(&mut self, now: std::time::Instant) -> bool {
+        match self.kept_since {
+            Some(since)
+                if self.state.is_kept_result()
+                    && now.saturating_duration_since(since) >= KEPT_PILL_MIN_VISIBLE =>
+            {
+                self.set_state(UiState::Idle);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn expire(&mut self, revision: u64) {
         if self.revision == revision {
             self.set_state(UiState::Idle);
@@ -242,7 +291,18 @@ impl Presentation {
     }
 }
 
-/// The last successfully-injected text, for the "Copy last dictation" item.
+/// How long a kept-result pill stays up when no key is pressed.
+pub const KEPT_PILL: std::time::Duration = std::time::Duration::from_millis(4000);
+
+/// A key press inside this window does not dismiss a kept-result pill.
+pub const KEPT_PILL_MIN_VISIBLE: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// True while a kept-result pill is up. Lets the event tap skip the
+/// presentation lock on every ordinary key press.
+static KEPT_PILL_UP: AtomicBool = AtomicBool::new(false);
+
+/// The most recent finished transcript (inserted, held, failed, transformed or
+/// recovered), for "Copy last dictation". Seeded from history at boot.
 static LAST_DICTATION: Mutex<String> = Mutex::new(String::new());
 
 /// Process-wide ring of recent RMS levels (one per cpal callback chunk).
@@ -255,6 +315,21 @@ static AUDIO_LEVELS: Mutex<VecDeque<f32>> = Mutex::new(VecDeque::new());
 pub fn set_state(state: UiState) {
     if let Ok(mut presentation) = PRESENTATION.lock() {
         presentation.set_state(state);
+    }
+    KEPT_PILL_UP.store(state.is_kept_result(), Ordering::SeqCst);
+}
+
+/// Called by the event tap on a fresh key-down. Cheap when no kept-result
+/// pill is showing (one atomic read); otherwise dismisses it once it has been
+/// visible long enough to read.
+pub fn key_pressed() {
+    if !KEPT_PILL_UP.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(mut p) = PRESENTATION.lock() {
+        if p.dismiss_kept_on_key(std::time::Instant::now()) || !p.state.is_kept_result() {
+            KEPT_PILL_UP.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -328,6 +403,7 @@ pub fn show_transient(state: UiState, duration: std::time::Duration) {
         Ok(mut p) => p.set_state(state),
         Err(_) => return,
     };
+    note_kept_pill(state);
     expire_transient_after(revision, duration);
 }
 
@@ -341,8 +417,17 @@ pub fn show_transient_if_unowned(state: UiState, duration: std::time::Duration) 
         },
         Err(_) => return false,
     };
+    note_kept_pill(state);
     expire_transient_after(revision, duration);
     true
+}
+
+/// Arm the key-press dismissal. A stale `true` is harmless: `key_pressed`
+/// clears it as soon as it finds another state showing.
+fn note_kept_pill(state: UiState) {
+    if state.is_kept_result() {
+        KEPT_PILL_UP.store(true, Ordering::SeqCst);
+    }
 }
 
 fn expire_transient_after(revision: u64, duration: std::time::Duration) {
@@ -360,6 +445,7 @@ pub fn show_transient_for(generation: u64, state: UiState, duration: std::time::
         Ok(mut p) if p.accepts(&crate::cancel::CANCEL, generation) => p.set_state(state),
         _ => return,
     };
+    note_kept_pill(state);
     std::thread::spawn(move || {
         std::thread::sleep(duration);
         if let Ok(mut p) = PRESENTATION.lock() {
@@ -393,10 +479,22 @@ pub fn undo_target_is_current(injected: Option<i32>, frontmost: Option<i32>) -> 
     matches!((injected, frontmost), (Some(a), Some(b)) if a == b)
 }
 
-/// Record the most recent injected text.
+/// Record the most recent finished transcript.
 pub fn set_last_dictation(text: &str) {
     if let Ok(mut g) = LAST_DICTATION.lock() {
         *g = text.to_string();
+    }
+}
+
+/// Boot-time seed: fill the last dictation only while it is still empty, so a
+/// dictation finished during startup is never replaced by an older one.
+pub fn seed_last_dictation(text: &str) -> bool {
+    match LAST_DICTATION.lock() {
+        Ok(mut g) if g.is_empty() && !text.trim().is_empty() => {
+            *g = text.to_string();
+            true
+        }
+        _ => false,
     }
 }
 
@@ -460,6 +558,59 @@ mod tests {
     use super::*;
     use crate::cancel::CancelGate;
     use std::sync::Arc;
+
+    #[test]
+    fn every_state_round_trips_through_its_byte() {
+        for v in 0..=15u8 {
+            assert_eq!(UiState::from_u8(v) as u8, v);
+        }
+        assert_eq!(UiState::from_u8(200), UiState::Idle);
+    }
+
+    #[test]
+    fn kept_results_are_terminal_and_let_escape_through() {
+        for s in [
+            UiState::NoEditableField,
+            UiState::PasteFailed,
+            UiState::HeldCopied,
+            UiState::PasteFailedCopied,
+            UiState::LimitReached,
+            UiState::LimitReachedCopied,
+        ] {
+            assert!(s.is_kept_result());
+            assert!(!s.is_active());
+            assert!(!s.is_cancellable());
+        }
+        for s in [UiState::Idle, UiState::Success, UiState::Copied, UiState::NothingToCopy, UiState::Error] {
+            assert!(!s.is_kept_result());
+        }
+    }
+
+    #[test]
+    fn a_key_press_dismisses_a_kept_pill_only_after_it_was_readable() {
+        let mut ui = Presentation::new();
+        ui.set_state(UiState::HeldCopied);
+        let shown = ui.kept_since.unwrap();
+        assert!(!ui.dismiss_kept_on_key(shown + std::time::Duration::from_millis(100)));
+        assert_eq!(ui.state, UiState::HeldCopied);
+        assert!(ui.dismiss_kept_on_key(shown + KEPT_PILL_MIN_VISIBLE));
+        assert_eq!(ui.state, UiState::Idle);
+        // Any other pill is left alone by typing.
+        ui.set_state(UiState::Success);
+        assert!(!ui.dismiss_kept_on_key(std::time::Instant::now() + KEPT_PILL));
+        assert_eq!(ui.state, UiState::Success);
+    }
+
+    #[test]
+    fn a_key_press_never_touches_a_live_recording() {
+        let gate = CancelGate::new();
+        let mut ui = Presentation::new();
+        ui.set_state(UiState::PasteFailedCopied);
+        let gen = ui.begin(&gate, UiState::Recording, false);
+        assert!(!ui.dismiss_kept_on_key(std::time::Instant::now() + KEPT_PILL));
+        assert_eq!(ui.state, UiState::Recording);
+        assert!(gate.allows_progress(gen));
+    }
 
     #[test]
     fn paste_failed_is_a_result_state_not_a_working_one() {

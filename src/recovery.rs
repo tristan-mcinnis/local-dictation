@@ -52,6 +52,43 @@ pub fn recovery_may_write(state: crate::ui_channel::UiState, cancel_active: bool
     !state.is_active() && !cancel_active
 }
 
+/// "Copy last dictation": the one code path behind the global hotkey, the menu
+/// item and the `copy-last` IPC command. A plain clipboard write (clipboard
+/// managers keep it), never a paste, never an app activation. The pill confirms
+/// it unless a live dictation owns the pill; the copy itself always happens.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn copy_last_dictation(source: &str) -> crate::last_dictation::CopyLastOutcome {
+    use crate::last_dictation::CopyLastOutcome;
+    let outcome = crate::last_dictation::copy_last(&crate::ui_channel::last_dictation(), |text| {
+        crate::clipboard_paste::copy_only(text).map_err(|e| e.to_string())
+    });
+    eprintln!("[copy-last] {source} · {outcome:?}");
+    if outcome == CopyLastOutcome::Failed {
+        crate::cues::play_error();
+    }
+    if let Some(state) = outcome.pill() {
+        crate::ui_channel::show_transient_if_unowned(state, COPY_LAST_PILL);
+    }
+    outcome
+}
+
+/// Keep a finished transcript that did not reach the app: last dictation,
+/// clipboard (when the setting allows), error cue. Returns the pill state for
+/// the caller to show under its own generation rules.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn keep_transcript(text: &str, cause: crate::last_dictation::KeptCause) -> crate::ui_channel::UiState {
+    let auto_copy = crate::settings::Settings::load().resolve_copy_on_paste_failure();
+    let state = crate::last_dictation::keep(text, cause, auto_copy, |t| {
+        crate::clipboard_paste::copy_only(t).map_err(|e| e.to_string())
+    });
+    crate::cues::play_error();
+    state
+}
+
+/// How long the "Copied to clipboard" / "No dictation yet" pill stays up.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+const COPY_LAST_PILL: std::time::Duration = std::time::Duration::from_millis(1400);
+
 /// Serializes recovery pastes so two "Paste last dictation" clicks can't run
 /// concurrently and trip over the same AX / clipboard path. Set true before the
 /// worker thread is spawned; the worker clears it on drop.
@@ -142,10 +179,8 @@ pub fn paste_last_dictation(
             eprintln!(
                 "[recovery] could not restore app pid {target} to frontmost — refusing to paste"
             );
-            ui_channel::show_transient_if_unowned(
-                UiState::NoEditableField,
-                Duration::from_millis(900),
-            );
+            let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField);
+            ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             return;
         }
         if !recovery_may_write(ui_channel::state(), crate::cancel::CANCEL.active()) {
@@ -175,28 +210,23 @@ pub fn paste_last_dictation(
                 eprintln!(
                     "[recovery] target pid {target} has no editable field — held (never paste blindly)"
                 );
-                ui_channel::set_last_dictation(&text);
-                ui_channel::show_transient_if_unowned(
-                    UiState::NoEditableField,
-                    Duration::from_millis(900),
-                );
+                let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField);
+                ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             }
             Ok(InjectOutcome::RefusedForeground) => {
                 eprintln!(
                     "[recovery] target pid {target} not frontmost at paste — held (not pasted)"
                 );
-                ui_channel::set_last_dictation(&text);
-                ui_channel::show_transient_if_unowned(
-                    UiState::NoEditableField,
-                    Duration::from_millis(900),
-                );
+                let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField);
+                ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             }
             Ok(InjectOutcome::Cancelled) => {
                 eprintln!("[recovery] live dictation won the write boundary — paste abandoned");
             }
             Err(e) => {
                 eprintln!("[recovery] injection into pid {target} failed: {e}");
-                ui_channel::show_transient_if_unowned(UiState::Error, Duration::from_millis(650));
+                let state = keep_transcript(&text, crate::last_dictation::KeptCause::PasteFailed);
+                ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             }
         }
     });

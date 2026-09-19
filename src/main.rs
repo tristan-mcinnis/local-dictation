@@ -53,6 +53,7 @@ async fn main() -> eyre::Result<()> {
         "stop" => run_control(fast_dictate_backend::ipc::Command::Stop),
         "cancel" => run_control(fast_dictate_backend::ipc::Command::Cancel),
         "retry" => run_control(fast_dictate_backend::ipc::Command::Retry),
+        "copy-last" => run_control(fast_dictate_backend::ipc::Command::CopyLast),
         "recover" => {
             let id = args.get(2).ok_or_else(|| eyre::eyre!("Usage: recover <dictation-id> — recover saved audio to the clipboard"))?;
             let command = fast_dictate_backend::ipc::Command::parse(&format!("recover {id}"))
@@ -73,7 +74,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, recover <dictation-id>, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, copy-last, recover <dictation-id>, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
         )),
     }
 }

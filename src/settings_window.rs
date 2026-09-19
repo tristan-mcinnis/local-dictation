@@ -183,6 +183,7 @@ pub struct SettingsUi {
     // Push-to-talk chord + behavior
     custom_hotkey_field: Retained<NSTextField>,
     custom_hotkey_hint: Retained<NSTextField>,
+    copy_last_hint: Retained<NSTextField>,
     whisper_switch: Retained<slate::InkToggle>,
     // Dictionary
     dictionary_heard_field: Retained<NSTextField>,
@@ -689,6 +690,30 @@ define_class!(
             });
         }
 
+        #[unsafe(method(changeCopyLastHotkey:))]
+        fn change_copy_last_hotkey(&self, sender: *mut AnyObject) {
+            let typed = field_string(sender);
+            let Some(ui) = SETTINGS_UI.get() else { return };
+            let ptt = crate::hotkeys::Hotkey::from_loaded(&ui.pending.lock().unwrap());
+            let (hint, value) = crate::hotkeys::copy_last_field(&typed, &ptt);
+            if let Some(value) = value {
+                with_pending(|p| p.copy_last_hotkey = Some(value));
+            }
+            ui.copy_last_hint.setStringValue(&NSString::from_str(&hint));
+        }
+
+        #[unsafe(method(changeCopyOnPasteFailure:))]
+        fn change_copy_on_paste_failure(&self, sender: *mut AnyObject) {
+            let on = switch_on(sender);
+            with_pending(|p| p.copy_on_paste_failure = Some(on));
+        }
+
+        #[unsafe(method(changeMaxRecording:))]
+        fn change_max_recording(&self, sender: *mut AnyObject) {
+            let minutes = popup_selected_tag(sender).max(0) as u32;
+            with_pending(|p| p.max_recording_minutes = Some(minutes));
+        }
+
         #[unsafe(method(changeCustomHotkey:))]
         fn change_custom_hotkey(&self, sender: *mut AnyObject) {
             let s = field_string(sender);
@@ -1134,6 +1159,72 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         custom_hotkey_field.setEnabled(!hotkey_locked);
     }
     let custom_hotkey_hint = hint_line(mtm, &mut card, &initial_hotkey_hint);
+
+    // The second global hotkey, next to the first: copy the last dictation
+    // from anywhere. Empty turns it off. Checked against the dictation hotkey.
+    let copy_last_locked = std::env::var_os("DICTATE_COPY_LAST_HOTKEY").is_some();
+    let (initial_copy_last, initial_copy_last_hint) = initial_copy_last_hotkey(&loaded);
+    let copy_last_field = text_row(mtm, &mut card, "Copy last dictation", &initial_copy_last);
+    copy_last_field.setPlaceholderString(Some(&NSString::from_str("e.g. ctrl+cmd+v · empty = off")));
+    unsafe {
+        copy_last_field.setTarget(Some(&controller));
+        copy_last_field.setAction(Some(sel!(changeCopyLastHotkey:)));
+        copy_last_field.setEnabled(!copy_last_locked);
+    }
+    let copy_last_hint = hint_line(mtm, &mut card, &initial_copy_last_hint);
+    if copy_last_locked {
+        env_hint(mtm, &mut card, "DICTATE_COPY_LAST_HOTKEY");
+    }
+
+    y = card_end(&card);
+
+    // Never lose a dictation: what happens when the text cannot be inserted,
+    // and the limit that ends a recording nobody is stopping.
+    let mut card = card_begin(mtm, &dictation, y, "Safety net");
+    let copy_on_failure_switch = toggle_row(
+        mtm,
+        &mut card,
+        "Copy when a paste fails",
+        "Text goes to the clipboard, then press ⌘V",
+    );
+    copy_on_failure_switch.set_on(loaded.resolve_copy_on_paste_failure());
+    wire_switch(
+        &copy_on_failure_switch,
+        &controller,
+        sel!(changeCopyOnPasteFailure:),
+        std::env::var_os("DICTATE_COPY_ON_PASTE_FAILURE").is_some(),
+    );
+    if std::env::var_os("DICTATE_COPY_ON_PASTE_FAILURE").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_COPY_ON_PASTE_FAILURE");
+    }
+
+    let max_recording_popup = popup_row(mtm, &mut card, "Stop recording after");
+    let max_recording_active = loaded.resolve_max_recording_minutes();
+    for (minutes, title) in settings::MAX_RECORDING_CHOICES {
+        popup_add_item(&max_recording_popup, title, Some(*minutes as isize), None);
+    }
+    if !settings::MAX_RECORDING_CHOICES.iter().any(|(m, _)| *m == max_recording_active) {
+        // A hand-edited value stays visible and selected instead of being
+        // silently shown as another choice.
+        popup_add_item(
+            &max_recording_popup,
+            &format!("{max_recording_active} minutes"),
+            Some(max_recording_active as isize),
+            None,
+        );
+    }
+    select_popup_tag(&max_recording_popup, i64::from(max_recording_active));
+    finish_popup(&max_recording_popup);
+    wire_popup(
+        &max_recording_popup,
+        &controller,
+        sel!(changeMaxRecording:),
+        std::env::var_os("DICTATE_MAX_RECORDING_MINUTES").is_some(),
+    );
+    if std::env::var_os("DICTATE_MAX_RECORDING_MINUTES").is_some() {
+        env_hint(mtm, &mut card, "DICTATE_MAX_RECORDING_MINUTES");
+    }
+    hint_line(mtm, &mut card, MAX_RECORDING_NOTE);
 
     y = card_end(&card);
 
@@ -1878,6 +1969,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         wake_field,
         custom_hotkey_field,
         custom_hotkey_hint,
+        copy_last_hint,
         whisper_switch,
         dictionary_heard_field,
         dictionary_correct_field,
@@ -3362,6 +3454,27 @@ fn parse_custom_hotkey(s: &str) -> (String, Option<(i64, u64)>) {
             None => (hk.display(), Some((hk.keycode, hk.modifiers))),
         },
         None => ("unrecognized hotkey".to_string(), None),
+    }
+}
+
+/// Under the recording-limit popup.
+const MAX_RECORDING_NOTE: &str =
+    "A recording stopped by the limit is kept, never pasted.";
+
+/// The initial (field value, hint) for the copy-last field, from the loaded
+/// settings: the chord in use (the built-in default when nothing is saved),
+/// blank when it is off, or the saved text with the reason it is not used.
+fn initial_copy_last_hotkey(loaded: &Settings) -> (String, String) {
+    let ptt = crate::hotkeys::Hotkey::from_loaded(loaded);
+    let configured = loaded.resolve_copy_last_hotkey();
+    match crate::hotkeys::copy_last_hotkey(configured.as_deref(), &ptt) {
+        Ok(Some(h)) => {
+            let text = crate::hotkeys::to_parseable(&h);
+            let hint = crate::hotkeys::copy_last_field(&text, &ptt).0;
+            (text, hint)
+        }
+        Ok(None) => (String::new(), crate::hotkeys::copy_last_field("", &ptt).0),
+        Err(why) => (configured.unwrap_or_default(), format!("Not used: {why}.")),
     }
 }
 

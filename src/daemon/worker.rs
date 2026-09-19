@@ -208,6 +208,13 @@ pub(super) fn worker_loop(
     // the pipeline on the same audio. Empty until the first dictation.
     let mut last_audio: Vec<f32> = Vec::new();
     let mut pending_saved_recoveries = std::collections::VecDeque::<i64>::new();
+    // Recording limit (minutes, 0 = none) and whether the in-flight stop came
+    // from it rather than from a key.
+    let max_recording_minutes = crate::settings::Settings::load().resolve_max_recording_minutes();
+    if max_recording_minutes > 0 {
+        eprintln!("[boot] recording  limit {max_recording_minutes} min");
+    }
+    let mut limit_hit = false;
 
     'evloop: loop {
         // While recording, wake periodically to checkpoint captured PCM and
@@ -224,6 +231,22 @@ pub(super) fn worker_loop(
             if engine.is_some() || session_active {
                 match rx.recv_timeout(std::time::Duration::from_millis(120)) {
                     Ok(ev) => ev,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if !warm_parked
+                            && crate::cancel::CANCEL.active()
+                            && t_press.is_some_and(|t| recording_limit_reached(t.elapsed(), max_recording_minutes)) =>
+                    {
+                        // A lost key-up (Secure Input, a disabled tap) or a
+                        // forgotten hands-free session: stop here instead of
+                        // recording without end. The text is kept and copied,
+                        // never pasted, because nobody may be at the keyboard.
+                        eprintln!(
+                            "[limit] recording reached {max_recording_minutes} min · stopping (text kept, not pasted)"
+                        );
+                        limit_hit = true;
+                        PTT_RESYNC.store(true, Ordering::SeqCst);
+                        DaemonEvent::StopRecording
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if warm_parked {
                             // Warm-window expiry: close the parked mic once idle
@@ -492,6 +515,7 @@ pub(super) fn worker_loop(
                 eprintln!();
             }
             DaemonEvent::StartRecording { transform } => {
+                limit_hit = false;
                 if session_active {
                     continue;
                 }
@@ -648,8 +672,11 @@ pub(super) fn worker_loop(
                 // Capture (and reset) whether this utterance is a transform. Done
                 // up-front so the tail-capture re-press restart can re-set it with
                 // the new gesture.
+                // A limit stop is never a transform or a spoken command: both
+                // write into the front app, and nobody asked for that write.
+                let limit_stopped = std::mem::take(&mut limit_hit);
                 #[allow(unused_variables)]
-                let transform = transform_mode;
+                let transform = transform_mode && !limit_stopped;
                 transform_mode = false;
 
                 // ── Tail-capture grace (open-on-press only) ──────────────
@@ -1099,7 +1126,11 @@ pub(super) fn worker_loop(
                         }
                     }
                     eprintln!();
-                    ui_channel::set_state(UiState::Idle);
+                    // Leave a kept-result pill on screen; only a still-working
+                    // state is reset.
+                    if ui_channel::state().is_processing() {
+                        ui_channel::set_state(UiState::Idle);
+                    }
                     continue;
                 }
 
@@ -1142,7 +1173,7 @@ pub(super) fn worker_loop(
                 // only runs once we know it's a command. Falls through to normal
                 // dictation when nothing matches, or when running --no-cleanup.
                 #[cfg(feature = "cleaner")]
-                if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript) {
+                if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript).filter(|_| !limit_stopped) {
                     match cleaner {
                         Some(ref c) => {
                             recovery.status = handle_spoken_command(&rt, c, cmd, captured_target, cur_gen);
@@ -1355,7 +1386,8 @@ pub(super) fn worker_loop(
                 let t_inject = Instant::now();
                 let finish = crate::injector::finalize_utterance(
                     false,
-                    None,
+                    // A limit stop is held by decision: known "do not write".
+                    limit_stopped.then_some(crate::injector::FocusEditability::NotEditable),
                     &final_text,
                     |text| {
                         // One authorization claim, exactly once, immediately
@@ -1448,18 +1480,16 @@ pub(super) fn worker_loop(
                     }
                     crate::injector::FinalizeResult::Held => {
                         recovery.status = crate::history::RecoveryStatus::Held;
-                        // No editable field focused: never paste blindly. Keep the
-                        // transcript recoverable for the menu's "Copy last
-                        // dictation" and surface a clear "No text field selected"
-                        // state instead of writing anywhere.
-                        eprintln!(
-                            "  ◌    no text field selected — transcript held (copy from menu)"
-                        );
-                        ui_channel::set_last_dictation(&final_text);
-                        ui_channel::show_transient_for(
-                            cur_gen, UiState::NoEditableField,
-                            Duration::from_millis(900),
-                        );
+                        // No editable field focused (or the recording limit
+                        // stopped it): never paste blindly. The words become the
+                        // last dictation, go to the clipboard, and the pill says so.
+                        let cause = if limit_stopped {
+                            crate::last_dictation::KeptCause::LimitReached
+                        } else {
+                            crate::last_dictation::KeptCause::NoEditableField
+                        };
+                        eprintln!("  ◌    not inserted ({cause:?}) — transcript kept");
+                        keep_and_show(cur_gen, &final_text, cause);
                     }
                     crate::injector::FinalizeResult::Cancelled => {
                         recovery.status = crate::history::RecoveryStatus::Cancelled;
@@ -1468,15 +1498,12 @@ pub(super) fn worker_loop(
                         ui_channel::set_state(UiState::Idle);
                     }
                     crate::injector::FinalizeResult::Failed => {
-                        eprintln!("  ✗    inject failed — transcript kept (copy from menu)");
-                        cues::play_error();
+                        eprintln!("  ✗    inject failed — transcript kept");
                         // The words exist; only the write failed. Keep them
                         // reachable (they used to be dropped, so "Copy last
                         // dictation" returned the PREVIOUS text) and say what
                         // really happened instead of "Couldn’t transcribe".
-                        ui_channel::set_last_dictation(&final_text);
-                        crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Output, &final_text, "Not inserted");
-                        ui_channel::show_transient_for(cur_gen, UiState::PasteFailed, PASTE_FAILED_PILL);
+                        keep_and_show(cur_gen, &final_text, crate::last_dictation::KeptCause::PasteFailed);
                     }
                 }
                 eprintln!();
@@ -1553,18 +1580,21 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
     match crate::clipboard_paste::paste_via_clipboard(result, expected) {
         Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
             eprintln!("  ✓    transformed in {} ms", ms(t.elapsed()));
+            // A rewrite is a finished transcript too: "Copy last dictation"
+            // must return it, not the dictation before it.
+            ui_channel::set_last_dictation(result);
+            ui_channel::set_last_inject_pid(expected);
             crate::history::append_recovery_stage(generation, StageKind::Output, result, "Selection replaced");
             RecoveryStatus::Completed
         },
         Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-            eprintln!(
-                "  ◌    transform refused — target app not frontmost at paste (text held)"
-            );
+            eprintln!("  ◌    transform refused — target app not frontmost at paste (text kept)");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
-            cues::play_error();
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
             RecoveryStatus::Failed
         }
     }
@@ -1860,10 +1890,8 @@ pub(super) fn handle_spoken_command(
             RecoveryStatus::Completed
         }
         Ok(crate::injector::InjectOutcome::NoEditableField) => {
-            eprintln!(
-                "  ◌    no text field selected — result held (copy from menu)"
-            );
-            ui_channel::set_last_dictation(result);
+            eprintln!("  ◌    no text field selected — result kept");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Ok(crate::injector::InjectOutcome::Cancelled) => {
@@ -1873,25 +1901,37 @@ pub(super) fn handle_spoken_command(
         }
         Ok(crate::injector::InjectOutcome::RefusedForeground) => {
             // Fail-closed: the expected app was not frontmost at the global
-            // Cmd+V, so nothing was written. Hold it recoverable.
-            eprintln!("  ◌    target not frontmost at paste — result held (copy from menu)");
-            ui_channel::set_last_dictation(result);
+            // Cmd+V, so nothing was written. Keep it recoverable.
+            eprintln!("  ◌    target not frontmost at paste — result kept");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Err(e) => {
-            eprintln!("  ✗    inject failed: {e:?} — result kept (copy from menu)");
-            cues::play_error();
-            ui_channel::set_last_dictation(result);
-            crate::history::append_recovery_stage(generation, StageKind::Output, result, "Not inserted");
-            ui_channel::show_transient_for(generation, UiState::PasteFailed, PASTE_FAILED_PILL);
+            eprintln!("  ✗    inject failed: {e:?} — result kept");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
             RecoveryStatus::Failed
         }
     }
 }
 
-/// How long the "Couldn’t paste" pill stays up. It carries a History button;
-/// the old 650 ms was gone before anyone could click it.
-const PASTE_FAILED_PILL: Duration = Duration::from_millis(4000);
+/// A finished transcript did not reach the app. Make it the last dictation,
+/// put it on the clipboard (setting permitting), note it in History, play the
+/// error cue and show the kept-result pill for this generation: about four
+/// seconds, or until the next key press, with the History button on it.
+pub(super) fn keep_and_show(generation: u64, text: &str, cause: crate::last_dictation::KeptCause) {
+    let state = crate::recovery::keep_transcript(text, cause);
+    let copied = matches!(
+        state,
+        UiState::HeldCopied | UiState::PasteFailedCopied | UiState::LimitReachedCopied
+    );
+    crate::history::append_recovery_stage(
+        generation,
+        crate::history::StageKind::Output,
+        text,
+        crate::last_dictation::kept_stage_note(cause, copied),
+    );
+    ui_channel::show_transient_for(generation, state, ui_channel::KEPT_PILL);
+}
 
 #[cfg(test)]
 mod tests {

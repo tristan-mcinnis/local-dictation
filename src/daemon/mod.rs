@@ -105,6 +105,23 @@ static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// "nothing was pressed" and "we were not listening".
 static TAP_DISABLES: AtomicU64 = AtomicU64::new(0);
 
+/// Set by the worker when it ends a recording without a key (the recording
+/// limit). The tap owns the hold/latch state, so it folds the reset in on its
+/// next event: otherwise a lost key-up leaves `ST_HOLDING` behind and the next
+/// real press is ignored as a duplicate.
+static PTT_RESYNC: AtomicBool = AtomicBool::new(false);
+
+/// Apply a pending [`PTT_RESYNC`]: back to idle, key considered up. If the key
+/// is in fact still held, its eventual release is a no-op edge.
+fn apply_ptt_resync(pending: &AtomicBool, state: &AtomicU8, hotkey_down: &AtomicBool) -> bool {
+    if !pending.swap(false, Ordering::SeqCst) {
+        return false;
+    }
+    state.store(ST_IDLE, Ordering::SeqCst);
+    hotkey_down.store(false, Ordering::SeqCst);
+    true
+}
+
 extern "C" {
     /// CoreGraphics: enable or disable a previously-created event tap.
     /// `void CGEventTapEnable(CFMachPortRef tap, bool enable);`
@@ -211,6 +228,13 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         ));
     }
 
+    // "Copy last dictation" must survive a relaunch (every settings change is
+    // one): re-read the newest transcript from the history store. With text
+    // history off there is nothing to read and it stays memory-only.
+    if crate::last_dictation::seed_from_history() {
+        eprintln!("[boot] last       dictation restored from history");
+    }
+
     let (tx, rx) = mpsc::channel::<DaemonEvent>();
 
     // Spawn the worker thread that owns the models + capture engine. It
@@ -301,6 +325,26 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         }
     };
 
+    // The second global hotkey: "Copy last dictation". The callback only sends
+    // on this channel; the clipboard write and the pill happen on a small
+    // dedicated thread, never behind the worker (which blocks during ASR).
+    let copy_last = crate::hotkeys::copy_last_from_settings();
+    match copy_last {
+        Some(h) => eprintln!("[boot] copy-last  hotkey {}", h.display()),
+        None => eprintln!("[boot] copy-last  hotkey off"),
+    }
+    let (copy_tx, copy_rx) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        while copy_rx.recv().is_ok() {
+            crate::recovery::copy_last_dictation("hotkey");
+        }
+    });
+    let copy_key_down = Arc::new(AtomicBool::new(false));
+    let copy_key_down_cb = copy_key_down.clone();
+    let resync_state = state.clone();
+    let resync_down = hotkey_down.clone();
+    let own_pid = i64::from(std::process::id());
+
     // Install CGEventTap manually so we can hand the main thread over to
     // NSApplication.run() (needed for the menu-bar item + floating pill).
     //
@@ -337,6 +381,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     }
                 }
                 CGEventType::FlagsChanged => {
+                    apply_ptt_resync(&PTT_RESYNC, &resync_state, &resync_down);
                     // Only the modifier-only hotkey uses FlagsChanged; a chord
                     // hotkey reads its modifiers off the KeyDown event's flags.
                     if !modifier_only {
@@ -435,7 +480,28 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                     // FlagsChanged is never swallowed — let the modifier through.
                 }
                 CGEventType::KeyDown => {
+                    apply_ptt_resync(&PTT_RESYNC, &resync_state, &resync_down);
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    let autorepeat =
+                        event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) != 0;
+                    // "Copy last dictation". Exact modifiers, so our own
+                    // synthesized ⌘V can never match; events we posted are
+                    // ignored outright. Autorepeats of the held chord are
+                    // swallowed without copying again.
+                    if let Some(chord) = copy_last {
+                        if crate::hotkeys::copy_last_matches(&chord, keycode, event.get_flags().bits())
+                            && event.get_integer_value_field(EventField::EVENT_SOURCE_UNIX_PROCESS_ID) != own_pid
+                        {
+                            if !autorepeat && !copy_key_down_cb.swap(true, Ordering::SeqCst) {
+                                let _ = copy_tx.send(());
+                            }
+                            return CallbackResult::Drop;
+                        }
+                    }
+                    // A fresh key press dismisses a "Copied, press ⌘V" pill.
+                    if !autorepeat {
+                        ui_channel::key_pressed();
+                    }
                     // Escape cancels an in-flight utterance (recording or pending
                     // transcription) and prevents any late insertion. It swallows
                     // the keystroke while active so it never leaks into the field;
@@ -533,6 +599,13 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                 }
                 CGEventType::KeyUp => {
                     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                    // Swallow the key-up that matches a swallowed copy-last
+                    // key-down, whatever modifiers are still held by now.
+                    if copy_last.is_some_and(|c| c.keycode == keycode)
+                        && copy_key_down_cb.swap(false, Ordering::SeqCst)
+                    {
+                        return CallbackResult::Drop;
+                    }
                     if !modifier_only && keycode == hotkey_keycode {
                         // Chord hotkey release: swallow the matching key-up.
                         if hotkey_edge(&hotkey_down_cb, false) {
@@ -620,6 +693,14 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
                 tx_for_ctl.send(DaemonEvent::CancelRecording)
             }
             Command::Retry => tx_for_ctl.send(DaemonEvent::Retry),
+            // Same code path as the hotkey and the menu item; off the socket
+            // thread so a slow pasteboard cannot hold the reply.
+            Command::CopyLast => {
+                std::thread::spawn(|| {
+                    crate::recovery::copy_last_dictation("ipc");
+                });
+                Ok(())
+            }
             Command::Recover(id) => tx_for_ctl.send(DaemonEvent::Recover { id }),
             // The server resolves Toggle → Start/Stop before dispatch, so a
             // Toggle reaching here would be a bug; treat it as a no-op.
@@ -730,6 +811,43 @@ pub(crate) fn stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_limit_stop_resets_a_stuck_hold_so_the_next_press_starts_cleanly() {
+        // Regression (PB-F06): a lost key-up left ST_HOLDING + hotkey_down set;
+        // the next real press was then dropped as a duplicate edge.
+        let pending = AtomicBool::new(true);
+        let state = AtomicU8::new(ST_HOLDING);
+        let down = AtomicBool::new(true);
+        assert!(apply_ptt_resync(&pending, &state, &down));
+        assert_eq!(state.load(Ordering::SeqCst), ST_IDLE);
+        assert!(hotkey_edge(&down, true), "the next press is a fresh edge");
+        let (next, decision) = ptt_transition(
+            state.load(Ordering::SeqCst),
+            PttInput::HotkeyPress { shift: false, double_tap: false },
+        );
+        assert_eq!((next, decision), (ST_HOLDING, PttDecision::Start { transform: false }));
+        // Applied once only.
+        state.store(ST_LATCHED, Ordering::SeqCst);
+        assert!(!apply_ptt_resync(&pending, &state, &down));
+        assert_eq!(state.load(Ordering::SeqCst), ST_LATCHED);
+    }
+
+    #[test]
+    fn a_key_still_held_at_the_limit_releases_as_a_no_op() {
+        let pending = AtomicBool::new(true);
+        let state = AtomicU8::new(ST_HOLDING);
+        let down = AtomicBool::new(true);
+        apply_ptt_resync(&pending, &state, &down);
+        assert!(!hotkey_edge(&down, false), "release after resync is not an edge");
+    }
+
+    #[test]
+    fn recording_limit_is_off_at_zero_and_exact_at_the_minute() {
+        assert!(!recording_limit_reached(Duration::from_secs(86_400), 0));
+        assert!(!recording_limit_reached(Duration::from_secs(599), 10));
+        assert!(recording_limit_reached(Duration::from_secs(600), 10));
+    }
 
     #[test]
     fn repeated_second_press_of_double_tap_cannot_stop_hands_free() {
