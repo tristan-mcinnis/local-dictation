@@ -1,5 +1,8 @@
-//! Feedback cues for the dictation state machine. Start and the landed cue
-//! are Superwhisper's Classic theme pair; the rest are original.
+//! Feedback cues for the dictation state machine. Every cue is original:
+//! all six are synthesized by `scripts/audio/generate_cues.py` (sine partials,
+//! python3 stdlib only), so the embedded bytes are reproducible and free to
+//! ship under this crate's licence. Do not swap in a sample taken from another
+//! product; change the generator and re-run it instead.
 //!
 //! Samples are embedded in the binary and registered with macOS' native
 //! system-sound service on first use. Playback is asynchronous, so a cue never
@@ -13,7 +16,7 @@ const CANCEL: &[u8] = include_bytes!("../resources/sounds/cancel.wav");
 const LATCH: &[u8] = include_bytes!("../resources/sounds/latch.wav");
 const ERROR: &[u8] = include_bytes!("../resources/sounds/error.wav");
 
-/// Recording started. Superwhisper's Classic start cue.
+/// Recording started: a short rising pair.
 pub fn play_start() {
     play(Cue::Start);
 }
@@ -27,7 +30,7 @@ pub fn play_stop() {
     }
 }
 
-/// Text was accepted and injected. Superwhisper's Classic stop cue.
+/// Text was accepted and injected: a softer rising pair.
 pub fn play_success() {
     play(Cue::Success);
 }
@@ -273,6 +276,29 @@ mod tests {
         for bytes in [START, STOP, SUCCESS, CANCEL, LATCH, ERROR] {
             assert!(bytes.len() > 44);
             assert!(wav_duration_ms(bytes) <= 800);
+        }
+    }
+
+    /// Every embedded cue must be exactly what `scripts/audio/generate_cues.py`
+    /// writes: 48 kHz mono 16-bit, with the generator's durations. Regression
+    /// guard: start/stop/success were once replaced by samples lifted from
+    /// another product (60 KB files against the generator's 11–14 KB).
+    #[test]
+    fn embedded_cues_match_the_generator() {
+        for (name, bytes, seconds) in [
+            ("start", START, 0.115),
+            ("stop", STOP, 0.125),
+            ("success", SUCCESS, 0.145),
+            ("cancel", CANCEL, 0.135),
+            ("latch", LATCH, 0.090),
+            ("error", ERROR, 0.145),
+        ] {
+            let channels = u16::from_le_bytes(bytes[22..24].try_into().unwrap());
+            let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+            let bits = u16::from_le_bytes(bytes[34..36].try_into().unwrap());
+            assert_eq!((channels, rate, bits), (1, 48_000, 16), "{name}");
+            let frames = (seconds * 48_000.0_f64) as usize;
+            assert_eq!(bytes.len(), 44 + frames * 2, "{name} is not the generated cue");
         }
     }
 }

@@ -372,7 +372,10 @@ ALL-CAPS runs and email boilerplate, and handles `’s`, `Name/Name` and markdow
 (`com.apple.TextEdit` → `com`, `apple`, `textedit`), never substrings. Normal
 cleanup never infers numbered-list structure from words such as "first" or "second"; structural
 formatting requires an explicit `numbered` or `bullets` output-format preset.
-`audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. `numbers.rs`
+`audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. All six cues
+are original and reproducible: `scripts/audio/generate_cues.py` (python3 stdlib) synthesizes them
+into `resources/sounds/`, and a unit test pins the embedded files to the generator's format and
+durations. No third-party audio is tracked in the repo. `numbers.rs`
 converts spoken numbers to numerals deterministically; `spoken_command.rs` handles *prefix*
 commands (e.g. "translate to Chinese …") via the warm transform engine; `voice_commands.rs` parses
 *trailing* commands ("press enter", "new line", "scratch that", "undo that"). The model is loaded
