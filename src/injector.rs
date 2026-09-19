@@ -8,15 +8,17 @@
 //!      sits immediately before and after the caret.
 //!   3. Run `smart_pad::smart_pad` to decide on a leading space, trailing
 //!      space, and whether to capitalize the first letter.
-//!   4. Try `kAXSelectedTextAttribute` (insert at caret / replace selection),
-//!      then `kAXValueAttribute` (whole-field replace) as a sub-fallback.
-//!   5. If both AX writes refuse (Electron / some Java apps), fall back to
+//!   4. Try `kAXSelectedTextAttribute` (insert at caret / replace selection).
+//!      There is deliberately NO `kAXValueAttribute` rung: setting the value
+//!      replaces the whole field with the utterance, which destroyed whatever
+//!      the field already held.
+//!   5. If the AX write is refused (Electron / some Java apps), fall back to
 //!      save-clipboard → set-clipboard → synthesize Cmd+V → restore.
+//!
+//! A password field (`AXSecureTextField`) is never a target: it classifies as
+//! `NotEditable`, and its value is never read for caret or screen context.
 
 use crate::smart_pad::smart_pad;
-// Only the real AX-injection `imp` module uses caret-context probing; gate the
-// import to that build so the default (featureless) build stays warning-clean.
-#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 use crate::smart_pad::last_non_ws_before;
 use std::sync::Mutex;
 
@@ -177,6 +179,12 @@ pub enum FinalizeResult {
     Failed,
 }
 
+/// A password field. Never a dictation target: nothing is written into it and
+/// its value (bullets) is never read for caret context or screen vocabulary.
+pub fn is_secure_field(subrole: Option<&str>) -> bool {
+    subrole == Some("AXSecureTextField")
+}
+
 /// Text-entry AX roles/subroles that read as editable fields.
 fn is_text_entry_role(role: Option<&str>, subrole: Option<&str>) -> bool {
     matches!(
@@ -246,8 +254,9 @@ pub fn classify_focus_editability(
 ) -> FocusEditability {
     // A positively non-input control (button / window chrome / page body /
     // canvas / static text / menu / checkbox / radio) is never a place to write,
-    // even for an allowlisted paste-safe app.
-    if is_clearly_noninput_role(role, subrole) {
+    // even for an allowlisted paste-safe app. A password field is refused the
+    // same way, whatever else it reports.
+    if is_secure_field(subrole) || is_clearly_noninput_role(role, subrole) {
         FocusEditability::NotEditable
     } else if paste_safe {
         // A paste-safe app (a genuine terminal, or an AX-blind native chat app
@@ -268,6 +277,95 @@ pub fn classify_focus_editability(
         }
     } else {
         FocusEditability::NotEditable
+    }
+}
+
+/// Convert a UTF-16 offset (what `kAXSelectedTextRange` reports) into a `char`
+/// index into `text`. The two differ by one for every non-BMP character (most
+/// emoji) before the offset. An offset inside a surrogate pair rounds down; one
+/// past the end clamps to the char count.
+pub fn char_index_from_utf16(text: &str, utf16_offset: usize) -> usize {
+    let mut units = 0usize;
+    for (i, c) in text.chars().enumerate() {
+        units += c.len_utf16();
+        if units > utf16_offset {
+            return i;
+        }
+    }
+    text.chars().count()
+}
+
+/// What the field's text says about the caret, for smart padding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CaretContext {
+    /// Whether `kAXValue` could be read at all. An EMPTY field, or a caret at
+    /// index 0, is readable: it has no character before the caret, but the app
+    /// is not AX-blind. Only `false` here may mark a PID as AX-blind.
+    pub value_readable: bool,
+    pub immediate_before: Option<char>,
+    pub last_nws_before: Option<char>,
+    pub char_after: Option<char>,
+}
+
+/// Derive the caret context from the field value and the UTF-16 caret offset
+/// (`None` = no range exposed → assume the caret is at the end).
+pub fn caret_context_from(value: Option<&str>, caret_utf16: Option<usize>) -> CaretContext {
+    let Some(value) = value else {
+        return CaretContext {
+            value_readable: false,
+            immediate_before: None,
+            last_nws_before: None,
+            char_after: None,
+        };
+    };
+    let chars: Vec<char> = value.chars().collect();
+    let caret = match caret_utf16 {
+        Some(off) => char_index_from_utf16(value, off),
+        None => chars.len(),
+    };
+    CaretContext {
+        value_readable: true,
+        immediate_before: caret.checked_sub(1).and_then(|i| chars.get(i).copied()),
+        last_nws_before: last_non_ws_before(value, caret),
+        char_after: chars.get(caret).copied(),
+    }
+}
+
+/// A field's observable state around an AX write: its value and its selected
+/// range `(location, length)` in UTF-16 units. Either may be unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldSnapshot {
+    pub value: Option<String>,
+    pub selection: Option<(usize, usize)>,
+}
+
+/// Did an AX write that returned success actually reach the field?
+///
+/// Compares the field BEFORE and AFTER the write instead of searching the
+/// value for the utterance. The old needle search passed falsely when the field
+/// already held the same words (a repeated "Yes."), and failed falsely when the
+/// app normalised the text (newlines, a length limit), which then pasted the
+/// same text a second time through the clipboard.
+///
+///   * value unreadable after the write → not landed (the accept-and-drop apps
+///     this check exists for expose nothing useful);
+///   * value or selection changed → landed;
+///   * nothing changed → not landed;
+///   * no "before" to compare with → fall back to the needle search.
+pub fn ax_write_landed(before: &FieldSnapshot, after: &FieldSnapshot, written: &str) -> bool {
+    let needle = written.trim();
+    if needle.is_empty() {
+        return true;
+    }
+    let Some(after_value) = after.value.as_deref() else {
+        return false;
+    };
+    match before.value.as_deref() {
+        Some(before_value) => {
+            after_value != before_value
+                || matches!((before.selection, after.selection), (Some(b), Some(a)) if a != b)
+        }
+        None => after_value.contains(needle),
     }
 }
 
@@ -505,21 +603,21 @@ pub fn is_wechat_pid(pid: i32) -> bool {
 /// back and saw our text). Once a PID is here we trust its AX path and skip
 /// the post-write verification read on every subsequent utterance.
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-static AX_VERIFIED_PID: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static AX_VERIFIED_PID: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-fn is_ax_verified(pid: i32) -> bool {
+fn is_ax_verified(pid: i32, role: &str) -> bool {
     AX_VERIFIED_PID
         .lock()
-        .map(|g| g.contains(&pid))
+        .map(|g| g.iter().any(|(p, r)| *p == pid && r == role))
         .unwrap_or(false)
 }
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-fn mark_ax_verified(pid: i32) {
+fn mark_ax_verified(pid: i32, role: &str) {
     if let Ok(mut g) = AX_VERIFIED_PID.lock() {
-        if !g.contains(&pid) {
-            g.push(pid);
+        if !g.iter().any(|(p, r)| *p == pid && r == role) {
+            g.push((pid, role.to_string()));
         }
     }
 }
@@ -996,18 +1094,21 @@ mod imp {
         match pid {
             Some(pid) if super::is_ax_blind(pid) => (None, None, None),
             Some(pid) => {
-                let ctx = read_caret_context(focused);
-                if ctx.0.is_none() && ctx.1.is_none() {
+                let ctx = read_caret_context_full(focused);
+                // Blind means kAXValue could not be READ. An empty field or a
+                // caret at index 0 also has no character before it, but the
+                // app is fully readable and must keep its caret context.
+                if !ctx.value_readable {
                     super::mark_ax_blind(pid);
                 }
-                ctx
+                (ctx.immediate_before, ctx.last_nws_before, ctx.char_after)
             }
             None => read_caret_context(focused),
         }
     }
 
     /// The single AX write ladder shared by both injection entry points:
-    /// focus gate → `kAXSelectedText` → `kAXValue` → clipboard paste.
+    /// focus gate → `kAXSelectedText` → clipboard paste.
     /// Records the injected tail on any success. Does **not**
     /// release `focused` — the caller owns its lifetime.
     ///
@@ -1084,6 +1185,14 @@ mod imp {
 
         let payload = CFString::new(padded);
 
+        // First write to this (app, kind of field): snapshot the field so the
+        // read-back can compare before and after. Trusted pairs skip the reads.
+        let role_key = verification_role_key(focused);
+        let before = match pid {
+            Some(p) if !super::is_ax_verified(p, &role_key) => Some(field_snapshot(focused)),
+            _ => None,
+        };
+
         let t = std::time::Instant::now();
         let sel_attr = CFString::new(kAXSelectedTextAttribute);
         let sel_err = AXUIElementSetAttributeValue(
@@ -1098,36 +1207,20 @@ mod imp {
             );
         }
         if sel_err == kAXErrorSuccess {
-            let r = confirm_or_fallback(focused, pid, padded, prof, expected_pid);
+            let r = confirm_or_fallback(focused, pid, &role_key, before, padded, prof, expected_pid);
             if prof {
                 eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
             }
             return r;
         }
 
-        let t = std::time::Instant::now();
-        let val_attr = CFString::new(kAXValueAttribute);
-        let val_err = AXUIElementSetAttributeValue(
-            focused,
-            val_attr.as_concrete_TypeRef(),
-            payload.as_concrete_TypeRef() as CFTypeRef,
-        );
-        if prof {
-            eprintln!("[inject-prof] set_value: {:?} (err={val_err})", t.elapsed());
-        }
-        if val_err == kAXErrorSuccess {
-            let r = confirm_or_fallback(focused, pid, padded, prof, expected_pid);
-            if prof {
-                eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
-            }
-            return r;
-        }
-
-        // Both AX writes refused — clipboard fallback. Only reachable when
+        // The caret write was refused — clipboard fallback. Only reachable when
         // editability was Editable; the app refused the write, so Cmd+V is the
-        // remaining write path (and we already proved there is a field).
+        // remaining write path (and we already proved there is a field). There
+        // is no kAXValue rung: setting the value replaces the WHOLE field with
+        // the utterance and destroys what the user already wrote there.
         eprintln!(
-            "[inject] AX writes refused (selected={sel_err}, value={val_err}); using clipboard paste"
+            "[inject] AX caret write refused (selected={sel_err}); using clipboard paste"
         );
         match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
             Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
@@ -1149,7 +1242,8 @@ mod imp {
     /// their renderer silently discards it — the static name list in
     /// `is_clipboard_only_pid` only knows the ones we've named. To catch the
     /// rest automatically, the *first* successful AX write to a PID is verified
-    /// by reading the value back and checking our text actually landed:
+    /// by comparing the field before and after the write ([`ax_write_landed`]).
+    /// Trust is kept per (pid, role/subrole):
     ///
     ///   * rendered  → mark the PID AX-verified (skip this check forever after)
     ///                 and return `Ok`.
@@ -1157,18 +1251,20 @@ mod imp {
     ///                 instead, so this and every future utterance render.
     ///
     /// PIDs already AX-verified short-circuit with zero extra AX calls, so the
-    /// read-back cost is paid at most once per app. A genuinely-good field that
-    /// doesn't expose a readable value reads as "vanished" and is downgraded to
-    /// clipboard paste — slightly more clipboard churn, but still correct.
+    /// read-back cost is paid at most once per kind of field per app. A field
+    /// whose value cannot be read at all reads as "vanished" and is downgraded
+    /// to clipboard paste.
     unsafe fn confirm_or_fallback(
         focused: AXUIElementRef,
         pid: Option<i32>,
+        role_key: &str,
+        before: Option<FieldSnapshot>,
         padded: &str,
         prof: bool,
         expected_pid: Option<i32>,
     ) -> eyre::Result<InjectOutcome> {
-        let pid = match pid {
-            Some(p) if !super::is_ax_verified(p) => p,
+        let (pid, before) = match (pid, before) {
+            (Some(p), Some(b)) => (p, b),
             // No PID to cache against, or already trusted — believe the success.
             _ => {
                 super::remember_tail(padded);
@@ -1176,8 +1272,8 @@ mod imp {
             }
         };
 
-        if ax_write_rendered(focused, padded) {
-            super::mark_ax_verified(pid);
+        if ax_write_landed(&before, &field_snapshot(focused), padded) {
+            super::mark_ax_verified(pid, role_key);
             super::remember_tail(padded);
             return Ok(InjectOutcome::Injected);
         }
@@ -1203,19 +1299,23 @@ mod imp {
         }
     }
 
-    /// True if the focused element's value now contains the text we just wrote.
-    /// The needle is the trimmed payload (smart-pad's leading/trailing spaces
-    /// don't survive into a terminal grid anyway). A missing/unreadable value
-    /// counts as "did not render".
-    unsafe fn ax_write_rendered(focused: AXUIElementRef, padded: &str) -> bool {
-        let needle = padded.trim();
-        if needle.is_empty() {
-            return true;
+    /// The field's value + selected range, for the before/after comparison in
+    /// [`ax_write_landed`].
+    unsafe fn field_snapshot(focused: AXUIElementRef) -> FieldSnapshot {
+        FieldSnapshot {
+            value: read_value(focused),
+            selection: read_selected_range(focused),
         }
-        match read_value(focused) {
-            Some(value) => value.contains(needle),
-            None => false,
-        }
+    }
+
+    /// Key for the AX-verified cache: one app can hold a native field and a web
+    /// view (Mail, Safari), so trust is per (pid, role/subrole), not per pid.
+    unsafe fn verification_role_key(focused: AXUIElementRef) -> String {
+        format!(
+            "{}/{}",
+            copy_string_attr(focused, kAXRoleAttribute).unwrap_or_default(),
+            copy_string_attr(focused, kAXSubroleAttribute).unwrap_or_default()
+        )
     }
 
     /// ±chars of focused-field text harvested around the caret. The text *near
@@ -1224,11 +1324,10 @@ mod imp {
     /// document can't flood the cleanup prompt with unrelated proper nouns.
     const HARVEST_RADIUS: usize = 600;
 
-    /// Read the caret position (char index) from `kAXSelectedTextRange`, or
-    /// `None` if the element doesn't expose it. The location is a UTF-16 index;
-    /// for ASCII (the dominant dictation case) it equals the char index, and
-    /// for non-BMP text it's a close-enough anchor for windowing.
-    unsafe fn read_caret_index(focused: AXUIElementRef) -> Option<usize> {
+    /// Read `kAXSelectedTextRange` as `(location, length)` in UTF-16 units, or
+    /// `None` if the element doesn't expose it. Convert the location with
+    /// [`char_index_from_utf16`] before indexing a Rust string by `char`.
+    unsafe fn read_selected_range(focused: AXUIElementRef) -> Option<(usize, usize)> {
         let mut range_ref: CFTypeRef = ptr::null();
         let range_attr = CFString::new(kAXSelectedTextRangeAttribute);
         let err = AXUIElementCopyAttributeValue(
@@ -1249,11 +1348,16 @@ mod imp {
             &mut cf_range as *mut _ as *mut c_void,
         );
         cf_release(range_ref);
-        if got && cf_range.location >= 0 {
-            Some(cf_range.location as usize)
+        if got && cf_range.location >= 0 && cf_range.length >= 0 {
+            Some((cf_range.location as usize, cf_range.length as usize))
         } else {
             None
         }
+    }
+
+    /// True when the element is a password field (never read, never written).
+    unsafe fn element_is_secure(focused: AXUIElementRef) -> bool {
+        is_secure_field(copy_string_attr(focused, kAXSubroleAttribute).as_deref())
     }
 
     /// Harvest the screen-context vocabulary source: a small window of the
@@ -1264,12 +1368,19 @@ mod imp {
     /// clutter. Runs in the parallel focus-capture thread, so it's off the
     /// critical path.
     unsafe fn harvest_screen_text(focused: AXUIElementRef) -> Option<String> {
+        if element_is_secure(focused) {
+            return None;
+        }
         let value = read_value(focused)?;
         if value.trim().is_empty() {
             return None;
         }
-        // Anchor at the caret; default to end-of-field (dictation usually appends).
-        let caret = read_caret_index(focused).unwrap_or_else(|| value.chars().count());
+        // Anchor at the caret; default to end-of-field (dictation usually
+        // appends). AX reports a UTF-16 offset; the window indexes chars.
+        let caret = match read_selected_range(focused) {
+            Some((loc, _)) => char_index_from_utf16(&value, loc),
+            None => value.chars().count(),
+        };
         let window = crate::screen_context::window_around(&value, caret, HARVEST_RADIUS);
         if window.trim().is_empty() {
             None
@@ -1309,56 +1420,24 @@ mod imp {
     unsafe fn read_caret_context(
         focused: AXUIElementRef,
     ) -> (Option<char>, Option<char>, Option<char>) {
-        let value_str = match read_value(focused) {
-            Some(v) => v,
-            None => return (None, None, None),
-        };
+        let ctx = read_caret_context_full(focused);
+        (ctx.immediate_before, ctx.last_nws_before, ctx.char_after)
+    }
 
-        // Read selected range.
-        let mut range_ref: CFTypeRef = ptr::null();
-        let range_attr = CFString::new(kAXSelectedTextRangeAttribute);
-        let err = AXUIElementCopyAttributeValue(
-            focused,
-            range_attr.as_concrete_TypeRef(),
-            &mut range_ref,
-        );
-        let caret_chars = if err == kAXErrorSuccess && !range_ref.is_null() {
-            let mut cf_range = CFRange {
-                location: 0,
-                length: 0,
-            };
-            let got = AXValueGetValue(
-                range_ref as AXValueRef,
-                kAXValueTypeCFRange,
-                &mut cf_range as *mut _ as *mut c_void,
-            );
-            cf_release(range_ref);
-            if got {
-                // CFRange.location is UTF-16 index. For ASCII (the dominant
-                // case for dictation) this equals char count; for non-BMP
-                // it's an approximation that's fine in practice.
-                cf_range.location as usize
-            } else {
-                value_str.chars().count()
-            }
-        } else {
-            // No range exposed — assume caret at end of value.
-            value_str.chars().count()
+    /// [`read_caret_context`] plus whether the value was readable at all (the
+    /// only evidence that may mark a PID AX-blind). The UTF-16 caret offset is
+    /// converted to a char index in the pure [`caret_context_from`].
+    unsafe fn read_caret_context_full(focused: AXUIElementRef) -> CaretContext {
+        if element_is_secure(focused) {
+            // Bullets, not text: report "readable, nothing around the caret".
+            return caret_context_from(Some(""), None);
+        }
+        let value = read_value(focused);
+        let caret = match value {
+            Some(_) => read_selected_range(focused).map(|(loc, _)| loc),
+            None => None,
         };
-
-        let chars: Vec<char> = value_str.chars().collect();
-        let immediate_before = if caret_chars > 0 && caret_chars <= chars.len() {
-            Some(chars[caret_chars - 1])
-        } else {
-            None
-        };
-        let char_after = if caret_chars < chars.len() {
-            Some(chars[caret_chars])
-        } else {
-            None
-        };
-        let last_nws = last_non_ws_before(&value_str, caret_chars);
-        (immediate_before, last_nws, char_after)
+        caret_context_from(value.as_deref(), caret)
     }
 
     extern "C" {
@@ -1825,6 +1904,110 @@ impl AccessibilityInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn password_fields_are_never_a_target() {
+        // Regression: role AXTextField + any subrole used to be Editable.
+        for paste_safe in [false, true] {
+            assert_eq!(
+                classify_focus_editability(
+                    Some("AXTextField"),
+                    Some("AXSecureTextField"),
+                    true,
+                    true,
+                    paste_safe
+                ),
+                FocusEditability::NotEditable
+            );
+        }
+        assert!(is_secure_field(Some("AXSecureTextField")));
+        assert!(!is_secure_field(Some("AXSearchField")));
+        assert!(!is_secure_field(None));
+        assert_eq!(
+            decide_inject(false, Some(FocusEditability::NotEditable)),
+            InjectDecision::Hold { reason: HoldReason::NoEditableField }
+        );
+    }
+
+    #[test]
+    fn utf16_offsets_convert_to_char_indices() {
+        assert_eq!(char_index_from_utf16("hello", 0), 0);
+        assert_eq!(char_index_from_utf16("hello", 3), 3);
+        assert_eq!(char_index_from_utf16("hello", 99), 5);
+        // CJK is BMP: one unit per char.
+        assert_eq!(char_index_from_utf16("你好世界", 2), 2);
+        // Each emoji is two UTF-16 units but one char.
+        let s = "😀😀😀😀😀 Jenifer";
+        assert_eq!(char_index_from_utf16(s, 10), 5);
+        assert_eq!(char_index_from_utf16(s, 11), 6);
+        // Inside a surrogate pair rounds down to the emoji itself.
+        assert_eq!(char_index_from_utf16(s, 1), 0);
+        assert_eq!(char_index_from_utf16("", 4), 0);
+    }
+
+    #[test]
+    fn caret_context_after_an_emoji_reads_the_right_neighbours() {
+        // "ok 👍|done": UTF-16 caret 5, char caret 4. The old code indexed
+        // chars with the UTF-16 offset and read 'd' as the char before.
+        let ctx = caret_context_from(Some("ok 👍done"), Some(5));
+        assert!(ctx.value_readable);
+        assert_eq!(ctx.immediate_before, Some('👍'));
+        assert_eq!(ctx.char_after, Some('d'));
+        assert_eq!(ctx.last_nws_before, Some('👍'));
+    }
+
+    #[test]
+    fn empty_field_and_caret_at_start_are_readable_not_blind() {
+        // Regression: both used to mark the app AX-blind (no char before the
+        // caret), which switched caret context off for that app.
+        let empty = caret_context_from(Some(""), Some(0));
+        assert!(empty.value_readable);
+        assert_eq!((empty.immediate_before, empty.last_nws_before, empty.char_after), (None, None, None));
+        let at_start = caret_context_from(Some("Hello"), Some(0));
+        assert!(at_start.value_readable);
+        assert_eq!(at_start.immediate_before, None);
+        assert_eq!(at_start.char_after, Some('H'));
+        // Only an unreadable value is blind.
+        assert!(!caret_context_from(None, None).value_readable);
+        assert!(!caret_context_from(None, Some(3)).value_readable);
+    }
+
+    #[test]
+    fn caret_context_defaults_to_end_of_field_without_a_range() {
+        let ctx = caret_context_from(Some("Hello. "), None);
+        assert_eq!(ctx.immediate_before, Some(' '));
+        assert_eq!(ctx.last_nws_before, Some('.'));
+        assert_eq!(ctx.char_after, None);
+    }
+
+    fn snap(value: Option<&str>, selection: Option<(usize, usize)>) -> FieldSnapshot {
+        FieldSnapshot { value: value.map(str::to_string), selection }
+    }
+
+    #[test]
+    fn write_verification_compares_before_and_after() {
+        // Landed: the value changed.
+        assert!(ax_write_landed(&snap(Some("Hi. "), Some((4, 0))), &snap(Some("Hi. Yes."), Some((8, 0))), "Yes."));
+        // Regression (false pass): the field already held the same words and
+        // the write vanished. `contains` said rendered; nothing changed.
+        assert!(!ax_write_landed(&snap(Some("Yes."), Some((4, 0))), &snap(Some("Yes."), Some((4, 0))), "Yes."));
+        // Regression (double insert): the app normalised the text, so the
+        // needle is absent, but the write did land.
+        assert!(ax_write_landed(
+            &snap(Some(""), Some((0, 0))),
+            &snap(Some("line one line two"), Some((17, 0))),
+            "line one\nline two"
+        ));
+        // A selection replaced by identical text: value equal, caret moved.
+        assert!(ax_write_landed(&snap(Some("Yes."), Some((0, 4))), &snap(Some("Yes."), Some((4, 0))), "Yes."));
+        // Unreadable after the write: treat as vanished (accept-and-drop apps).
+        assert!(!ax_write_landed(&snap(Some("x"), None), &snap(None, None), "Yes."));
+        // No "before": fall back to the needle search.
+        assert!(ax_write_landed(&snap(None, None), &snap(Some("so Yes. ok"), None), " Yes. "));
+        assert!(!ax_write_landed(&snap(None, None), &snap(Some("nothing"), None), "Yes."));
+        // Nothing to write is trivially fine.
+        assert!(ax_write_landed(&snap(None, None), &snap(None, None), "  "));
+    }
 
     #[test]
     fn editable_role_with_writable_value_reads_editable() {
