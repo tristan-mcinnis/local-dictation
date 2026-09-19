@@ -68,11 +68,16 @@ pub fn to_clipboard(
                     text
                 }
                 Err(error) => {
-                    return if gate.allows_progress(generation) {
-                        Outcome::Failed(error.to_string())
-                    } else {
-                        Outcome::Cancelled
+                    if !gate.allows_progress(generation) {
+                        return Outcome::Cancelled;
                     }
+                    // Recovery is the safety net: a cleanup failure must not
+                    // cost the user the words. Degrade exactly as live
+                    // dictation does, to the deterministic pass over the raw
+                    // transcript. No Cleaned version is recorded, because the
+                    // model produced none.
+                    eprintln!("[recovery] cleanup failed ({error}); copying the raw transcript");
+                    crate::text_polish::fix_speech_mechanics(&raw)
                 }
             }
         }
@@ -208,6 +213,38 @@ mod tests {
         assert!(gate.commit(fresh.get()));
         gate.end_generation(old);
         assert!(gate.allows_progress(fresh.get()));
+    }
+
+    #[test]
+    fn failed_cleanup_copies_the_raw_transcript() {
+        // Regression: a cleanup error used to fail the whole recovery, and the
+        // transcript was never copied.
+        let gate = CancelGate::new();
+        let gen = gate.begin();
+        let versions = RefCell::new(Vec::new());
+        let mut copies = Vec::new();
+        let mut cleanup =
+            |_: &str| -> eyre::Result<String> { Err(eyre::eyre!("decode prompt failed")) };
+        let result = to_clipboard(
+            &gate,
+            gen,
+            &[0.2],
+            |_| Ok("Ship the build to Lumen today.".into()),
+            Some(&mut cleanup),
+            |_| {},
+            |kind, text| versions.borrow_mut().push((kind, text.to_string())),
+            |text| {
+                copies.push(text.to_string());
+                Ok(())
+            },
+        );
+        assert_eq!(result, Outcome::Copied("Ship the build to Lumen today.".into()));
+        assert_eq!(copies, vec!["Ship the build to Lumen today."]);
+        assert_eq!(
+            *versions.borrow(),
+            vec![(Version::Raw, "Ship the build to Lumen today.".to_string())],
+            "no Cleaned version is invented"
+        );
     }
 
     #[test]
