@@ -476,23 +476,21 @@ impl Settings {
             std::fs::create_dir_all(dir)
                 .map_err(|e| eyre::eyre!("create {}: {e}", dir.display()))?;
         }
-        // A file that is not a JSON object loaded as defaults, so this save
-        // would replace whatever the user had. Keep a copy first.
+        // A file this build could not fully read (not JSON at all, or an
+        // object with a value of the wrong type, which `parse_lenient` loaded
+        // as "unset") is about to lose what it held. Keep a copy first.
         if let Ok(existing) = std::fs::read_to_string(path) {
-            let is_object = matches!(
-                serde_json::from_str::<serde_json::Value>(&existing),
-                Ok(serde_json::Value::Object(_))
-            );
-            if !existing.trim().is_empty() && !is_object {
+            let fully_read = serde_json::from_str::<Self>(&existing).is_ok();
+            if !existing.trim().is_empty() && !fully_read {
                 match crate::config_io::backup(path) {
                     Ok(bak) => eprintln!(
-                        "[settings] {} was unreadable; kept a copy at {}",
+                        "[settings] {} was not fully readable; kept a copy at {}",
                         path.display(),
                         bak.display()
                     ),
                     Err(e) => {
                         return Err(eyre::eyre!(
-                            "{} is unreadable and could not be backed up ({e}); not overwriting it",
+                            "{} is not fully readable and could not be backed up ({e}); not overwriting it",
                             path.display()
                         ))
                     }
@@ -1245,6 +1243,24 @@ mod tests {
         assert_eq!(s.tail_capture_cap_ms, None);
         assert_eq!(s.cleanup_enabled, None);
         assert_eq!(s.translation_targets, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_with_one_bad_value_is_backed_up_before_it_is_rewritten() {
+        // The bad value loads as "unset", so the next save drops it. The user
+        // typed it; keep the original beside the rewritten file.
+        let dir = std::env::temp_dir().join(format!("fd-settings-badkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = r#"{ "hotkey_keycode": 54, "preroll_ms": "400" }"#;
+        std::fs::write(&path, original).unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.hotkey_keycode, Some(54));
+        s.save_to(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("settings.json.bak")).unwrap(), original);
+        assert_eq!(Settings::load_from(&path).hotkey_keycode, Some(54));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

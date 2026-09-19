@@ -429,7 +429,8 @@ re-joining the path:
 the same directory, fsync, rename; a new file is `0600`; a symlinked file is written through the
 link, so a dotfiles link survives). `settings.json` is parsed one key at a time: a single bad value
 falls back to that key's default with a `[warn]` line and the other keys survive; a document that
-is not a JSON object loads as defaults and is copied to `settings.json.bak` before the next save.
+is not a JSON object loads as defaults. Either kind of file is copied to `settings.json.bak`
+before the next save rewrites it.
 `corrections.json` and `dictionary.json` cannot be rebuilt from anything, so a file that does not
 parse is never overwritten: `save_to` returns an error, the Dictionary window disables Add and
 Save, and the Settings pane refuses Add and says why. `_`-prefixed comment keys in
