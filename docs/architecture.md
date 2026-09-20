@@ -476,7 +476,9 @@ cues are original and reproducible: `scripts/audio/generate_cues.py` (python3 st
 them into `resources/sounds/`, and a unit test pins the embedded files to the generator's format
 and durations. The cue that plays when text lands is selectable: `resources/completion_sounds/`
 holds twenty audition candidates (twelve original, eight CC0 by Kenney Vleugels), and a unit test
-pins the catalog to their stable ids, order and format. `numbers.rs`
+pins the catalog to their stable ids, order and format. The cue that plays when recording starts is
+selectable too: `resources/start_sounds/` holds seven original rising candidates beside the default
+(`resources/sounds/start.wav`). `numbers.rs`
 converts spoken numbers to numerals deterministically; `spoken_command.rs` handles *prefix*
 commands (e.g. "translate to Chinese …") via the warm transform engine; `voice_commands.rs` parses
 *trailing* commands ("press enter", "new line", "scratch that", "undo that"). The model is loaded
@@ -493,11 +495,13 @@ re-joining the path:
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
-  `double_tap_latch`, `show_result`, `completion_sound`, `appearance`, `pill_size`,
+  `double_tap_latch`, `show_result`, `completion_sound`, `start_sound`, `appearance`, `pill_size`,
   `waveform_sensitivity`, `show_processing_detail`, `audio_history_enabled`,
   `audio_retention`, `audio_storage_cap_mb`.
   `completion_sound` is a stable id from `cues::COMPLETION_SOUNDS`; absent or unknown falls back to
   the default tight thud (`resources/sounds/success.wav`), so an upgrade keeps the cue it had.
+  `start_sound` is the same for `cues::START_SOUNDS`, falling back to the default rising pair
+  (`resources/sounds/start.wav`).
   `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
   `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
   silently ignored by serde — an old settings file still parses.
@@ -556,6 +560,7 @@ stack:
 | `DICTATE_WHISPER_MODE` | Lower VAD speech threshold for quiet speech |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_COMPLETION_SOUND` | Completion cue id for the sound that plays when text lands (default the tight thud; e.g. `glass-tick`). Unknown/blank falls back to the default |
+| `DICTATE_START_SOUND` | Start cue id for the sound that plays when recording starts (default the rising pair; e.g. `glass-rise`). Unknown/blank falls back to the default |
 | `DICTATE_TRANSLATION_TARGETS` / `DICTATE_ACTIVE_TRANSLATION_TARGET` | Translate-mode target list (comma-separated) and the active one |
 | `DICTATE_HISTORY_RETENTION` | History pruning window (see `history.rs`) |
 | `DICTATE_REDUCED_MOTION` | Force the pill's reduced-motion animation |

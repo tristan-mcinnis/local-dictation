@@ -1520,6 +1520,13 @@ pub(super) fn worker_loop(
                         crate::daemon_log::text(&raw_transcript)
                     );
                 }
+                // Capture is over; un-mute other audio now so the outcome cue
+                // below is actually audible. `play_start` runs before `mute()`,
+                // but the completion/error/cancel cues otherwise played inside
+                // the muted window and were silent (the guarded Drop restores
+                // only when this arm ends). Restore is idempotent, so the
+                // `RestoreOnDrop` guard later is a no-op.
+                crate::audio_duck::restore();
                 match finish {
                     crate::injector::FinalizeResult::Injected => {
                         recovery.status = crate::history::RecoveryStatus::Completed;

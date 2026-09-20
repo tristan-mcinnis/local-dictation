@@ -14,7 +14,12 @@ import wave
 from pathlib import Path
 
 RATE = 48_000
-OUT = Path(__file__).resolve().parents[2] / "resources" / "sounds"
+RESOURCES = Path(__file__).resolve().parents[2] / "resources"
+OUT = RESOURCES / "sounds"
+# Selectable start cues audition beside the default in Settings. They live in
+# their own directory so a completion candidate and a start candidate can never
+# be confused for one another.
+START_OUT = RESOURCES / "start_sounds"
 
 
 def tone(seconds: float, notes: list[tuple[float, float, float]], gain: float = 0.13) -> list[float]:
@@ -63,13 +68,17 @@ def landing_thud(seconds: float = 0.145) -> list[float]:
     return samples
 
 
-def write(name: str, samples: list[float]) -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(OUT / name), "wb") as file:
+def write_at(directory: Path, name: str, samples: list[float]) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(directory / name), "wb") as file:
         file.setnchannels(1)
         file.setsampwidth(2)
         file.setframerate(RATE)
         file.writeframes(b"".join(struct.pack("<h", int(sample * 32767)) for sample in samples))
+
+
+def write(name: str, samples: list[float]) -> None:
+    write_at(OUT, name, samples)
 
 
 def main() -> None:
@@ -83,6 +92,17 @@ def main() -> None:
     write("cancel.wav", tone(0.135, [(300, 0.000, 0.060), (220, 0.052, 0.083)], 0.11))
     write("latch.wav", tone(0.090, [(540, 0.000, 0.075)], 0.105))
     write("error.wav", tone(0.145, [(260, 0.000, 0.068), (195, 0.064, 0.078)], 0.105))
+
+    # Selectable START cues: every one rises, so "recording" and "landed" can
+    # never be confused by shape. `resources/sounds/start.wav` above stays the
+    # default; these seven are the audition set (`resources/start_sounds/`).
+    write_at(START_OUT, "soft-rise.wav", tone(0.120, [(520, 0.000, 0.052), (640, 0.050, 0.070)], 0.110))
+    write_at(START_OUT, "bright-rise.wav", tone(0.115, [(740, 0.000, 0.045), (980, 0.044, 0.070)], 0.120))
+    write_at(START_OUT, "low-rise.wav", tone(0.125, [(430, 0.000, 0.055), (560, 0.052, 0.073)], 0.120))
+    write_at(START_OUT, "quick-blip.wav", tone(0.075, [(880, 0.000, 0.062)], 0.120))
+    write_at(START_OUT, "double-tap.wav", tone(0.130, [(600, 0.000, 0.040), (760, 0.042, 0.040), (920, 0.084, 0.046)], 0.110))
+    write_at(START_OUT, "glass-rise.wav", tone(0.130, [(784, 0.000, 0.050), (1175, 0.048, 0.082)], 0.100))
+    write_at(START_OUT, "warm-rise.wav", tone(0.140, [(480, 0.000, 0.060), (620, 0.056, 0.084)], 0.105))
 
 
 if __name__ == "__main__":

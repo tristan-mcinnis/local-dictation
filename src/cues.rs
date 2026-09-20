@@ -4,10 +4,13 @@
 //! ship under this crate's licence. Do not swap in a sample taken from another
 //! product; change the generator and re-run it instead.
 //!
-//! The completion sound is selectable. `resources/completion_sounds/` holds the
-//! twenty audition candidates plus the default; see [`COMPLETION_SOUNDS`].
-//! Twelve are original local synthesis, eight are CC0 by Kenney Vleugels
-//! (attribution in `THIRD-PARTY-NOTICES.md`).
+//! The start and completion sounds are each selectable.
+//! `resources/start_sounds/` holds the start audition set and
+//! `resources/completion_sounds/` the twenty completion candidates plus the
+//! default; see [`START_SOUNDS`] and [`COMPLETION_SOUNDS`]. The start variants
+//! are original local synthesis; of the completion set twelve are original
+//! local synthesis and eight are CC0 by Kenney Vleugels (attribution in
+//! `THIRD-PARTY-NOTICES.md`).
 //!
 //! Samples are embedded in the binary and registered with macOS' native
 //! system-sound service on first use. Playback is asynchronous, so a cue never
@@ -21,6 +24,25 @@ const CANCEL: &[u8] = include_bytes!("../resources/sounds/cancel.wav");
 const LATCH: &[u8] = include_bytes!("../resources/sounds/latch.wav");
 const ERROR: &[u8] = include_bytes!("../resources/sounds/error.wav");
 
+// ─── Selectable start sounds ─────────────────────────────────────────────
+//
+// One embedded entry per candidate. The default is the existing rising pair
+// (`start.wav`), so an upgrade with no saved selection keeps the sound it
+// already had. Every candidate rises, so "recording" and "landed" can never be
+// confused by contour.
+
+/// Stable id of the start cue used when nothing else is saved: the existing
+/// rising pair.
+pub const DEFAULT_START_SOUND: &str = "rising-pair";
+
+const SS_SOFT_RISE: &[u8] = include_bytes!("../resources/start_sounds/soft-rise.wav");
+const SS_BRIGHT_RISE: &[u8] = include_bytes!("../resources/start_sounds/bright-rise.wav");
+const SS_LOW_RISE: &[u8] = include_bytes!("../resources/start_sounds/low-rise.wav");
+const SS_QUICK_BLIP: &[u8] = include_bytes!("../resources/start_sounds/quick-blip.wav");
+const SS_DOUBLE_TAP: &[u8] = include_bytes!("../resources/start_sounds/double-tap.wav");
+const SS_GLASS_RISE: &[u8] = include_bytes!("../resources/start_sounds/glass-rise.wav");
+const SS_WARM_RISE: &[u8] = include_bytes!("../resources/start_sounds/warm-rise.wav");
+
 // ─── Selectable completion sounds ────────────────────────────────────────
 //
 // One embedded entry per candidate. `DEFAULT_COMPLETION_SOUND` is the existing
@@ -33,15 +55,15 @@ const ERROR: &[u8] = include_bytes!("../resources/sounds/error.wav");
 /// existing tight completion thud.
 pub const DEFAULT_COMPLETION_SOUND: &str = "tight-thud";
 
-/// A selectable completion cue: a stable id (the value stored in
-/// `settings.json`), a human-readable label, and the embedded WAV bytes.
-pub struct CompletionSound {
+/// A selectable cue: a stable id (the value stored in `settings.json`), a
+/// human-readable label, and the embedded WAV bytes.
+pub struct CueSound {
     pub id: &'static str,
     pub label: &'static str,
     bytes: &'static [u8],
 }
 
-impl CompletionSound {
+impl CueSound {
     /// The embedded WAV bytes for this cue.
     pub fn bytes(&self) -> &'static [u8] {
         self.bytes
@@ -84,119 +106,180 @@ const CS_KENNEY_CONFIRMATION_3: &[u8] =
 
 /// Every completion cue offered in Settings, default first. The order is the
 /// audition order; ids are stable across releases and never renumbered.
-pub static COMPLETION_SOUNDS: &[CompletionSound] = &[
-    CompletionSound {
+pub static COMPLETION_SOUNDS: &[CueSound] = &[
+    CueSound {
         id: DEFAULT_COMPLETION_SOUND,
         label: "Tight thud (default)",
         bytes: SUCCESS,
     },
-    CompletionSound {
+    CueSound {
         id: "tight-felt-thud",
         label: "01 · Tight felt thud",
         bytes: CS_TIGHT_FELT_THUD,
     },
-    CompletionSound {
+    CueSound {
         id: "compact-wood-thud",
         label: "02 · Compact wood thud",
         bytes: CS_COMPACT_WOOD_THUD,
     },
-    CompletionSound {
+    CueSound {
         id: "soft-landing-thud",
         label: "03 · Soft landing thud",
         bytes: CS_SOFT_LANDING_THUD,
     },
-    CompletionSound {
+    CueSound {
         id: "deep-settle-thud",
         label: "04 · Deep settle thud",
         bytes: CS_DEEP_SETTLE_THUD,
     },
-    CompletionSound {
+    CueSound {
         id: "muted-stamp",
         label: "05 · Muted stamp",
         bytes: CS_MUTED_STAMP,
     },
-    CompletionSound {
+    CueSound {
         id: "soft-ui-click",
         label: "06 · Soft UI click",
         bytes: CS_SOFT_UI_CLICK,
     },
-    CompletionSound {
+    CueSound {
         id: "glass-tick",
         label: "07 · Glass tick",
         bytes: CS_GLASS_TICK,
     },
-    CompletionSound {
+    CueSound {
         id: "warm-key-tap",
         label: "08 · Warm key tap",
         bytes: CS_WARM_KEY_TAP,
     },
-    CompletionSound {
+    CueSound {
         id: "bubble-pop",
         label: "09 · Bubble pop",
         bytes: CS_BUBBLE_POP,
     },
-    CompletionSound {
+    CueSound {
         id: "muted-pluck",
         label: "10 · Muted pluck",
         bytes: CS_MUTED_PLUCK,
     },
-    CompletionSound {
+    CueSound {
         id: "double-settle",
         label: "11 · Double settle",
         bytes: CS_DOUBLE_SETTLE,
     },
-    CompletionSound {
+    CueSound {
         id: "warm-done-tone",
         label: "12 · Warm done tone",
         bytes: CS_WARM_DONE_TONE,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-tight-click",
         label: "13 · Tight click",
         bytes: CS_KENNEY_TIGHT_CLICK,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-bong-impact",
         label: "14 · Bong impact",
         bytes: CS_KENNEY_BONG_IMPACT,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-drop-impact",
         label: "15 · Drop impact",
         bytes: CS_KENNEY_DROP_IMPACT,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-soft-impact",
         label: "16 · Soft impact",
         bytes: CS_KENNEY_SOFT_IMPACT,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-heavy-wood-impact",
         label: "17 · Heavy wood impact",
         bytes: CS_KENNEY_HEAVY_WOOD_IMPACT,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-confirmation-1",
         label: "18 · Confirmation 1",
         bytes: CS_KENNEY_CONFIRMATION_1,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-confirmation-2",
         label: "19 · Confirmation 2",
         bytes: CS_KENNEY_CONFIRMATION_2,
     },
-    CompletionSound {
+    CueSound {
         id: "kenney-confirmation-3",
         label: "20 · Confirmation 3",
         bytes: CS_KENNEY_CONFIRMATION_3,
     },
 ];
 
-/// The catalog entry for `id`, if it is a known completion sound. Trims
-/// surrounding whitespace first so a hand-edited settings value still matches.
-pub fn completion_sound(id: &str) -> Option<&'static CompletionSound> {
+/// Every start cue offered in Settings, default first. Order is the audition
+/// order; ids are stable across releases and never renumbered.
+pub static START_SOUNDS: &[CueSound] = &[
+    CueSound {
+        id: DEFAULT_START_SOUND,
+        label: "Rising pair (default)",
+        bytes: START,
+    },
+    CueSound {
+        id: "soft-rise",
+        label: "01 · Soft rise",
+        bytes: SS_SOFT_RISE,
+    },
+    CueSound {
+        id: "bright-rise",
+        label: "02 · Bright rise",
+        bytes: SS_BRIGHT_RISE,
+    },
+    CueSound {
+        id: "low-rise",
+        label: "03 · Low rise",
+        bytes: SS_LOW_RISE,
+    },
+    CueSound {
+        id: "quick-blip",
+        label: "04 · Quick blip",
+        bytes: SS_QUICK_BLIP,
+    },
+    CueSound {
+        id: "double-tap",
+        label: "05 · Double tap",
+        bytes: SS_DOUBLE_TAP,
+    },
+    CueSound {
+        id: "glass-rise",
+        label: "06 · Glass rise",
+        bytes: SS_GLASS_RISE,
+    },
+    CueSound {
+        id: "warm-rise",
+        label: "07 · Warm rise",
+        bytes: SS_WARM_RISE,
+    },
+];
+
+/// A catalog lookup by id. Trims surrounding whitespace first so a
+/// hand-edited settings value still matches.
+fn find_sound(catalog: &'static [CueSound], id: &str) -> Option<&'static CueSound> {
     let id = id.trim();
-    COMPLETION_SOUNDS.iter().find(|s| s.id == id)
+    catalog.iter().find(|s| s.id == id)
+}
+
+/// The catalog entry for `id`, if it is a known completion sound.
+pub fn completion_sound(id: &str) -> Option<&'static CueSound> {
+    find_sound(COMPLETION_SOUNDS, id)
+}
+
+/// The catalog entry for `id`, if it is a known start sound.
+pub fn start_sound(id: &str) -> Option<&'static CueSound> {
+    find_sound(START_SOUNDS, id)
+}
+
+/// Any selectable cue (start or completion) by id. The two id sets are
+/// disjoint, so one lookup serves the shared playback cache.
+fn selectable_sound(id: &str) -> Option<&'static CueSound> {
+    start_sound(id).or_else(|| completion_sound(id))
 }
 
 /// Canonicalize a completion-sound id: known ids pass through, anything else
@@ -205,6 +288,14 @@ pub fn normalize_completion_sound(id: &str) -> &'static str {
     completion_sound(id)
         .map(|s| s.id)
         .unwrap_or(DEFAULT_COMPLETION_SOUND)
+}
+
+/// Canonicalize a start-sound id: known ids pass through, anything else
+/// (blank, unknown, hand-edited) falls back to [`DEFAULT_START_SOUND`].
+pub fn normalize_start_sound(id: &str) -> &'static str {
+    start_sound(id)
+        .map(|s| s.id)
+        .unwrap_or(DEFAULT_START_SOUND)
 }
 
 /// The completion sound selected for this process, read from settings once and
@@ -216,9 +307,17 @@ fn selected_completion_sound() -> &'static str {
         .as_str()
 }
 
-/// Recording started: a short rising pair.
+/// The start sound selected for this process, read and cached the same way.
+fn selected_start_sound() -> &'static str {
+    static SELECTED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SELECTED
+        .get_or_init(|| crate::settings::Settings::load().resolve_start_sound())
+        .as_str()
+}
+
+/// Recording started: the resolved start sound.
 pub fn play_start() {
-    play(Cue::Start);
+    play_selected(selected_start_sound());
 }
 
 /// Recording stopped. Silent by design (2026-09-09): the pair the user wants
@@ -233,28 +332,39 @@ pub fn play_stop() {
 /// Text was accepted and injected: the resolved completion sound. Played only
 /// after a successful injection (see the `Injected` arm in `daemon::worker`).
 pub fn play_success() {
-    play_completion(selected_completion_sound());
+    play_selected(selected_completion_sound());
 }
 
 /// Play a completion cue by id, for the Settings audition. Respects
 /// `DICTATE_QUIET`; an unknown id falls back to the default.
 pub fn preview_completion_sound(id: &str) {
-    play_completion(normalize_completion_sound(id));
+    play_selected(normalize_completion_sound(id));
 }
 
-/// Play one completion cue through the same native path as the state cues.
-fn play_completion(id: &str) {
+/// Play a start cue by id, for the Settings audition. Respects `DICTATE_QUIET`;
+/// an unknown id falls back to the default.
+pub fn preview_start_sound(id: &str) {
+    play_selected(normalize_start_sound(id));
+}
+
+/// Play one selectable cue through the same native path as the state cues.
+fn play_selected(id: &str) {
     if std::env::var_os("DICTATE_QUIET").is_some() {
         return;
     }
+    // Resolve to the catalog's own `'static` id so the playback cache can key
+    // on it. Unknown ids play nothing; the public previews normalize first.
+    let Some(canonical) = selectable_sound(id).map(|s| s.id) else {
+        return;
+    };
     #[cfg(target_os = "macos")]
     {
         if let Some(sounds) = macos::sounds() {
-            sounds.play_completion(id);
+            sounds.play_selected(canonical);
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = id;
+    let _ = canonical;
 }
 
 /// The current recording was cancelled by the user.
@@ -395,11 +505,12 @@ mod macos {
 
     pub(super) struct Sounds {
         sounds: [Id; 6],
-        /// Completion cues loaded so far, keyed by their stable id. The selected
-        /// one is loaded with the state cues; an audition candidate is loaded
-        /// on first play. A `Vec`, not a fixed array, so the catalog can grow
-        /// without a positional index to keep in sync.
-        completion: Mutex<Vec<(&'static str, Id)>>,
+        /// Selectable cues (start and completion) loaded so far, keyed by their
+        /// stable id. The selected ones are loaded with the state cues; an
+        /// audition candidate is loaded on first play. A `Vec`, not a fixed
+        /// array, so the catalog can grow without a positional index to keep in
+        /// sync.
+        selectable: Mutex<Vec<(&'static str, Id)>>,
         directory: PathBuf,
     }
     // NSSound is safe to `play` from any thread; the objects are created once
@@ -433,26 +544,31 @@ mod macos {
                 }
                 sounds[index] = create_sound(&path)?;
             }
-            // Preload the selected completion cue. A failure here is not fatal:
-            // `play_completion` retries at play time, and a missing cue must
-            // never take down the state cues.
-            let mut completion = Vec::new();
-            if let Some(entry) = load_completion(&directory, super::selected_completion_sound()) {
-                completion.push(entry);
+            // Preload the selected start and completion cues. A failure here
+            // is not fatal: `play_selected` retries at play time, and a missing
+            // cue must never take down the state cues.
+            let mut selectable = Vec::new();
+            for id in [
+                super::selected_start_sound(),
+                super::selected_completion_sound(),
+            ] {
+                if let Some(entry) = load_completion(&directory, id) {
+                    selectable.push(entry);
+                }
             }
             Some(Self {
                 sounds,
-                completion: Mutex::new(completion),
+                selectable: Mutex::new(selectable),
                 directory,
             })
         }
 
-        /// Play a completion cue by canonical id, loading and caching it on
+        /// Play a selectable cue by canonical id, loading and caching it on
         /// first use.
-        pub(super) fn play_completion(&self, id: &str) {
-            let canonical = super::normalize_completion_sound(id);
+        pub(super) fn play_selected(&self, id: &'static str) {
+            let canonical = id;
             let sound = {
-                let mut cache = self.completion.lock().unwrap();
+                let mut cache = self.selectable.lock().unwrap();
                 match cache.iter().find(|(cached, _)| *cached == canonical) {
                     Some((_, sound)) => *sound,
                     None => match load_completion(&self.directory, canonical) {
@@ -489,10 +605,10 @@ mod macos {
         }
     }
 
-    /// Materialize one completion cue in the cache directory and wrap it as an
+    /// Materialize one selectable cue in the cache directory and wrap it as an
     /// `NSSound`. Returns the canonical id beside it so the cache can key on it.
     fn load_completion(directory: &Path, id: &str) -> Option<(&'static str, Id)> {
-        let entry = super::completion_sound(id)?;
+        let entry = super::selectable_sound(id)?;
         let path = directory.join(format!("{}.wav", entry.id));
         if !matches_bytes(&path, entry.bytes()) {
             fs::write(&path, entry.bytes()).ok()?;
@@ -662,5 +778,70 @@ mod tests {
             .label
             .contains("Glass tick"));
         assert!(completion_sound("nope").is_none());
+    }
+
+    #[test]
+    fn start_catalog_lists_default_plus_seven_auditions() {
+        assert_eq!(START_SOUNDS.len(), 8);
+        assert_eq!(START_SOUNDS[0].id, DEFAULT_START_SOUND);
+        assert_eq!(START_SOUNDS[0].bytes, START);
+        assert_eq!(START_SOUNDS[0].label, "Rising pair (default)");
+
+        let ids: Vec<&str> = START_SOUNDS.iter().map(|s| s.id).collect();
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "start ids must be unique");
+
+        assert_eq!(
+            &ids[1..],
+            &[
+                "soft-rise",
+                "bright-rise",
+                "low-rise",
+                "quick-blip",
+                "double-tap",
+                "glass-rise",
+                "warm-rise",
+            ]
+        );
+
+        // The two selectable id sets are disjoint so one playback cache serves
+        // both.
+        for start in START_SOUNDS {
+            assert!(
+                completion_sound(start.id).is_none(),
+                "{} collides with a completion id",
+                start.id
+            );
+            assert_eq!(selectable_sound(start.id).unwrap().id, start.id);
+        }
+    }
+
+    #[test]
+    fn start_cues_are_valid_48k_wavs() {
+        for entry in START_SOUNDS {
+            assert!(!entry.label.is_empty(), "{} has no label", entry.id);
+            let bytes = entry.bytes;
+            assert!(bytes.len() > 44, "{} is not a WAV", entry.id);
+            let (channels, rate, bits, data_len) = wav_info(bytes);
+            assert!(channels >= 1 && channels <= 2, "{} channels", entry.id);
+            assert_eq!(bits, 16, "{} sample width", entry.id);
+            assert_eq!(rate, 48_000, "{} sample rate", entry.id);
+            let bytes_per_frame = u32::from(channels) * 2;
+            let ms = data_len.saturating_mul(1_000) / (rate * bytes_per_frame);
+            assert!(ms <= 800, "{} is {ms} ms", entry.id);
+        }
+    }
+
+    #[test]
+    fn unknown_start_sound_falls_back_to_default() {
+        assert_eq!(normalize_start_sound(""), DEFAULT_START_SOUND);
+        assert_eq!(normalize_start_sound("nope"), DEFAULT_START_SOUND);
+        assert_eq!(normalize_start_sound("   "), DEFAULT_START_SOUND);
+        assert_eq!(normalize_start_sound("  glass-rise  "), "glass-rise");
+        assert_eq!(normalize_start_sound("glass-tick"), DEFAULT_START_SOUND);
+        assert!(start_sound("glass-rise").unwrap().label.contains("Glass rise"));
+        assert!(start_sound("glass-tick").is_none());
     }
 }

@@ -113,6 +113,8 @@ const WAVEFORM_SENSITIVITY_NOTE: &str =
     "Visual response only. Microphone gain and recognition stay the same.";
 /// Under the completion-sound popup: the picker auditions on selection.
 const COMPLETION_SOUND_NOTE: &str = "Plays when the text lands. Pick one to hear it.";
+/// Under the start-sound popup: the picker auditions on selection.
+const START_SOUND_NOTE: &str = "Plays when recording starts. Pick one to hear it.";
 
 /// The rail's sections, in order: label, SF Symbol, subtitle.
 const PANES: &[(&str, &str, &str)] = &[
@@ -192,6 +194,7 @@ pub struct SettingsUi {
     pill_size_popup: Retained<NSPopUpButton>,
     waveform_sensitivity_popup: Retained<NSPopUpButton>,
     completion_sound_popup: Retained<NSPopUpButton>,
+    start_sound_popup: Retained<NSPopUpButton>,
     feedback_card_y: f64,
     tail_capture_switch: Retained<slate::InkToggle>,
     listen_switch: Retained<slate::InkToggle>,
@@ -670,6 +673,19 @@ define_class!(
             }
             with_pending(|p| {
                 p.completion_sound = if id.is_empty() { None } else { Some(id) };
+            });
+        }
+
+        #[unsafe(method(changeStartSound:))]
+        fn change_start_sound(&self, sender: *mut AnyObject) {
+            let id = popup_selected_rep(sender);
+            // Audition the cue at once; like the completion picker this is a
+            // preview only until Apply & Restart.
+            if !id.is_empty() {
+                crate::cues::preview_start_sound(&id);
+            }
+            with_pending(|p| {
+                p.start_sound = if id.is_empty() { None } else { Some(id) };
             });
         }
 
@@ -1379,6 +1395,26 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         env_hint(mtm, &mut card, "DICTATE_SHOW_RESULT");
     }
 
+    // The cue that plays when recording starts. Selecting an item auditions it
+    // right away; Apply & Restart persists the choice.
+    let start_sound_locked = std::env::var_os(settings::START_SOUND_ENV).is_some();
+    let start_sound_popup = popup_row(mtm, &mut card, "Start sound");
+    for sound in crate::cues::START_SOUNDS {
+        popup_add_item(&start_sound_popup, sound.label, None, Some(sound.id));
+    }
+    select_popup_rep(&start_sound_popup, &loaded.resolve_start_sound());
+    finish_popup(&start_sound_popup);
+    wire_popup(
+        &start_sound_popup,
+        &controller,
+        sel!(changeStartSound:),
+        start_sound_locked,
+    );
+    if start_sound_locked {
+        env_hint(mtm, &mut card, settings::START_SOUND_ENV);
+    }
+    hint_line(mtm, &mut card, START_SOUND_NOTE);
+
     // The cue that plays once the text lands. Selecting an item auditions it
     // right away; Apply & Restart persists the choice.
     let completion_sound_locked = std::env::var_os(settings::COMPLETION_SOUND_ENV).is_some();
@@ -2032,6 +2068,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         pill_size_popup,
         waveform_sensitivity_popup,
         completion_sound_popup,
+        start_sound_popup,
         feedback_card_y,
         tail_capture_switch,
         listen_switch,
