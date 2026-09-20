@@ -488,6 +488,21 @@ pub(super) fn install_poll_timer() {
             update_live_feedback(globals, state);
             update_pill_hover(globals);
         }
+        // About once a second, on this main-thread timer: follow a keyboard
+        // layout switch (Text Input Source calls are main-thread only) and
+        // notice Secure Input, which silences the hotkeys.
+        let tick = globals.slow_tick.fetch_add(1, Ordering::Relaxed);
+        if tick % SLOW_TICK_FRAMES == 0 {
+            crate::key_layout::refresh();
+            if let Some(on) = crate::secure_input::refresh() {
+                eprintln!(
+                    "[hotkey] Secure Input {} · hotkeys {}",
+                    if on { "ON" } else { "off" },
+                    if on { "paused (control socket still works)" } else { "back" }
+                );
+                apply_state_transition(globals, state);
+            }
+        }
     }
 
     unsafe {
@@ -525,7 +540,7 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
     // the template at 40 %, which is the rule's "busy" treatment.
     let icon = if state == UiState::Recording {
         &globals.icon_recording
-    } else if state.is_processing() || matches!(state, UiState::Error | UiState::NoEditableField) {
+    } else if state.is_processing() || (state == UiState::Error || state.is_kept_result()) {
         &globals.icon_processing
     } else {
         &globals.icon_idle
@@ -538,20 +553,27 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 "●"
             } else if state.is_processing() {
                 "◌"
-            } else if matches!(state, UiState::Error | UiState::NoEditableField) {
+            } else if state == UiState::Error || state.is_kept_result() {
                 "!"
             } else {
                 "◯"
             }));
         }
-        button.setAlphaValue(if state.is_processing() {
+        // Secure Input silences the hotkeys; while idle the glyph dims and the
+        // tooltip says why (the menu carries the same line).
+        let paused = state == UiState::Idle && crate::secure_input::active();
+        button.setAlphaValue(if state.is_processing() || paused {
             PROCESSING_ALPHA
         } else {
             1.0
         });
         button.setToolTip(Some(&NSString::from_str(&format!(
             "Local Dictation · {}",
-            pill_status(state, globals.show_processing_detail)
+            if paused {
+                crate::secure_input::PAUSED_TEXT
+            } else {
+                pill_status(state, globals.show_processing_detail)
+            }
         ))));
     }
     globals.pill_hovered.store(false, Ordering::Relaxed);
@@ -636,19 +658,43 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
-        UiState::NoEditableField => {
-            // The transcript was held (not pasted) because no editable field was
-            // focused. Say so plainly and point at the one real recovery path:
-            // the menu-bar "Copy last dictation" item (there is no copy button
-            // on the pill, so we label the menu recovery accurately, not "Copy").
-            globals.pill.status.setStringValue(&NSString::from_str(
-                "No text field selected · Copy from menu",
-            ));
+        UiState::NothingToCopy => {
+            globals
+                .pill
+                .status
+                .setStringValue(&NSString::from_str(NOTHING_TO_COPY_TEXT));
             set_pill_layout(globals, PillLayout::Copied);
+            show_pill(globals);
+        }
+        UiState::NoEditableField
+        | UiState::PasteFailed
+        | UiState::HeldCopied
+        | UiState::PasteFailedCopied
+        | UiState::LimitReached
+        | UiState::LimitReachedCopied => {
+            // The words exist but did not reach the app. One sentence: what
+            // happened, then where the text is ("Copied, press ⌘V" when it is
+            // on the clipboard). The Error layout carries the History button,
+            // so the pill itself is a route to the transcript. It stays about
+            // four seconds, or until the next key press.
+            globals.pill.status.setStringValue(&NSString::from_str(
+                crate::last_dictation::kept_pill_text(state).unwrap_or("Text kept · Copy from menu"),
+            ));
+            globals
+                .pill
+                .hint
+                .setStringValue(&NSString::from_str("History"));
+            set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
     }
 }
+
+/// Pill text when "Copy last dictation" has nothing to copy.
+pub(super) const NOTHING_TO_COPY_TEXT: &str = "No dictation to copy yet";
+
+/// Poll-timer frames between slow checks (30 FPS, so about one second).
+const SLOW_TICK_FRAMES: u32 = 30;
 
 /// The menu-bar glyph's alpha while the pipeline works.
 const PROCESSING_ALPHA: f64 = 0.4;
@@ -818,7 +864,10 @@ pub(super) fn pill_status(state: UiState, details: bool) -> &'static str {
         UiState::Copied => "Copied to clipboard",
         UiState::Success => "Landed",
         UiState::Error => "Couldn’t transcribe",
-        UiState::NoEditableField => "No text field selected",
+        UiState::PasteFailed | UiState::PasteFailedCopied => "Couldn’t paste",
+        UiState::NoEditableField | UiState::HeldCopied => "No text field selected",
+        UiState::LimitReached | UiState::LimitReachedCopied => "Recording limit reached",
+        UiState::NothingToCopy => NOTHING_TO_COPY_TEXT,
         UiState::Idle => "Ready",
     }
 }

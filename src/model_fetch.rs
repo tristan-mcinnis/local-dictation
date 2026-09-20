@@ -1,7 +1,10 @@
 //! Fixed-stack model readiness checks.
 //!
-//! This personal build never downloads models silently. Cohere Q4 is converted
-//! from the user's local checkpoint and S1-mini is linked/copied explicitly.
+//! The app never downloads anything: there is no network code in it. Despite
+//! the module name (kept for the `fetch-models` subcommand), this only CHECKS
+//! that the fixed stack is on disk. `scripts/download-models.sh` prepares it:
+//! Cohere Q4 is converted from a checkpoint already on this Mac and S1-mini is
+//! linked/copied explicitly.
 
 use std::path::Path;
 
@@ -25,7 +28,7 @@ pub fn ensure_default_models(base: &Path) -> eyre::Result<bool> {
         return Ok(false);
     }
     Err(eyre::eyre!(
-        "fixed model stack is incomplete under {}. Run the Cohere conversion +         script and link S1-mini; see README.md",
+        "fixed model stack is incomplete under {}. Run ./scripts/download-models.sh (it converts the Cohere checkpoint and links S1-mini); see README.md",
         base.display()
     ))
 }

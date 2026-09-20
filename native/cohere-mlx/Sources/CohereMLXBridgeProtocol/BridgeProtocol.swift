@@ -74,6 +74,19 @@ public struct BridgeResponse: Codable, Sendable {
 public enum BridgeProtocol {
     public static let protocolVersion = 1
 
+    /// The `request_id` of a request line, read leniently: it succeeds even
+    /// when the rest of the line would not decode as a `BridgeRequest` (a
+    /// missing `op`, a wrong-typed field). An error reply must carry the id of
+    /// the request it answers, or the client reports "response id mismatch"
+    /// and the real error is lost.
+    public static func requestID(fromLine line: String) -> String? {
+        struct IDOnly: Decodable {
+            var requestID: String?
+            enum CodingKeys: String, CodingKey { case requestID = "request_id" }
+        }
+        return (try? JSONDecoder().decode(IDOnly.self, from: Data(line.utf8)))?.requestID
+    }
+
     public static func encode(_ response: BridgeResponse) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]

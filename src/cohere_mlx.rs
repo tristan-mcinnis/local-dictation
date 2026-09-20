@@ -106,12 +106,7 @@ impl CohereMlxWorker {
         self.stdin.flush()?;
 
         let response = read_response(&mut self.stdout)?;
-        if response.request_id.as_deref() != Some(&request_id) {
-            return Err(eyre::eyre!("Cohere MLX response id mismatch"));
-        }
-        if !response.ok {
-            return Err(response_error("Cohere MLX transcription failed", &response));
-        }
+        check_response(&response, &request_id)?;
         if let Some(timings) = &response.timings_ms {
             if let Some(total) = timings.get("total") {
                 eprintln!("[cohere] helper inference {total:.1} ms");
@@ -133,7 +128,36 @@ fn read_response(reader: &mut BufReader<ChildStdout>) -> eyre::Result<Response> 
     if reader.read_line(&mut line)? == 0 {
         return Err(eyre::eyre!("Cohere MLX helper exited unexpectedly"));
     }
-    serde_json::from_str(&line).map_err(|e| eyre::eyre!("invalid Cohere MLX response: {e}: {line}"))
+    parse_response_line(&line, crate::daemon_log::text_logging_enabled())
+}
+
+/// Decode one reply line. A line that does not decode may still hold a
+/// transcript, and this error is printed to the daemon log, so the line is
+/// shown by the log's text rule: its size only, unless `DICTATE_LOG_TEXT=1`.
+fn parse_response_line(line: &str, log_text: bool) -> eyre::Result<Response> {
+    serde_json::from_str(line).map_err(|e| {
+        eyre::eyre!(
+            "invalid Cohere MLX response: {e}: {}",
+            crate::daemon_log::render_text(log_text, line.trim())
+        )
+    })
+}
+
+/// Validate a transcribe reply. The helper's own error is reported FIRST: an
+/// error reply used to arrive without a `request_id`, and checking the id first
+/// turned every real failure into "response id mismatch". Requests are strictly
+/// one-in, one-out, so a failure line is this request's reply either way.
+fn check_response(response: &Response, request_id: &str) -> eyre::Result<()> {
+    if !response.ok {
+        return Err(response_error("Cohere MLX transcription failed", response));
+    }
+    if response.request_id.as_deref() != Some(request_id) {
+        return Err(eyre::eyre!(
+            "Cohere MLX response id mismatch (sent {request_id}, got {:?})",
+            response.request_id
+        ));
+    }
+    Ok(())
 }
 
 fn response_error(context: &str, response: &Response) -> eyre::Report {
@@ -162,5 +186,38 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
         assert_eq!(value["sample_rate"], 16_000);
         assert_eq!(value["request_id"], "7");
+    }
+
+    #[test]
+    fn a_helper_error_is_reported_even_without_a_request_id() {
+        // Regression: this reply used to surface as "response id mismatch".
+        let reply: Response = serde_json::from_str(
+            r#"{"ok":false,"error_code":"model","error_message":"audio too short"}"#,
+        )
+        .unwrap();
+        let err = check_response(&reply, "7").unwrap_err().to_string();
+        assert!(err.contains("model") && err.contains("audio too short"), "{err}");
+        assert!(!err.contains("mismatch"), "{err}");
+    }
+
+    #[test]
+    fn an_undecodable_reply_does_not_put_its_text_in_the_error() {
+        // Regression: the raw line (which can hold the transcript) was pasted
+        // into the error, and the error is printed to the daemon log.
+        let line = r#"{"ok":true,"text":"call Dr. Okafor about the biopsy""#;
+        let err = parse_response_line(line, false).unwrap_err().to_string();
+        assert!(err.contains("invalid Cohere MLX response"), "{err}");
+        assert!(!err.contains("Okafor"), "{err}");
+        let debug = parse_response_line(line, true).unwrap_err().to_string();
+        assert!(debug.contains("Okafor"), "{debug}");
+    }
+
+    #[test]
+    fn a_successful_reply_must_answer_this_request() {
+        let ok: Response =
+            serde_json::from_str(r#"{"ok":true,"request_id":"7","text":"hi"}"#).unwrap();
+        assert!(check_response(&ok, "7").is_ok());
+        let err = check_response(&ok, "8").unwrap_err().to_string();
+        assert!(err.contains("mismatch"), "{err}");
     }
 }

@@ -12,7 +12,11 @@ fi
 # MLX Swift's Metal kernels are emitted only by Xcode's package build. A plain
 # `swift build` produces an executable that compiles but fails at runtime with
 # "Failed to load the default metallib".
+# -onlyUsePackageVersionsFromResolvedFile: build exactly the revisions in the
+# tracked Package.resolved. A missing or mismatched file is a hard error, not a
+# silent re-resolve to whatever upstream is today.
 xcodebuild -quiet \
+  -onlyUsePackageVersionsFromResolvedFile \
   -scheme cohere-mlx-bridge \
   -destination 'platform=macOS,arch=arm64' \
   -configuration Release \

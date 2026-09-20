@@ -40,13 +40,18 @@ Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first w
 
 ## Install
 
-This personal build expects the locally installed Superwhisper Cohere Q4 and
-S1-mini checkpoints. Model bytes are never committed.
+Requires macOS 14 or later on Apple Silicon. Model bytes are never committed.
+`./scripts/download-models.sh` prepares the stack: it downloads the cleanup
+model, "S1-mini" by "Superwhisper", from Hugging Face and verifies its SHA-256
+(a local Superwhisper install is used instead when present, since the bytes are
+identical). The Cohere Q4 speech model still comes from a local 4-bit MLX
+checkpoint, so that part is not yet a clean-room install for a stranger. The app
+itself never downloads anything at runtime.
 
 Local builds use an available Apple Development signing identity. Keep the same identity across updates to preserve macOS permission grants.
 
 Launch it, then grant Microphone and Accessibility in System Settings → Privacy
-& Security. The menu-bar mic icon means it is ready.
+& Security. The waveform icon in the menu bar means it is ready.
 
 **Build from source.**
 
@@ -165,12 +170,22 @@ for current-machine numbers.
 
 | Model | Size | Role |
 | --- | ---: | --- |
-| Cohere Transcribe Q4 MLX | about 1.5 GB | Fixed speech-to-text model |
-| S1-mini Q4_K_M | about 462 MB | Fixed cleanup model |
+| [Cohere Transcribe 03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) Q4 MLX, by Cohere Labs | about 1.5 GB | Fixed speech-to-text model |
+| [S1-mini](https://huggingface.co/superwhisper/s1-mini) Q4_K_M, by Superwhisper | about 462 MB | Fixed cleanup model |
+
+Both models are open weights under Apache-2.0. S1-mini adds a naming clause: the
+model keeps the name **"S1-mini" by "Superwhisper"** wherever it is used. Local
+Dictation loads the released weights unmodified and supplies its own prompts and
+guards. GGUF builds are published at
+[superwhisper/s1-mini-GGUF](https://huggingface.co/superwhisper/s1-mini-GGUF);
+the persistent llama.cpp worker loads one of them.
 
 The Cohere setup script re-keys Safetensors metadata for the public
-`mlx-audio-swift` module; tensor bytes are unchanged. S1-mini is linked from the
-local installation and loaded by the persistent llama.cpp worker.
+`mlx-audio-swift` module; tensor bytes are unchanged, so the result is a derived
+work of the Apache-2.0 model.
+
+Full attribution for models, native packages and crates is in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Compared to the alternatives
 
@@ -203,6 +218,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_NO_MUTE` | Do not mute other audio during capture |
+| `DICTATE_LOG_TEXT` | Debug only: write dictated text into the log. Off by default; the log holds timings and lengths |
 
 ## Subcommands
 
@@ -212,7 +228,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | `toggle`, `start`, `stop`, `cancel` | Drive a running daemon over its control socket (Shortcuts, Raycast, a foot pedal) |
 | `fetch-models [dir]` | Verify the fixed local model stack |
 | `bench [wav]` | Transcribe and clean a WAV, report timings |
-| `logs` | Open the daemon log |
+| `logs` | Open the daemon log (`~/Library/Logs/Local Dictation/daemon.log`, readable only by you; it records timings and text lengths, never what you said) |
 | `ax-check` | Surface the Accessibility permission prompt |
 | `context-probe` | Print the proper nouns harvested from the focused window |
 
@@ -222,7 +238,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 * S1-mini is guarded; failed quality checks fall back to deterministic text.
 * Electron apps add about 185 ms (clipboard paste settle time). Native apps inject in about 5 ms.
 * Recording is bounded by key hold, not silence detection.
-* macOS and Apple Silicon only.
+* macOS 14 or later, Apple Silicon only.
 
 ## Tests
 

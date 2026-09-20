@@ -125,7 +125,7 @@ pub(super) fn worker_loop(
     // release we join this receiver (usually instant) and reuse the target; a
     // failed or stale press-time capture re-resolves fresh. `None` means no
     // capture is in flight (between utterances / after a cancel).
-    let mut pending_target: Option<std::sync::mpsc::Receiver<eyre::Result<FocusTarget>>> = None;
+    let mut pending_target: Option<std::sync::mpsc::Receiver<PressCapture>> = None;
 
     // ── Capture mode (release tail-capture + warm-window reuse) ──────────
     // Tail capture: on key release, keep the mic open for a brief adaptive grace
@@ -180,7 +180,10 @@ pub(super) fn worker_loop(
     // dictation must go through the LLM to be reshaped — so the short-utterance
     // deterministic shortcut is disabled. Default cleanup has no such need.
     #[cfg(feature = "cleaner")]
-    let format_active = crate::settings::Settings::load().resolve_format().is_some();
+    // Asked of the engine, which validated the name against prompts.json: an
+    // unknown or deleted preset name must not force every utterance through
+    // the model with the default prompt.
+    let format_active = cleaner.as_ref().is_some_and(|c| c.format_active());
     // Per-utterance streaming accumulators (only used when `streaming_asr`). These
     // are the whole incremental-ASR state, independent of the cleaner feature:
     // transcribe_pcm + SegmentStream + corrections need no LLM.
@@ -205,6 +208,13 @@ pub(super) fn worker_loop(
     // the pipeline on the same audio. Empty until the first dictation.
     let mut last_audio: Vec<f32> = Vec::new();
     let mut pending_saved_recoveries = std::collections::VecDeque::<i64>::new();
+    // Recording limit (minutes, 0 = none) and whether the in-flight stop came
+    // from it rather than from a key.
+    let max_recording_minutes = crate::settings::Settings::load().resolve_max_recording_minutes();
+    if max_recording_minutes > 0 {
+        eprintln!("[boot] recording  limit {max_recording_minutes} min");
+    }
+    let mut limit_hit = false;
 
     'evloop: loop {
         // While recording, wake periodically to checkpoint captured PCM and
@@ -221,6 +231,22 @@ pub(super) fn worker_loop(
             if engine.is_some() || session_active {
                 match rx.recv_timeout(std::time::Duration::from_millis(120)) {
                     Ok(ev) => ev,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if !warm_parked
+                            && crate::cancel::CANCEL.active()
+                            && t_press.is_some_and(|t| recording_limit_reached(t.elapsed(), max_recording_minutes)) =>
+                    {
+                        // A lost key-up (Secure Input, a disabled tap) or a
+                        // forgotten hands-free session: stop here instead of
+                        // recording without end. The text is kept and copied,
+                        // never pasted, because nobody may be at the keyboard.
+                        eprintln!(
+                            "[limit] recording reached {max_recording_minutes} min · stopping (text kept, not pasted)"
+                        );
+                        limit_hit = true;
+                        PTT_RESYNC.store(true, Ordering::SeqCst);
+                        DaemonEvent::StopRecording
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if warm_parked {
                             // Warm-window expiry: close the parked mic once idle
@@ -489,6 +515,7 @@ pub(super) fn worker_loop(
                 eprintln!();
             }
             DaemonEvent::StartRecording { transform } => {
+                limit_hit = false;
                 if session_active {
                     continue;
                 }
@@ -645,8 +672,11 @@ pub(super) fn worker_loop(
                 // Capture (and reset) whether this utterance is a transform. Done
                 // up-front so the tail-capture re-press restart can re-set it with
                 // the new gesture.
+                // A limit stop is never a transform or a spoken command: both
+                // write into the front app, and nobody asked for that write.
+                let limit_stopped = std::mem::take(&mut limit_hit);
                 #[allow(unused_variables)]
-                let transform = transform_mode;
+                let transform = transform_mode && !limit_stopped;
                 transform_mode = false;
 
                 // ── Tail-capture grace (open-on-press only) ──────────────
@@ -888,6 +918,7 @@ pub(super) fn worker_loop(
                 if !ui_channel::set_phase(cur_gen, UiState::Transcribing) { continue; }
                 let press_to_release = t_press.take().map(|t| t.elapsed());
                 let held = press_to_release.unwrap_or_default();
+                crate::daemon_log::rotate_stdio_if_needed();
                 eprintln!("⏹ stopped · held {}", secs(held));
 
                 // Focus capturing now starts at key-press (StartRecording), not
@@ -1095,7 +1126,11 @@ pub(super) fn worker_loop(
                         }
                     }
                     eprintln!();
-                    ui_channel::set_state(UiState::Idle);
+                    // Leave a kept-result pill on screen; only a still-working
+                    // state is reset.
+                    if ui_channel::state().is_processing() {
+                        ui_channel::set_state(UiState::Idle);
+                    }
                     continue;
                 }
 
@@ -1108,10 +1143,11 @@ pub(super) fn worker_loop(
                 // Gemma when the destination is a terminal. The injector still
                 // resolves the current field at write time; this capture is the
                 // same-app fallback only if that fresh lookup loses focus.
-                let press_target: Option<FocusTarget> = match pending_target.take() {
-                    Some(rx) => rx.recv().ok().and_then(|r| r.ok()),
-                    None => None,
-                };
+                let (press_app, press_target): (Option<crate::injector::TargetApp>, Option<FocusTarget>) =
+                    match pending_target.take().and_then(|rx| rx.recv().ok()) {
+                        Some((app, focus)) => (app, focus.ok()),
+                        None => (None, None),
+                    };
                 // Stale-target fallback: if the press-time capture failed, or
                 // the frontmost app changed since the key was pressed (a long
                 // hold or hands-free can out-last the user's focus), the retained
@@ -1122,7 +1158,16 @@ pub(super) fn worker_loop(
                 // code did — correctness over speed.
                 let captured_target: Option<FocusTarget> = press_target
                     .filter(crate::injector::focus_target_still_current);
-                let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
+                // One app identity for every per-app decision below (terminal
+                // raw mode, tone, the log line): the press-time app while it is
+                // still in front, else the app the text will actually go to.
+                // Resolved once here; nothing re-reads the frontmost app later.
+                let target_app = crate::injector::resolve_target_app(
+                    press_app,
+                    crate::injector::frontmost_pid(),
+                    crate::injector::bundle_id_for_pid,
+                );
+                let target_pid = target_app.as_ref().map(|a| a.pid);
                 if captured_target.is_some() {
                     eprintln!("  ⌖    press-time focus ready · fresh check at write");
                 } else {
@@ -1138,12 +1183,16 @@ pub(super) fn worker_loop(
                 // only runs once we know it's a command. Falls through to normal
                 // dictation when nothing matches, or when running --no-cleanup.
                 #[cfg(feature = "cleaner")]
-                if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript) {
+                if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript).filter(|_| !limit_stopped) {
                     match cleaner {
                         Some(ref c) => {
                             recovery.status = handle_spoken_command(&rt, c, cmd, captured_target, cur_gen);
                             eprintln!();
-                            ui_channel::set_state(UiState::Idle);
+                            // Leave a result pill ("Couldn’t paste") on screen;
+                            // only a still-working state is reset.
+                            if ui_channel::state().is_processing() {
+                                ui_channel::set_state(UiState::Idle);
+                            }
                             continue;
                         }
                         None => {
@@ -1186,9 +1235,9 @@ pub(super) fn worker_loop(
                 // whole-utterance cleanup prompt as the vocabulary block.
                 #[cfg(feature = "cleaner")]
                 let tone: Option<&'static str> = {
-                    let bundle = crate::audio_duck::frontmost_bundle_id();
+                    let bundle = target_app.as_ref().and_then(|a| a.bundle_id.as_deref());
                     let name = target_pid.map(app_name).unwrap_or_default();
-                    let t = crate::app_tones::tone_for(&name, bundle.as_deref());
+                    let t = crate::app_tones::tone_for(&name, bundle);
                     if let Some(t) = t {
                         eprintln!("  ♪    tone: {t}");
                     }
@@ -1202,7 +1251,7 @@ pub(super) fn worker_loop(
                         match cleaner {
                             Some(ref c) if !is_terminal => {
                                 if !screen_vocab.is_empty() {
-                                    eprintln!("  ⌕    screen vocab: {}", screen_vocab.join(", "));
+                                    eprintln!("  ⌕    screen vocab: {}", crate::daemon_log::terms(&screen_vocab));
                                 }
                                 // Fix known proper nouns in the *raw* transcript
                                 // before cleanup, so the small model sees the
@@ -1347,7 +1396,8 @@ pub(super) fn worker_loop(
                 let t_inject = Instant::now();
                 let finish = crate::injector::finalize_utterance(
                     false,
-                    None,
+                    // A limit stop is held by decision: known "do not write".
+                    limit_stopped.then_some(crate::injector::FocusEditability::NotEditable),
                     &final_text,
                     |text| {
                         // One authorization claim, exactly once, immediately
@@ -1401,7 +1451,7 @@ pub(super) fn worker_loop(
                 // the fact. One line to the /tmp log, well off the hot path.
                 #[cfg(feature = "cleaner")]
                 if cleaner.is_some() && raw_transcript.trim() != final_text.trim() {
-                    eprintln!("  ⟫ raw · \"{raw_transcript}\"");
+                    eprintln!("  ⟫ raw · {}", crate::daemon_log::text(&raw_transcript));
                 }
                 // Truncation watchdog: if the cleaned text is dramatically
                 // shorter than the raw transcript (>40% dropped), the cleanup
@@ -1412,18 +1462,22 @@ pub(super) fn worker_loop(
                 let final_chars = final_text.chars().count();
                 if raw_chars > 40 && final_chars * 5 < raw_chars * 3 {
                     eprintln!(
-                        "  ⚠    cleanup shrank text {raw_chars} → {final_chars} chars · raw: \"{raw_transcript}\""
+                        "  ⚠    cleanup shrank text {raw_chars} → {final_chars} chars · raw: {}",
+                        crate::daemon_log::text(&raw_transcript)
                     );
                 }
                 match finish {
                     crate::injector::FinalizeResult::Injected => {
                         recovery.status = crate::history::RecoveryStatus::Completed;
-                        eprintln!("  ✓    \"{final_text}\"");
+                        eprintln!("  ✓    {}", crate::daemon_log::text(&final_text));
                         cues::play_success();
                         // Remember it for the menu-bar "Copy last dictation" item.
                         // Stored BEFORE the pill shows so the word count is this
                         // dictation's, not the previous one's.
                         ui_channel::set_last_dictation(&final_text);
+                        // The write was just verified against the frontmost app;
+                        // the pill's Undo is only valid while that app stays in front.
+                        ui_channel::set_last_inject_pid(crate::injector::frontmost_pid());
                         show_result_pill();
                         // Persist to the browsable dictation history (best-effort;
                         // never blocks or fails the hot path).
@@ -1436,18 +1490,16 @@ pub(super) fn worker_loop(
                     }
                     crate::injector::FinalizeResult::Held => {
                         recovery.status = crate::history::RecoveryStatus::Held;
-                        // No editable field focused: never paste blindly. Keep the
-                        // transcript recoverable for the menu's "Copy last
-                        // dictation" and surface a clear "No text field selected"
-                        // state instead of writing anywhere.
-                        eprintln!(
-                            "  ◌    no text field selected — transcript held (copy from menu)"
-                        );
-                        ui_channel::set_last_dictation(&final_text);
-                        ui_channel::show_transient_for(
-                            cur_gen, UiState::NoEditableField,
-                            Duration::from_millis(900),
-                        );
+                        // No editable field focused (or the recording limit
+                        // stopped it): never paste blindly. The words become the
+                        // last dictation, go to the clipboard, and the pill says so.
+                        let cause = if limit_stopped {
+                            crate::last_dictation::KeptCause::LimitReached
+                        } else {
+                            crate::last_dictation::KeptCause::NoEditableField
+                        };
+                        eprintln!("  ◌    not inserted ({cause:?}) — transcript kept");
+                        keep_and_show(cur_gen, &final_text, cause);
                     }
                     crate::injector::FinalizeResult::Cancelled => {
                         recovery.status = crate::history::RecoveryStatus::Cancelled;
@@ -1456,9 +1508,12 @@ pub(super) fn worker_loop(
                         ui_channel::set_state(UiState::Idle);
                     }
                     crate::injector::FinalizeResult::Failed => {
-                        eprintln!("  ✗    inject failed");
-                        cues::play_error();
-                        ui_channel::show_transient_for(cur_gen, UiState::Error, Duration::from_millis(650));
+                        eprintln!("  ✗    inject failed — transcript kept");
+                        // The words exist; only the write failed. Keep them
+                        // reachable (they used to be dropped, so "Copy last
+                        // dictation" returned the PREVIOUS text) and say what
+                        // really happened instead of "Couldn’t transcribe".
+                        keep_and_show(cur_gen, &final_text, crate::last_dictation::KeptCause::PasteFailed);
                     }
                 }
                 eprintln!();
@@ -1505,8 +1560,8 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
         }
     };
     eprintln!(
-        "  ✎    \"{}\"  ·  {} chars selected",
-        instruction.trim(),
+        "  ✎    {}  ·  {} chars selected",
+        crate::daemon_log::text(instruction.trim()),
         selection.chars().count()
     );
 
@@ -1535,18 +1590,21 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
     match crate::clipboard_paste::paste_via_clipboard(result, expected) {
         Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
             eprintln!("  ✓    transformed in {} ms", ms(t.elapsed()));
+            // A rewrite is a finished transcript too: "Copy last dictation"
+            // must return it, not the dictation before it.
+            ui_channel::set_last_dictation(result);
+            ui_channel::set_last_inject_pid(expected);
             crate::history::append_recovery_stage(generation, StageKind::Output, result, "Selection replaced");
             RecoveryStatus::Completed
         },
         Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-            eprintln!(
-                "  ◌    transform refused — target app not frontmost at paste (text held)"
-            );
+            eprintln!("  ◌    transform refused — target app not frontmost at paste (text kept)");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
-            cues::play_error();
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
             RecoveryStatus::Failed
         }
     }
@@ -1681,7 +1739,7 @@ pub(super) fn stream_process_asr(
         // model runs once on the whole utterance at release, not on partial
         // segments, so accuracy isn't traded for a marginal latency win.
         if std::env::var_os("DICTATE_DEBUG_STREAM").is_some() {
-            eprintln!("  ⟫ seg · {raw:?}");
+            eprintln!("  ⟫ seg · {}", crate::daemon_log::text(&raw));
         }
         let (raw_so_far, preview) = cache_stream_segment(refiner, raw, raw_segs_acc, segs_acc);
         crate::history::append_recovery_stage(generation, crate::history::StageKind::Raw, &raw_so_far, "Streaming ASR, partial");
@@ -1727,13 +1785,22 @@ pub(super) fn guarded_transcribe_len(
 /// result is joined (usually instantly) at release. A very short hold simply
 /// blocks on the join — the same cost the old release-time spawn paid, and
 /// usually strictly less because the resolve happened during speech, not after.
-pub(super) fn spawn_focus_capture() -> std::sync::mpsc::Receiver<eyre::Result<FocusTarget>> {
-    let (tx, rx) = std::sync::mpsc::channel::<eyre::Result<FocusTarget>>();
+///
+/// The app identity (PID + bundle id) is read first and travels with the
+/// result even when the AX capture fails: terminals and other AX-blind apps
+/// expose no focused element, and they are exactly the apps whose identity
+/// decides raw-vs-cleaned text.
+pub(super) fn spawn_focus_capture() -> std::sync::mpsc::Receiver<PressCapture> {
+    let (tx, rx) = std::sync::mpsc::channel::<PressCapture>();
     std::thread::spawn(move || {
-        let _ = tx.send(FocusTarget::capture());
+        let app = crate::injector::frontmost_target_app();
+        let _ = tx.send((app, FocusTarget::capture()));
     });
     rx
 }
+
+/// What the press-time capture thread hands back: the app, and its focus.
+pub(super) type PressCapture = (Option<crate::injector::TargetApp>, eyre::Result<FocusTarget>);
 
 /// Start a fresh open-on-press recording: build a new engine, open the mic,
 /// arm the streaming segment stream, and set the per-utterance state (engine,
@@ -1836,16 +1903,14 @@ pub(super) fn handle_spoken_command(
     };
     match inject_result {
         Ok(crate::injector::InjectOutcome::Injected) => {
-            eprintln!("  ✓    {} ms → \"{result}\"", ms(t.elapsed()));
+            eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
             ui_channel::set_last_dictation(result);
             crate::history::append_recovery_stage(generation, StageKind::Output, result, "Inserted");
             RecoveryStatus::Completed
         }
         Ok(crate::injector::InjectOutcome::NoEditableField) => {
-            eprintln!(
-                "  ◌    no text field selected — result held (copy from menu)"
-            );
-            ui_channel::set_last_dictation(result);
+            eprintln!("  ◌    no text field selected — result kept");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Ok(crate::injector::InjectOutcome::Cancelled) => {
@@ -1855,17 +1920,36 @@ pub(super) fn handle_spoken_command(
         }
         Ok(crate::injector::InjectOutcome::RefusedForeground) => {
             // Fail-closed: the expected app was not frontmost at the global
-            // Cmd+V, so nothing was written. Hold it recoverable.
-            eprintln!("  ◌    target not frontmost at paste — result held (copy from menu)");
-            ui_channel::set_last_dictation(result);
+            // Cmd+V, so nothing was written. Keep it recoverable.
+            eprintln!("  ◌    target not frontmost at paste — result kept");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Err(e) => {
-            eprintln!("  ✗    inject failed: {e:?}");
-            cues::play_error();
+            eprintln!("  ✗    inject failed: {e:?} — result kept");
+            keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
             RecoveryStatus::Failed
         }
     }
+}
+
+/// A finished transcript did not reach the app. Make it the last dictation,
+/// put it on the clipboard (setting permitting), note it in History, play the
+/// error cue and show the kept-result pill for this generation: about four
+/// seconds, or until the next key press, with the History button on it.
+pub(super) fn keep_and_show(generation: u64, text: &str, cause: crate::last_dictation::KeptCause) {
+    let state = crate::recovery::keep_transcript(text, cause);
+    let copied = matches!(
+        state,
+        UiState::HeldCopied | UiState::PasteFailedCopied | UiState::LimitReachedCopied
+    );
+    crate::history::append_recovery_stage(
+        generation,
+        crate::history::StageKind::Output,
+        text,
+        crate::last_dictation::kept_stage_note(cause, copied),
+    );
+    ui_channel::show_transient_for(generation, state, ui_channel::KEPT_PILL);
 }
 
 #[cfg(test)]

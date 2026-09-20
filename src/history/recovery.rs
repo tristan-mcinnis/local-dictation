@@ -510,27 +510,42 @@ impl RecoveryStore {
         )?;
         Ok(())
     }
+    /// Apply the audio-retention window. Runs on every Finish and on the 60 s
+    /// idle tick, so it must be a no-op when nothing changed: it used to issue
+    /// one journaled UPDATE per history row (and re-delete every expired clip)
+    /// on every pass, forever. Now one set-based UPDATE touches only rows
+    /// whose expiry is wrong, and only rows that still hold audio are removed,
+    /// all in one transaction.
     fn expire(&self, now: i64) -> Result<()> {
+        const SETTLED: &str = "is_recovery=1 AND recovery_status NOT IN ('recording','recovering')";
         let Some(window) = self.policy.window else {
             self.conn.execute(
-                "UPDATE dictations SET audio_expires_at=NULL WHERE is_recovery=1",
+                "UPDATE dictations SET audio_expires_at=NULL
+                 WHERE is_recovery=1 AND audio_expires_at IS NOT NULL",
                 [],
             )?;
             return Ok(());
         };
-        let rows=self.conn.prepare("SELECT id,created_at FROM dictations WHERE is_recovery=1 AND recovery_status NOT IN ('recording','recovering')")?
-            .query_map([],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?)))?.collect::<Result<Vec<_>,_>>()?;
-        for (id, created) in rows {
-            let expiry = created.saturating_add(window);
-            self.conn.execute(
-                "UPDATE dictations SET audio_expires_at=?1 WHERE id=?2",
-                params![expiry, id],
-            )?;
-            if expiry <= now {
-                remove_audio_at(&self.path, id)?;
-                self.conn.execute("UPDATE dictations SET audio_bytes=0,audio_error=COALESCE(audio_error,'Audio expired under retention setting') WHERE id=?1",[id])?;
-            }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            &format!(
+                "UPDATE dictations SET audio_expires_at=created_at+?1
+                 WHERE {SETTLED} AND audio_expires_at IS NOT created_at+?1"
+            ),
+            [window],
+        )?;
+        let expired = tx
+            .prepare(&format!(
+                "SELECT id FROM dictations
+                 WHERE {SETTLED} AND audio_bytes>0 AND created_at+?1<=?2"
+            ))?
+            .query_map(params![window, now], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in expired {
+            remove_audio_at(&self.path, id)?;
+            tx.execute("UPDATE dictations SET audio_bytes=0,audio_error=COALESCE(audio_error,'Audio expired under retention setting') WHERE id=?1",[id])?;
         }
+        tx.commit()?;
         Ok(())
     }
     fn make_room(&self, current: i64, additional: u64) -> Result<()> {
@@ -673,9 +688,20 @@ struct StorageNotice {
     message: String,
     is_failure: bool,
 }
+/// The CURRENT notice. A failure here is what the recording pill shows, so it
+/// is scoped to the capture it happened in: the next record that opens
+/// successfully clears it (`clear_failure_notice`). It used to be set-only, so
+/// one full queue replaced the live preview with "Recovery warning" until the
+/// app restarted.
 static NOTICE: Mutex<Option<StorageNotice>> = Mutex::new(None);
+/// The most recent failure, kept for Settings → History after the pill's copy
+/// has been cleared.
+static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 static LOST: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
 fn set_notice(message: &str) {
+    if let Ok(mut last) = LAST_FAILURE.lock() {
+        *last = Some(message.into());
+    }
     if let Ok(mut notice) = NOTICE.lock() {
         *notice = Some(StorageNotice {
             message: message.into(),
@@ -693,11 +719,25 @@ fn set_info_notice(message: &str) {
         }
     }
 }
+/// A new record opened and is being written: storage works again, so the
+/// pill stops warning. Informational notices are left alone.
+fn clear_failure_notice() {
+    if let Ok(mut notice) = NOTICE.lock() {
+        *notice = without_failure(notice.take());
+    }
+}
+/// Drop a failure notice, keep an informational one.
+fn without_failure(notice: Option<StorageNotice>) -> Option<StorageNotice> {
+    notice.filter(|notice| !notice.is_failure)
+}
+/// For Settings → History: the current notice, else the last failure seen
+/// since launch (the pill's copy may already have been cleared).
 pub fn recovery_storage_notice() -> Option<String> {
     NOTICE
         .lock()
         .ok()
         .and_then(|notice| notice.as_ref().map(|notice| notice.message.clone()))
+        .or_else(|| LAST_FAILURE.lock().ok().and_then(|last| last.clone()))
 }
 /// Actual write/queue failures for the pill; configured-cap retirement is
 /// informational and belongs in History, not an "audio not saved" warning.
@@ -766,6 +806,7 @@ fn process_command(
         None => {
             let id = store.begin(unix_now())?;
             ids.insert(generation, id);
+            clear_failure_notice();
             id
         }
     };
@@ -1125,6 +1166,67 @@ mod tests {
         assert!(detail.audio.is_none());
         assert_eq!(detail.stages[0].text, "Keep this transcript");
         assert_eq!(detail.entry.text, "Keep this transcript");
+    }
+    fn total_changes(store: &RecoveryStore) -> i64 {
+        store
+            .conn
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    }
+    #[test]
+    fn a_new_record_clears_a_failure_notice_but_not_an_informational_one() {
+        // Regression: the notice was set-only, so one full queue turned the
+        // live preview into "Recovery warning" until the app restarted. (Pure
+        // helper on purpose: NOTICE is process-global and other tests run the
+        // real writer.)
+        let failure = StorageNotice { message: "busy".into(), is_failure: true };
+        let info = StorageNotice { message: "cap".into(), is_failure: false };
+        assert!(without_failure(Some(failure)).is_none());
+        assert_eq!(without_failure(Some(info)).map(|n| n.message).as_deref(), Some("cap"));
+        assert!(without_failure(None).is_none());
+    }
+    #[test]
+    fn a_second_expiry_pass_writes_nothing() {
+        // Regression: every pass rewrote every row (one journaled UPDATE each)
+        // and re-expired every already-expired clip, every 60 s, forever.
+        let mut fixture = Fixture::new("expiry-idle", policy());
+        let store = &mut fixture.store;
+        let now = unix_now();
+        for age in [40, 35, 3, 2, 1] {
+            let id = store.begin(now - age * DAY).unwrap();
+            store.append_audio(id, &[0.2; 16], 16_000).unwrap();
+            store.stage(id, StageKind::Raw, "text", "").unwrap();
+            store.finish(id, RecoveryStatus::Completed, None).unwrap();
+        }
+        store.expire(now).unwrap();
+        let expired: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM dictations WHERE audio_bytes=0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(expired, 2, "the two clips past 30 days");
+        let before = total_changes(store);
+        store.expire(now).unwrap();
+        store.expire(now + 30).unwrap();
+        assert_eq!(total_changes(store) - before, 0, "idle passes must not write");
+        // A newly settled record is still picked up.
+        let id = store.begin(now - 31 * DAY).unwrap();
+        store.append_audio(id, &[0.2; 16], 16_000).unwrap();
+        store.finish(id, RecoveryStatus::Completed, None).unwrap();
+        store.expire(now).unwrap();
+        assert!(!audio_filename(&store.path, id).unwrap().exists());
+    }
+    #[test]
+    fn turning_retention_off_clears_expiry_once() {
+        let mut fixture = Fixture::new("expiry-off", policy());
+        let store = &mut fixture.store;
+        let id = store.begin(unix_now() - DAY).unwrap();
+        store.finish(id, RecoveryStatus::Completed, None).unwrap();
+        store.expire(unix_now()).unwrap();
+        store.policy.window = None;
+        store.expire(unix_now()).unwrap();
+        let before = total_changes(store);
+        store.expire(unix_now()).unwrap();
+        assert_eq!(total_changes(store) - before, 0);
     }
     #[test]
     fn short_text_retention_and_never_preserve_unexpired_audio() {

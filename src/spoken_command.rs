@@ -152,7 +152,7 @@ pub fn parse_spoken_command(text: &str) -> Option<SpokenCommand> {
     let settings = crate::settings::Settings::load();
     let targets = settings.resolve_translation_targets();
     let active_target = settings.resolve_active_translation_target(&targets);
-    parse_spoken_command_ex(text, active_target.as_deref())
+    parse_spoken_command_with(text, active_target.as_deref(), &targets)
 }
 
 /// Parse a transcript for a leading spoken command given an already-resolved
@@ -165,6 +165,21 @@ pub fn parse_spoken_command(text: &str) -> Option<SpokenCommand> {
 pub fn parse_spoken_command_ex(
     text: &str,
     active_target: Option<&str>,
+) -> Option<SpokenCommand> {
+    let own: Vec<String> = active_target.map(str::to_string).into_iter().collect();
+    parse_spoken_command_with(text, active_target, &own)
+}
+
+/// [`parse_spoken_command_ex`] plus the user's configured translation targets.
+/// An explicit "translate to <language> …" only fires when `<language>` is a
+/// known language or one of `user_languages`. It used to fall back to "the
+/// first word is the language", so "Translate this into action items for the
+/// team" became a translation into "Action" and the model's output replaced the
+/// user's sentence.
+pub fn parse_spoken_command_with(
+    text: &str,
+    active_target: Option<&str>,
+    user_languages: &[String],
 ) -> Option<SpokenCommand> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -182,7 +197,7 @@ pub fn parse_spoken_command_ex(
             // Use the lowercased remainder length-parity for nothing; we re-split
             // `remainder` directly. (`rest` only confirmed the prefix matched.)
             let _ = rest;
-            let (language, body) = split_language(remainder)?;
+            let (language, body) = split_language(remainder, user_languages)?;
             let body = body.trim().to_string();
             if body.is_empty() {
                 // "translate to Chinese" with nothing after it isn't a usable
@@ -243,10 +258,12 @@ fn leads_into_explicit(remainder: &str) -> bool {
 
 /// Split a remainder like "simplified Chinese the meeting is tomorrow" into the
 /// target language ("Simplified Chinese") and the body ("the meeting is
-/// tomorrow"). Matches the longest known multi-word language first, then falls
-/// back to treating the first word as the language so uncommon targets still
-/// work. Returns `None` only when there are no words at all.
-fn split_language(remainder: &str) -> Option<(String, String)> {
+/// tomorrow"). Matches the longest multi-word language first. The language must
+/// be in [`KNOWN_LANGUAGES`] or in `user_languages` (the configured translation
+/// targets, so an uncommon target still works once the user has added it).
+/// Anything else is `None`: ordinary dictation that happens to start with
+/// "translate".
+fn split_language(remainder: &str, user_languages: &[String]) -> Option<(String, String)> {
     let words: Vec<&str> = remainder.split_whitespace().collect();
     if words.is_empty() {
         return None;
@@ -262,10 +279,15 @@ fn split_language(remainder: &str) -> Option<(String, String)> {
         if KNOWN_LANGUAGES.contains(&candidate.as_str()) {
             return Some((title_case(&candidate), words[take..].join(" ")));
         }
+        if let Some(own) = user_languages
+            .iter()
+            .find(|l| l.trim().to_lowercase() == candidate)
+        {
+            // Keep the user's own spelling of their target.
+            return Some((own.trim().to_string(), words[take..].join(" ")));
+        }
     }
-
-    // Fallback: first word is the language, rest is the body.
-    Some((title_case(&norm[0]), words[1..].join(" ")))
+    None
 }
 
 /// Trim leading/trailing non-alphanumeric characters (so "Chinese," → "Chinese").
@@ -360,10 +382,37 @@ mod tests {
     }
 
     #[test]
-    fn unknown_language_falls_back_to_first_word() {
-        let cmd = parse_spoken_command("translate to Klingon live long and prosper").unwrap();
+    fn an_unknown_language_is_ordinary_dictation() {
+        // Regression: the first word used to become the language, so this
+        // sentence was replaced by a "translation into Action".
+        for text in [
+            "Translate this into action items for the team",
+            "translate to Klingon live long and prosper",
+            "Translate into plain words what the contract says",
+        ] {
+            assert!(parse_spoken_command_with(text, None, &[]).is_none(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_configured_target_is_a_valid_language_even_if_uncommon() {
+        let targets = vec!["Klingon".to_string(), "Haitian Creole".to_string()];
+        let cmd = parse_spoken_command_with(
+            "translate to klingon live long and prosper",
+            Some("Klingon"),
+            &targets,
+        )
+        .unwrap();
         assert_eq!(cmd.label, "translate → Klingon");
         assert_eq!(cmd.body, "live long and prosper");
+        let cmd = parse_spoken_command_with(
+            "translate to Haitian Creole, see you soon",
+            None,
+            &targets,
+        )
+        .unwrap();
+        assert_eq!(cmd.label, "translate → Haitian Creole");
+        assert_eq!(cmd.body, "see you soon");
     }
 
     #[test]

@@ -8,10 +8,13 @@
 //! deterministic: unknown apps return `None` and the default cleanup prompt is
 //! used unchanged.
 //!
-//! Matching is case-insensitive and substring/prefix based (never exact), and
-//! the bundle id takes precedence over the human-facing app name — a bundle id
-//! is the stricter, more precise identifier, so when both are present the bundle
-//! id is checked first.
+//! Matching is case-insensitive and on WHOLE SEGMENTS: the bundle id or app
+//! name is split on anything that is not a letter or digit
+//! (`com.apple.TextEdit` → `com`, `apple`, `textedit`), and a pattern must equal
+//! one segment (or, for a multi-word pattern, a run of them). It used to be a
+//! substring test, so the pattern "x" made Firefox, Excel, TextEdit and Dropbox
+//! "social", and "word" made 1Password "neutral prose". The bundle id takes
+//! precedence over the human-facing app name.
 
 /// A category rule: one or more lowercase patterns (app name / bundle-id
 /// substrings) mapped to a single tone keyword.
@@ -20,14 +23,18 @@ struct ToneRule {
     tone: &'static str,
 }
 
-/// The tone table, checked in order. Order matters: more specific categories
-/// (code vs. the bare "x" social pattern) come first so a name like "Xcode" is
-/// not pulled into the social bucket by its trailing "x".
+/// The tone table, checked in order. A pattern is one or more whole segments
+/// (see the module docs), so "x" is the app named X and nothing else. Bundle
+/// ids whose segment is not the product name get their own pattern
+/// (`slackmacgap`, `mobilesms`, `teams2`).
 static RULES: &[ToneRule] = &[
     ToneRule {
         patterns: &[
             "slack",
+            "slackmacgap",
             "teams",
+            "teams2",
+            "mobilesms",
             "whatsapp",
             "messages",
             "imessage",
@@ -70,21 +77,39 @@ static RULES: &[ToneRule] = &[
     },
 ];
 
+/// Lowercased alphanumeric segments of a bundle id or app name.
+fn segments(candidate: &str) -> Vec<String> {
+    candidate
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// True when `pattern`'s words equal a contiguous run of `segs`.
+fn pattern_matches(segs: &[String], pattern: &str) -> bool {
+    let words: Vec<&str> = pattern.split_whitespace().collect();
+    !words.is_empty()
+        && segs
+            .windows(words.len())
+            .any(|w| w.iter().zip(&words).all(|(seg, word)| seg == word))
+}
+
 /// Look up the tone keyword for a target app.
 ///
 /// `bundle_id` is checked first (higher specificity), then `app_name`, across
-/// all rules in order. Matching is case-insensitive and substring/prefix based.
-/// Returns `None` for anything unmatched so the caller can keep the default
-/// cleanup prompt.
+/// all rules in order. Matching is case-insensitive and whole-segment (see the
+/// module docs). Returns `None` for anything unmatched so the caller can keep
+/// the default cleanup prompt.
 pub fn tone_for(app_name: &str, bundle_id: Option<&str>) -> Option<&'static str> {
-    [bundle_id.unwrap_or("").trim(), app_name.trim()]
+    [bundle_id.unwrap_or(""), app_name]
         .into_iter()
-        .map(|c| c.to_ascii_lowercase())
-        .filter(|c| !c.is_empty())
-        .find_map(|c| {
+        .map(segments)
+        .filter(|segs| !segs.is_empty())
+        .find_map(|segs| {
             RULES
                 .iter()
-                .find(|rule| rule.patterns.iter().any(|p| c.contains(p)))
+                .find(|rule| rule.patterns.iter().any(|p| pattern_matches(&segs, p)))
                 .map(|rule| rule.tone)
         })
 }
@@ -98,6 +123,50 @@ pub fn tone_suffix(tone: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pattern_must_be_a_whole_segment_not_a_substring() {
+        // Regression: every one of these used to get a tone from a substring
+        // ("x" in textedit/excel/firefox/dropbox, "word" in 1password).
+        for (name, bundle) in [
+            ("TextEdit", Some("com.apple.TextEdit")),
+            ("Microsoft Excel", Some("com.microsoft.Excel")),
+            ("Firefox", Some("org.mozilla.firefox")),
+            ("Dropbox", Some("com.getdropbox.dropbox")),
+            ("1Password", Some("com.1password.1password")),
+            ("Pixelmator Pro", Some("com.pixelmatorteam.pixelmator")),
+            ("Mailchimp", None),
+            ("Keynotes", None),
+            ("Perplexity", Some("ai.perplexity.mac")),
+        ] {
+            assert_eq!(tone_for(name, bundle), None, "{name} / {bundle:?}");
+        }
+    }
+
+    #[test]
+    fn real_bundle_ids_and_names_still_match() {
+        for (name, bundle, tone) in [
+            ("Slack", Some("com.tinyspeck.slackmacgap"), "casual chat"),
+            ("Messages", Some("com.apple.MobileSMS"), "casual chat"),
+            ("Microsoft Teams", Some("com.microsoft.teams2"), "casual chat"),
+            ("WhatsApp", Some("net.whatsapp.WhatsApp"), "casual chat"),
+            ("Signal", Some("org.whispersystems.signal-desktop"), "casual chat"),
+            ("Mail", Some("com.apple.mail"), "email"),
+            ("Microsoft Outlook", Some("com.microsoft.Outlook"), "email"),
+            ("Microsoft Word", Some("com.microsoft.Word"), "neutral prose"),
+            ("Notes", Some("com.apple.Notes"), "neutral prose"),
+            ("Obsidian", Some("md.obsidian"), "neutral prose"),
+            ("Code", Some("com.microsoft.VSCode"), "technical"),
+            ("Xcode", Some("com.apple.dt.Xcode"), "technical"),
+            ("Cursor", Some("com.todesktop.230313mzl4w4u92"), "technical"),
+            ("Sublime Text", Some("com.sublimetext.4"), "technical"),
+            ("Visual Studio Code", None, "technical"),
+            ("X", None, "social"),
+            ("LinkedIn", None, "social"),
+        ] {
+            assert_eq!(tone_for(name, bundle), Some(tone), "{name} / {bundle:?}");
+        }
+    }
 
     #[test]
     fn bundle_id_matches() {

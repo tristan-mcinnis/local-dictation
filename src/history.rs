@@ -200,9 +200,16 @@ fn prune_at(path: &Path, window_secs: Option<i64>) -> eyre::Result<()> {
     } else {
         unix_now() - window
     };
+    // Rows already reduced to the placeholder whose clip is still inside its
+    // own retention need no work; without this filter every Finish re-opened a
+    // connection and rewrote each of them again.
     let ids = conn
-        .prepare("SELECT id FROM dictations WHERE created_at < ?1")?
-        .query_map([cutoff], |row| row.get::<_, i64>(0))?
+        .prepare(
+            "SELECT id FROM dictations WHERE created_at < ?1
+             AND NOT (text='(Audio retained; transcript expired)' AND audio_bytes>0
+                      AND (audio_expires_at IS NULL OR audio_expires_at > ?2))",
+        )?
+        .query_map([cutoff, unix_now()], |row| row.get::<_, i64>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     for id in ids {
         // Text and audio have independent retention. Keep a recoverable clip

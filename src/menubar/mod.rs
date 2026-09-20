@@ -71,7 +71,6 @@ use std::sync::{Mutex, OnceLock};
 use crate::settings::{self, PillSize, Settings, WaveformSensitivity};
 use crate::ui_channel::{self, UiState};
 
-use crate::app_paths::DAEMON_LOG_PATH as LOG_PATH;
 
 // ─── Slate geometry ──────────────────────────────────────────────────────
 //
@@ -205,6 +204,8 @@ struct UiGlobals {
     show_processing_detail: bool,
     reduced_motion: bool,
     last_state: AtomicU8,
+    /// Frame counter for the poll timer's once-a-second checks.
+    slow_tick: std::sync::atomic::AtomicU32,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
     /// slowly toward the new RMS sample — gives the snappy bouncing
     /// feel of real audio meters.
@@ -244,9 +245,7 @@ define_class!(
     impl MenuActions {
         #[unsafe(method(openLog:))]
         fn open_log(&self, _sender: *mut AnyObject) {
-            let _ = std::process::Command::new("open")
-                .args(["-t", LOG_PATH])
-                .status();
+            open_log_in_editor();
         }
 
         #[unsafe(method(exportLog:))]
@@ -256,10 +255,12 @@ define_class!(
 
         #[unsafe(method(copyLast:))]
         fn copy_last(&self, _sender: *mut AnyObject) {
-            let text = ui_channel::last_dictation();
-            if !text.is_empty() {
-                copy_to_clipboard(&text);
-            }
+            // Same code path as the global hotkey and `copy-last` over IPC,
+            // with the same pill confirmation. Off the main thread: the
+            // pasteboard lock can be held through a paste settle.
+            std::thread::spawn(|| {
+                crate::recovery::copy_last_dictation("menu");
+            });
         }
 
         #[unsafe(method(openHistory:))]
@@ -416,7 +417,15 @@ define_class!(
         // useful after the text had already landed.)
         #[unsafe(method(undoPill:))]
         fn undo_pill(&self, _sender: *mut AnyObject) {
-            if let Err(e) = crate::clipboard_paste::synthesize_undo() {
+            // ⌘Z is global: only send it while the app that received the text
+            // is still frontmost, the same rule the paste itself follows.
+            let injected = crate::ui_channel::last_inject_pid();
+            let frontmost = crate::injector::frontmost_pid();
+            if !crate::ui_channel::undo_target_is_current(injected, frontmost) {
+                eprintln!(
+                    "[pill] undo skipped: text went to pid {injected:?}, frontmost is {frontmost:?}"
+                );
+            } else if let Err(e) = crate::clipboard_paste::synthesize_undo() {
                 eprintln!("[pill] undo failed: {e}");
             }
             crate::ui_channel::set_state(crate::ui_channel::UiState::Idle);
@@ -557,6 +566,7 @@ define_class!(
             if let Ok(mut target) = RECOVERY_TARGET.lock() {
                 *target = (pid, retained_focus);
             }
+            refresh_recovery_items(_menu);
         }
     }
 );
@@ -690,6 +700,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         show_processing_detail: settings.resolve_show_processing_detail(),
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
+        slow_tick: std::sync::atomic::AtomicU32::new(0),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
         icon_idle: built.icon_idle,
         icon_recording: built.icon_recording,
@@ -872,7 +883,29 @@ fn build_status_item(
     last_item.setEnabled(false);
     menu.addItem(&last_item);
 
-    let copy_last = action_item(mtm, "Copy last dictation", sel!(copyLast:), "c", actions);
+    // Hidden unless Secure Input is on; `refresh_recovery_items` decides each
+    // time the menu opens.
+    let secure_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(crate::secure_input::PAUSED_TEXT),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    secure_item.setEnabled(false);
+    secure_item.setTag(TAG_SECURE_INPUT);
+    secure_item.setHidden(true);
+    menu.insertItem_atIndex(&secure_item, 0);
+
+    let copy_last = action_item(
+        mtm,
+        &copy_last_title(crate::hotkeys::copy_last_from_settings().as_ref()),
+        sel!(copyLast:),
+        "c",
+        actions,
+    );
+    copy_last.setTag(TAG_COPY_LAST);
     menu.addItem(&copy_last);
 
     // Explicit recovery: paste the already-captured last dictation into the
@@ -881,7 +914,9 @@ fn build_status_item(
     // the text (restoring + verifying the target; see `crate::recovery`). The
     // injector's focus gate still applies — never a blind paste.
     let paste_last = action_item(mtm, "Paste last dictation", sel!(pasteLast:), "", actions);
+    paste_last.setTag(TAG_PASTE_LAST);
     menu.addItem(&paste_last);
+    refresh_recovery_items(&menu);
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
@@ -1307,6 +1342,38 @@ fn build_hotkey_submenu(
     submenu
 }
 
+const TAG_COPY_LAST: isize = 9101;
+const TAG_PASTE_LAST: isize = 9102;
+const TAG_SECURE_INPUT: isize = 9103;
+
+/// The copy item names its global hotkey, so the chord is discoverable.
+fn copy_last_title(hotkey: Option<&crate::hotkeys::Hotkey>) -> String {
+    match hotkey {
+        Some(h) => format!("Copy last dictation  ({})", h.display()),
+        None => "Copy last dictation".to_string(),
+    }
+}
+
+/// Bring the recovery rows up to date as the menu opens: the preview text,
+/// Copy / Paste enabled only when there is a dictation, and the Secure Input
+/// line shown only while it applies.
+fn refresh_recovery_items(menu: &NSMenu) {
+    let have_text = !ui_channel::last_dictation().trim().is_empty();
+    for tag in [TAG_COPY_LAST, TAG_PASTE_LAST] {
+        if let Some(item) = menu.itemWithTag(tag) {
+            item.setEnabled(have_text);
+        }
+    }
+    if let Some(item) = menu.itemWithTag(TAG_SECURE_INPUT) {
+        item.setHidden(!crate::secure_input::query());
+    }
+    if let Some(globals) = GLOBALS.get() {
+        globals
+            .last_item
+            .setTitle(&NSString::from_str(&last_dictation_label()));
+    }
+}
+
 /// Title for the disabled preview item, truncated for the menu.
 fn last_dictation_label() -> String {
     let text = ui_channel::last_dictation();
@@ -1350,12 +1417,7 @@ pub(crate) fn relaunch_daemon() {
         }
     };
 
-    let open_log = || {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(LOG_PATH)
-    };
+    let open_log = crate::daemon_log::open;
     let (stdout, stderr) = match (open_log(), open_log()) {
         (Ok(a), Ok(b)) => (Stdio::from(a), Stdio::from(b)),
         _ => (Stdio::inherit(), Stdio::inherit()),
@@ -1394,11 +1456,22 @@ pub(crate) fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Open the daemon log in the default text editor ("Open Log").
+pub(crate) fn open_log_in_editor() {
+    let Some(log) = crate::app_paths::daemon_log_path() else {
+        return;
+    };
+    let _ = std::process::Command::new("open").arg("-t").arg(log).status();
+}
+
 pub(crate) fn export_log_to_downloads() {
     let Some(home) = crate::app_paths::home_dir() else {
         return;
     };
-    if !std::path::Path::new(LOG_PATH).exists() {
+    let Some(log) = crate::app_paths::daemon_log_path() else {
+        return;
+    };
+    if !log.exists() {
         return;
     }
     let ts = std::time::SystemTime::now()
@@ -1408,7 +1481,7 @@ pub(crate) fn export_log_to_downloads() {
     let dest = home
         .join("Downloads")
         .join(format!("dictate-log-{ts}.txt"));
-    if std::fs::copy(LOG_PATH, &dest).is_ok() {
+    if std::fs::copy(&log, &dest).is_ok() {
         // Reveal it in Finder so the user sees where it landed.
         let _ = std::process::Command::new("open")
             .arg("-R")

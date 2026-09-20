@@ -75,9 +75,9 @@ launches. The app itself is built by `scripts/build-app.sh`:
 ```bash
 ./scripts/build-app.sh                  # dev: tiny app; models shared from ./models via a symlink
 ./scripts/build-app.sh --bundle-models  # ship: copy ONLY the fixed stack (cohere-mlx-q4 + s1-mini, ~1.7 GB) into the app
-./scripts/build-app.sh --slim           # ship: NO models bundled; app verifies/errors on the fixed stack at first run
+./scripts/build-app.sh --slim           # ship: NO models bundled; the app never downloads, it logs what is missing at first run
 ./scripts/build-app.sh --install        # also copy to /Applications, add a Login Item, launch it
-./scripts/build-app.sh --dmg            # wrap in a distributable dist/Local-Dictation-<ver>.dmg (defaults to --bundle-models; --slim --dmg = fetch-on-first-run DMG)
+./scripts/build-app.sh --dmg            # wrap in a distributable dist/Local-Dictation-<ver>.dmg (defaults to --bundle-models; --slim --dmg = a small DMG with no models in it)
 ```
 
 `build-app.sh` builds the native MLX helper first (`native/cohere-mlx/build.sh`), then the Rust
@@ -85,14 +85,16 @@ release binary, then assembles the bundle: helper copied to `Contents/Resources/
 with `Contents/Resources/mlx.metallib` beside it (MLX looks for `mlx.metallib` next to its
 executable before bundle lookup).
 
-The bundle is `dist/Local Dictation.app` — `LSUIElement` menu-bar agent (no Dock icon), ad-hoc
-signed, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
+The bundle is `dist/Local Dictation.app` — `LSUIElement` menu-bar agent (no Dock icon), signed
+with the first Apple Development identity in the login keychain (ad-hoc only when there is none,
+or with `SIGN_IDENTITY=-`), `LSMinimumSystemVersion` 14.0, `Info.plist` carries `NSMicrophoneUsageDescription` + a stable bundle id
 (`com.tristanmcinnis.local-dictation`). Icon is rendered from an SF Symbol by
 `resources/AppIcon.icns` (rendered by design-system/icons/make-icon.py --glyph waveform). Because it's a stable signed bundle, macOS attributes Microphone +
 Accessibility to the app itself (granted once), instead of to whatever terminal launched it.
-Ad-hoc signing means a *rebuild* changes the signature hash and macOS may re-ask — a real
-Developer ID would make grants stick. When bundled, the daemon redirects stdout/stderr to
-`/tmp/dictate-daemon.log` (no terminal to print to).
+With a development identity the grants survive rebuilds. An *ad-hoc* signature changes on every
+rebuild, so macOS re-asks. Neither is notarized, so a copy sent to another Mac is blocked by
+Gatekeeper until a Developer ID + notarization step exists. When bundled, the daemon redirects stdout/stderr to
+`~/Library/Logs/Local Dictation/daemon.log` (no terminal to print to; see Debugging).
 
 **Model resolution** (`src/app_paths.rs`). The *base* directory, in order:
 `DICTATE_MODELS_DIR` env > `<app>/Contents/Resources/models` (shipped, self-contained) >
@@ -122,11 +124,11 @@ there are two very different loops, and only one needs a rebuild:
    corpus; see `prompts-lab/`), or `--example s1_mini_eval`. This is the right loop for prompt work.
 
 2. **Changing code or built-in defaults** (`src/**`, the `DEFAULT_*` consts in `prompts.rs`).
-   Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. Because the bundle is
-   *ad-hoc* signed, a rebuild changes the signature hash and **macOS may revoke + re-prompt for
-   Accessibility/Microphone** — the daemon will exit at boot (`daemon/mod.rs` permission check) until
+   Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. When the bundle is
+   *ad-hoc* signed (no Apple Development identity, or `SIGN_IDENTITY=-`), a rebuild changes the
+   signature hash and **macOS may revoke + re-prompt for Accessibility/Microphone** — the daemon will exit at boot (`daemon/mod.rs` permission check) until
    you re-grant it in System Settings → Privacy & Security. An agent cannot grant this; it requires
-   the user. (A real Developer ID signature would make the grant stick across rebuilds.)
+   the user. (A stable signing identity makes the grant stick across rebuilds.)
 
 Gotcha: `build-app.sh --install` runs `open`, which only *activates* an already-running instance
 rather than replacing it — so after an `--install` you still need a real relaunch
@@ -211,6 +213,13 @@ audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with option
   → injector.rs (AX direct, or clipboard paste for Electron) + trailing-action keystroke
 ```
 
+**Keycodes** are the real macOS virtual keycodes (`kVK_*`), which are not alphabetical; the one
+name↔code table is `hotkeys::KEY_TABLE`. Before 2026-09 the table was arithmetic, so a typed chord
+bound a different physical key than it displayed (`cmd+shift+d` watched F). A keycode already saved
+in `settings.json` still names the same physical key; only its label is now honest, so there is no
+migration. There is no "chord already taken" probe: the Carbon check it used was unreliable and was
+removed rather than reassure falsely.
+
 **Hotkey stop boundary:** only a new physical key edge reaches the hold/latch
 state machine. Autorepeated chord key-downs and duplicate modifier events do
 not count as another tap. Modifier events use the SDK's left/right device
@@ -230,7 +239,7 @@ few milliseconds before the HID state commits it: a mismatch there is normal and
 is not evidence of a synthesized event. There is no silence or duration
 auto-stop in the push-to-talk daemon path.
 
-**Focus capture at key-press** (default on): the focused UI element + caret context (`kAXValue` + `kAXSelectedTextRange`) are resolved from the frontmost application's own AX root on a background thread when recording *starts*, so the AX wake / cross-process cost is paid while the user is speaking rather than after the pipelines finish. At write time the injector still resolves the current field fresh, so a real same-app field change wins and an app switch cannot revive the old target. If that fresh lookup transiently returns no focused element (`-25212` is common while Electron reshuffles its AX tree), the retained field is a narrow fallback only when it had positive editable evidence, still reports `AXFocused=true`, and its owning PID is still the OS-frontmost app. A failed capture or changed app still holds/re-resolves normally. A very short hold just blocks on the capture join. The clipboard fallback's snapshot restore runs on a *detached* thread after the Cmd+V settle, so a slow restore can't pin the next dictation. The fallback's own pasteboard write carries the nspasteboard.org markers `org.nspasteboard.TransientType` + `org.nspasteboard.AutoGeneratedType` (empty data, declared on the same item as the text), so clipboard managers — Quick Launch's Clipboard History included — don't record dictated sentences; the snapshot saves and restores every flavour of every pasteboard item (images, RTF, file URLs), except lazily promised file data and anything past a 16 MB byte budget, which are dropped and logged.
+**Focus capture at key-press** (default on): the focused UI element + caret context (`kAXValue` + `kAXSelectedTextRange`, whose UTF-16 offset is converted to a char index by `injector::char_index_from_utf16`) are resolved from the frontmost application's own AX root on a background thread when recording *starts*, so the AX wake / cross-process cost is paid while the user is speaking rather than after the pipelines finish. At write time the injector still resolves the current field fresh, so a real same-app field change wins and an app switch cannot revive the old target. If that fresh lookup transiently returns no focused element (`-25212` is common while Electron reshuffles its AX tree), the retained field is a narrow fallback only when it had positive editable evidence, still reports `AXFocused=true`, and its owning PID is still the OS-frontmost app. A failed capture or changed app still holds/re-resolves normally. A very short hold just blocks on the capture join. The clipboard fallback's snapshot restore runs on a *detached* thread after the Cmd+V settle, so a slow restore can't pin the next dictation. The fallback's own pasteboard write carries the nspasteboard.org markers `org.nspasteboard.TransientType` + `org.nspasteboard.AutoGeneratedType` (empty data, declared on the same item as the text), so clipboard managers — Quick Launch's Clipboard History included — don't record dictated sentences; the snapshot saves and restores every flavour of every pasteboard item (images, RTF, file URLs), except lazily promised file data and anything past a 16 MB byte budget, which are dropped and logged.
 
 **Cancellation (Escape / IPC), out-of-band** (`src/cancel.rs`): the worker is *blocked* inside the release pipeline (ASR / cleanup), so a cancel queued on the event channel would only be processed after the utterance was already injected. Cancellation therefore goes through a lock-free atomic gate scoped to an **utterance generation**, linearized around a single write-commit point:
   * `begin()` marks a recording in flight and returns a monotonically increasing generation.
@@ -244,9 +253,9 @@ Escape *while idle* passes through untouched (normal Escape use); only an in-fli
 **Cancellation and retry:** accepted cancellation immediately clears the pill and flips the active generation's capture flag, so queued inference cannot admit more audio or write later. The complete captured buffer is retained for the legacy **Retry and paste last recording** action. Durable recovery is separate: completed/cancelled/failed captures use the archive described below, and **Recover to Clipboard** never invokes voice actions, target replacement, or injection.
 
 **No-blind-paste focus gate** (`src/injector.rs`): before any write, the injector classifies the focused surface from *positive, focus-level evidence* — never an app name — into `FocusEditability`:
-  * `Editable` — hard AX evidence: a text-entry role (`AXTextField`/`AXTextArea`/`AXComboBox`, or the `AXSearchField`/`AXFullScreenSearchField`/`AXTextArea` subroles) **and** a writable `AXValue`/`AXSelectedText`. Native apps write via the AX ladder.
+  * `Editable` — hard AX evidence: a text-entry role (`AXTextField`/`AXTextArea`/`AXComboBox`, or the `AXSearchField`/`AXFullScreenSearchField`/`AXTextArea` subroles) **and** a writable `AXValue`/`AXSelectedText`. Native apps write via the AX ladder: `kAXSelectedText` at the caret, then clipboard paste if that is refused. There is no `kAXValue` rung, because setting the value replaces the whole field with the utterance. The first successful write to each (pid, role/subrole) is verified by comparing the field's value and selection before and after (`injector::ax_write_landed`), not by searching for the utterance, so a repeated phrase cannot pass falsely and normalised text is not pasted twice.
   * `PasteSafe` — the *narrow, justified* fallback: a genuine terminal emulator **or WeChat** whose focused element discloses no clearly non-input role, including an `AXTextArea`/text-entry role with non-settable AX attributes. Terminal grids such as Ghostty, and WeChat's custom message box, accept keyboard + Cmd+V paste but are AX-blind, so writes go through clipboard paste. WeChat's message box never exposes a focused UI element at all (`AXFocusedUIElement` returns `kAXErrorNoValue` -25212 even with the caret visible), so the paste-safe app-type fallback also covers the no-focused-element path. The terminal exception does not distinguish shell prompts from pagers or terminal applications; choose the intended terminal input before dictating. **There is no editor/compose blanket** — a Slack pane, a Notion/Obsidian page, an Outlook window, a Cursor/VS Code editor *window*, or a browser body is only pasted into when its **focused element** reports an editable role, never by app name.
-  * `NotEditable` — a positively non-input role (`AXButton`/`AXWindow`/`AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio) denies injection **even for an allowlisted terminal or WeChat**. A read-only text-entry field in a **non-paste-safe** app is also denied, as is unknown/absent non-paste-safe focus. The daemon **never** pastes here. It holds the transcript recoverable (menu "Copy last dictation") and surfaces a distinct `UiState::NoEditableField` (pill: "No text field selected").
+  * `NotEditable` — a positively non-input role (`AXButton`/`AXWindow`/`AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio) denies injection **even for an allowlisted terminal or WeChat**. A password field (subrole `AXSecureTextField`) is denied the same way in every app, and its value is never read for caret context or screen vocabulary. A read-only text-entry field in a **non-paste-safe** app is also denied, as is unknown/absent non-paste-safe focus. The daemon **never** pastes here. It holds the transcript recoverable (menu "Copy last dictation") and surfaces a distinct `UiState::NoEditableField` (pill: "No text field selected").
 
 The daemon runs the focus decision through the tested seam `injector::finalize_utterance` immediately before the write. Crucially, the injector **re-resolves the CURRENT focused element at write time**, so a same-app field change never writes into a stale element, and a failed initial capture still reaches the fresh resolver. It does NOT rely on the systemwide AX proxy (`AXUIElementCreateSystemWide` → focused), which can return `kAXErrorCannotComplete` (-25204) or no value (-25212) even when the app resolves fine. Instead `injector::plan_live_inject(frontmost_pid())` snapshots the OS-frontmost app via `NSWorkspace` and resolves ITS focused element per-app (`AXUIElementCreateApplication(pid)`) — the same robust path `inject_into_pid` uses. Only if this fresh per-app query returns no element may `retained_focus_can_fallback` reuse the positively-editable press-time field, and only while the element still reports focused and its PID still equals the current frontmost PID. With no qualifying retained field, AX absence alone is never proof of input: a terminal or WeChat is a legitimate `PasteSafe` target, while a page body / unknown app is held.
 
@@ -274,6 +283,12 @@ the default input changed since it was built. `DICTATE_WARM_WINDOW_MS=0` restore
 cold-open behaviour; no-op under always-on pre-roll. No pre-press lookback (the plain SPSC ring isn't
 a rolling lookback; the win is skipping the open).
 
+Transform output replaces the user's selection, so it has two extra guards: a selection over
+`cleaner::MAX_TRANSFORM_CHARS` (6000) is refused up front, and a rewrite that stops at the token
+budget instead of the model's own end is an error, never pasted. `run_job` keeps its `resident`
+token bookkeeping in step with the KV cache at every step (truncate after the wipe, set once the
+prompt is decoded), so a failed job cannot leave the next one reusing a prefix the cache lost.
+
 `cleaner.rs` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
 `LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in a
 struct). The worker tracks the resident token sequence and **reuses the shared KV-cache prefix**
@@ -298,7 +313,11 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
 
 `ui_channel.rs` carries a generation/revision-guarded snapshot: recording state,
 bounded draft preview, capture flag, last output, and audio levels. States include
-Transcribing, Cleaning, Pasting, and Copied. Only actual model/injection boundaries
+Transcribing, Cleaning, Pasting, and Copied. `PasteFailed` is the write-failed result: the words are kept
+as the last dictation and as a "Not inserted" Output stage, and the pill says "Couldn’t paste ·
+Copy from menu" for 4 s with the History button ("Couldn’t transcribe" is for real ASR
+failures only). The success pill's Undo posts ⌘Z only while the app that received the text
+(`ui_channel::last_inject_pid`) is still frontmost. Only actual model/injection boundaries
 publish these phases; Pasting is beyond the cancellation commit point. Old
 completion timers and cancelled inference cannot clear or revive a newer pill.
 The preview uses existing sentence-based ASR results, capped at 320 Unicode
@@ -342,10 +361,24 @@ its refresh never steals focus, and playback stops on close or selection change.
 
 `screen_context.rs`
 harvests proper nouns from the focused window and feeds them to
-`cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. Normal
+`cleaner::process_transcript_with_vocab` so the model preserves on-screen spellings. The prompt's
+vocabulary block holds at most 64 terms: the curated terms (corrections + dictionary) are capped
+once at boot to 48 (`prompts::curated_vocabulary`: `dictionary.json` terms first, then the
+correction targets in sorted order, so the cut is the same on every launch and never falls on a
+dictionary term while a correction target, which the refiner enforces anyway, could go) and stay
+FIRST, so that block is byte-identical
+on every utterance and its KV prefix is reused; the last 16 slots are reserved for screen terms
+(`prompts::combined_vocabulary`), so a large dictionary can no longer evict them. The extractor
+ranks mid-sentence capitals above sentence-start ones, rewards repeats rather than length, drops
+ALL-CAPS runs and email boilerplate, and handles `’s`, `Name/Name` and markdown links.
+`app_tones.rs` adds a per-app tone word; it matches whole segments of the bundle id or app name
+(`com.apple.TextEdit` → `com`, `apple`, `textedit`), never substrings. Normal
 cleanup never infers numbered-list structure from words such as "first" or "second"; structural
 formatting requires an explicit `numbered` or `bullets` output-format preset.
-`audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. `numbers.rs`
+`audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. All six cues
+are original and reproducible: `scripts/audio/generate_cues.py` (python3 stdlib) synthesizes them
+into `resources/sounds/`, and a unit test pins the embedded files to the generator's format and
+durations. No third-party audio is tracked in the repo. `numbers.rs`
 converts spoken numbers to numerals deterministically; `spoken_command.rs` handles *prefix*
 commands (e.g. "translate to Chinese …") via the warm transform engine; `voice_commands.rs` parses
 *trailing* commands ("press enter", "new line", "scratch that", "undo that"). The model is loaded
@@ -377,7 +410,7 @@ re-joining the path:
   (`numbered`/`bullets`/`email`/`code` in `DEFAULT_FORMATS`); a user's `formats` overlays them (same
   key overrides, new key adds). The active preset (`active_format` / `DICTATE_FORMAT`) replaces the
   cleanup prompt for normal dictation, and list presets keep their line breaks (cleanup preserves
-  newlines when a preset is active); unknown/blank falls back to default. A deterministic
+  newlines when a preset is active); unknown/blank falls back to default — everywhere: `Prompts::format_is_defined` is the one test, and the daemon asks the engine (`TextCleanupEngine::format_active`), so a stale or mistyped name cannot switch off the deterministic fast path while the default prompt runs. A deterministic
   `text_polish::fix_speech_mechanics` pass handles leftover filler + lone "i" so the prompt doesn't
   have to.
 - `corrections.json` (`corrections.rs`) — the user's single personal vocabulary, a word→replacement
@@ -392,6 +425,18 @@ re-joining the path:
   `dictionary.example.json` shows the format). It is a plain-list input for power users; the menu bar
   manages `corrections.json`, not this file.
 
+**File safety** (`src/config_io.rs`). Every writer of these files writes atomically (temp file in
+the same directory, fsync, rename; a new file is `0600`; a symlinked file is written through the
+link, so a dotfiles link survives). `settings.json` is parsed one key at a time: a single bad value
+falls back to that key's default with a `[warn]` line and the other keys survive; a document that
+is not a JSON object loads as defaults. Either kind of file is copied to `settings.json.bak`
+before the next save rewrites it.
+`corrections.json` and `dictionary.json` cannot be rebuilt from anything, so a file that does not
+parse is never overwritten: `save_to` returns an error, the Dictionary window disables Add and
+Save, and the Settings pane refuses Add and says why. `_`-prefixed comment keys in
+`corrections.json` survive a save. A blank `corrections.json` is an empty dictionary, not a
+corrupt one. CSV import strips a UTF-8 BOM.
+
 Precedence is always **env var > JSON file > built-in default**. The active env knobs on the fixed
 stack:
 
@@ -403,8 +448,11 @@ stack:
 | `DICTATE_COHERE_LANG` | Decoder language hint (default `en`) |
 | `DICTATE_LLM_MODEL_PATH` | Cleanup-LLM GGUF path. `S1_MODEL_PATH` is an accepted alias; `GEMMA_MODEL_PATH` is deprecated (still honoured, warns once). New name wins when several are set |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `hotkeys::DEFAULT_KEYCODE` = `0x3D` Right Option; decimal or `0x` hex) |
-| `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key) |
+| `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key). The held modifiers must equal the mask (an extra Shift is the transform gesture). A plain typing key with no modifier is refused (`Hotkey::problem`) and falls back to the default; only a modifier key or F1–F20 may stand alone |
 | `DICTATE_DOUBLE_TAP_LATCH` | Double-tap the hotkey to latch hands-free (`0`/`false`/`off` disables) |
+| `DICTATE_COPY_LAST_HOTKEY` | Second global hotkey that copies the last dictation to the clipboard, written like `ctrl+cmd+v`. Empty string = off; unset = the `copy_last_hotkey` JSON key, itself unset by default. Validated against the push-to-talk hotkey |
+| `DICTATE_COPY_ON_PASTE_FAILURE` | Put the transcript on the clipboard when insertion is refused or fails, default on (`0`/`false`/`off` disables). The text is never lost either way: the pill and "Copy last dictation" still hold it |
+| `DICTATE_MAX_RECORDING_MINUTES` | Stop a recording that reaches this many minutes, so a lost key-up cannot record forever (default 10; `0` = no limit) |
 | `DICTATE_WHISPER_MODE` | Lower VAD speech threshold for quiet speech |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_TRANSLATION_TARGETS` / `DICTATE_ACTIVE_TRANSLATION_TARGET` | Translate-mode target list (comma-separated) and the active one |
@@ -419,13 +467,16 @@ stack:
 | `DICTATE_PASTE_SETTLE_MS` | Override the clipboard-paste settle (ms) that waits for the target app to consume the Cmd+V before the background clipboard restore. Default is length-scaled (280 ms base +1 ms/3 chars, capped 1000); `0` disables the wait for the lowest latency |
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |
+| `DICTATE_STOP_CUE` | Also play a cue when a recording stops (default off; the landed cue already marks the end) |
+| `DICTATE_RENDER_UI` | Render-proof harness only: write pill / window PNGs from invented fixtures and exit, never touching user data |
 | `DICTATE_DEBUG_STREAM` | Per-segment `⟫ seg` stream logging (default off) |
+| `DICTATE_LOG_TEXT` | Debug only: log dictated text, spoken instructions and screen terms verbatim. Default off — the log carries lengths and timings only |
 | `DICTATE_NO_MUTE` | Do not duck other audio during capture |
 | `DICTATE_NO_NORMALIZE` | Skip ASR amplitude normalization |
 | `DICTATE_PROMPTS_PATH` / `DICTATE_CLEANUP_PROMPT` / `DICTATE_TRANSFORM_PROMPT` | Override the prompts file / cleanup prompt / transform prompt |
 | `DICTATE_CONTROL_SOCK` | Override the daemon control-socket path |
 | `DICTATE_CORRECTIONS_PATH` / `DICTATE_DICTIONARY_PATH` | Override the corrections / dictionary file paths |
-
+| `DICTATE_APPEARANCE` | `dark` (default), `light` or `system` |
 | `DICTATE_PILL_SIZE` | `compact` (default) or `standard` |
 | `DICTATE_WAVEFORM_SENSITIVITY` | Visual response: `low`, `balanced` (default), `high` |
 | `DICTATE_SHOW_PROCESSING_DETAIL` | Show distinct processing labels, default on |
@@ -441,8 +492,18 @@ on Cohere MLX Q4. Only `DICTATE_COHERE_LANG` (decoder language) is honored. `FOC
 
 ## Debugging
 
-Structured per-utterance logs (asr/cleanup/inject timings, target app, injected text, screen-vocab)
-go to `app_paths::DAEMON_LOG_PATH` (`/tmp/dictate-daemon.log`) — `tail -f` it, or `fast-dictate-backend logs` to open it. First
+Structured per-utterance logs (asr/cleanup/inject timings, target app, text and screen-vocab
+*sizes*) go to `app_paths::daemon_log_path()` (`~/Library/Logs/Local Dictation/daemon.log`) —
+`tail -f` it, or `fast-dictate-backend logs` to open it. `src/daemon_log.rs` owns the file: the
+directory is `0700`, the file `0600`, the open refuses a symlink (`O_NOFOLLOW`), and a file past
+5 MB is renamed to `daemon.log.1` (one generation kept) at boot and again at the end of a
+recording. The log does **not** contain dictated text, spoken instructions or harvested on-screen
+terms: those sites go through `daemon_log::text` / `daemon_log::terms`, which print lengths
+(`<42 chars · 8 words>`, `<5 terms>`). History retention and "Delete all" cannot reach the log, so
+text must never land there by default. `DICTATE_LOG_TEXT=1` is the debug switch that logs the
+text verbatim; new log lines that carry user text must use the same helpers. (Until 2026-09 the
+log was the shared, world-readable `/tmp/dictate-daemon.log`; that file is no longer written and
+can be deleted.) First
 daemon run needs Microphone + Accessibility permissions granted in System Settings; macOS ties
 Accessibility permission to the launching terminal, so the daemon must be started from a real
 terminal (an agent can't grant it). `ax-check` surfaces the permission prompt.

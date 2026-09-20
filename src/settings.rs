@@ -10,18 +10,22 @@
 //! `DICTATE_HOTKEY_KEYCODE`) authoritative for power users / scripted
 //! launches: if one of those is set, the matching menu item is ignored.
 //!
-//! File format (all fields optional):
+//! File format (all fields optional; the full key list is in
+//! `docs/architecture.md`):
 //!
 //! ```json
 //! {
-//!     "gemma_model": "/abs/path/to/models/llm/qwen-2.5-1.5b-it/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+//!     "llm_model": "/abs/path/to/models/llm/s1-mini/s1-mini.gguf",
 //!     "hotkey_keycode": 61,
 //!     "cleanup_enabled": true
 //! }
-//!
-//! (The `gemma_model` key name is historical — it holds the path to whatever
-//! cleanup model is selected; the recommended default is now Qwen 2.5 1.5B.)
 //! ```
+//!
+//! `llm_model` is the path to whichever cleanup model is selected (the name is
+//! model-neutral on purpose; the shipped default is S1-mini). The pre-2026-09
+//! key `gemma_model` is still read once and migrated; see
+//! `migrate_legacy_keys`. A single malformed value only resets that key
+//! (`parse_lenient`), and writes are atomic (`config_io`).
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -340,6 +344,27 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_result: Option<bool>,
 
+    /// Put the text on the clipboard when a finished dictation could not be
+    /// inserted (no text field, a failed paste, the recording limit), so ⌘V
+    /// works at once. A plain clipboard write: clipboard managers keep it.
+    /// `None`/true ⇒ on. Override: `DICTATE_COPY_ON_PASTE_FAILURE`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_on_paste_failure: Option<bool>,
+
+    /// Global "Copy last dictation" chord as a parseable string
+    /// (`"ctrl+cmd+v"`). Absent ⇒ the built-in default
+    /// ([`crate::hotkeys::COPY_LAST_DEFAULTS`]); `""` or `"off"` ⇒ no hotkey.
+    /// Override: `DICTATE_COPY_LAST_HOTKEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_last_hotkey: Option<String>,
+
+    /// Stop a recording that has run this many minutes, so a lost key-up or a
+    /// forgotten hands-free session cannot record without end. 0 ⇒ no limit.
+    /// `None` ⇒ [`DEFAULT_MAX_RECORDING_MINUTES`]. Override:
+    /// `DICTATE_MAX_RECORDING_MINUTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_recording_minutes: Option<u32>,
+
     /// Window appearance: `"system"`, `"light"`, or `"dark"`. `None` ⇒
     /// [`DEFAULT_APPEARANCE`] (dark — the house design's default). Applied with
     /// `NSApplication.setAppearance`, so every window follows it; nothing is
@@ -351,6 +376,19 @@ pub struct Settings {
 /// How long the optional "Landed · N words" result pill stays on screen. Long
 /// enough to read; the old 420 ms vanished before the eye reached it.
 pub const RESULT_PILL_MS: u64 = 2000;
+
+/// Default recording limit. Long enough for any real dictation; short enough
+/// that a stuck key is caught the same morning.
+pub const DEFAULT_MAX_RECORDING_MINUTES: u32 = 10;
+
+/// Recording-limit choices offered in Settings, as `(minutes, label)`.
+pub const MAX_RECORDING_CHOICES: &[(u32, &str)] = &[
+    (5, "5 minutes"),
+    (10, "10 minutes"),
+    (30, "30 minutes"),
+    (60, "1 hour"),
+    (0, "No limit"),
+];
 
 /// Appearance choices offered in the menu and the Settings window, as
 /// `(on-disk value, label)`.
@@ -402,14 +440,48 @@ impl Settings {
     /// caller can decide to rewrite the file).
     fn load_from_migrating(path: &Path) -> (Self, bool) {
         let mut settings: Self = match std::fs::read_to_string(path) {
-            Ok(body) => serde_json::from_str(&body).unwrap_or_else(|e| {
-                eprintln!("[warn] settings parse failed ({}): {e}", path.display());
-                Self::default()
-            }),
+            Ok(body) => Self::parse_lenient(&body, &path.display().to_string()),
             Err(_) => Self::default(), // missing file is the common case
         };
         let migrated = settings.migrate_legacy_keys();
         (settings, migrated)
+    }
+
+    /// Parse a settings document one key at a time. A single bad value (for
+    /// example `"preroll_ms": "400"` or `-1`) used to fail the whole document
+    /// and reset EVERY setting; now only that key falls back to its default,
+    /// with a warning, and the rest survive. A document that is not a JSON
+    /// object at all still degrades to defaults (and `save_to` keeps a `.bak`
+    /// of it before writing).
+    fn parse_lenient(body: &str, origin: &str) -> Self {
+        if let Ok(s) = serde_json::from_str::<Self>(body) {
+            return s;
+        }
+        let map = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(serde_json::Value::Object(map)) => map,
+            Ok(_) => {
+                eprintln!("[warn] settings ignored ({origin}): not a JSON object");
+                return Self::default();
+            }
+            Err(e) => {
+                eprintln!("[warn] settings parse failed ({origin}): {e}");
+                return Self::default();
+            }
+        };
+        let mut good = serde_json::Map::new();
+        for (key, value) in map {
+            let mut one = serde_json::Map::new();
+            one.insert(key.clone(), value.clone());
+            match serde_json::from_value::<Self>(serde_json::Value::Object(one)) {
+                Ok(_) => {
+                    good.insert(key, value);
+                }
+                Err(e) => eprintln!(
+                    "[warn] settings: ignoring \"{key}\" ({origin}): {e}; using its default"
+                ),
+            }
+        }
+        serde_json::from_value(serde_json::Value::Object(good)).unwrap_or_default()
     }
 
     /// Fold renamed keys into their current fields. Returns true when
@@ -438,8 +510,30 @@ impl Settings {
             std::fs::create_dir_all(dir)
                 .map_err(|e| eyre::eyre!("create {}: {e}", dir.display()))?;
         }
+        // A file this build could not fully read (not JSON at all, or an
+        // object with a value of the wrong type, which `parse_lenient` loaded
+        // as "unset") is about to lose what it held. Keep a copy first.
+        if let Ok(existing) = std::fs::read_to_string(path) {
+            let fully_read = serde_json::from_str::<Self>(&existing).is_ok();
+            if !existing.trim().is_empty() && !fully_read {
+                match crate::config_io::backup(path) {
+                    Ok(bak) => eprintln!(
+                        "[settings] {} was not fully readable; kept a copy at {}",
+                        path.display(),
+                        bak.display()
+                    ),
+                    Err(e) => {
+                        return Err(eyre::eyre!(
+                            "{} is not fully readable and could not be backed up ({e}); not overwriting it",
+                            path.display()
+                        ))
+                    }
+                }
+            }
+        }
         let body = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, body).map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
+        crate::config_io::write_atomic(path, body.as_bytes())
+            .map_err(|e| eyre::eyre!("write {}: {e}", path.display()))?;
         Ok(())
     }
 
@@ -767,6 +861,40 @@ impl Settings {
         self.show_result.unwrap_or(false)
     }
 
+    /// Resolve copy-on-failure: `DICTATE_COPY_ON_PASTE_FAILURE` env >
+    /// settings > on.
+    pub fn resolve_copy_on_paste_failure(&self) -> bool {
+        if let Ok(v) = std::env::var("DICTATE_COPY_ON_PASTE_FAILURE") {
+            let v = v.trim().to_ascii_lowercase();
+            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
+        }
+        self.copy_on_paste_failure.unwrap_or(true)
+    }
+
+    /// The configured "Copy last dictation" chord string:
+    /// `DICTATE_COPY_LAST_HOTKEY` env > settings. `None` means nothing was
+    /// configured, so the caller applies the built-in default; an empty string
+    /// means the user turned the hotkey off. Parsing and validation against the
+    /// dictation hotkey live in [`crate::hotkeys::copy_last_hotkey`].
+    pub fn resolve_copy_last_hotkey(&self) -> Option<String> {
+        if let Ok(v) = std::env::var("DICTATE_COPY_LAST_HOTKEY") {
+            return Some(v.trim().to_string());
+        }
+        self.copy_last_hotkey.as_ref().map(|s| s.trim().to_string())
+    }
+
+    /// Resolve the recording limit in minutes: `DICTATE_MAX_RECORDING_MINUTES`
+    /// env > settings > [`DEFAULT_MAX_RECORDING_MINUTES`]. 0 = no limit.
+    pub fn resolve_max_recording_minutes(&self) -> u32 {
+        if let Ok(v) = std::env::var("DICTATE_MAX_RECORDING_MINUTES") {
+            if let Ok(n) = v.trim().parse::<u32>() {
+                return n;
+            }
+        }
+        self.max_recording_minutes
+            .unwrap_or(DEFAULT_MAX_RECORDING_MINUTES)
+    }
+
     /// Resolve double-tap-to-latch (hands-free from a hotkey double-tap):
     /// `DICTATE_DOUBLE_TAP_LATCH` env > settings > enabled.
     pub fn resolve_double_tap_latch(&self) -> bool {
@@ -1050,6 +1178,52 @@ mod tests {
     }
 
     #[test]
+    fn copy_on_paste_failure_is_on_by_default() {
+        if std::env::var_os("DICTATE_COPY_ON_PASTE_FAILURE").is_none() {
+            assert!(Settings::default().resolve_copy_on_paste_failure());
+            let mut s = Settings::default();
+            s.copy_on_paste_failure = Some(false);
+            assert!(!s.resolve_copy_on_paste_failure());
+        }
+    }
+
+    #[test]
+    fn copy_last_hotkey_distinguishes_unset_from_off() {
+        if std::env::var_os("DICTATE_COPY_LAST_HOTKEY").is_none() {
+            assert_eq!(Settings::default().resolve_copy_last_hotkey(), None);
+            let mut s = Settings::default();
+            s.copy_last_hotkey = Some("".into());
+            assert_eq!(s.resolve_copy_last_hotkey().as_deref(), Some(""));
+            s.copy_last_hotkey = Some(" ctrl+cmd+v ".into());
+            assert_eq!(s.resolve_copy_last_hotkey().as_deref(), Some("ctrl+cmd+v"));
+        }
+    }
+
+    #[test]
+    fn max_recording_defaults_to_ten_minutes_and_zero_means_no_limit() {
+        if std::env::var_os("DICTATE_MAX_RECORDING_MINUTES").is_none() {
+            assert_eq!(Settings::default().resolve_max_recording_minutes(), 10);
+            let mut s = Settings::default();
+            s.max_recording_minutes = Some(0);
+            assert_eq!(s.resolve_max_recording_minutes(), 0);
+            assert!(MAX_RECORDING_CHOICES.iter().any(|(m, _)| *m == DEFAULT_MAX_RECORDING_MINUTES));
+        }
+    }
+
+    #[test]
+    fn an_old_settings_file_without_the_new_keys_still_loads() {
+        let s = Settings::parse_lenient(r#"{"hotkey_keycode": 61, "show_result": true}"#, "test");
+        assert_eq!(s.hotkey_keycode, Some(61));
+        assert_eq!(s.copy_last_hotkey, None);
+        assert_eq!(s.copy_on_paste_failure, None);
+        assert_eq!(s.max_recording_minutes, None);
+        // A bad value in a new key costs only that key.
+        let s = Settings::parse_lenient(r#"{"max_recording_minutes": "ten", "show_result": true}"#, "test");
+        assert_eq!(s.max_recording_minutes, None);
+        assert_eq!(s.show_result, Some(true));
+    }
+
+    #[test]
     fn double_tap_latch_on_by_default() {
         if std::env::var_os("DICTATE_DOUBLE_TAP_LATCH").is_none() {
             assert!(Settings::default().resolve_double_tap_latch());
@@ -1146,6 +1320,102 @@ mod tests {
             s2.wake_word = Some("jarvis".into());
             assert_eq!(s2.resolve_wake_word(), "jarvis");
         }
+    }
+
+    #[test]
+    fn one_bad_value_does_not_reset_the_other_settings() {
+        // Regression: any single type error failed the whole document and
+        // every setting silently reverted to its default.
+        let dir = std::env::temp_dir().join(format!("fd-settings-lenient-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "hotkey_keycode": 54,
+                "preroll_ms": "400",
+                "warm_window_ms": -1,
+                "tail_capture_cap_ms": 400.5,
+                "cleanup_enabled": "yes",
+                "appearance": "light",
+                "cohere_language": "de",
+                "translation_targets": ["Spanish", 7],
+                "history_retention": "1week",
+                "some_future_key": {"nested": true}
+            }"#,
+        )
+        .unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.hotkey_keycode, Some(54));
+        assert_eq!(s.appearance.as_deref(), Some("light"));
+        assert_eq!(s.cohere_language.as_deref(), Some("de"));
+        assert_eq!(s.history_retention.as_deref(), Some("1week"));
+        // The bad ones fall back to "unset" (their built-in default).
+        assert_eq!(s.preroll_ms, None);
+        assert_eq!(s.warm_window_ms, None);
+        assert_eq!(s.tail_capture_cap_ms, None);
+        assert_eq!(s.cleanup_enabled, None);
+        assert_eq!(s.translation_targets, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_with_one_bad_value_is_backed_up_before_it_is_rewritten() {
+        // The bad value loads as "unset", so the next save drops it. The user
+        // typed it; keep the original beside the rewritten file.
+        let dir = std::env::temp_dir().join(format!("fd-settings-badkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = r#"{ "hotkey_keycode": 54, "preroll_ms": "400" }"#;
+        std::fs::write(&path, original).unwrap();
+        let s = Settings::load_from(&path);
+        assert_eq!(s.hotkey_keycode, Some(54));
+        s.save_to(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("settings.json.bak")).unwrap(), original);
+        assert_eq!(Settings::load_from(&path).hotkey_keycode, Some(54));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lenient_parse_still_migrates_the_legacy_model_key() {
+        let s = {
+            let mut s = Settings::parse_lenient(
+                r#"{ "gemma_model": "/tmp/legacy.gguf", "preroll_ms": "bad" }"#,
+                "test",
+            );
+            s.migrate_legacy_keys();
+            s
+        };
+        assert_eq!(s.llm_model.as_deref(), Some("/tmp/legacy.gguf"));
+        assert_eq!(s.preroll_ms, None);
+    }
+
+    #[test]
+    fn unparseable_settings_are_backed_up_before_the_first_save() {
+        let dir = std::env::temp_dir().join(format!("fd-settings-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let broken = "{ \"hotkey_keycode\": 54,, }";
+        std::fs::write(&path, broken).unwrap();
+        // Unparseable → defaults, as before.
+        let mut s = Settings::load_from(&path);
+        assert_eq!(s, Settings::default());
+        // The menu's load → mutate → save must not destroy the user's file.
+        s.cleanup_enabled = Some(false);
+        s.save_to(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("settings.json.bak")).unwrap(), broken);
+        assert_eq!(Settings::load_from(&path).cleanup_enabled, Some(false));
+        // A healthy file is not backed up again.
+        s.save_to(&path).unwrap();
+        let baks = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert_eq!(baks, 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

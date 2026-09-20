@@ -9,8 +9,14 @@
 //!
 //! [`Settings`](crate::settings::Settings) remains the source of truth at
 //! boot (`from_settings` reads it); this module also renders a human-readable
-//! `display()`, parses a CLI/shorthand string (`parse`), and can probe whether
-//! a chord is already claimed system-wide (`detect_conflict`).
+//! `display()`, parses a CLI/shorthand string (`parse`), says why a hotkey is
+//! unusable (`problem`) and decides whether held modifiers satisfy a chord
+//! (`chord_modifiers_match`).
+//!
+//! There is deliberately no "is this chord taken?" probe. The old one called
+//! Carbon's `RegisterEventHotKey` with the wrong signature, and even a correct
+//! call does not fail when another app owns the chord and never sees system
+//! shortcuts, so "no conflict detected" was a false reassurance.
 
 /// Raw [`CGEventFlags`] bit for Caps Lock (not currently used by the daemon,
 /// but part of the real flag mask).
@@ -61,7 +67,7 @@ const MODIFIER_KEYCODES: [i64; 8] = [
 /// where the press is only recognised when the listed modifiers are also held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
-    /// CGEvent keycode to watch (e.g. `0x3D` for Right Option, `0x03` for D).
+    /// CGEvent keycode to watch (e.g. `0x3D` for Right Option, `0x02` for D).
     pub keycode: i64,
     /// CGEventFlags modifier bitmask (`SHIFT | CONTROL | OPTION | COMMAND`).
     pub modifiers: u64,
@@ -74,10 +80,53 @@ impl Hotkey {
     /// key. See [`crate::settings::Settings::resolve_hotkey`] and
     /// [`crate::settings::Settings::resolve_hotkey_modifiers`].
     pub fn from_settings() -> Hotkey {
-        let settings = crate::settings::Settings::load();
+        Hotkey::from_loaded(&crate::settings::Settings::load())
+    }
+
+    /// As [`Hotkey::from_settings`], for settings already in hand (the
+    /// Settings window validates against its unsaved edits).
+    pub fn from_loaded(settings: &crate::settings::Settings) -> Hotkey {
         Hotkey {
             keycode: settings.resolve_hotkey(DEFAULT_KEYCODE),
             modifiers: settings.resolve_hotkey_modifiers(),
+        }
+        .or_default_if_unusable()
+    }
+
+    /// Why this hotkey must not be bound, or `None` when it is fine.
+    ///
+    /// The event tap swallows every matching key-down system-wide, so a plain
+    /// typing key with no modifier ("d", "space", an arrow) would take that key
+    /// away from every app. Only a modifier key or F1–F20 may stand alone.
+    /// Escape is refused in any chord: the tap handles Escape first (cancel),
+    /// so such a hotkey could never fire.
+    pub fn problem(&self) -> Option<&'static str> {
+        if self.is_modifier_only() {
+            return None;
+        }
+        if self.keycode == ESCAPE_KEYCODE {
+            return Some("Escape cancels a dictation, so it cannot be the hotkey");
+        }
+        const FOUR: u64 = SHIFT | CONTROL | OPTION | COMMAND;
+        if self.modifiers & FOUR == 0 && !is_function_key(self.keycode) {
+            return Some("add a modifier (cmd, ctrl, option or shift): a plain key would stop typing everywhere");
+        }
+        None
+    }
+
+    /// A hand-edited or env-supplied hotkey that fails [`Hotkey::problem`]
+    /// falls back to the default instead of swallowing a typing key.
+    fn or_default_if_unusable(self) -> Hotkey {
+        match self.problem() {
+            None => self,
+            Some(why) => {
+                eprintln!(
+                    "[hotkey] ignoring configured hotkey {} ({why}); using {}",
+                    self.display(),
+                    modifier_keycode_name(DEFAULT_KEYCODE)
+                );
+                Hotkey { keycode: DEFAULT_KEYCODE, modifiers: 0 }
+            }
         }
     }
 
@@ -118,8 +167,9 @@ impl Hotkey {
         out
     }
 
-    /// Parse a shorthand like `"cmd+shift+d"`, `"ctrl+option+space"`,
-    /// `"command+option+escape"`, or a bare key `"f5"` / `"escape"`.
+    /// Parse a shorthand like `"cmd+shift+d"`, `"ctrl+option+space"`, or a bare
+    /// key `"f5"`. Parsing is syntactic only; check [`Hotkey::problem`] before
+    /// binding the result.
     ///
     /// Modifier words (`cmd`/`command`, `ctrl`/`control`, `alt`/`option`,
     /// `shift`) are joined with `+` to a single key word; a bare key word with
@@ -220,180 +270,311 @@ pub fn modifier_keycode_name(keycode: i64) -> String {
     }
 }
 
-/// Best-effort glyph for a non-modifier keycode, used by `display` for the key
-/// portion of a chord. Covers letters, digits, Space/Return/Tab/Escape, the
-/// four arrows, and F1–F20; anything else falls back to `key 0x{keycode:x}`.
-///
-/// Named keys are matched before the F-key and digit ranges because the arrow
-/// keycodes (`0x7B..0x7E`) sit inside the F1–F20 range and `0x24` (Return) sits
-/// inside the digit range.
-fn key_glyph(keycode: i64) -> String {
-    match keycode {
-        0x31 => return "Space".into(),
-        0x24 => return "Return".into(),
-        0x30 => return "Tab".into(),
-        0x35 => return "Escape".into(),
-        0x7B => return "←".into(),
-        0x7C => return "→".into(),
-        0x7D => return "↓".into(),
-        0x7E => return "↑".into(),
-        _ => {}
-    }
-    if (0x7A..=0x8D).contains(&keycode) {
-        return format!("F{}", keycode - 0x7A + 1);
-    }
-    if (0x00..=0x19).contains(&keycode) {
-        return ((b'A' + keycode as u8) as char).to_string();
-    }
-    if (0x1D..=0x26).contains(&keycode) {
-        return ((b'0' + (keycode - 0x1D) as u8) as char).to_string();
-    }
-    format!("key 0x{keycode:x}")
+/// The macOS virtual keycodes (`kVK_*` in Carbon's `HIToolbox/Events.h`) for
+/// every key a chord may be built on, paired with the lowercase name
+/// [`Hotkey::parse`] accepts. The codes are NOT contiguous or alphabetical
+/// (`A`=0x00 `S`=0x01 `D`=0x02 `F`=0x03; `1`=0x12 … `0`=0x1D; `F1`=0x7A
+/// `F2`=0x78 `F5`=0x60), so both directions read this one table. It names
+/// physical key positions (ANSI layout), like every macOS hotkey.
+const KEY_TABLE: &[(&str, i64)] = &[
+    ("a", 0x00), ("s", 0x01), ("d", 0x02), ("f", 0x03), ("h", 0x04), ("g", 0x05),
+    ("z", 0x06), ("x", 0x07), ("c", 0x08), ("v", 0x09), ("b", 0x0B), ("q", 0x0C),
+    ("w", 0x0D), ("e", 0x0E), ("r", 0x0F), ("y", 0x10), ("t", 0x11), ("o", 0x1F),
+    ("u", 0x20), ("i", 0x22), ("p", 0x23), ("l", 0x25), ("j", 0x26), ("k", 0x28),
+    ("n", 0x2D), ("m", 0x2E),
+    ("1", 0x12), ("2", 0x13), ("3", 0x14), ("4", 0x15), ("6", 0x16), ("5", 0x17),
+    ("9", 0x19), ("7", 0x1A), ("8", 0x1C), ("0", 0x1D),
+    ("space", 0x31), ("return", 0x24), ("tab", 0x30), ("escape", 0x35),
+    ("left", 0x7B), ("right", 0x7C), ("down", 0x7D), ("up", 0x7E),
+    ("f1", 0x7A), ("f2", 0x78), ("f3", 0x63), ("f4", 0x76), ("f5", 0x60),
+    ("f6", 0x61), ("f7", 0x62), ("f8", 0x64), ("f9", 0x65), ("f10", 0x6D),
+    ("f11", 0x67), ("f12", 0x6F), ("f13", 0x69), ("f14", 0x6B), ("f15", 0x71),
+    ("f16", 0x6A), ("f17", 0x40), ("f18", 0x4F), ("f19", 0x50), ("f20", 0x5A),
+];
+
+const ESCAPE_KEYCODE: i64 = 0x35;
+
+/// The parseable lowercase name of a non-modifier keycode (`"d"`, `"f5"`,
+/// `"space"`), the inverse of [`keycode_for_name`]. `None` for a key outside
+/// the table.
+pub fn key_name_for_keycode(keycode: i64) -> Option<&'static str> {
+    KEY_TABLE
+        .iter()
+        .find(|(_, code)| *code == keycode)
+        .map(|(name, _)| *name)
 }
 
-/// Map a key word to a standard macOS virtual keycode, or `None` if unknown.
-///
-/// Covers single letters (`A`–`Z` → `0x00..0x19`), digits (`0`–`9` →
-/// `0x1D..0x26`), and the named keys Space (`0x31`), Return/Enter (`0x24`),
-/// Tab (`0x30`), Escape (`0x35`), the four arrows (`0x7B..0x7E`), and F1–F20
-/// (`0x7A..0x8D`). Case-insensitive.
+/// True for F1–F20: the only non-modifier keys that may be a hotkey with no
+/// modifier held, because nothing types with them.
+pub fn is_function_key(keycode: i64) -> bool {
+    key_name_for_keycode(keycode).is_some_and(|n| {
+        n.len() >= 2 && n.starts_with('f') && n[1..].bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Glyph for a non-modifier keycode, used by `display` for the key portion of
+/// a chord. Anything outside [`KEY_TABLE`] falls back to `key 0x{keycode:x}`.
+fn key_glyph(keycode: i64) -> String {
+    match key_name_for_keycode(keycode) {
+        Some("space") => "Space".into(),
+        Some("return") => "Return".into(),
+        Some("tab") => "Tab".into(),
+        Some("escape") => "Escape".into(),
+        Some("left") => "←".into(),
+        Some("right") => "→".into(),
+        Some("down") => "↓".into(),
+        Some("up") => "↑".into(),
+        Some(name) => name.to_ascii_uppercase(),
+        None => format!("key 0x{keycode:x}"),
+    }
+}
+
+/// Map a key word to its macOS virtual keycode, or `None` if unknown. Covers
+/// letters, digits, Space, Return/Enter, Tab, Escape/Esc, the four arrows and
+/// F1–F20 (see [`KEY_TABLE`]). Case-insensitive.
 pub fn keycode_for_name(name: &str) -> Option<i64> {
     let name = name.trim().to_ascii_lowercase();
-    if name.is_empty() {
-        return None;
+    let name = match name.as_str() {
+        "enter" => "return",
+        "esc" => "escape",
+        other => other,
+    };
+    KEY_TABLE
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, code)| *code)
+}
+
+/// True when the modifiers held on a key-down satisfy a chord that requires
+/// exactly `required` (both are raw CGEventFlags). The four modifier bits are
+/// compared for EQUALITY, so `⌘⇧D` does not also fire on (and swallow)
+/// `⌘⇧⌥D`. Caps Lock, Fn and the side-specific device bits are ignored. One
+/// exception: an extra Shift is allowed when the chord does not itself use
+/// Shift, because Shift + hotkey is the transform gesture.
+pub fn chord_modifiers_match(flags: u64, required: u64) -> bool {
+    const FOUR: u64 = SHIFT | CONTROL | OPTION | COMMAND;
+    let held = flags & FOUR;
+    let required = required & FOUR;
+    held == required || (required & SHIFT == 0 && held == required | SHIFT)
+}
+
+// ─── The second hotkey: "Copy last dictation" ───────────────────────────
+
+/// Built-in chords for "Copy last dictation", tried in order; the first one
+/// that does not collide with the dictation hotkey is used. `⌃⌘V` reads as
+/// "paste" and avoids Option, the default dictation key's family.
+pub const COPY_LAST_DEFAULTS: &[&str] = &["ctrl+cmd+v", "ctrl+option+v", "shift+option+v"];
+
+const SPACE_KEYCODE: i64 = 0x31;
+const FOUR_MODIFIERS: u64 = SHIFT | CONTROL | OPTION | COMMAND;
+
+/// Why `copy` cannot be the "Copy last dictation" chord next to the dictation
+/// hotkey `ptt`, or `None` when it is fine. The event tap swallows a matching
+/// key-down system-wide, so the rules are stricter than for an app shortcut.
+pub fn copy_last_problem(ptt: &Hotkey, copy: &Hotkey) -> Option<String> {
+    if copy.is_modifier_only() {
+        return Some("use a key with modifiers, for example ctrl+cmd+v".into());
     }
-    if name.len() == 1 {
-        let c = name.as_bytes()[0];
-        if c.is_ascii_lowercase() {
-            return Some((c - b'a') as i64);
-        }
-        if c.is_ascii_digit() {
-            return Some(0x1D + (c - b'0') as i64);
-        }
-        return None;
+    if let Some(why) = copy.problem() {
+        return Some(why.into());
     }
-    match name.as_str() {
-        "space" => Some(0x31),
-        "return" | "enter" => Some(0x24),
-        "tab" => Some(0x30),
-        "escape" | "esc" => Some(0x35),
-        "left" => Some(0x7B),
-        "right" => Some(0x7C),
-        "down" => Some(0x7D),
-        "up" => Some(0x7E),
-        _ => {
-            let n = name.strip_prefix('f')?.parse::<i64>().ok()?;
-            if (1..=20).contains(&n) {
-                Some(0x7A + n - 1)
-            } else {
-                None
+    if copy.keycode == SPACE_KEYCODE {
+        return Some("Space is part of the hands-free gesture".into());
+    }
+    let held = copy.modifiers & FOUR_MODIFIERS;
+    if held == COMMAND {
+        return Some("⌘ plus one key belongs to the app in front; add ctrl or option".into());
+    }
+    if !ptt.is_modifier_only() && ptt.keycode == copy.keycode {
+        let ptt_held = ptt.modifiers & FOUR_MODIFIERS;
+        // Shift + the dictation chord is the transform gesture.
+        if held == ptt_held || held == ptt_held | SHIFT {
+            return Some(format!("{} is the dictation hotkey", ptt.display()));
+        }
+    }
+    if let Some((_, _, family)) = modifier_key_masks(ptt.keycode) {
+        if held & family != 0 {
+            return Some(format!(
+                "it uses the same modifier as the dictation key ({}), so pressing it would start a recording",
+                ptt.display()
+            ));
+        }
+    }
+    None
+}
+
+/// Resolve the "Copy last dictation" chord. `configured` is the raw string from
+/// [`crate::settings::Settings::resolve_copy_last_hotkey`]: `None` picks the
+/// first usable built-in default, blank / `off` / `none` turns the hotkey off,
+/// anything else must parse and pass [`copy_last_problem`].
+pub fn copy_last_hotkey(configured: Option<&str>, ptt: &Hotkey) -> Result<Option<Hotkey>, String> {
+    match configured.map(str::trim) {
+        None => Ok(COPY_LAST_DEFAULTS
+            .iter()
+            .filter_map(|s| Hotkey::parse(s))
+            .find(|h| copy_last_problem(ptt, h).is_none())),
+        Some(s) if s.is_empty() || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none") => Ok(None),
+        Some(s) => {
+            let hotkey = Hotkey::parse(s).ok_or_else(|| format!("\"{s}\" is not a hotkey"))?;
+            match copy_last_problem(ptt, &hotkey) {
+                None => Ok(Some(hotkey)),
+                Some(why) => Err(why),
             }
         }
     }
 }
 
-/// Carbon global-hotkey bindings (macOS + `ax-inject` only).
-#[cfg(all(target_os = "macos", feature = "ax-inject"))]
-mod carbon {
-    // `OSStatus RegisterEventHotKey(UInt32 hotKeyCode, UInt32 hotKeyModifiers,
-    // EventHotKeyID hotKeyID, EventTargetRef target, OptionBits options,
-    // EventHotKeyRef *outRef);`
-    //
-    // Exposed with the simplified pointer forms used by [`detect_conflict`]:
-    // the ID and (ignored) out-parameter are passed as opaque pointers so callers
-    // can hand a small fixed value without modelling the full EventHotKeyID
-    // struct. Returns 0 on success, `-9878` (`kEventHotKeyExistsErr`) when an
-    // app already owns the combo.
-    #[link(name = "Carbon", kind = "framework")]
-    extern "C" {
-        pub fn RegisterEventHotKey(
-            hotKeyCode: u32,
-            hotKeyModifiers: u32,
-            hotKeyID: *const std::ffi::c_void,
-            target: *const std::ffi::c_void,
-            options: u32,
-            refcon: *mut std::ffi::c_void,
-        ) -> i32;
-        pub fn UnregisterEventHotKey(hotKeyID: *const std::ffi::c_void) -> i32;
+/// What the Settings field should show and store for a typed copy-last chord:
+/// `(hint line, value to store)`. `None` for the value means "not usable, keep
+/// what was there". Blank is a deliberate "off" and is stored as `""`.
+pub fn copy_last_field(text: &str, ptt: &Hotkey) -> (String, Option<String>) {
+    match copy_last_hotkey(Some(text), ptt) {
+        Ok(None) => ("Off. Copy from the menu bar instead.".to_string(), Some(String::new())),
+        Ok(Some(h)) => (
+            format!("{} copies the last dictation from anywhere.", h.display()),
+            Some(to_parseable(&h)),
+        ),
+        Err(why) => (format!("Not used: {why}."), None),
     }
 }
 
-/// Check whether a hotkey is already claimed system-wide by another app.
-///
-/// Registers the combo transiently via Carbon's `RegisterEventHotKey` and
-/// immediately unregisters it. Returns `None` when it is free (or the check
-/// cannot be made), or `Some(message)` when another app already owns it.
-///
-/// Modifier-only hotkeys cannot be registered this way (they are seen via
-/// `FlagsChanged`, not as a chord), so the check short-circuits to `None` for
-/// them. This function requires a real macOS session and is not unit-tested.
-#[cfg(all(target_os = "macos", feature = "ax-inject"))]
-pub fn detect_conflict(hotkey: &Hotkey) -> Option<String> {
-    if hotkey.is_modifier_only() {
-        return None;
-    }
-
-    // Carbon modifier bit encoding: cmdKey=256, shiftKey=512, optionKey=2048,
-    // controlKey=4096.
-    let mut carbon_modifiers = 0u32;
-    if hotkey.modifiers & COMMAND != 0 {
-        carbon_modifiers |= 256;
-    }
-    if hotkey.modifiers & SHIFT != 0 {
-        carbon_modifiers |= 512;
-    }
-    if hotkey.modifiers & OPTION != 0 {
-        carbon_modifiers |= 2048;
-    }
-    if hotkey.modifiers & CONTROL != 0 {
-        carbon_modifiers |= 4096;
-    }
-
-    // A fixed, arbitrary hotkey id. We only need it to attempt a transient
-    // registration, then release it immediately.
-    let hotkey_id: u32 = 42;
-    let id_ptr = &hotkey_id as *const u32 as *const std::ffi::c_void;
-
-    let status = unsafe {
-        carbon::RegisterEventHotKey(
-            hotkey.keycode as u32,
-            carbon_modifiers,
-            id_ptr,
-            std::ptr::null(), // null == application's default event target
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if status == 0 {
-        // We own it transiently; release it so we don't keep the registration.
-        unsafe {
-            carbon::UnregisterEventHotKey(id_ptr);
+/// The chord the running app should watch, from settings. A bad configured
+/// value turns the hotkey off (with a log line) rather than guessing another.
+pub fn copy_last_from_settings() -> Option<Hotkey> {
+    let configured = crate::settings::Settings::load().resolve_copy_last_hotkey();
+    match copy_last_hotkey(configured.as_deref(), &Hotkey::from_settings()) {
+        Ok(hotkey) => hotkey,
+        Err(why) => {
+            eprintln!("[hotkey] copy-last hotkey ignored ({why}); it is off");
+            None
         }
-        None
-    } else if status == -9878 {
-        // kEventHotKeyExistsErr: another app already owns this combo.
-        Some(format!(
-            "The hotkey {} is already in use by another app.",
-            hotkey.display()
-        ))
-    } else {
-        // Some unrelated failure (e.g. the keycode can't be registered at all).
-        // We can't prove a conflict, so report the combo as free.
-        None
     }
 }
 
-/// Stub on non-macOS or without `ax-inject`, so callers can compile uniformly
-/// and always get a `detect_conflict` symbol.
-#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-pub fn detect_conflict(_hotkey: &Hotkey) -> Option<String> {
-    None
+/// True when a key-down with `flags` is the copy-last chord. The four modifier
+/// bits must be EQUAL: no extra-Shift allowance, and our own synthesized ⌘V
+/// (Command only) can never match a chord that needs a second modifier.
+pub fn copy_last_matches(copy: &Hotkey, keycode: i64, flags: u64) -> bool {
+    keycode == copy.keycode && flags & FOUR_MODIFIERS == copy.modifiers & FOUR_MODIFIERS
+}
+
+/// A parseable shorthand for a hotkey (`"ctrl+cmd+v"`, `"f5"`), the inverse of
+/// [`Hotkey::parse`] for every key in the table.
+pub fn to_parseable(h: &Hotkey) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if h.modifiers & COMMAND != 0 {
+        parts.push("cmd");
+    }
+    if h.modifiers & SHIFT != 0 {
+        parts.push("shift");
+    }
+    if h.modifiers & CONTROL != 0 {
+        parts.push("ctrl");
+    }
+    if h.modifiers & OPTION != 0 {
+        parts.push("option");
+    }
+    let key = key_name_for_keycode(h.keycode)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("key{}", h.keycode));
+    let mut out = parts.join("+");
+    if !out.is_empty() {
+        out.push('+');
+    }
+    out.push_str(&key);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RIGHT_OPTION: Hotkey = Hotkey { keycode: DEFAULT_KEYCODE, modifiers: 0 };
+
+    fn parsed(s: &str) -> Hotkey {
+        Hotkey::parse(s).unwrap()
+    }
+
+    #[test]
+    fn the_default_copy_last_chord_is_ctrl_cmd_v_next_to_right_option() {
+        let h = copy_last_hotkey(None, &RIGHT_OPTION).unwrap().unwrap();
+        assert_eq!(h, Hotkey { keycode: 0x09, modifiers: CONTROL | COMMAND });
+        assert_eq!(h.display(), "⌘⌃V");
+    }
+
+    #[test]
+    fn the_default_steps_aside_for_a_command_or_control_dictation_key() {
+        let right_cmd = Hotkey { keycode: 0x36, modifiers: 0 };
+        assert_eq!(copy_last_hotkey(None, &right_cmd).unwrap(), Some(parsed("ctrl+option+v")));
+        let right_ctrl = Hotkey { keycode: 0x3E, modifiers: 0 };
+        assert_eq!(copy_last_hotkey(None, &right_ctrl).unwrap(), Some(parsed("shift+option+v")));
+        // Every built-in default parses and is a legal chord on its own.
+        for s in COPY_LAST_DEFAULTS {
+            assert!(parsed(s).problem().is_none(), "{s}");
+        }
+    }
+
+    #[test]
+    fn blank_or_off_turns_the_copy_last_hotkey_off() {
+        for s in ["", "  ", "off", "OFF", "none"] {
+            assert_eq!(copy_last_hotkey(Some(s), &RIGHT_OPTION), Ok(None), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn copy_last_is_validated_against_the_dictation_hotkey() {
+        // Same family as a modifier-only dictation key: pressing the chord
+        // would start a recording on the way.
+        assert!(copy_last_hotkey(Some("option+v"), &RIGHT_OPTION).is_err());
+        assert!(copy_last_hotkey(Some("ctrl+option+cmd+v"), &RIGHT_OPTION).is_err());
+        // The dictation chord itself, and its Shift (transform) form.
+        let chord = parsed("cmd+shift+d");
+        assert!(copy_last_hotkey(Some("cmd+shift+d"), &chord).is_err());
+        let chord = parsed("ctrl+option+d");
+        assert!(copy_last_hotkey(Some("ctrl+option+shift+d"), &chord).is_err());
+        assert!(copy_last_hotkey(Some("ctrl+cmd+d"), &chord).is_ok());
+        // Not a chord, a bare typing key, Escape, Space, plain ⌘V, garbage.
+        for bad in ["v", "escape", "ctrl+escape", "ctrl+space", "cmd+v", "cmd+c", "ctrl+cmd+nope", "ctrl+"] {
+            assert!(copy_last_hotkey(Some(bad), &RIGHT_OPTION).is_err(), "{bad}");
+        }
+        assert!(copy_last_problem(&RIGHT_OPTION, &Hotkey { keycode: 0x36, modifiers: 0 }).is_some());
+        // Fine: a function key alone, or a two-modifier chord.
+        assert!(copy_last_hotkey(Some("f6"), &RIGHT_OPTION).unwrap().is_some());
+        assert!(copy_last_hotkey(Some("ctrl+shift+c"), &RIGHT_OPTION).unwrap().is_some());
+    }
+
+    #[test]
+    fn copy_last_matches_exact_modifiers_only() {
+        let h = parsed("ctrl+cmd+v");
+        assert!(copy_last_matches(&h, 0x09, CONTROL | COMMAND));
+        // Device bits, Caps Lock and Fn do not matter.
+        assert!(copy_last_matches(&h, 0x09, CONTROL | COMMAND | CAPS_LOCK | 0x08 | 0x01));
+        // Our own synthesized ⌘V must never trigger it; nor may a superset.
+        assert!(!copy_last_matches(&h, 0x09, COMMAND));
+        assert!(!copy_last_matches(&h, 0x09, CONTROL | COMMAND | SHIFT));
+        assert!(!copy_last_matches(&h, 0x08, CONTROL | COMMAND));
+    }
+
+    #[test]
+    fn the_settings_field_stores_only_usable_chords() {
+        let (hint, value) = copy_last_field(" Ctrl+Cmd+V ", &RIGHT_OPTION);
+        assert_eq!(value.as_deref(), Some("cmd+ctrl+v"));
+        assert!(hint.starts_with("⌘⌃V"));
+        let (hint, value) = copy_last_field("", &RIGHT_OPTION);
+        assert_eq!(value.as_deref(), Some(""), "blank is a stored, deliberate off");
+        assert!(hint.starts_with("Off"));
+        let (hint, value) = copy_last_field("option+v", &RIGHT_OPTION);
+        assert_eq!(value, None, "a bad chord never replaces the saved one");
+        assert!(hint.starts_with("Not used:"), "{hint}");
+    }
+
+    #[test]
+    fn to_parseable_round_trips() {
+        for s in ["ctrl+cmd+v", "cmd+shift+d", "f5", "ctrl+option+space", "shift+option+v"] {
+            let h = parsed(s);
+            assert_eq!(Hotkey::parse(&to_parseable(&h)), Some(h), "{s}");
+        }
+    }
 
     #[test]
     fn modifier_state_distinguishes_each_physical_side() {
@@ -447,9 +628,9 @@ mod tests {
             );
         }
         // A regular key is never modifier-only, even with a modifier mask.
-        assert!(!Hotkey { keycode: 0x03, modifiers: 0 }.is_modifier_only()); // D
+        assert!(!Hotkey { keycode: 0x02, modifiers: 0 }.is_modifier_only()); // D
         assert!(!Hotkey { keycode: 0x00, modifiers: COMMAND }.is_modifier_only()); // A
-        assert!(!Hotkey { keycode: 0x02, modifiers: SHIFT | CONTROL }.is_modifier_only()); // C
+        assert!(!Hotkey { keycode: 0x08, modifiers: SHIFT | CONTROL }.is_modifier_only()); // C
     }
 
     #[test]
@@ -474,10 +655,14 @@ mod tests {
 
     #[test]
     fn display_chord_forms() {
-        // cmd+shift+d → ⌘⇧D
+        // cmd+shift+d → ⌘⇧D (kVK_ANSI_D is 0x02; 0x03 is F)
+        assert_eq!(
+            Hotkey { keycode: 0x02, modifiers: COMMAND | SHIFT }.display(),
+            "⌘⇧D"
+        );
         assert_eq!(
             Hotkey { keycode: 0x03, modifiers: COMMAND | SHIFT }.display(),
-            "⌘⇧D"
+            "⌘⇧F"
         );
         // ctrl+option+space → ⌃⌥Space
         assert_eq!(
@@ -486,10 +671,10 @@ mod tests {
         );
         // Bare key (no modifiers) renders just the glyph.
         assert_eq!(Hotkey { keycode: 0x31, modifiers: 0 }.display(), "Space");
-        assert_eq!(Hotkey { keycode: 0x03, modifiers: 0 }.display(), "D");
+        assert_eq!(Hotkey { keycode: 0x02, modifiers: 0 }.display(), "D");
         // All four modifiers in the Command→Shift→Control→Option order.
         assert_eq!(
-            Hotkey { keycode: 0x01, modifiers: COMMAND | SHIFT | CONTROL | OPTION }.display(),
+            Hotkey { keycode: 0x0B, modifiers: COMMAND | SHIFT | CONTROL | OPTION }.display(),
             "⌘⇧⌃⌥B"
         );
     }
@@ -499,7 +684,8 @@ mod tests {
         assert_eq!(Hotkey { keycode: 0x7B, modifiers: SHIFT }.display(), "⇧←");
         assert_eq!(Hotkey { keycode: 0x7E, modifiers: 0 }.display(), "↑");
         assert_eq!(Hotkey { keycode: 0x7A, modifiers: 0 }.display(), "F1");
-        assert_eq!(Hotkey { keycode: 0x8D, modifiers: 0 }.display(), "F20");
+        assert_eq!(Hotkey { keycode: 0x60, modifiers: 0 }.display(), "F5");
+        assert_eq!(Hotkey { keycode: 0x5A, modifiers: 0 }.display(), "F20");
         assert_eq!(
             Hotkey { keycode: 0x7A, modifiers: OPTION }.display(),
             "⌥F1"
@@ -515,7 +701,7 @@ mod tests {
     fn parse_chords_and_case_insensitivity() {
         assert_eq!(
             Hotkey::parse("cmd+shift+d"),
-            Some(Hotkey { keycode: 0x03, modifiers: COMMAND | SHIFT })
+            Some(Hotkey { keycode: 0x02, modifiers: COMMAND | SHIFT })
         );
         assert_eq!(
             Hotkey::parse("ctrl+option+space"),
@@ -528,29 +714,31 @@ mod tests {
         // Case-insensitive.
         assert_eq!(
             Hotkey::parse("CMd+ShIfT+D"),
-            Some(Hotkey { keycode: 0x03, modifiers: COMMAND | SHIFT })
+            Some(Hotkey { keycode: 0x02, modifiers: COMMAND | SHIFT })
         );
         // Whitespace around '+' is tolerated.
         assert_eq!(
             Hotkey::parse(" cmd + shift + d "),
-            Some(Hotkey { keycode: 0x03, modifiers: COMMAND | SHIFT })
+            Some(Hotkey { keycode: 0x02, modifiers: COMMAND | SHIFT })
         );
-        // alt is an alias for option.
+        // alt is an alias for option. kVK_F5 is 0x60 (0x7E is Up Arrow).
         assert_eq!(
             Hotkey::parse("alt+f5"),
-            Some(Hotkey { keycode: 0x7A + 4, modifiers: OPTION })
+            Some(Hotkey { keycode: 0x60, modifiers: OPTION })
+        );
+        // The recovery chord the audit called out: V is 0x09, not 0x15 ("4").
+        assert_eq!(
+            Hotkey::parse("ctrl+cmd+v"),
+            Some(Hotkey { keycode: 0x09, modifiers: CONTROL | COMMAND })
         );
     }
 
     #[test]
     fn parse_bare_keys() {
-        assert_eq!(
-            Hotkey::parse("f5"),
-            Some(Hotkey { keycode: 0x7A + 4, modifiers: 0 })
-        );
+        assert_eq!(Hotkey::parse("f5"), Some(Hotkey { keycode: 0x60, modifiers: 0 }));
         assert_eq!(Hotkey::parse("escape"), Some(Hotkey { keycode: 0x35, modifiers: 0 }));
         assert_eq!(Hotkey::parse("space"), Some(Hotkey { keycode: 0x31, modifiers: 0 }));
-        assert_eq!(Hotkey::parse("d"), Some(Hotkey { keycode: 0x03, modifiers: 0 }));
+        assert_eq!(Hotkey::parse("d"), Some(Hotkey { keycode: 0x02, modifiers: 0 }));
         assert_eq!(Hotkey::parse("LEFT"), Some(Hotkey { keycode: 0x7B, modifiers: 0 }));
     }
 
@@ -564,32 +752,136 @@ mod tests {
         assert_eq!(Hotkey::parse("d+e"), None); // two key words
         assert_eq!(Hotkey::parse("cmd+bogus"), None);
         assert_eq!(Hotkey::parse("f21"), None); // F-key out of range
+        assert_eq!(Hotkey::parse("f0"), None);
         assert_eq!(Hotkey::parse("left+right"), None); // two key words
     }
 
+    /// The full kVK table from Carbon HIToolbox/Events.h. The old code computed
+    /// these arithmetically ("d" → 0x03 = F, "f5" → 0x7E = Up, "1" → 0x1E = ]).
     #[test]
-    fn keycode_for_name_lookup() {
-        assert_eq!(keycode_for_name("a"), Some(0x00));
-        assert_eq!(keycode_for_name("z"), Some(0x19));
+    fn keycodes_are_the_real_macos_virtual_keycodes() {
+        let expected: &[(&str, i64)] = &[
+            ("a", 0x00), ("b", 0x0B), ("c", 0x08), ("d", 0x02), ("e", 0x0E), ("f", 0x03),
+            ("g", 0x05), ("h", 0x04), ("i", 0x22), ("j", 0x26), ("k", 0x28), ("l", 0x25),
+            ("m", 0x2E), ("n", 0x2D), ("o", 0x1F), ("p", 0x23), ("q", 0x0C), ("r", 0x0F),
+            ("s", 0x01), ("t", 0x11), ("u", 0x20), ("v", 0x09), ("w", 0x0D), ("x", 0x07),
+            ("y", 0x10), ("z", 0x06),
+            ("0", 0x1D), ("1", 0x12), ("2", 0x13), ("3", 0x14), ("4", 0x15), ("5", 0x17),
+            ("6", 0x16), ("7", 0x1A), ("8", 0x1C), ("9", 0x19),
+            ("f1", 0x7A), ("f2", 0x78), ("f3", 0x63), ("f4", 0x76), ("f5", 0x60),
+            ("f6", 0x61), ("f7", 0x62), ("f8", 0x64), ("f9", 0x65), ("f10", 0x6D),
+            ("f11", 0x67), ("f12", 0x6F), ("f13", 0x69), ("f14", 0x6B), ("f15", 0x71),
+            ("f16", 0x6A), ("f17", 0x40), ("f18", 0x4F), ("f19", 0x50), ("f20", 0x5A),
+            ("space", 0x31), ("return", 0x24), ("tab", 0x30), ("escape", 0x35),
+            ("left", 0x7B), ("right", 0x7C), ("down", 0x7D), ("up", 0x7E),
+        ];
+        assert_eq!(expected.len(), KEY_TABLE.len());
+        for (name, code) in expected {
+            assert_eq!(keycode_for_name(name), Some(*code), "{name}");
+            assert_eq!(key_name_for_keycode(*code), Some(*name), "{code:#x}");
+        }
+    }
+
+    #[test]
+    fn key_table_has_no_duplicate_or_modifier_codes() {
+        let mut codes: Vec<i64> = KEY_TABLE.iter().map(|(_, c)| *c).collect();
+        codes.sort_unstable();
+        let before = codes.len();
+        codes.dedup();
+        assert_eq!(before, codes.len(), "two names share a keycode");
+        for code in codes {
+            assert!(!MODIFIER_KEYCODES.contains(&code), "{code:#x}");
+        }
+    }
+
+    #[test]
+    fn every_name_round_trips_through_parse_and_display() {
+        for (name, code) in KEY_TABLE {
+            let hk = Hotkey::parse(&format!("cmd+{name}")).expect(name);
+            assert_eq!(hk.keycode, *code);
+            assert_eq!(key_name_for_keycode(hk.keycode), Some(*name));
+            assert!(!hk.display().contains("0x"), "{name} has a glyph");
+        }
+    }
+
+    #[test]
+    fn keycode_for_name_aliases_and_rejects() {
         assert_eq!(keycode_for_name("A"), Some(0x00)); // case-insensitive
-        assert_eq!(keycode_for_name("0"), Some(0x1D));
-        assert_eq!(keycode_for_name("9"), Some(0x26));
-        assert_eq!(keycode_for_name("space"), Some(0x31));
-        assert_eq!(keycode_for_name("return"), Some(0x24));
         assert_eq!(keycode_for_name("enter"), Some(0x24));
-        assert_eq!(keycode_for_name("tab"), Some(0x30));
-        assert_eq!(keycode_for_name("escape"), Some(0x35));
         assert_eq!(keycode_for_name("esc"), Some(0x35));
-        assert_eq!(keycode_for_name("left"), Some(0x7B));
-        assert_eq!(keycode_for_name("right"), Some(0x7C));
-        assert_eq!(keycode_for_name("down"), Some(0x7D));
-        assert_eq!(keycode_for_name("up"), Some(0x7E));
-        assert_eq!(keycode_for_name("f1"), Some(0x7A));
-        assert_eq!(keycode_for_name("f20"), Some(0x8D));
+        assert_eq!(keycode_for_name("F12"), Some(0x6F));
         assert_eq!(keycode_for_name("f21"), None);
         assert_eq!(keycode_for_name("bogus"), None);
         assert_eq!(keycode_for_name(""), None);
         assert_eq!(keycode_for_name(" "), None);
+        assert_eq!(keycode_for_name("é"), None);
+        assert_eq!(key_name_for_keycode(0x3D), None); // a modifier, not a key
+    }
+
+    #[test]
+    fn function_keys_are_recognised() {
+        assert!(is_function_key(0x7A)); // F1
+        assert!(is_function_key(0x60)); // F5
+        assert!(is_function_key(0x5A)); // F20
+        assert!(!is_function_key(0x03)); // the letter F
+        assert!(!is_function_key(0x7E)); // Up
+        assert!(!is_function_key(0x999));
+    }
+
+    #[test]
+    fn bare_typing_keys_are_refused_but_modifiers_and_fkeys_stand_alone() {
+        // Fine: a bare modifier, a bare F-key, any real chord.
+        assert_eq!(Hotkey { keycode: 0x3D, modifiers: 0 }.problem(), None);
+        assert_eq!(Hotkey::parse("f5").unwrap().problem(), None);
+        assert_eq!(Hotkey::parse("cmd+shift+d").unwrap().problem(), None);
+        assert_eq!(Hotkey::parse("ctrl+option+space").unwrap().problem(), None);
+        assert_eq!(Hotkey::parse("shift+f5").unwrap().problem(), None);
+        // Refused: a plain key would be swallowed in every app.
+        for bare in ["d", "1", "space", "return", "tab", "left"] {
+            assert!(Hotkey::parse(bare).unwrap().problem().is_some(), "{bare}");
+        }
+        // Caps Lock alone is not a modifier for this purpose.
+        assert!(Hotkey { keycode: 0x02, modifiers: CAPS_LOCK }.problem().is_some());
+        // An unknown bare keycode (hand-edited file) is refused too.
+        assert!(Hotkey { keycode: 0x999, modifiers: 0 }.problem().is_some());
+        // Escape never reaches the chord branch of the tap.
+        assert!(Hotkey::parse("escape").unwrap().problem().is_some());
+        assert!(Hotkey::parse("cmd+option+escape").unwrap().problem().is_some());
+    }
+
+    #[test]
+    fn unusable_configured_hotkey_falls_back_to_the_default() {
+        let bad = Hotkey { keycode: 0x02, modifiers: 0 };
+        assert_eq!(
+            bad.or_default_if_unusable(),
+            Hotkey { keycode: DEFAULT_KEYCODE, modifiers: 0 }
+        );
+        let good = Hotkey { keycode: 0x02, modifiers: COMMAND | SHIFT };
+        assert_eq!(good.or_default_if_unusable(), good);
+    }
+
+    #[test]
+    fn chord_modifiers_must_be_equal_not_a_superset() {
+        let req = COMMAND | SHIFT;
+        assert!(chord_modifiers_match(COMMAND | SHIFT, req));
+        // Regression: ⌘⇧⌥D used to fire (and swallow) a ⌘⇧D hotkey.
+        assert!(!chord_modifiers_match(COMMAND | SHIFT | OPTION, req));
+        assert!(!chord_modifiers_match(COMMAND | SHIFT | CONTROL, req));
+        assert!(!chord_modifiers_match(COMMAND, req));
+        assert!(!chord_modifiers_match(0, req));
+        // Caps Lock, Fn (1<<23), non-coalesced (0x100) and device bits are ignored.
+        assert!(chord_modifiers_match(req | CAPS_LOCK | (1 << 23) | 0x100 | 0x0A, req));
+    }
+
+    #[test]
+    fn extra_shift_is_the_transform_gesture_only_when_the_chord_has_no_shift() {
+        let req = CONTROL | OPTION;
+        assert!(chord_modifiers_match(CONTROL | OPTION | SHIFT, req));
+        assert!(!chord_modifiers_match(CONTROL | OPTION | SHIFT | COMMAND, req));
+        // A bare F-key hotkey: nothing held, or Shift for transform.
+        assert!(chord_modifiers_match(0, 0));
+        assert!(chord_modifiers_match(SHIFT, 0));
+        assert!(!chord_modifiers_match(COMMAND, 0));
     }
 
     #[test]

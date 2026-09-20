@@ -162,9 +162,41 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             ),
             (
                 "pill-held",
-                PillLayout::Copied,
+                PillLayout::Error,
                 UiState::NoEditableField,
-                "No text field selected · Copy from menu",
+                crate::last_dictation::kept_pill_text(UiState::NoEditableField).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-held-copied",
+                PillLayout::Error,
+                UiState::HeldCopied,
+                crate::last_dictation::kept_pill_text(UiState::HeldCopied).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-paste-failed-copied",
+                PillLayout::Error,
+                UiState::PasteFailedCopied,
+                crate::last_dictation::kept_pill_text(UiState::PasteFailedCopied).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-limit-copied",
+                PillLayout::Error,
+                UiState::LimitReachedCopied,
+                crate::last_dictation::kept_pill_text(UiState::LimitReachedCopied).unwrap(),
+                false,
+                false,
+            ),
+            (
+                "pill-nothing-to-copy",
+                PillLayout::Copied,
+                UiState::NothingToCopy,
+                super::pill::NOTHING_TO_COPY_TEXT,
                 false,
                 false,
             ),
@@ -185,6 +217,14 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 false,
             ),
             (
+                "pill-paste-failed",
+                PillLayout::Error,
+                UiState::PasteFailed,
+                crate::last_dictation::kept_pill_text(UiState::PasteFailed).unwrap(),
+                false,
+                false,
+            ),
+            (
                 "pill-error",
                 PillLayout::Error,
                 UiState::Error,
@@ -196,7 +236,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             pill.storage_warning.set(name.ends_with("storage-warning"));
             pill.status.setStringValue(&NSString::from_str(status));
             pill.hint
-                .setStringValue(&NSString::from_str(if state == UiState::Error {
+                .setStringValue(&NSString::from_str(if state == UiState::Error || state.is_kept_result() {
                     "History"
                 } else {
                     "Undo"
@@ -218,10 +258,10 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 assert_eq!(pill.cancel.keyEquivalent().to_string(), "\u{1b}");
                 assert!(pill.cancel.keyEquivalentModifierMask().is_empty());
             }
-            if matches!(state, UiState::Copied | UiState::NoEditableField) {
+            if matches!(state, UiState::Copied | UiState::NothingToCopy) {
                 assert!(pill.undo.isHidden());
             }
-            if state == UiState::Error {
+            if state == UiState::Error || state.is_kept_result() {
                 assert!(!pill.history.isHidden());
                 assert!(
                     pill.history.frame().size.width >= 24.0
@@ -616,6 +656,8 @@ fn history_detail_fixtures(
 ) -> Vec<(&'static str, crate::history::RecoveryRecord)> {
     use crate::history::{AudioRecord, RecoveryRecord, RecoveryStatus, StageKind, TextStage};
     let now = 1_800_000_000;
+    // Ordinals are 1-based, exactly as `RecoveryStore::stage` writes them, so
+    // the proof shows the same layer numbers a real record does.
     let stage = |id, ordinal, kind, title: &str, text: &str| TextStage {
         id,
         ordinal,
@@ -648,14 +690,14 @@ fn history_detail_fixtures(
                 stages: vec![
                     stage(
                         1,
-                        0,
+                        1,
                         StageKind::Raw,
                         "Raw",
                         "um please send the revised notes tomorrow",
                     ),
                     stage(
                         2,
-                        1,
+                        2,
                         StageKind::Cleaned,
                         "Cleaned",
                         "Please send the revised notes tomorrow.",
@@ -676,7 +718,7 @@ fn history_detail_fixtures(
                 error: Some("Cleanup failed. Original audio and raw text are kept.".to_string()),
                 stages: vec![stage(
                     3,
-                    0,
+                    1,
                     StageKind::Raw,
                     "Raw",
                     "A partial transcript remains available even if a later stage fails.",
@@ -710,7 +752,7 @@ fn history_detail_fixtures(
                 error: None,
                 stages: vec![stage(
                     4,
-                    0,
+                    1,
                     StageKind::Output,
                     "Saved text",
                     "The saved text remains after its audio expires.",
@@ -723,10 +765,10 @@ fn history_detail_fixtures(
                 entry: Entry { id: 47, text: "A later cleaned attempt.".to_string(), created_at: now },
                 status: RecoveryStatus::Copied, audio: audio(), error: None,
                 stages: vec![
-                    stage(8, 0, StageKind::Raw, "Raw", "The first raw attempt."),
-                    stage(9, 1, StageKind::Cleaned, "Cleaned", "The first cleaned attempt."),
-                    stage(10, 2, StageKind::Raw, "Raw", "A later raw attempt."),
-                    stage(11, 3, StageKind::Cleaned, "Cleaned", "A later cleaned attempt."),
+                    stage(8, 1, StageKind::Raw, "Raw", "The first raw attempt."),
+                    stage(9, 2, StageKind::Cleaned, "Cleaned", "The first cleaned attempt."),
+                    stage(10, 3, StageKind::Raw, "Raw", "A later raw attempt."),
+                    stage(11, 4, StageKind::Cleaned, "Cleaned", "A later cleaned attempt."),
                 ],
             },
         ),
@@ -758,21 +800,21 @@ fn history_detail_fixtures(
                 stages: vec![
                     stage(
                         5,
-                        0,
+                        1,
                         StageKind::Raw,
                         "Raw",
                         "um please send the revised notes tomorrow",
                     ),
                     stage(
                         6,
-                        1,
+                        2,
                         StageKind::Cleaned,
                         "Cleaned",
                         "Please send the revised notes tomorrow.",
                     ),
                     stage(
                         7,
-                        2,
+                        3,
                         StageKind::Transform,
                         "Shorten",
                         "Send the notes tomorrow.",

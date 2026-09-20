@@ -44,12 +44,16 @@ makes macOS re-ask. Only the user can grant the permission.
   before adding anything on the critical path. No OCR, vision LLMs, or
   whole-window scraping.
 - The cleanup model gets the tightest relevant context only.
+- One macOS floor: 14.0, set by the Swift helper (`Package.swift`
+  `.macOS(.v14)`). `scripts/build-app.sh` `MIN_MACOS` (plist +
+  `MACOSX_DEPLOYMENT_TARGET`) and the `install.sh` check follow it; change
+  them together.
 
 ## One way of doing things
 
 - Paths: every per-user location resolves through `src/app_paths.rs`
   (`home_dir`, `config_dir`, `config_file`, `cache_dir`, `app_support_dir`,
-  `models_base_dir`, `DAEMON_LOG_PATH`). Never re-join `$HOME` elsewhere.
+  `models_base_dir`, `daemon_log_path`). Never re-join `$HOME` elsewhere.
 - Precedence is always env var > JSON file > built-in default, resolved in
   `settings.rs` `resolve_*` methods. Read config once at boot; relaunch to
   apply.
@@ -59,8 +63,11 @@ makes macOS re-ask. Only the user can grant the permission.
 - `daemon/` and `menubar/` are module directories (`mod.rs` + one file per
   concern). Child files start with `use super::*;` and expose cross-file items
   as `pub(super)`; only `mod.rs` re-exports the crate-public API.
-- Logging is `eprintln!` with a `[tag]` prefix to the daemon log. No logging
-  crate.
+- Logging is `eprintln!` with a `[tag]` prefix to the daemon log
+  (`~/Library/Logs/Local Dictation/daemon.log`, `0600`, rotated at 5 MB by
+  `src/daemon_log.rs`). No logging crate. User text never goes in a log line
+  raw: wrap it in `daemon_log::text` / `daemon_log::terms`, which print
+  lengths unless `DICTATE_LOG_TEXT=1`.
 - Child processes use `std::process::Command` with argument arrays. No
   shell interpolation.
 - User data on disk (`~/.config/local-dictation/*.json`, `history.db`) keeps
@@ -82,6 +89,13 @@ makes macOS re-ask. Only the user can grant the permission.
 Never commit model bytes, API keys, personal dictionary or corrections
 content, dictation history, logs, or `~/.config/local-dictation` data.
 Example files (`*.example.json`) are the only config in the tree.
+
+Attribution is a licence obligation, not a courtesy: the cleanup model is
+**"S1-mini" by "Superwhisper"** (Apache-2.0 with a naming clause that requires
+that exact capitalization wherever the model is used), and the speech model is
+Cohere Transcribe 03-2026 by Cohere Labs (Apache-2.0). Keep both names, their
+Hugging Face links and `THIRD-PARTY-NOTICES.md` accurate; `download-models.sh`
+saves the model's own LICENSE and NOTICE next to the weights.
 
 Recovery audio and transcript versions are user data: private local files only,
 30-day audio retention by default, independent text retention. Render proofs
