@@ -51,7 +51,10 @@ def main() -> None:
     # interval rather than an alarm-like blast.
     write("start.wav", tone(0.115, [(620, 0.000, 0.048), (830, 0.046, 0.069)]))
     write("stop.wav", tone(0.125, [(760, 0.000, 0.052), (520, 0.044, 0.081)]))
-    write("success.wav", tone(0.145, [(560, 0.000, 0.046), (700, 0.040, 0.105)], 0.11))
+    # The landed cue answers the start cue with the same notes in reverse. It is
+    # equally loud, but slightly longer and descending, so it reads as a clear
+    # completion rather than a second "start" or a sharp notification.
+    write("success.wav", tone(0.140, [(830, 0.000, 0.060), (620, 0.052, 0.088)]))
     write("cancel.wav", tone(0.135, [(300, 0.000, 0.060), (220, 0.052, 0.083)], 0.11))
     write("latch.wav", tone(0.090, [(540, 0.000, 0.075)], 0.105))
     write("error.wav", tone(0.145, [(260, 0.000, 0.068), (195, 0.064, 0.078)], 0.105))
