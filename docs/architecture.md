@@ -471,10 +471,12 @@ ALL-CAPS runs and email boilerplate, and handles `’s`, `Name/Name` and markdow
 (`com.apple.TextEdit` → `com`, `apple`, `textedit`), never substrings. Normal
 cleanup never infers numbered-list structure from words such as "first" or "second"; structural
 formatting requires an explicit `numbered` or `bullets` output-format preset.
-`audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. All six cues
-are original and reproducible: `scripts/audio/generate_cues.py` (python3 stdlib) synthesizes them
-into `resources/sounds/`, and a unit test pins the embedded files to the generator's format and
-durations. No third-party audio is tracked in the repo. `numbers.rs`
+`audio_duck.rs` mutes other audio during capture; `cues.rs` plays start/stop cues. All six state
+cues are original and reproducible: `scripts/audio/generate_cues.py` (python3 stdlib) synthesizes
+them into `resources/sounds/`, and a unit test pins the embedded files to the generator's format
+and durations. The cue that plays when text lands is selectable: `resources/completion_sounds/`
+holds twenty audition candidates (twelve original, eight CC0 by Kenney Vleugels), and a unit test
+pins the catalog to their stable ids, order and format. `numbers.rs`
 converts spoken numbers to numerals deterministically; `spoken_command.rs` handles *prefix*
 commands (e.g. "translate to Chinese …") via the warm transform engine; `voice_commands.rs` parses
 *trailing* commands ("press enter", "new line", "scratch that", "undo that"). The model is loaded
@@ -491,9 +493,11 @@ re-joining the path:
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
-  `double_tap_latch`, `show_result`, `appearance`, `pill_size`, `waveform_sensitivity`,
-  `show_processing_detail`, `audio_history_enabled`, `audio_retention`,
-  `audio_storage_cap_mb`.
+  `double_tap_latch`, `show_result`, `completion_sound`, `appearance`, `pill_size`,
+  `waveform_sensitivity`, `show_processing_detail`, `audio_history_enabled`,
+  `audio_retention`, `audio_storage_cap_mb`.
+  `completion_sound` is a stable id from `cues::COMPLETION_SOUNDS`; absent or unknown falls back to
+  the default tight thud (`resources/sounds/success.wav`), so an upgrade keeps the cue it had.
   `cohere_language` is the only surviving ASR key (decoder language, default `en`). The legacy
   `asr_backend` / `cohere_quant` / `moonshine_variant` keys were removed from the struct and are now
   silently ignored by serde — an old settings file still parses.
@@ -551,6 +555,7 @@ stack:
 | `DICTATE_MAX_RECORDING_MINUTES` | Stop a recording that reaches this many minutes, so a lost key-up cannot record forever (default 10; `0` = no limit) |
 | `DICTATE_WHISPER_MODE` | Lower VAD speech threshold for quiet speech |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
+| `DICTATE_COMPLETION_SOUND` | Completion cue id for the sound that plays when text lands (default the tight thud; e.g. `glass-tick`). Unknown/blank falls back to the default |
 | `DICTATE_TRANSLATION_TARGETS` / `DICTATE_ACTIVE_TRANSLATION_TARGET` | Translate-mode target list (comma-separated) and the active one |
 | `DICTATE_HISTORY_RETENTION` | History pruning window (see `history.rs`) |
 | `DICTATE_REDUCED_MOTION` | Force the pill's reduced-motion animation |

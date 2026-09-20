@@ -179,6 +179,8 @@ pub fn hotkey_name(keycode: i64) -> String {
 
 /// Env var that pins the cleanup model path (wins over `settings.json`).
 pub const LLM_MODEL_PATH_ENV: &str = "DICTATE_LLM_MODEL_PATH";
+/// Env var that pins the completion sound id (wins over `settings.json`).
+pub const COMPLETION_SOUND_ENV: &str = "DICTATE_COMPLETION_SOUND";
 /// Still-accepted spellings of `LLM_MODEL_PATH_ENV`, checked in order after
 /// it. `S1_MODEL_PATH` is a documented alias (the model is S1-mini);
 /// `GEMMA_MODEL_PATH` is the pre-rename name and logs a one-time deprecation
@@ -343,6 +345,14 @@ pub struct Settings {
     /// `DICTATE_SHOW_RESULT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_result: Option<bool>,
+
+    /// The completion sound that plays after a successful injection: a stable
+    /// id from [`crate::cues::COMPLETION_SOUNDS`] (e.g. `"glass-tick"`).
+    /// `None`/unknown ⇒ the default tight thud, so an upgrade with no saved
+    /// selection keeps the sound it already had. Override:
+    /// `DICTATE_COMPLETION_SOUND`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_sound: Option<String>,
 
     /// Put the text on the clipboard when a finished dictation could not be
     /// inserted (no text field, a failed paste, the recording limit), so ⌘V
@@ -861,6 +871,17 @@ impl Settings {
         self.show_result.unwrap_or(false)
     }
 
+    /// Resolve the completion sound: `DICTATE_COMPLETION_SOUND` env > settings
+    /// > the default tight thud. Blank or unknown ids fall back to the default,
+    /// so a hand-edited file can never leave the app with a missing cue.
+    pub fn resolve_completion_sound(&self) -> String {
+        let raw = std::env::var(COMPLETION_SOUND_ENV)
+            .ok()
+            .or_else(|| self.completion_sound.clone())
+            .unwrap_or_default();
+        crate::cues::normalize_completion_sound(&raw).to_string()
+    }
+
     /// Resolve copy-on-failure: `DICTATE_COPY_ON_PASTE_FAILURE` env >
     /// settings > on.
     pub fn resolve_copy_on_paste_failure(&self) -> bool {
@@ -1217,10 +1238,63 @@ mod tests {
         assert_eq!(s.copy_last_hotkey, None);
         assert_eq!(s.copy_on_paste_failure, None);
         assert_eq!(s.max_recording_minutes, None);
+        assert_eq!(s.completion_sound, None);
+        // An old file with no completion_sound key still resolves the default.
+        assert_eq!(
+            s.resolve_completion_sound(),
+            crate::cues::DEFAULT_COMPLETION_SOUND
+        );
         // A bad value in a new key costs only that key.
         let s = Settings::parse_lenient(r#"{"max_recording_minutes": "ten", "show_result": true}"#, "test");
         assert_eq!(s.max_recording_minutes, None);
         assert_eq!(s.show_result, Some(true));
+    }
+
+    #[test]
+    fn completion_sound_defaults_and_unknown_falls_back() {
+        if std::env::var_os(COMPLETION_SOUND_ENV).is_none() {
+            // Unset ⇒ the currently installed tight thud, not an audition cue.
+            assert_eq!(
+                Settings::default().resolve_completion_sound(),
+                crate::cues::DEFAULT_COMPLETION_SOUND
+            );
+            // A saved audition cue is honored.
+            let mut s = Settings::default();
+            s.completion_sound = Some("glass-tick".into());
+            assert_eq!(s.resolve_completion_sound(), "glass-tick");
+            // Unknown, blank and whitespace all fall back rather than go silent.
+            s.completion_sound = Some("not-a-real-cue".into());
+            assert_eq!(
+                s.resolve_completion_sound(),
+                crate::cues::DEFAULT_COMPLETION_SOUND
+            );
+            s.completion_sound = Some("   ".into());
+            assert_eq!(
+                s.resolve_completion_sound(),
+                crate::cues::DEFAULT_COMPLETION_SOUND
+            );
+            // A padded but valid id is trimmed to the canonical spelling.
+            s.completion_sound = Some("  glass-tick  ".into());
+            assert_eq!(s.resolve_completion_sound(), "glass-tick");
+        }
+    }
+
+    #[test]
+    fn completion_sound_round_trips_through_the_settings_file() {
+        let dir = std::env::temp_dir().join(format!("fd-settings-sound-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.completion_sound = Some("glass-tick".into());
+        s.save_to(&path).unwrap();
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.completion_sound.as_deref(), Some("glass-tick"));
+        if std::env::var_os(COMPLETION_SOUND_ENV).is_none() {
+            assert_eq!(loaded.resolve_completion_sound(), "glass-tick");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1457,6 +1531,7 @@ mod tests {
         s.active_format = Some("bullets".into());
         s.preroll_ms = Some(400);
         s.cohere_language = Some("de".into());
+        s.completion_sound = Some("glass-tick".into());
         s.save_to(&path).unwrap();
 
         let loaded = Settings::load_from(&path);
@@ -1465,6 +1540,7 @@ mod tests {
         assert_eq!(loaded.active_format, Some("bullets".into()));
         assert_eq!(loaded.preroll_ms, Some(400));
         assert_eq!(loaded.cohere_language, Some("de".into()));
+        assert_eq!(loaded.completion_sound.as_deref(), Some("glass-tick"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -111,6 +111,8 @@ const HISTORY_TIME_W: f64 = 40.0;
 const HISTORY_PANE: usize = 2;
 const WAVEFORM_SENSITIVITY_NOTE: &str =
     "Visual response only. Microphone gain and recognition stay the same.";
+/// Under the completion-sound popup: the picker auditions on selection.
+const COMPLETION_SOUND_NOTE: &str = "Plays when the text lands. Pick one to hear it.";
 
 /// The rail's sections, in order: label, SF Symbol, subtitle.
 const PANES: &[(&str, &str, &str)] = &[
@@ -189,6 +191,7 @@ pub struct SettingsUi {
     processing_detail_switch: Retained<slate::InkToggle>,
     pill_size_popup: Retained<NSPopUpButton>,
     waveform_sensitivity_popup: Retained<NSPopUpButton>,
+    completion_sound_popup: Retained<NSPopUpButton>,
     feedback_card_y: f64,
     tail_capture_switch: Retained<slate::InkToggle>,
     listen_switch: Retained<slate::InkToggle>,
@@ -655,6 +658,19 @@ define_class!(
         fn change_show_result(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
             with_pending(|p| p.show_result = Some(on));
+        }
+
+        #[unsafe(method(changeCompletionSound:))]
+        fn change_completion_sound(&self, sender: *mut AnyObject) {
+            let id = popup_selected_rep(sender);
+            // Audition the cue at once. This is a preview only: nothing is
+            // written until Apply & Restart, and no other setting is touched.
+            if !id.is_empty() {
+                crate::cues::preview_completion_sound(&id);
+            }
+            with_pending(|p| {
+                p.completion_sound = if id.is_empty() { None } else { Some(id) };
+            });
         }
 
         #[unsafe(method(changeWhisper:))]
@@ -1363,6 +1379,26 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         env_hint(mtm, &mut card, "DICTATE_SHOW_RESULT");
     }
 
+    // The cue that plays once the text lands. Selecting an item auditions it
+    // right away; Apply & Restart persists the choice.
+    let completion_sound_locked = std::env::var_os(settings::COMPLETION_SOUND_ENV).is_some();
+    let completion_sound_popup = popup_row(mtm, &mut card, "Completion sound");
+    for sound in crate::cues::COMPLETION_SOUNDS {
+        popup_add_item(&completion_sound_popup, sound.label, None, Some(sound.id));
+    }
+    select_popup_rep(&completion_sound_popup, &loaded.resolve_completion_sound());
+    finish_popup(&completion_sound_popup);
+    wire_popup(
+        &completion_sound_popup,
+        &controller,
+        sel!(changeCompletionSound:),
+        completion_sound_locked,
+    );
+    if completion_sound_locked {
+        env_hint(mtm, &mut card, settings::COMPLETION_SOUND_ENV);
+    }
+    hint_line(mtm, &mut card, COMPLETION_SOUND_NOTE);
+
     y = card_end(&card);
     let mut card = card_begin(mtm, &dictation, y, "Capture");
     let preroll_switch = toggle_row(
@@ -1995,6 +2031,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         processing_detail_switch,
         pill_size_popup,
         waveform_sensitivity_popup,
+        completion_sound_popup,
         feedback_card_y,
         tail_capture_switch,
         listen_switch,

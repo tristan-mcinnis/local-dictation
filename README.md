@@ -224,6 +224,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | `DICTATE_FORMAT` | Active output-format preset |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
+| `DICTATE_COMPLETION_SOUND` | Completion cue id for the sound that plays when text lands (default tight thud) |
 | `DICTATE_NO_MUTE` | Do not mute other audio during capture |
 | `DICTATE_LOG_TEXT` | Debug only: write dictated text into the log. Off by default; the log holds timings and lengths |
 
