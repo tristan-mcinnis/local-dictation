@@ -24,7 +24,7 @@ subscription, or runtime telemetry.
 
 1. **Fast Cohere MLX.** The old ONNX/Core ML path fell back to CPU. The native
    persistent MLX helper runs the 8.35-second fixture in about 198–220 ms hot.
-2. **Fully private and offline.** Audio and text never leave your Mac. No account, no telemetry, no network at runtime.
+2. **Fully private and offline.** Audio and text never leave your Mac. No account, no telemetry, no network while you dictate. The one time the app uses the network is a model download you start yourself, from Setup & permissions.
 3. **Lands at your cursor, in any app.** Dictate into any text field or chat box and press Enter to send. Works in native Cocoa apps directly, and falls back to clipboard paste for Electron apps (VS Code, Slack, browsers, Notion).
 4. **Guarded S1-mini cleanup.** Clean speech skips generation. Messy speech is
    offered to S1-mini; deterministic cleanup and content/runaway guards win if
@@ -44,14 +44,21 @@ Requires macOS 14 or later on Apple Silicon. Model bytes are never committed.
 `./scripts/download-models.sh` prepares the stack: it downloads the cleanup
 model, "S1-mini" by "Superwhisper", from Hugging Face and verifies its SHA-256
 (a local Superwhisper install is used instead when present, since the bytes are
-identical). The Cohere Q4 speech model still comes from a local 4-bit MLX
-checkpoint, so that part is not yet a clean-room install for a stranger. The app
-itself never downloads anything at runtime.
+identical). The app can fetch that same cleanup model for itself from Setup &
+permissions, against the same published digest.
+
+The Cohere Q4 speech model still comes from a local 4-bit MLX checkpoint: no
+public conversion exists to download, so that part is not yet a clean-room
+install for a stranger. Setup & permissions says so and offers a folder picker
+for a checkpoint you already have. The app never invents a download.
 
 Local builds use an available Apple Development signing identity. Keep the same identity across updates to preserve macOS permission grants.
 
-Launch it, then grant Microphone and Accessibility in System Settings → Privacy
-& Security. The waveform icon in the menu bar means it is ready.
+Launch it. The menu bar icon appears straight away, and a **Setup &
+permissions** window opens listing what is still needed: Microphone,
+Accessibility and Models. Turn Accessibility on in System Settings and the
+hotkey starts working immediately, with no relaunch. A waveform icon with no
+warning means it is ready.
 
 **Build from source.**
 
@@ -101,9 +108,9 @@ https://github.com/tristan-mcinnis/local-dictation:
 2. Run ./install.sh. It checks prerequisites, prepares the local model links, builds
    "Local Dictation.app", installs it to /Applications, and sets it to launch
    at login. Answer "yes" to prompts about installing Rust or cmake.
-Then stop and tell me the one thing you cannot do for me: on first launch macOS
-asks for Microphone and Accessibility permission, and I have to grant both in
-System Settings, Privacy and Security myself.
+Then stop and tell me the one thing you cannot do for me: the app's own Setup
+window will list Microphone and Accessibility, and I have to grant both in
+System Settings, Privacy and Security myself. The app stays running either way.
 Hotkey: hold Right Option to dictate and release to transcribe.
 ```
 
@@ -226,7 +233,7 @@ User config lives in `~/.config/local-dictation/`. The app writes `settings.json
 | --- | --- |
 | `daemon` | The push-to-talk daemon, the real way to use this |
 | `toggle`, `start`, `stop`, `cancel` | Drive a running daemon over its control socket (Shortcuts, Raycast, a foot pedal) |
-| `fetch-models [dir]` | Verify the fixed local model stack |
+| `fetch-models [dir]` | Report the model stack and fetch what the manifest can |
 | `bench [wav]` | Transcribe and clean a WAV, report timings |
 | `logs` | Open the daemon log (`~/Library/Logs/Local Dictation/daemon.log`, readable only by you; it records timings and text lengths, never what you said) |
 | `ax-check` | Surface the Accessibility permission prompt |

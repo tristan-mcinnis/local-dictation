@@ -47,6 +47,19 @@ use crate::menubar::house_theme::{
     WEIGHT_REGULAR, WEIGHT_SEMIBOLD,
 };
 
+/// The app's own name, version and the commit it was built from. The commit
+/// comes from the bundle's `Info.plist`, so a bug report can name the exact
+/// build; a `cargo run` has no bundle and simply omits it.
+pub(crate) fn version_line() -> String {
+    match crate::app_paths::build_commit() {
+        Some(commit) => format!(
+            "Local Dictation {} ({commit})",
+            env!("CARGO_PKG_VERSION")
+        ),
+        None => format!("Local Dictation {}", env!("CARGO_PKG_VERSION")),
+    }
+}
+
 // ─── Shell geometry, all derived from tokens ─────────────────────────────
 const WIN_W: f64 = LAYOUT_SETTINGS_WIDTH;
 const WIN_H: f64 = LAYOUT_SETTINGS_HEIGHT;
@@ -1875,10 +1888,29 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     let y = card_end(&card);
 
     let mut card = card_begin(mtm, &about, y, "About");
+    hint_line(mtm, &mut card, &version_line());
+    // The two grants, stated here as well as in the Setup window: About is
+    // where a user looks when something is not working, and "which permission
+    // is missing" is the first thing they need.
     hint_line(
         mtm,
         &mut card,
-        &format!("Local Dictation {}", env!("CARGO_PKG_VERSION")),
+        &format!(
+            "Microphone: {}",
+            crate::permissions::microphone_status().label()
+        ),
+    );
+    hint_line(
+        mtm,
+        &mut card,
+        &format!(
+            "Accessibility: {}",
+            if crate::permissions::accessibility_trusted() {
+                "Allowed"
+            } else {
+                "Off — open Setup & permissions"
+            }
+        ),
     );
     if let Some(dir) = crate::app_paths::config_dir() {
         hint_line(mtm, &mut card, &format!("Config: {}", dir.display()));
@@ -2975,7 +3007,10 @@ fn fill_history_body(
 
     let note = if matched.is_empty() {
         if needle.is_empty() {
-            "No dictations yet. Hold your hotkey and speak.".to_string()
+            crate::history::empty_state_text(
+                crate::history::unreadable_reason().as_deref(),
+                false,
+            )
         } else {
             format!("No dictation matches “{needle}”.")
         }

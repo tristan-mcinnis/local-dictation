@@ -533,16 +533,18 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
     doc.setSubviews(&empty);
 
     if entries.is_empty() {
-        // Distinguish "history is empty" from "search matched nothing".
+        // Three situations, not two: history is empty, the search matched
+        // nothing, or the store could not be opened at all. The third used to
+        // read as the first, which told a user with a corrupt or unreachable
+        // database that they had never dictated anything.
         let has_history = HISTORY_ALL.lock().map(|g| !g.is_empty()).unwrap_or(false);
-        let msg = if has_history {
-            "No dictations match your search."
-        } else {
-            "No dictations yet — hold your hotkey and speak."
-        };
+        let msg = crate::history::empty_state_text(
+            crate::history::unreadable_reason().as_deref(),
+            has_history,
+        );
         let label = slate::label(
             mtm,
-            msg,
+            &msg,
             TYPE_BODY_SMALL,
             WEIGHT_REGULAR,
             theme::text_tertiary(),

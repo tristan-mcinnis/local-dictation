@@ -27,6 +27,7 @@ mod history;
 mod history_detail;
 mod pill;
 mod render_ui;
+pub(crate) mod setup;
 pub(crate) mod slate;
 use dictionary::*;
 use history::*;
@@ -204,6 +205,10 @@ struct UiGlobals {
     show_processing_detail: bool,
     reduced_motion: bool,
     last_state: AtomicU8,
+    /// What the status item last showed about health (see
+    /// `pill::health_signature`). Most faults arrive and clear without moving
+    /// `UiState`, so without this the glyph and tooltip went stale.
+    last_health: AtomicU8,
     /// Frame counter for the poll timer's once-a-second checks.
     slow_tick: std::sync::atomic::AtomicU32,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
@@ -516,6 +521,19 @@ define_class!(
         fn import_csv(&self, _sender: *mut AnyObject) {
             import_dictionary_csv();
         }
+
+        // "Setup & permissions…" — the checklist window.
+        #[unsafe(method(openSetup:))]
+        fn open_setup(&self, _sender: *mut AnyObject) {
+            setup::show_setup_window();
+        }
+
+        // A Setup row's action chip. Its `tag` names the requirement.
+        #[unsafe(method(setupRowAction:))]
+        fn setup_row_action(&self, sender: *mut AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            setup::row_action(tag);
+        }
     }
 );
 
@@ -614,6 +632,15 @@ define_class!(
                     MODEL_RELEASE_TIMEOUT.as_millis()
                 );
             }
+            // Only now. "Apply and restart" has already spawned the
+            // replacement and it is sitting on the single-instance lock: the
+            // moment it gets the lock it loads the whole model stack, so
+            // handing it over before this line would put two full stacks of
+            // Metal buffers in memory at once — the thing overlapping the two
+            // processes was supposed to avoid. Releasing here instead of
+            // waiting for `exit()` still saves the replacement the rest of
+            // HANDOFF_WAIT.
+            crate::single_instance::release_held();
         }
     }
 );
@@ -700,6 +727,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         show_processing_detail: settings.resolve_show_processing_detail(),
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
+        last_health: AtomicU8::new(255),
         slow_tick: std::sync::atomic::AtomicU32::new(0),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
         icon_idle: built.icon_idle,
@@ -711,6 +739,13 @@ pub fn init_and_run() -> eyre::Result<()> {
         _app_delegate: app_delegate,
     };
     let _ = GLOBALS.set(globals);
+
+    // A launch that cannot dictate opens the checklist by itself. A launch
+    // that can never sees it — the item stays in the menu either way.
+    if setup::should_open_on_launch(&setup::current_states()) {
+        eprintln!("[boot] setup      needed — opening Setup & permissions");
+        setup::show_setup_window();
+    }
 
     install_poll_timer();
     app.run();
@@ -883,6 +918,14 @@ fn build_status_item(
     last_item.setEnabled(false);
     menu.addItem(&last_item);
 
+    // The fault row: hidden while everything works, first in the menu when
+    // something is wrong, and a route straight to the window that fixes it.
+    // `refresh_recovery_items` decides each time the menu opens.
+    let health_item = action_item(mtm, "", sel!(openSetup:), "", actions);
+    health_item.setTag(TAG_HEALTH);
+    health_item.setHidden(true);
+    menu.insertItem_atIndex(&health_item, 0);
+
     // Hidden unless Secure Input is on; `refresh_recovery_items` decides each
     // time the menu opens.
     let secure_item = unsafe {
@@ -927,6 +970,16 @@ fn build_status_item(
     // warmed Cohere MLX transcriber followed by S1-mini).
     let settings_item = action_item(mtm, "Settings…", sel!(openSettings:), ",", actions);
     menu.addItem(&settings_item);
+
+    // Always reachable, not only when something is broken: it is also where
+    // the permission status and the model state are stated.
+    menu.addItem(&action_item(
+        mtm,
+        "Setup & permissions…",
+        sel!(openSetup:),
+        "",
+        actions,
+    ));
 
     let more_parent = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -1342,6 +1395,7 @@ fn build_hotkey_submenu(
     submenu
 }
 
+const TAG_HEALTH: isize = 9100;
 const TAG_COPY_LAST: isize = 9101;
 const TAG_PASTE_LAST: isize = 9102;
 const TAG_SECURE_INPUT: isize = 9103;
@@ -1358,6 +1412,17 @@ fn copy_last_title(hotkey: Option<&crate::hotkeys::Hotkey>) -> String {
 /// Copy / Paste enabled only when there is a dictation, and the Secure Input
 /// line shown only while it applies.
 fn refresh_recovery_items(menu: &NSMenu) {
+    // Fault first: what is wrong, then the one thing to do about it.
+    if let Some(item) = menu.itemWithTag(TAG_HEALTH) {
+        match crate::health::current() {
+            Some(problem) => {
+                item.setTitle(&NSString::from_str(&problem.pill_line()));
+                item.setEnabled(true);
+                item.setHidden(false);
+            }
+            None => item.setHidden(true),
+        }
+    }
     let have_text = !ui_channel::last_dictation().trim().is_empty();
     for tag in [TAG_COPY_LAST, TAG_PASTE_LAST] {
         if let Some(item) = menu.itemWithTag(tag) {

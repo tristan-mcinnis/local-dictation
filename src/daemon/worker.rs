@@ -1,6 +1,16 @@
 //! Worker thread: capture, streaming ASR, cleanup, transform, spoken commands, injection.
 use super::*;
 
+/// How long a failure pill stays up.
+const FAILURE_PILL: Duration = Duration::from_millis(3500);
+
+/// Say that the transcription failed, and where the words are. Before this the
+/// only signal was a cue played while `audio_duck` still held the system
+/// muted, so a failed dictation looked exactly like one that did nothing.
+fn show_transcribe_failure(generation: u64) {
+    ui_channel::show_transient_for(generation, UiState::Error, FAILURE_PILL);
+}
+
 pub(super) fn worker_loop(
     rx: std::sync::mpsc::Receiver<DaemonEvent>,
     config: DaemonConfig,
@@ -8,13 +18,32 @@ pub(super) fn worker_loop(
     crate::history::initialize_recovery();
     cues::preload();
     let t_load = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
+    // The ASR model IS the app: a failure here is fatal to the worker, but it
+    // now leaves behind a named fault instead of an idle icon over a dead
+    // hotkey. `?` still returns — `run` catches it and publishes EngineFailed.
+    let mut worker = LocalInferenceWorker::initialize(&config.asr).map_err(|e| {
+        crate::health::raise(
+            if crate::model_fetch::ASR
+                .present_at(&std::path::PathBuf::from(&config.asr.model_dir))
+            {
+                crate::health::Fault::EngineFailed
+            } else {
+                crate::health::Fault::ModelsMissing
+            },
+            format!("speech model: {e}"),
+        );
+        e
+    })?;
     eprintln!(
         "[boot] asr         loaded in {:>4} ms · {}",
         ms(t_load.elapsed()),
         config.asr.describe()
     );
 
+    // The cleanup model is OPTIONAL (CP-01/CP-11). A moved, corrupt or
+    // template-less GGUF used to take the whole worker down with `?`, which
+    // left the menu bar alive and every key press going nowhere. Now it is a
+    // visible warning and dictation carries on with the raw transcript.
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
         let pretty = std::path::Path::new(&config.llm_model_path)
@@ -22,12 +51,24 @@ pub(super) fn worker_loop(
             .and_then(|s| s.to_str())
             .unwrap_or(&config.llm_model_path);
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&config.llm_model_path)?;
-        eprintln!(
-            "[boot] cleaner     loaded in {:>4} ms · {pretty}",
-            ms(t.elapsed())
-        );
-        Some(c)
+        match TextCleanupEngine::initialize(&config.llm_model_path) {
+            Ok(c) => {
+                eprintln!(
+                    "[boot] cleaner     loaded in {:>4} ms · {pretty}",
+                    ms(t.elapsed())
+                );
+                crate::health::clear(crate::health::Fault::CleanupUnavailable);
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("[warn] cleaner     failed to load ({pretty}): {e}");
+                crate::health::raise(
+                    crate::health::Fault::CleanupUnavailable,
+                    format!("cleanup model: {e}"),
+                );
+                None
+            }
+        }
     } else {
         eprintln!("[boot] cleaner     disabled (--no-cleanup)");
         None
@@ -51,6 +92,10 @@ pub(super) fn worker_loop(
         "[boot] warm-up     done   in {:>4} ms",
         ms(t_warm.elapsed())
     );
+    // The engine is live. Anything still raised (a permission, a missing
+    // cleanup model) stays raised and stays visible; only "Starting up…"
+    // ends here.
+    crate::health::clear(crate::health::Fault::Booting);
 
     // Load personal corrections dictionary (no-op if no file) and wrap it in
     // the refiner that applies corrections + voice-command parsing in the
@@ -529,12 +574,14 @@ pub(super) fn worker_loop(
                 // changed since the stream was built.
                 if engine.is_some() {
                     if warm_parked {
-                        let changed = engine
-                            .as_mut()
-                            .map(|e| e.device_changed())
-                            .unwrap_or(false);
-                        if changed {
-                            eprintln!("[audio] default input changed → rebuilt warm stream");
+                        // Not only a device change: a stream that cpal has
+                        // reported an error on is dead while the object is
+                        // alive, and `Instant` does not advance while the Mac
+                        // sleeps, so a lid closed overnight can leave a
+                        // "fresh" parked stream bound to a device that is gone.
+                        let changed = engine.as_mut().and_then(|e| e.should_rebuild());
+                        if let Some(why) = changed {
+                            eprintln!("[audio] {why} → rebuilt warm stream");
                             drop(engine.take());
                             consumer.take();
                             is_recording.take();
@@ -592,18 +639,19 @@ pub(super) fn worker_loop(
                     // we capture from the *current* device instead of silently
                     // recording the old one. Cheap host query; only the rare
                     // device-change case pays the rebuild.
-                    if always
-                        .as_ref()
-                        .map(|(ao, _)| ao.device_changed())
-                        .unwrap_or(false)
-                    {
+                    // Same three tests as the warm stream, through the same
+                    // function: the always-on stream is open for hours, so it
+                    // is the one most likely to have been slept through, and
+                    // an inline copy of two of the three checks left it out.
+                    let always_stale = always.as_ref().and_then(|(ao, _)| ao.should_rebuild());
+                    if let Some(why) = always_stale {
                         let preroll = crate::audio::preroll_samples(preroll_ms);
                         let (mut ao2, cons2) =
                             crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
                         match ao2.start() {
                             Ok(()) => {
                                 eprintln!(
-                                    "[audio] default input changed → rebuilt always-on stream on `{}`",
+                                    "[audio] {why} → rebuilt always-on stream on `{}`",
                                     ao2.device_name()
                                 );
                                 always = Some((ao2, cons2));
@@ -647,6 +695,12 @@ pub(super) fn worker_loop(
                     whisper_mode,
                 ) {
                     cues::play_error();
+                    // The cue alone is not enough: it plays while the app's own
+                    // system mute is still held, and it says nothing.
+                    ui_channel::show_transient_if_unowned(
+                        UiState::Unavailable,
+                        FAILURE_PILL,
+                    );
                 } else {
                     noise_floor.clear();
                     last_audio.clear(); // new recording invalidates the previous buffer
@@ -961,7 +1015,7 @@ pub(super) fn worker_loop(
                                     recovery.error = Some(format!("Transcription failed: {err}"));
                                     eprintln!("[err]  transcribe failed: {err:?}");
                                     cues::play_error();
-                                    ui_channel::set_state(UiState::Idle);
+                                    show_transcribe_failure(cur_gen);
                                     eprintln!();
                                     continue 'evloop;
                                 }
@@ -1049,7 +1103,7 @@ pub(super) fn worker_loop(
                                 recovery.error = Some(format!("Transcription failed: {err}"));
                                 eprintln!("[err]  transcribe failed: {err:?}");
                                 cues::play_error();
-                                ui_channel::set_state(UiState::Idle);
+                                show_transcribe_failure(cur_gen);
                                 eprintln!();
                                 continue 'evloop;
                             }
@@ -1071,7 +1125,7 @@ pub(super) fn worker_loop(
                             recovery.error = Some(format!("Transcription failed: {err}"));
                             eprintln!("[err]  transcribe failed: {err:?}");
                             cues::play_error();
-                            ui_channel::set_state(UiState::Idle);
+                            show_transcribe_failure(cur_gen);
                             eprintln!();
                             continue 'evloop;
                         }
@@ -1831,6 +1885,13 @@ pub(super) fn begin_open_capture(
         Ok(r) => r,
         Err(err) => {
             eprintln!("[err]  mic open failed: {err:?}");
+            // A denied or missing microphone is the reason, and it is the one
+            // the user can act on. Raising it here means the menu bar, the
+            // pill and the Setup window all say the same thing.
+            crate::permissions::refresh_microphone_health();
+            if !crate::health::is_raised(crate::health::Fault::MicrophoneBlocked) {
+                crate::health::raise(crate::health::Fault::AudioLost, format!("{err}"));
+            }
             return false;
         }
     };

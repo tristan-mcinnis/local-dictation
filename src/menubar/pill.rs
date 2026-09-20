@@ -493,6 +493,27 @@ pub(super) fn install_poll_timer() {
         // notice Secure Input, which silences the hotkeys.
         let tick = globals.slow_tick.fetch_add(1, Ordering::Relaxed);
         if tick % SLOW_TICK_FRAMES == 0 {
+            // The grant can land at any moment in System Settings. Installing
+            // the event tap here is what makes "turn it on and it works"
+            // true, with no relaunch.
+            let was_waiting = crate::permissions::accessibility_task_pending();
+            crate::permissions::poll_pending_accessibility();
+            if was_waiting && !crate::permissions::accessibility_task_pending() {
+                apply_state_transition(globals, state);
+            }
+            crate::permissions::refresh_microphone_health();
+            super::setup::refresh();
+            // The status item is only repainted on a UiState transition, and
+            // most health changes do not move UiState: "Starting up…" clears
+            // when the worker is ready, a microphone grant lands in System
+            // Settings, the helper dies between utterances. Without this the
+            // icon and its tooltip kept whatever the last transition painted
+            // — an app that had finished booting still wore the danger glyph
+            // and said "Starting up…" until the first dictation.
+            let health = health_signature(crate::health::current().as_ref());
+            if globals.last_health.swap(health, Ordering::SeqCst) != health {
+                apply_state_transition(globals, state);
+            }
             crate::key_layout::refresh();
             if let Some(on) = crate::secure_input::refresh() {
                 eprintln!(
@@ -529,16 +550,34 @@ pub(super) fn install_poll_timer() {
     }
 }
 
+/// One byte standing for what the status item currently says about health:
+/// `0` for "nothing wrong", otherwise the fault's discriminant plus one.
+///
+/// Only a fault that blocks dictation reaches the status item, so only those
+/// move the signature — a lost microphone stream or a missing cleanup model
+/// must not make the menu bar repaint once a second.
+pub(super) fn health_signature(problem: Option<&crate::health::Problem>) -> u8 {
+    match problem {
+        Some(p) if p.fault.blocks_dictation() => p.fault as u8 + 1,
+        _ => 0,
+    }
+}
+
 pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
     let mtm = match MainThreadMarker::new() {
         Some(m) => m,
         None => return,
     };
 
+    // A fault outranks the utterance state: an idle-looking icon over a dead
+    // hotkey is the one thing the menu bar must never show. The rule allows
+    // `danger` on the status item for exactly this and for recording.
+    let fault = crate::health::current().filter(|p| p.fault.blocks_dictation());
+
     // One glyph family — the waveform, matching the app icon. Idle is the
     // template ink; recording is the same shape tinted `danger`; processing is
     // the template at 40 %, which is the rule's "busy" treatment.
-    let icon = if state == UiState::Recording {
+    let icon = if state == UiState::Recording || fault.is_some() {
         &globals.icon_recording
     } else if state.is_processing() || (state == UiState::Error || state.is_kept_result()) {
         &globals.icon_processing
@@ -549,7 +588,9 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         if let Some(img) = icon {
             button.setImage(Some(img));
         } else {
-            button.setTitle(&NSString::from_str(if state == UiState::Recording {
+            button.setTitle(&NSString::from_str(if fault.is_some() {
+                "!"
+            } else if state == UiState::Recording {
                 "●"
             } else if state.is_processing() {
                 "◌"
@@ -569,10 +610,13 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         });
         button.setToolTip(Some(&NSString::from_str(&format!(
             "Local Dictation · {}",
-            if paused {
-                crate::secure_input::PAUSED_TEXT
-            } else {
-                pill_status(state, globals.show_processing_detail)
+            match (&fault, paused) {
+                // A word beside the colour: the rule never lets a state be
+                // carried by the tint alone.
+                (Some(problem), _) => problem.pill_line(),
+                (None, true) => crate::secure_input::PAUSED_TEXT.to_string(),
+                (None, false) =>
+                    pill_status(state, globals.show_processing_detail).to_string(),
             }
         ))));
     }
@@ -655,6 +699,7 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .pill
                 .hint
                 .setStringValue(&NSString::from_str("History"));
+            set_hint_action(globals, sel!(openHistory:), "Open Dictation History");
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
@@ -664,6 +709,22 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .status
                 .setStringValue(&NSString::from_str(NOTHING_TO_COPY_TEXT));
             set_pill_layout(globals, PillLayout::Copied);
+            show_pill(globals);
+        }
+        UiState::Unavailable => {
+            // The reason lives in the health channel, not in the state byte.
+            let line = crate::health::current()
+                .map(|p| p.pill_line())
+                .unwrap_or_else(|| "Dictation is not ready".to_string());
+            globals.pill.status.setStringValue(&NSString::from_str(&line));
+            globals
+                .pill
+                .hint
+                .setStringValue(&NSString::from_str("Setup"));
+            // The same hint slot, pointed at the window that fixes it rather
+            // than at History, which holds nothing relevant here.
+            set_hint_action(globals, sel!(openSetup:), "Open Setup & permissions");
+            set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
         UiState::NoEditableField
@@ -684,10 +745,24 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .pill
                 .hint
                 .setStringValue(&NSString::from_str("History"));
+            set_hint_action(globals, sel!(openHistory:), "Open Dictation History");
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
     }
+}
+
+/// Point the error pill's hint button at one action. The slot is shared by the
+/// kept-result pills (History) and the not-ready pill (Setup), so it is always
+/// set explicitly rather than left on whatever the previous state wanted.
+fn set_hint_action(globals: &UiGlobals, action: objc2::runtime::Sel, tooltip: &str) {
+    unsafe {
+        let _: () = msg_send![&*globals.pill.history, setAction: action];
+    }
+    globals
+        .pill
+        .history
+        .setToolTip(Some(&NSString::from_str(tooltip)));
 }
 
 /// Pill text when "Copy last dictation" has nothing to copy.
@@ -868,6 +943,7 @@ pub(super) fn pill_status(state: UiState, details: bool) -> &'static str {
         UiState::NoEditableField | UiState::HeldCopied => "No text field selected",
         UiState::LimitReached | UiState::LimitReachedCopied => "Recording limit reached",
         UiState::NothingToCopy => NOTHING_TO_COPY_TEXT,
+        UiState::Unavailable => "Not ready",
         UiState::Idle => "Ready",
     }
 }
@@ -982,6 +1058,55 @@ pub(super) fn position_pill_at_cursor_screen(window: &NSWindow) {
         // Sit close to the bottom edge so the pill stays out of the way.
         let y = chosen.origin.y + SPACE_XXL;
         window.setFrameOrigin(NSPoint::new(x, y));
+    }
+}
+
+#[cfg(test)]
+mod health_signature_tests {
+    use super::health_signature;
+    use crate::health::{Fault, Problem};
+
+    fn problem(fault: Fault) -> Problem {
+        Problem {
+            fault,
+            detail: String::new(),
+        }
+    }
+
+    /// Regression: the status item was repainted only on a `UiState`
+    /// transition, and most health changes do not move `UiState`. The
+    /// signature is what makes the once-a-second tick notice one.
+    #[test]
+    fn every_blocking_fault_has_its_own_signature_and_nothing_else_moves_it() {
+        assert_eq!(health_signature(None), 0);
+
+        let mut seen = vec![0u8];
+        for fault in [
+            Fault::AccessibilityMissing,
+            Fault::MicrophoneBlocked,
+            Fault::ModelsMissing,
+            Fault::EngineFailed,
+            Fault::HelperFailed,
+            Fault::Booting,
+        ] {
+            let signature = health_signature(Some(&problem(fault)));
+            assert_ne!(signature, 0, "{fault:?} blocks dictation and must show");
+            assert!(!seen.contains(&signature), "{fault:?} collides");
+            seen.push(signature);
+        }
+
+        // The two non-blocking faults never reach the status item, so they
+        // must read the same as "nothing wrong" — otherwise an unplugged mic
+        // would repaint the menu bar with a danger glyph it does not deserve.
+        for fault in [Fault::AudioLost, Fault::CleanupUnavailable] {
+            assert_eq!(health_signature(Some(&problem(fault))), 0, "{fault:?}");
+        }
+
+        // The whole point: boot → ready is a change the tick can see.
+        assert_ne!(
+            health_signature(Some(&problem(Fault::Booting))),
+            health_signature(None)
+        );
     }
 }
 

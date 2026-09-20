@@ -18,6 +18,14 @@ it over **newline-delimited JSON on stdin/stdout**:
   latency; the Rust worker records its own encode/write/read/paste timings separately.
 - Requests are serialized — the model object is single-flight and kept memory-stable.
 - `Drop` kills/waits the helper process.
+- **Reads are bounded and the helper is restartable.** `stdout` is drained on its own thread into
+  a channel, so every read is a `recv_timeout` with a budget of three times real time, floored at
+  15 s (`cohere_mlx::read_budget`); the ready line gets 120 s for the model load. A helper that
+  has gone (EOF / broken pipe) is killed, waited for, respawned with backoff
+  (`cohere_mlx::restart_backoff`) and the request retried **once**; a helper that is merely hung
+  is replaced but the request is **not** retried, so the user waits one budget rather than two
+  and the utterance's audio stays recoverable. Three failed restarts in a row raise
+  `health::Fault::HelperFailed`.
 
 The helper is built by `native/cohere-mlx/build.sh` (an `xcodebuild` release build into
 `native/cohere-mlx/.build/xcode/…`; `.build/` is gitignored). Full Xcode is required because MLX's
@@ -57,7 +65,9 @@ Subcommands of the binary (a plain `match` in `src/main.rs`): `daemon [--no-clea
 - `bench`/`dictate` transcribe a WAV or capture for N ms and report per-stage timings.
   `transform "<i>" "<t>"` runs the warm transform path on raw text (no audio/AX) — the fast loop
   for eyeballing transform prompts.
-- `fetch-models [dir]` verifies the fixed local model stack is present (errors if incomplete).
+- `fetch-models [dir]` reports the model stack and fetches whatever the compiled-in manifest can
+  legitimately fetch (see "Models: the manifest and the one download"). A model with no published
+  artefact is reported with what to do about it; no URL is ever invented.
   `context-probe` waits 4 s, captures the focused element like the daemon does, and prints the
   proper-noun terms that would feed cleanup — the live check for screen-context vocabulary.
 - `inject-test [text]` injects literal text via the production injector. `mock-loop` spins up a
@@ -126,13 +136,99 @@ there are two very different loops, and only one needs a rebuild:
 2. **Changing code or built-in defaults** (`src/**`, the `DEFAULT_*` consts in `prompts.rs`).
    Rebuild + reinstall the bundle: **`./scripts/build-app.sh --install`**. When the bundle is
    *ad-hoc* signed (no Apple Development identity, or `SIGN_IDENTITY=-`), a rebuild changes the
-   signature hash and **macOS may revoke + re-prompt for Accessibility/Microphone** — the daemon will exit at boot (`daemon/mod.rs` permission check) until
+   signature hash and **macOS may revoke + re-prompt for Accessibility/Microphone**. The daemon
+   does **not** exit over that any more (see "First run, permissions and health"): the menu bar
+   comes up, the Setup window says what is missing, and the event tap installs itself the moment
    you re-grant it in System Settings → Privacy & Security. An agent cannot grant this; it requires
    the user. (A stable signing identity makes the grant stick across rebuilds.)
 
 Gotcha: `build-app.sh --install` runs `open`, which only *activates* an already-running instance
 rather than replacing it — so after an `--install` you still need a real relaunch
 (`reload-daemon.sh`, or quit from the menu bar) to run the new binary.
+
+## First run, permissions and health
+
+`daemon::run` never exits over a missing grant. The order is: panic hook, architecture check,
+single-instance lock, one prompting Accessibility check, the microphone request, then the worker
+and the menu bar.
+
+- **Single instance** (`src/single_instance.rs`). An `flock` on
+  `~/Library/Application Support/Local Dictation/daemon.lock`. Two daemons would mean two event
+  taps (every dictation pasted twice), two model loads and a stolen control socket. The guard
+  *waits* up to `HANDOFF_WAIT` (12 s) rather than exiting, because the menu's "Apply and restart"
+  spawns the replacement **before** the parent terminates. The parent hands the lock over from
+  `applicationWillTerminate:` with `single_instance::release_held`, **after**
+  `shutdown::release_models` has returned — so the handoff takes a moment rather than the full
+  wait, and the replacement (which loads the whole model stack the instant it gets the lock) never
+  overlaps the parent's Metal buffers with its own. Only a lock still held at the end of the wait
+  makes the new process exit 0, leaving the working daemon alone.
+- **Accessibility** (`src/permissions.rs`). `AccessibilityInjector::check_permission` is called
+  once — the prompting `AXIsProcessTrustedWithOptions`, which is what lists the app in System
+  Settings. After that everything polls the silent `AXIsProcessTrusted`. Only the event tap needs
+  the grant, so the models load regardless; the whole tap installation is a closure handed to
+  `run_when_accessibility_granted`, and the menu bar's once-a-second tick calls
+  `poll_pending_accessibility`, which installs it the moment the grant lands. No relaunch.
+- **Microphone** (`src/permissions.rs`). `AVCaptureDevice.authorizationStatusForMediaType:` and
+  `requestAccessForMediaType:completionHandler:` through a hand-written AVFoundation binding
+  (`objc2` + `block2`, both already `ax-inject` dependencies; a whole framework crate for two
+  selectors was not worth the build surface). Asked for at boot, not as a side effect of the first
+  `cpal` stream open.
+- **Health** (`src/health.rs`). The channel beside `ui_channel`: `UiState` is a `Copy` `repr(u8)`
+  enum describing one utterance and cannot carry a reason string. Faults are ordered by what the
+  user must fix first (Accessibility, Microphone, Models, Engine, Helper, Audio, Cleanup,
+  Booting); `health::current()` returns the one to act on. `AudioLost` and `CleanupUnavailable` do
+  not block dictation. `install_panic_hook` turns a panic on any thread into a logged, visible
+  `EngineFailed`, and the worker thread holds a `ReleaseOnExit` drop guard so a panic still
+  releases the models instead of making Quit wait out its timeout.
+- **Where health shows.** The status item takes the `danger` glyph and states the reason in its
+  tooltip; the status menu's first row carries the fault and opens the Setup window; a hotkey
+  press that cannot work shows `UiState::Unavailable` with the reason and the next step, instead
+  of sending into a channel with no reader.
+- **Setup window** (`src/menubar/setup.rs`). The registered Slate "setup checklist": three rows
+  (Microphone, Accessibility, Models) with live state and one action each. It opens by itself on
+  a launch that is not ready, never on one that is, and is always reachable from the menu as
+  "Setup & permissions…". Render proofs `setup-fresh` / `setup-ready` in both appearances, from
+  invented rows that never read the user's permissions or model directory.
+- **Audio resilience** (`src/audio.rs`). cpal's error callback sets a flag and raises `AudioLost`,
+  so a parked warm stream that died is rebuilt on the next press rather than resumed into
+  silence; `AudioCaptureEngine::should_rebuild` also throws away a stream the Mac slept through,
+  detected as the **gap between the wall clock and the monotonic clock** (`audio::slept_for`),
+  because `Instant` does not advance while the Mac sleeps and `SystemTime` does. Comparing the
+  wall-clock age against the warm window instead called every stream that had merely been open
+  longer than the window a sleep. Multi-channel input picks one sticky channel per stream
+  (`ChannelPicker`: the loudest channel of the first 200 ms window that carries sound, above
+  `PICK_RMS_FLOOR`) instead of averaging every channel, which cost a one-channel mic on an 8-in
+  interface about 18 dB. The window has to carry sound: a stream opens before anyone speaks, so
+  deciding from silence would tie-break onto channel 0 and stick there for the stream's life —
+  on that same interface, a silent recording. The mean is used until a window decides.
+
+## Models: the manifest and the one download
+
+`src/model_fetch.rs` carries a compiled-in manifest of every model the app may fetch: id, role,
+path under the models base, URL, byte count, SHA-256, licence and the credit the licence requires.
+
+- **Dictation still never touches the network.** The one exception is a fetch the user starts from
+  the Setup window's Models row (or `fetch-models` on the command line). Nothing here runs unasked.
+- **The cleanup model** has a published artefact, so the app can get it: `/usr/bin/curl` with an
+  argument array, `-fL --retry 3 -C -` into a `.part` file, a free-disk preflight, progress and
+  cancellation, then a SHA-256 check (`src/sha256.rs`, in-tree, checked against the FIPS 180-4
+  vectors) before one atomic rename. Bytes that do not match the manifest are deleted, never
+  loaded. The model's own LICENSE and NOTICE are saved beside the weights.
+- **The ASR model has no URL.** No public 4-bit MLX conversion of Cohere Transcribe exists, so the
+  manifest entry deliberately carries none and the Models row says what is missing, where to put
+  it, and offers a folder picker for a checkpoint the user already has.
+- **Readiness follows the resolved paths**, not the manifest defaults. `model_fetch::resolved_status`
+  is the single place that resolution lives: the ASR checkpoint through
+  `app_paths::cohere_mlx_default_dir` (which honours `DICTATE_COHERE_MLX_MODEL_DIR`) and the cleanup
+  model through `settings::resolve_llm_model`, exactly as the daemon loads them. The boot check, the
+  Setup window and the Models action all read it, so they cannot disagree — checking the manifest
+  default instead reported a missing speech model on a Mac whose daemon loads one perfectly well,
+  and `ModelsMissing` refuses every hotkey press.
+- **The two models are not the same kind of problem.** A missing speech model is
+  `ModelsMissing`, which blocks a press; a missing cleanup model is `CleanupUnavailable`, which
+  does not — the same split the worker makes (CP-11). The cleanup row is only required when
+  cleanup is on, so a missing LLM alone never dead-ends the app, and a cleanup model that fails to
+  load is a warning, not a dead worker.
 
 ## Feature flags are the architecture
 
@@ -503,7 +599,11 @@ terms: those sites go through `daemon_log::text` / `daemon_log::terms`, which pr
 text must never land there by default. `DICTATE_LOG_TEXT=1` is the debug switch that logs the
 text verbatim; new log lines that carry user text must use the same helpers. (Until 2026-09 the
 log was the shared, world-readable `/tmp/dictate-daemon.log`; that file is no longer written and
-can be deleted.) First
-daemon run needs Microphone + Accessibility permissions granted in System Settings; macOS ties
-Accessibility permission to the launching terminal, so the daemon must be started from a real
-terminal (an agent can't grant it). `ax-check` surfaces the permission prompt.
+can be deleted.) The first
+line of every run names the version and, for a bundle, the commit it was built from.
+
+A first daemon run needs Microphone + Accessibility granted in System Settings. Neither is fatal
+any more: the menu bar comes up, the Setup window says which is missing, and the event tap
+installs itself when the grant lands (see "First run, permissions and health"). macOS ties
+Accessibility to the *launching* binary, so a `cargo run` from a terminal asks on behalf of that
+terminal — an agent cannot grant it either way. `ax-check` surfaces the prompt for the CLI.

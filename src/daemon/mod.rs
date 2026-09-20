@@ -111,6 +111,59 @@ static TAP_DISABLES: AtomicU64 = AtomicU64::new(0);
 /// real press is ignored as a duplicate.
 static PTT_RESYNC: AtomicBool = AtomicBool::new(false);
 
+/// Unblocks a quit that is waiting on the worker's models, from a `Drop` so a
+/// panic cannot skip it. Before this, a panic inside `worker_loop` left Quit
+/// waiting out the whole `MODEL_RELEASE_TIMEOUT`.
+struct ReleaseOnExit;
+
+impl Drop for ReleaseOnExit {
+    fn drop(&mut self) {
+        // Every model this thread owned is dropped by now, so the process can
+        // safely run ggml's static Metal teardown (see `crate::shutdown`).
+        crate::shutdown::mark_released();
+    }
+}
+
+/// How long the "not ready" pill stays up. Long enough to read a sentence.
+const UNAVAILABLE_PILL: Duration = Duration::from_millis(3500);
+
+/// A press that cannot start a dictation says why, instead of going into a
+/// channel nobody is reading. Returns true when the press was refused.
+///
+/// Called from the event-tap thread, so it stays to one uncontended mutex read
+/// and, only in the failing case, a pill update.
+fn report_if_unavailable() -> bool {
+    let Some(problem) = crate::health::current().filter(|p| p.fault.blocks_dictation()) else {
+        return false;
+    };
+    eprintln!(
+        "[hotkey] {} press refused · {} · {}",
+        stamp(),
+        problem.headline(),
+        problem.detail
+    );
+    ui_channel::show_transient_if_unowned(UiState::Unavailable, UNAVAILABLE_PILL);
+    true
+}
+
+/// This build only runs on Apple Silicon: the Swift MLX helper is arm64-only
+/// and the models are Metal. Said plainly at boot, rather than as a Finder
+/// "can't open this application" or a link error deep in a build script.
+pub fn unsupported_architecture() -> Option<String> {
+    architecture_problem(std::env::consts::ARCH)
+}
+
+/// Split out so it can be tested without an Intel Mac.
+fn architecture_problem(arch: &str) -> Option<String> {
+    if arch == "aarch64" {
+        return None;
+    }
+    Some(format!(
+        "Local Dictation needs an Apple Silicon Mac (M1 or later). This build is running on \
+         {arch}, where the speech model cannot load."
+    ))
+}
+
 /// Apply a pending [`PTT_RESYNC`]: back to idle, key considered up. If the key
 /// is in fact still held, its eventual release is a no-op edge.
 fn apply_ptt_resync(pending: &AtomicBool, state: &AtomicU8, hotkey_down: &AtomicBool) -> bool {
@@ -218,15 +271,61 @@ enum TailGraceOutcome {
 }
 
 pub fn run(config: DaemonConfig) -> eyre::Result<()> {
-    // Surface the AX permission prompt up front — if we're not trusted, the
-    // event tap below will silently fail.
-    if !AccessibilityInjector::check_permission() {
-        return Err(eyre::eyre!(
-            "Accessibility permission required. macOS just showed the prompt — \
-             enable this binary in System Settings → Privacy & Security → \
-             Accessibility, then re-run."
-        ));
+    // A panic anywhere — worker thread included — must reach the log and the
+    // menu bar. Installed first so it covers everything below.
+    crate::health::install_panic_hook();
+
+    // First line of every run: which build this log belongs to.
+    eprintln!("[boot] {}", crate::settings_window::version_line());
+
+    if let Some(problem) = unsupported_architecture() {
+        return Err(eyre::eyre!("{problem}"));
     }
+
+    // One daemon per user. Two would install two event taps and paste every
+    // dictation twice. The guard WAITS rather than exits, because the menu's
+    // "Apply and restart" spawns the replacement before this process ends.
+    match crate::single_instance::acquire(
+        &crate::single_instance::default_path(),
+        crate::single_instance::HANDOFF_WAIT,
+    ) {
+        // Parked in the module, because the hand-over happens at quit, from
+        // the AppKit delegate — after the models are gone, not before.
+        crate::single_instance::Outcome::Held(lock) => crate::single_instance::hold(lock),
+        crate::single_instance::Outcome::Busy { pid } => {
+            let who = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            eprintln!("[boot] Local Dictation is already running{who} — leaving it alone.");
+            return Ok(());
+        }
+        crate::single_instance::Outcome::Unavailable { reason } => {
+            eprintln!("[warn] no single-instance lock ({reason}) — starting unguarded");
+        }
+    }
+
+    // Ask for Accessibility ONCE with the prompting check: that is what puts
+    // this app in the System Settings list at all. Whatever the answer, the
+    // daemon carries on — the menu bar appears, the models load, and the
+    // event tap is installed the moment the grant lands. Exiting here is how
+    // a first launch used to end with a permission dialog and then nothing.
+    let trusted_at_boot = AccessibilityInjector::check_permission();
+    eprintln!(
+        "[boot] accessibility {}",
+        if trusted_at_boot {
+            "granted"
+        } else {
+            "NOT granted — the hotkey starts working as soon as you turn it on"
+        }
+    );
+
+    // Ask for the microphone now, not in the middle of the user's first
+    // dictation. An already-answered status returns without a prompt.
+    if crate::permissions::microphone_status() == crate::permissions::Grant::Undecided {
+        crate::permissions::request_microphone(|grant| {
+            eprintln!("[boot] microphone   {}", grant.label());
+            crate::permissions::refresh_microphone_health();
+        });
+    }
+    crate::permissions::refresh_microphone_health();
 
     // "Copy last dictation" must survive a relaunch (every settings change is
     // one): re-read the newest transcript from the history store. With text
@@ -237,17 +336,28 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
 
     let (tx, rx) = mpsc::channel::<DaemonEvent>();
 
+    // Only the event tap needs Accessibility, so the models load straight
+    // away whatever the grant says. "Starting up…" is a visible state until
+    // the worker reports ready.
+    crate::health::raise(crate::health::Fault::Booting, "loading models");
+
     // Spawn the worker thread that owns the models + capture engine. It
     // outlives the CFRunLoop on the main thread until shutdown.
-    let worker_handle = std::thread::spawn(move || {
-        if let Err(e) = worker_loop(rx, config) {
-            eprintln!("[daemon] worker exited with error: {e:?}");
-        }
-        // Every model this thread owned is dropped by now, so the process can
-        // safely run ggml's static Metal teardown. Unblocks a quit that is
-        // waiting on us (see `crate::shutdown`).
-        crate::shutdown::mark_released();
-    });
+    let worker_handle = std::thread::Builder::new()
+        .name("dictation-worker".into())
+        .spawn(move || {
+            // A drop guard, not a straight call: a panic inside worker_loop
+            // used to skip mark_released entirely, so Quit then waited out the
+            // whole model-release timeout with the menu bar still on Idle.
+            let _released = ReleaseOnExit;
+            match worker_loop(rx, config) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("[daemon] worker exited with error: {e:?}");
+                    crate::health::raise(crate::health::Fault::EngineFailed, e.to_string());
+                }
+            }
+        })?;
 
     eprintln!("[daemon] installing event tap on main run loop...");
 
@@ -307,13 +417,17 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             }
             match decision {
                 PttDecision::Start { transform } => {
-                    let _ = tx.send(DaemonEvent::StartRecording { transform });
+                    if !report_if_unavailable() {
+                        let _ = tx.send(DaemonEvent::StartRecording { transform });
+                    }
                 }
                 // Double-tap from idle: begin recording AND cue latched,
                 // mirroring the Space-chord Start + LatchArmed sequence.
                 PttDecision::StartLatched { transform } => {
-                    let _ = tx.send(DaemonEvent::StartRecording { transform });
-                    let _ = tx.send(DaemonEvent::LatchArmed);
+                    if !report_if_unavailable() {
+                        let _ = tx.send(DaemonEvent::StartRecording { transform });
+                        let _ = tx.send(DaemonEvent::LatchArmed);
+                    }
                 }
                 PttDecision::Stop => {
                     let why = if prev == ST_LATCHED { "hotkey tap ended hands-free" } else { "hotkey released" };
@@ -353,6 +467,13 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // modifier + Space would insert a character (e.g. Option+Space → nbsp).
     // The callback stays trivial (atomics + non-blocking channel sends) so it
     // can never stall the input stream; TapDisabled events re-enable the tap.
+    //
+    // The whole installation is deferred into a closure because it is the one
+    // part of the daemon that needs Accessibility. `run_when_accessibility_
+    // granted` runs it now when the grant is already there, and otherwise
+    // holds it until the Setup window's polling sees the grant land — no
+    // relaunch, and no exit in the meantime.
+    let install_tap = move || -> Result<(), String> {
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
@@ -636,7 +757,7 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
         },
     )
     .map_err(|_| {
-        eyre::eyre!("failed to install CGEventTap — Accessibility permission missing or revoked")
+        "could not install the event tap — Accessibility is missing or was revoked".to_string()
     })?;
 
     // Stash the tap's port so the callback can re-enable it after a
@@ -649,13 +770,17 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let loop_source = tap
         .mach_port()
         .create_runloop_source(0)
-        .map_err(|_| eyre::eyre!("create_runloop_source failed"))?;
+        .map_err(|_| "create_runloop_source failed".to_string())?;
     CFRunLoop::get_current().add_source(&loop_source, unsafe { kCFRunLoopCommonModes });
     tap.enable();
     // Leak the tap — it must outlive the run loop. Safe to drop only on
     // process exit (which NSApp.terminate handles).
     std::mem::forget(tap);
     std::mem::forget(loop_source);
+    eprintln!("[boot] event tap  installed");
+    Ok(())
+    };
+    crate::permissions::run_when_accessibility_granted(install_tap);
 
     let hotkey_label = hotkey.display();
     if modifier_only {
@@ -811,6 +936,21 @@ pub(crate) fn stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_intel_mac_is_told_plainly_instead_of_failing_somewhere_deeper() {
+        // The bundle is arm64-only and the Swift MLX helper refuses to build
+        // anywhere else, so an x86 run used to end as a Finder "can't open
+        // this application" or a link error inside a build script.
+        assert_eq!(architecture_problem("aarch64"), None);
+        for arch in ["x86_64", "x86", "powerpc"] {
+            let problem = architecture_problem(arch).expect(arch);
+            assert!(problem.contains("Apple Silicon"), "{problem}");
+            assert!(problem.contains(arch), "{problem}");
+        }
+        // This build itself must be on a supported machine.
+        assert_eq!(unsupported_architecture(), None);
+    }
 
     #[test]
     fn a_limit_stop_resets_a_stuck_hold_so_the_next_press_starts_cleanly() {
