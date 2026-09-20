@@ -288,7 +288,7 @@ mod tests {
         for (name, bytes, seconds) in [
             ("start", START, 0.115),
             ("stop", STOP, 0.125),
-            ("success", SUCCESS, 0.220),
+            ("success", SUCCESS, 0.145),
             ("cancel", CANCEL, 0.135),
             ("latch", LATCH, 0.090),
             ("error", ERROR, 0.145),

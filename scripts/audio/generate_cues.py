@@ -36,7 +36,7 @@ def tone(seconds: float, notes: list[tuple[float, float, float]], gain: float = 
     return [max(-0.9, min(0.9, sample)) for sample in samples]
 
 
-def landing_thud(seconds: float = 0.220) -> list[float]:
+def landing_thud(seconds: float = 0.145) -> list[float]:
     """A soft, weighty impact: pitched body plus a very short felt-like tap."""
     length = int(seconds * RATE)
     samples: list[float] = []
@@ -47,10 +47,10 @@ def landing_thud(seconds: float = 0.220) -> list[float]:
         # A fast downward pitch bend gives the impact weight without sounding
         # like a bass note. The long exponential tail makes it feel as though
         # the text has settled into place.
-        frequency = 112.0 + 128.0 * math.exp(-t / 0.036)
+        frequency = 132.0 + 138.0 * math.exp(-t / 0.026)
         phase += 2 * math.pi * frequency / RATE
         attack = min(1.0, t / 0.003)
-        body = 0.16 * attack * math.exp(-t / 0.064) * (
+        body = 0.16 * attack * math.exp(-t / 0.040) * (
             math.sin(phase) + 0.22 * math.sin(2 * phase)
         )
 
@@ -58,7 +58,7 @@ def landing_thud(seconds: float = 0.220) -> list[float]:
         # muted wooden/felt impact. It is deliberately quieter than the body.
         noise_state = (1103515245 * noise_state + 12345) & 0x7FFFFFFF
         noise = noise_state / 0x3FFFFFFF - 1.0
-        tap = 0.026 * noise * math.exp(-t / 0.009)
+        tap = 0.026 * noise * math.exp(-t / 0.006)
         samples.append(max(-0.9, min(0.9, body + tap)))
     return samples
 
