@@ -32,11 +32,24 @@ the first Apple Development identity in the keychain so Microphone +
 Accessibility grants survive rebuilds; `SIGN_IDENTITY=-` forces ad-hoc, which
 makes macOS re-ask. Only the user can grant the permission.
 
+**A missing grant is never fatal.** The daemon boots the menu bar and loads the
+models whatever the permissions say; only the event tap needs Accessibility,
+and it installs itself the moment the grant lands (`src/permissions.rs`). The
+Setup window (`src/menubar/setup.rs`) states what is missing. Anything that
+stops dictation working is a `src/health.rs` fault with a reason and a next
+step, shown in the status item, the menu and the pill — never an idle icon
+over a dead hotkey.
+
 ## Boundaries (do not widen without a design)
 
 - The ASR is fixed: Cohere MLX Q4. The only ASR knob is the decoder
   language. No model picker for ASR, no cloud providers, no accounts, no
-  telemetry, no network at runtime.
+  telemetry. **No network while dictating**: the one exception is
+  `src/model_fetch.rs`, and only for a download the user starts from the Setup
+  window. Everything the app may fetch is a compiled-in manifest row with a
+  URL, a byte count, a SHA-256 and a licence; bytes that do not match are
+  deleted, never loaded, and a model with no published artefact carries no URL
+  at all.
 - Features are the architecture: `cohere-mlx`, `cleaner`, `ax-inject`,
   `full`. Gate new code behind the right feature; keep featureless
   `cargo test` green and dependency-free.
@@ -69,7 +82,12 @@ makes macOS re-ask. Only the user can grant the permission.
   raw: wrap it in `daemon_log::text` / `daemon_log::terms`, which print
   lengths unless `DICTATE_LOG_TEXT=1`.
 - Child processes use `std::process::Command` with argument arrays. No
-  shell interpolation.
+  shell interpolation. That includes the model download (`/usr/bin/curl`) and
+  the folder picker (`/usr/bin/osascript`).
+- One daemon per user: `src/single_instance.rs` holds an `flock` for the
+  process lifetime. It WAITS for a departing instance rather than exiting,
+  because "Apply and restart" spawns the child before the parent quits. Do not
+  turn that into an exit-on-first-refusal check.
 - User data on disk (`~/.config/local-dictation/*.json`, `history.db`) keeps
   its format. Unknown keys are ignored by serde; never break an old file.
   Renaming a key means a migration: read the old key when the new one is

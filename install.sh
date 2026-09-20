@@ -43,8 +43,11 @@ echo
 # One floor everywhere: the MLX helper and the bundle both require macOS 14.
 OS_MAJOR="$(sw_vers -productVersion | cut -d. -f1)"
 [ "$OS_MAJOR" -ge 14 ] || die "Local Dictation needs macOS 14 or later (this Mac runs $(sw_vers -productVersion))."
+# Apple Silicon only, and said here rather than three steps later: the Swift
+# MLX helper's own build.sh exits 2 on any other architecture, which used to
+# happen AFTER this script had already installed Rust and cmake.
 if [ "$(uname -m)" != "arm64" ]; then
-  warn "This is built for Apple Silicon (M-series). Intel Macs are untested."
+  die "Local Dictation needs an Apple Silicon Mac (M1 or later). This Mac reports $(uname -m)."
 fi
 
 # ── 1. prerequisites ─────────────────────────────────────────────────────────

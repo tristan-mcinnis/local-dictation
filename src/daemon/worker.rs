@@ -1,6 +1,16 @@
 //! Worker thread: capture, streaming ASR, cleanup, transform, spoken commands, injection.
 use super::*;
 
+/// How long a failure pill stays up.
+const FAILURE_PILL: Duration = Duration::from_millis(3500);
+
+/// Say that the transcription failed, and where the words are. Before this the
+/// only signal was a cue played while `audio_duck` still held the system
+/// muted, so a failed dictation looked exactly like one that did nothing.
+fn show_transcribe_failure(generation: u64) {
+    ui_channel::show_transient_for(generation, UiState::Error, FAILURE_PILL);
+}
+
 pub(super) fn worker_loop(
     rx: std::sync::mpsc::Receiver<DaemonEvent>,
     config: DaemonConfig,
@@ -691,6 +701,12 @@ pub(super) fn worker_loop(
                     whisper_mode,
                 ) {
                     cues::play_error();
+                    // The cue alone is not enough: it plays while the app's own
+                    // system mute is still held, and it says nothing.
+                    ui_channel::show_transient_if_unowned(
+                        UiState::Unavailable,
+                        FAILURE_PILL,
+                    );
                 } else {
                     noise_floor.clear();
                     last_audio.clear(); // new recording invalidates the previous buffer
@@ -1005,7 +1021,7 @@ pub(super) fn worker_loop(
                                     recovery.error = Some(format!("Transcription failed: {err}"));
                                     eprintln!("[err]  transcribe failed: {err:?}");
                                     cues::play_error();
-                                    ui_channel::set_state(UiState::Idle);
+                                    show_transcribe_failure(cur_gen);
                                     eprintln!();
                                     continue 'evloop;
                                 }
@@ -1093,7 +1109,7 @@ pub(super) fn worker_loop(
                                 recovery.error = Some(format!("Transcription failed: {err}"));
                                 eprintln!("[err]  transcribe failed: {err:?}");
                                 cues::play_error();
-                                ui_channel::set_state(UiState::Idle);
+                                show_transcribe_failure(cur_gen);
                                 eprintln!();
                                 continue 'evloop;
                             }
@@ -1115,7 +1131,7 @@ pub(super) fn worker_loop(
                             recovery.error = Some(format!("Transcription failed: {err}"));
                             eprintln!("[err]  transcribe failed: {err:?}");
                             cues::play_error();
-                            ui_channel::set_state(UiState::Idle);
+                            show_transcribe_failure(cur_gen);
                             eprintln!();
                             continue 'evloop;
                         }
@@ -1875,6 +1891,13 @@ pub(super) fn begin_open_capture(
         Ok(r) => r,
         Err(err) => {
             eprintln!("[err]  mic open failed: {err:?}");
+            // A denied or missing microphone is the reason, and it is the one
+            // the user can act on. Raising it here means the menu bar, the
+            // pill and the Setup window all say the same thing.
+            crate::permissions::refresh_microphone_health();
+            if !crate::health::is_raised(crate::health::Fault::MicrophoneBlocked) {
+                crate::health::raise(crate::health::Fault::AudioLost, format!("{err}"));
+            }
             return false;
         }
     };
