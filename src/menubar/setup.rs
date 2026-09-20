@@ -172,6 +172,12 @@ pub(crate) fn models_state(
         statuses.iter().filter(|s| s.is_blocking()).collect();
     if missing.is_empty() {
         let note = match phase {
+            // The worker loads its models once at boot, so a model that only
+            // just landed is on disk but not in memory. Say so, rather than
+            // leaving the user to wonder why the hotkey is still dead.
+            Some(model_fetch::Phase::Done) => {
+                "Ready · relaunch from the menu to load it".to_string()
+            }
             Some(model_fetch::Phase::Failed(why)) => format!("Ready · last attempt: {why}"),
             _ => "Ready".to_string(),
         };
@@ -730,6 +736,24 @@ mod tests {
         );
         assert!(state.satisfied, "{state:?}");
         assert!(state.action.is_none());
+    }
+
+    #[test]
+    fn a_model_that_just_landed_says_it_needs_a_relaunch_to_be_loaded() {
+        // The worker loads its models once at boot. "Ready" alone would leave
+        // a user staring at a dead hotkey after a successful download.
+        let state = models_state(
+            &[
+                present(model_fetch::ASR, true),
+                present(model_fetch::CLEANUP, true),
+            ],
+            Some(&model_fetch::Phase::Done),
+        );
+        assert!(state.satisfied);
+        assert!(state.detail.contains("relaunch"), "{}", state.detail);
+        // A session that downloaded nothing just says Ready.
+        let quiet = models_state(&[present(model_fetch::ASR, true)], None);
+        assert_eq!(quiet.detail, "Ready");
     }
 
     #[test]
