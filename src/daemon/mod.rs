@@ -285,25 +285,22 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // One daemon per user. Two would install two event taps and paste every
     // dictation twice. The guard WAITS rather than exits, because the menu's
     // "Apply and restart" spawns the replacement before this process ends.
-    let instance_lock = match crate::single_instance::acquire(
+    match crate::single_instance::acquire(
         &crate::single_instance::default_path(),
         crate::single_instance::HANDOFF_WAIT,
     ) {
-        crate::single_instance::Outcome::Held(lock) => Some(lock),
+        // Parked in the module, because the hand-over happens at quit, from
+        // the AppKit delegate — after the models are gone, not before.
+        crate::single_instance::Outcome::Held(lock) => crate::single_instance::hold(lock),
         crate::single_instance::Outcome::Busy { pid } => {
-            let who = pid
-                .map(|p| format!(" (pid {p})"))
-                .unwrap_or_else(|| String::new());
+            let who = pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
             eprintln!("[boot] Local Dictation is already running{who} — leaving it alone.");
             return Ok(());
         }
         crate::single_instance::Outcome::Unavailable { reason } => {
             eprintln!("[warn] no single-instance lock ({reason}) — starting unguarded");
-            None
         }
-    };
-    // Interior mutability so the quit hook (an `Fn`) can hand the lock over.
-    let instance_lock = Mutex::new(instance_lock);
+    }
 
     // Ask for Accessibility ONCE with the prompting check: that is what puts
     // this app in the System Settings list at all. Whatever the answer, the
@@ -856,15 +853,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     let tx_for_shutdown = tx.clone();
     crate::shutdown::on_release_requested(move || {
         let _ = tx_for_shutdown.send(DaemonEvent::Shutdown);
-        // A relaunch ("Apply and restart") has already spawned the replacement
-        // and it is sitting on the lock. Hand it over here, as soon as quit
-        // begins, so the new daemon starts in a fraction of a second instead
-        // of waiting out HANDOFF_WAIT.
-        if let Ok(mut held) = instance_lock.lock() {
-            if let Some(lock) = held.as_mut() {
-                lock.release();
-            }
-        }
     });
 
     menubar::init_and_run()?;

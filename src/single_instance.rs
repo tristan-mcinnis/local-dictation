@@ -16,8 +16,11 @@
 //! only when the old instance is still alive at the end of it. Giving up is
 //! the safe outcome — the user keeps the daemon that is already working.
 //!
-//! The parent shortens that wait by calling [`InstanceLock::release`] from the
-//! quit path, right after its models are dropped.
+//! The parent shortens that wait with [`release_held`], called from
+//! `applicationWillTerminate:` **after** `shutdown::release_models` has
+//! returned — that is, once its own models are actually gone. Not before: the
+//! replacement loads the whole stack the moment it gets the lock, and two
+//! stacks of Metal buffers at once is what the overlap exists to avoid.
 //!
 //! `flock` is released by the kernel when the process exits, however it exits,
 //! so a crash never leaves a lock behind. The file's *contents* (the holder's
@@ -42,6 +45,38 @@ const RETRY_EVERY: Duration = Duration::from_millis(100);
 pub struct InstanceLock {
     file: Option<File>,
     path: PathBuf,
+}
+
+/// The lock this process holds for its lifetime, parked where the quit path
+/// can reach it. The daemon puts it here and never touches it again.
+static HELD: std::sync::Mutex<Option<InstanceLock>> = std::sync::Mutex::new(None);
+
+/// Park the process lock so [`release_held`] can hand it over at quit.
+pub fn hold(lock: InstanceLock) {
+    if let Ok(mut slot) = HELD.lock() {
+        *slot = Some(lock);
+    }
+}
+
+/// Hand the lock to a waiting replacement.
+///
+/// Call this only once the models are **actually gone**, not when quit is
+/// merely requested: the replacement loads the whole stack the moment it gets
+/// the lock, and the point of overlapping the two processes at all is that
+/// only one of them holds several gigabytes of Metal buffers at a time.
+pub fn release_held() {
+    if let Ok(mut slot) = HELD.lock() {
+        if let Some(lock) = slot.as_mut() {
+            lock.release();
+        }
+    }
+}
+
+/// Is the process lock still held? For the tests, and for a log line.
+pub fn is_held() -> bool {
+    HELD.lock()
+        .map(|slot| slot.as_ref().is_some_and(|l| l.file.is_some()))
+        .unwrap_or(false)
 }
 
 impl InstanceLock {
@@ -213,6 +248,41 @@ mod tests {
             other => panic!("the relaunched child must get the lock, got {other:?}"),
         }
         releaser.join().unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Regression: the lock used to be handed over from the quit *request*
+    /// hook, which fires before the worker has dropped a single model. The
+    /// replacement takes the lock and immediately loads the whole stack, so
+    /// that ordering put two full sets of Metal buffers in memory at once —
+    /// the exact thing the handover is meant to prevent. It is released from
+    /// `applicationWillTerminate:`, after `release_models` has returned.
+    #[test]
+    fn the_process_lock_is_handed_over_only_once_it_is_released() {
+        let path = scratch("held");
+        let lock = match acquire(&path, Duration::ZERO) {
+            Outcome::Held(lock) => lock,
+            other => panic!("setup: {other:?}"),
+        };
+        hold(lock);
+        assert!(is_held());
+        // While this process holds it, a replacement waits.
+        match acquire(&path, Duration::from_millis(50)) {
+            Outcome::Busy { .. } => {}
+            other => panic!("a parked lock must still exclude, got {other:?}"),
+        }
+
+        release_held();
+        assert!(!is_held());
+        match acquire(&path, Duration::ZERO) {
+            Outcome::Held(_) => {}
+            other => panic!("the replacement must get it after release, got {other:?}"),
+        }
+        // Idempotent: a second quit path must not panic on an empty slot.
+        release_held();
+        if let Ok(mut slot) = HELD.lock() {
+            *slot = None;
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

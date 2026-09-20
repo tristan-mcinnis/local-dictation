@@ -639,15 +639,11 @@ pub(super) fn worker_loop(
                     // we capture from the *current* device instead of silently
                     // recording the old one. Cheap host query; only the rare
                     // device-change case pays the rebuild.
-                    let always_stale = always.as_ref().and_then(|(ao, _)| {
-                        if ao.stream_failed() {
-                            Some("the always-on stream reported an error")
-                        } else if ao.device_changed() {
-                            Some("the default input changed")
-                        } else {
-                            None
-                        }
-                    });
+                    // Same three tests as the warm stream, through the same
+                    // function: the always-on stream is open for hours, so it
+                    // is the one most likely to have been slept through, and
+                    // an inline copy of two of the three checks left it out.
+                    let always_stale = always.as_ref().and_then(|(ao, _)| ao.should_rebuild());
                     if let Some(why) = always_stale {
                         let preroll = crate::audio::preroll_samples(preroll_ms);
                         let (mut ao2, cons2) =

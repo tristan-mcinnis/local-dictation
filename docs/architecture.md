@@ -156,9 +156,12 @@ and the menu bar.
   `~/Library/Application Support/Local Dictation/daemon.lock`. Two daemons would mean two event
   taps (every dictation pasted twice), two model loads and a stolen control socket. The guard
   *waits* up to `HANDOFF_WAIT` (12 s) rather than exiting, because the menu's "Apply and restart"
-  spawns the replacement **before** the parent terminates; the parent's quit hook calls
-  `InstanceLock::release` so the handoff takes a moment, not the full wait. Only a lock still held
-  at the end of the wait makes the new process exit 0, leaving the working daemon alone.
+  spawns the replacement **before** the parent terminates. The parent hands the lock over from
+  `applicationWillTerminate:` with `single_instance::release_held`, **after**
+  `shutdown::release_models` has returned — so the handoff takes a moment rather than the full
+  wait, and the replacement (which loads the whole model stack the instant it gets the lock) never
+  overlaps the parent's Metal buffers with its own. Only a lock still held at the end of the wait
+  makes the new process exit 0, leaving the working daemon alone.
 - **Accessibility** (`src/permissions.rs`). `AccessibilityInjector::check_permission` is called
   once — the prompting `AXIsProcessTrustedWithOptions`, which is what lists the app in System
   Settings. After that everything polls the silent `AXIsProcessTrusted`. Only the event tap needs

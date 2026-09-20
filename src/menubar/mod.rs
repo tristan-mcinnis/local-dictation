@@ -632,6 +632,15 @@ define_class!(
                     MODEL_RELEASE_TIMEOUT.as_millis()
                 );
             }
+            // Only now. "Apply and restart" has already spawned the
+            // replacement and it is sitting on the single-instance lock: the
+            // moment it gets the lock it loads the whole model stack, so
+            // handing it over before this line would put two full stacks of
+            // Metal buffers in memory at once — the thing overlapping the two
+            // processes was supposed to avoid. Releasing here instead of
+            // waiting for `exit()` still saves the replacement the rest of
+            // HANDOFF_WAIT.
+            crate::single_instance::release_held();
         }
     }
 );
