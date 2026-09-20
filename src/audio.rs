@@ -43,6 +43,13 @@ pub struct AudioCaptureEngine {
     // Needed so a warm-window reuse can detect the default input changing since
     // the stream was built, and rebuild instead of silently reusing a stale one.
     device_name: String,
+    // Set by cpal's error callback. A parked stream that has failed must be
+    // rebuilt on the next press, not resumed into silence.
+    stream_failed: Arc<AtomicBool>,
+    // Wall clock at stream open. `Instant` pauses while the Mac sleeps, so the
+    // warm-window deadline alone cannot tell a 20 ms gap from a lid closed
+    // overnight; this can.
+    opened_at: std::time::SystemTime,
 }
 
 // cpal::Stream is not Send (CoreAudio invariant); we keep AudioCaptureEngine
@@ -62,6 +69,8 @@ impl AudioCaptureEngine {
                 native_sample_rate: 0,
                 native_channels: 0,
                 device_name: String::new(),
+                stream_failed: Arc::new(AtomicBool::new(false)),
+                opened_at: std::time::SystemTime::UNIX_EPOCH,
             },
             consumer,
         )
@@ -119,6 +128,9 @@ impl AudioCaptureEngine {
         self.native_sample_rate = native_rate;
         self.native_channels = native_channels;
         self.device_name = device_name.clone();
+        self.stream_failed.store(false, Ordering::SeqCst);
+        self.opened_at = std::time::SystemTime::now();
+        crate::health::clear(crate::health::Fault::AudioLost);
         eprintln!(
             "[audio] capturing on `{device_name}` @ {native_rate} Hz × {native_channels} ch ({:?}); resampling to {SAMPLE_RATE} Hz mono",
             sample_format
@@ -136,7 +148,17 @@ impl AudioCaptureEngine {
         // Grip the recording flag so the callback can gate pushes: while parked
         // (warm-window idle) it must drop chunks, not fill the ring with silence.
         let recording = self.is_recording.clone();
-        let err_fn = |e| eprintln!("[audio] cpal stream error: {e}");
+        let mut picker = ChannelPicker::new(channels, native_rate);
+        // A cpal error used to be a log line and nothing else, so an unplugged
+        // mic, a default-device change or a sleep/wake left a dead stream that
+        // the warm-window path happily reused: the user got silence and a
+        // "no speech" line. The flag reaches the worker, which rebuilds.
+        let failed = self.stream_failed.clone();
+        let err_fn = move |e| {
+            eprintln!("[audio] cpal stream error: {e}");
+            failed.store(true, Ordering::SeqCst);
+            crate::health::raise(crate::health::Fault::AudioLost, format!("{e}"));
+        };
 
         let stream = match sample_format {
             SampleFormat::F32 => device.build_input_stream(
@@ -144,6 +166,7 @@ impl AudioCaptureEngine {
                 move |data: &[f32], _| {
                     push_resampled(
                         data, channels, stride, &mut pos, &mut last, &mut producer, &recording,
+                        &mut picker,
                     );
                 },
                 err_fn,
@@ -153,7 +176,7 @@ impl AudioCaptureEngine {
                 &config,
                 move |data: &[i16], _| {
                     let f: Vec<f32> = data.iter().map(|s| *s as f32 / 32_768.0).collect();
-                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording);
+                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording, &mut picker);
                 },
                 err_fn,
                 None,
@@ -165,7 +188,7 @@ impl AudioCaptureEngine {
                         .iter()
                         .map(|s| (*s as f32 - 32_768.0) / 32_768.0)
                         .collect();
-                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording);
+                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording, &mut picker);
                 },
                 err_fn,
                 None,
@@ -220,6 +243,123 @@ impl AudioCaptureEngine {
             None => false,
         }
     }
+
+    /// Has cpal reported an error on this stream? The object stays alive after
+    /// a device unplug or a sample-rate switch, but the stream is dead, so a
+    /// warm-window resume would capture nothing.
+    pub fn stream_failed(&self) -> bool {
+        self.stream_failed.load(Ordering::SeqCst)
+    }
+
+    /// Wall-clock age of the open stream. `Instant` (which the warm-window
+    /// deadline uses) does not advance while the Mac is asleep, so a lid
+    /// closed overnight can leave a "20 ms old" parked stream bound to a
+    /// device that is long gone. This sees the real gap.
+    pub fn wall_age(&self) -> std::time::Duration {
+        self.opened_at
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+
+    /// Must the parked stream be thrown away rather than resumed?
+    /// `warm_window` is how long a parked stream may be reused for.
+    pub fn should_rebuild(&self, warm_window: std::time::Duration) -> Option<&'static str> {
+        if self.stream_failed() {
+            return Some("the stream reported an error");
+        }
+        if self.device_changed() {
+            return Some("the default input changed");
+        }
+        if self.wall_age() > warm_window {
+            return Some("the Mac slept while the stream was parked");
+        }
+        None
+    }
+}
+
+/// How a multi-channel callback buffer becomes one mono sample per frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Downmix {
+    /// Average every channel. Right for a mono or stereo microphone, where
+    /// both channels carry the same voice.
+    Mean,
+    /// Take one channel. Right for an interface or aggregate device, where the
+    /// microphone is on one input and the rest are silence — averaging those
+    /// in costs 20·log10(N) dB and makes normal speech read as "no speech".
+    Channel(usize),
+}
+
+/// Picks one input channel per stream and then sticks to it.
+///
+/// Switching channels mid-word would click, so the choice is made once: for a
+/// device with more than two inputs, the loudest channel over the first
+/// [`PROBE_MS`] of the stream, defaulting to channel 0 until then and if
+/// nothing is louder. One and two channel devices keep the mean.
+pub struct ChannelPicker {
+    channels: usize,
+    energy: Vec<f64>,
+    frames_seen: usize,
+    probe_frames: usize,
+    chosen: Option<Downmix>,
+}
+
+/// How much of a stream is listened to before its channel is fixed.
+pub const PROBE_MS: usize = 200;
+
+impl ChannelPicker {
+    pub fn new(channels: usize, native_rate: u32) -> Self {
+        let probe_frames = native_rate as usize * PROBE_MS / 1000;
+        Self {
+            channels,
+            energy: vec![0.0; channels],
+            frames_seen: 0,
+            probe_frames,
+            chosen: (channels <= 2).then_some(Downmix::Mean),
+        }
+    }
+
+    /// Feed one interleaved callback buffer and get the downmix to use for it.
+    pub fn observe(&mut self, interleaved: &[f32]) -> Downmix {
+        if let Some(chosen) = self.chosen {
+            return chosen;
+        }
+        for frame in interleaved.chunks_exact(self.channels) {
+            for (channel, sample) in frame.iter().enumerate() {
+                self.energy[channel] += (*sample as f64) * (*sample as f64);
+            }
+        }
+        self.frames_seen += interleaved.len() / self.channels.max(1);
+        if self.frames_seen < self.probe_frames {
+            // Channel 0 while we listen: deterministic, and at full level.
+            return Downmix::Channel(0);
+        }
+        // Strictly greater, so a tie — silence on every input, or a duplicated
+        // signal — keeps the lowest channel rather than drifting to the last.
+        let mut best = 0usize;
+        for (channel, energy) in self.energy.iter().enumerate() {
+            if *energy > self.energy[best] {
+                best = channel;
+            }
+        }
+
+        eprintln!("[audio] listening on input channel {best} of {}", self.channels);
+        let chosen = Downmix::Channel(best);
+        self.chosen = Some(chosen);
+        chosen
+    }
+}
+
+/// Fold one interleaved frame to a single sample under `mix`.
+pub fn fold_frame(frame: &[f32], mix: Downmix) -> f32 {
+    match mix {
+        Downmix::Mean => {
+            if frame.is_empty() {
+                return 0.0;
+            }
+            frame.iter().sum::<f32>() / frame.len() as f32
+        }
+        Downmix::Channel(channel) => frame.get(channel).copied().unwrap_or(0.0),
+    }
 }
 
 /// Downmix interleaved native samples to mono, then linearly resample at
@@ -233,20 +373,21 @@ fn push_resampled(
     last: &mut f32,
     producer: &mut HeapAudioProducer,
     recording: &AtomicBool,
+    picker: &mut ChannelPicker,
 ) {
     let frames = interleaved.len() / channels.max(1);
     if frames == 0 {
         return;
     }
 
+    let mix = picker.observe(interleaved);
     // Reusable mono buffer.
     let mut mono = Vec::with_capacity(frames);
     if channels <= 1 {
         mono.extend_from_slice(interleaved);
     } else {
         for frame in interleaved.chunks_exact(channels) {
-            let sum: f32 = frame.iter().sum();
-            mono.push(sum / channels as f32);
+            mono.push(fold_frame(frame, mix));
         }
     }
 
@@ -281,6 +422,65 @@ fn push_resampled(
 
 #[cfg(test)]
 mod tests {
+    use super::{fold_frame, ChannelPicker, Downmix};
+
+    #[test]
+    fn a_one_and_two_channel_microphone_keeps_the_mean() {
+        // Both capsules of a stereo mic carry the same voice, so averaging is
+        // right and must not change.
+        for channels in [1usize, 2] {
+            let mut picker = ChannelPicker::new(channels, 48_000);
+            for _ in 0..100 {
+                assert_eq!(picker.observe(&vec![0.5; channels * 64]), Downmix::Mean);
+            }
+        }
+        assert_eq!(fold_frame(&[1.0, 0.0], Downmix::Mean), 0.5);
+        assert_eq!(fold_frame(&[], Downmix::Mean), 0.0);
+    }
+
+    #[test]
+    fn an_interface_listens_to_the_loudest_input_instead_of_averaging_it_away() {
+        // Regression: a mic on input 3 of an 8-in interface was averaged with
+        // seven silent channels, an 18 dB loss, and every utterance came back
+        // as "no speech above noise floor".
+        let channels = 8;
+        let rate = 48_000;
+        let mut picker = ChannelPicker::new(channels, rate);
+        let frames = rate as usize * super::PROBE_MS / 1000;
+        let mut buffer = vec![0.0f32; channels * frames];
+        for frame in buffer.chunks_exact_mut(channels) {
+            frame[3] = 0.4;
+        }
+        // While it listens, channel 0 at full level — never the mean.
+        assert_eq!(picker.observe(&buffer[..channels * 8]), Downmix::Channel(0));
+        assert_eq!(picker.observe(&buffer), Downmix::Channel(3));
+        // And the choice sticks: it must not move channel mid-word.
+        let mut louder = vec![0.0f32; channels * frames];
+        for frame in louder.chunks_exact_mut(channels) {
+            frame[6] = 0.9;
+        }
+        assert_eq!(picker.observe(&louder), Downmix::Channel(3));
+
+        // The picked channel arrives at full amplitude.
+        let frame = [0.0, 0.0, 0.0, 0.4, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(fold_frame(&frame, Downmix::Channel(3)), 0.4);
+        // The old behaviour, for the record: an eighth of the level.
+        assert!((fold_frame(&frame, Downmix::Mean) - 0.05).abs() < 1e-6);
+        // A channel index past the end is silence, never a panic.
+        assert_eq!(fold_frame(&frame, Downmix::Channel(99)), 0.0);
+    }
+
+    #[test]
+    fn silence_on_every_input_leaves_the_pick_on_channel_zero() {
+        let channels = 4;
+        let mut picker = ChannelPicker::new(channels, 16_000);
+        let frames = 16_000 * super::PROBE_MS / 1000;
+        assert_eq!(
+            picker.observe(&vec![0.0; channels * frames]),
+            Downmix::Channel(0)
+        );
+    }
+
     #[test]
     fn cancelled_capture_drops_later_microphone_samples_while_worker_is_busy() {
         use super::*;
@@ -288,10 +488,11 @@ mod tests {
         let recording = AtomicBool::new(true);
         let mut pos = 0.0;
         let mut last = 0.0;
-        push_resampled(&[0.2; 8], 1, 1.0, &mut pos, &mut last, &mut producer, &recording);
+        let mut picker = ChannelPicker::new(1, 16_000);
+        push_resampled(&[0.2; 8], 1, 1.0, &mut pos, &mut last, &mut producer, &recording, &mut picker);
         let before = consumer.occupied_len();
         recording.store(false, Ordering::SeqCst); // accepted out-of-band Cancel
-        push_resampled(&[0.9; 32], 1, 1.0, &mut pos, &mut last, &mut producer, &recording);
+        push_resampled(&[0.9; 32], 1, 1.0, &mut pos, &mut last, &mut producer, &recording, &mut picker);
         assert_eq!(consumer.occupied_len(), before, "waiting for ASR must not capture post-cancel speech");
         let samples = drain_session(&mut consumer, &recording);
         assert_eq!(samples.len(), before);
@@ -393,7 +594,14 @@ mod tests {
         // the `last` carry of 0.0).
         let mut pos = 0.0;
         let mut last = 0.0;
-        let out = resample_to_vec(&[0.5, 0.5, 0.5, 0.5], 1, 1.0, &mut pos, &mut last);
+        let out = resample_to_vec(
+            &[0.5, 0.5, 0.5, 0.5],
+            1,
+            1.0,
+            &mut pos,
+            &mut last,
+            &mut ChannelPicker::new(1, 16_000),
+        );
         assert_eq!(out.len(), 4);
         assert_eq!(*out.last().unwrap(), 0.5);
     }
@@ -808,6 +1016,11 @@ pub struct AlwaysOnCapture {
     // capturing the old device — `device_changed` detects that so the daemon can
     // rebuild. Empty until `start`.
     device_name: String,
+    // As on `AudioCaptureEngine`: cpal's error callback sets this so a dead
+    // always-on stream is rebuilt instead of reused into silence.
+    stream_failed: Arc<AtomicBool>,
+    // Wall clock at stream open, for the same sleep/wake reason.
+    opened_at: std::time::SystemTime,
 }
 
 unsafe impl Sync for AlwaysOnCapture {}
@@ -828,6 +1041,8 @@ impl AlwaysOnCapture {
                 native_sample_rate: 0,
                 native_channels: 0,
                 device_name: String::new(),
+                stream_failed: Arc::new(AtomicBool::new(false)),
+                opened_at: std::time::SystemTime::UNIX_EPOCH,
             },
             consumer,
         )
@@ -873,6 +1088,9 @@ impl AlwaysOnCapture {
         self.native_sample_rate = native_rate;
         self.native_channels = native_channels;
         self.device_name = device_name.clone();
+        self.stream_failed.store(false, Ordering::SeqCst);
+        self.opened_at = std::time::SystemTime::now();
+        crate::health::clear(crate::health::Fault::AudioLost);
         eprintln!(
             "[audio] always-on on `{device_name}` @ {native_rate} Hz × {native_channels} ch ({:?}); \
              pre-roll {} ms",
@@ -898,15 +1116,21 @@ impl AlwaysOnCapture {
         let mut last: f32 = 0.0;
         let mut preroll = PrerollRing::new(self.preroll_samples);
         let mut prev_recording = false;
+        let mut picker = ChannelPicker::new(channels, native_rate);
         let recording = self.recording.clone();
-        let err_fn = |e| eprintln!("[audio] cpal stream error: {e}");
+        let failed = self.stream_failed.clone();
+        let err_fn = move |e| {
+            eprintln!("[audio] cpal stream error: {e}");
+            failed.store(true, Ordering::SeqCst);
+            crate::health::raise(crate::health::Fault::AudioLost, format!("{e}"));
+        };
 
         // One callback body, generic over the sample type, shared by all formats.
         macro_rules! make_cb {
             ($t:ty, $to_f32:expr) => {
                 move |data: &[$t], _: &_| {
                     let f: Vec<f32> = data.iter().map($to_f32).collect();
-                    let chunk = resample_to_vec(&f, channels, stride, &mut pos, &mut last);
+                    let chunk = resample_to_vec(&f, channels, stride, &mut pos, &mut last, &mut picker);
                     if chunk.is_empty() {
                         return;
                     }
@@ -975,6 +1199,38 @@ impl AlwaysOnCapture {
             None => false,
         }
     }
+
+    /// Has cpal reported an error on this stream? The object stays alive after
+    /// a device unplug or a sample-rate switch, but the stream is dead, so a
+    /// warm-window resume would capture nothing.
+    pub fn stream_failed(&self) -> bool {
+        self.stream_failed.load(Ordering::SeqCst)
+    }
+
+    /// Wall-clock age of the open stream. `Instant` (which the warm-window
+    /// deadline uses) does not advance while the Mac is asleep, so a lid
+    /// closed overnight can leave a "20 ms old" parked stream bound to a
+    /// device that is long gone. This sees the real gap.
+    pub fn wall_age(&self) -> std::time::Duration {
+        self.opened_at
+            .elapsed()
+            .unwrap_or(std::time::Duration::ZERO)
+    }
+
+    /// Must the parked stream be thrown away rather than resumed?
+    /// `warm_window` is how long a parked stream may be reused for.
+    pub fn should_rebuild(&self, warm_window: std::time::Duration) -> Option<&'static str> {
+        if self.stream_failed() {
+            return Some("the stream reported an error");
+        }
+        if self.device_changed() {
+            return Some("the default input changed");
+        }
+        if self.wall_age() > warm_window {
+            return Some("the Mac slept while the stream was parked");
+        }
+        None
+    }
 }
 
 /// Name of the current system default input device, or `None` if there isn't
@@ -1008,18 +1264,19 @@ fn resample_to_vec(
     stride: f64,
     pos: &mut f64,
     last: &mut f32,
+    picker: &mut ChannelPicker,
 ) -> Vec<f32> {
     let frames = interleaved.len() / channels.max(1);
     if frames == 0 {
         return Vec::new();
     }
+    let mix = picker.observe(interleaved);
     let mut mono = Vec::with_capacity(frames);
     if channels <= 1 {
         mono.extend_from_slice(interleaved);
     } else {
         for frame in interleaved.chunks_exact(channels) {
-            let sum: f32 = frame.iter().sum();
-            mono.push(sum / channels as f32);
+            mono.push(fold_frame(frame, mix));
         }
     }
     let sum_sq: f32 = mono.iter().map(|x| x * x).sum();

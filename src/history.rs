@@ -228,13 +228,56 @@ fn prune_at(path: &Path, window_secs: Option<i64>) -> eyre::Result<()> {
 }
 
 /// Most-recent-first dictations, capped at `limit`. Returns an empty vec on
-/// any error (a missing DB just means "no history yet").
+/// any error; call [`unreadable_reason`] to tell "nothing yet" from "the
+/// store would not open".
 pub fn recent(limit: usize) -> Vec<Entry> {
     if let Some(path) = db_path() {
         try_recent_at(&path, limit).unwrap_or_default()
     } else {
         Vec::new()
     }
+}
+
+/// Why the history store cannot be read, or `None` when it is readable (which
+/// includes "it does not exist yet" — nothing has been dictated).
+///
+/// An unreadable store used to look exactly like an empty one: a corrupt file,
+/// a locked database or a config directory managed by a dotfile tool all
+/// showed "No dictations yet", so a user whose history was there but
+/// unreachable was told it was not there at all.
+pub fn unreadable_reason() -> Option<String> {
+    unreadable_reason_at(&db_path()?)
+}
+
+/// Injectable counterpart of [`unreadable_reason`], so tests can point at an
+/// invented fixture instead of the user's own store.
+pub fn unreadable_reason_at(path: &Path) -> Option<String> {
+    if !path.exists() {
+        // Nothing has been dictated yet. That is not a fault, and a new user
+        // must not be shown one.
+        return None;
+    }
+    // Opening is lazy in SQLite, so a corrupt file only fails on a real
+    // query. One cheap count is the honest check.
+    let probe = open_at(path).and_then(|conn| {
+        conn.query_row("SELECT count(*) FROM dictations", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(Into::into)
+    });
+    probe.err().map(|e| e.to_string())
+}
+
+/// The empty-list line for a history surface. `searching` is true when a query
+/// is narrowing the list.
+pub fn empty_state_text(unreadable: Option<&str>, searching: bool) -> String {
+    if let Some(reason) = unreadable {
+        return format!("History could not be opened. It was left untouched. {reason}");
+    }
+    if searching {
+        return "No dictations match your search.".to_string();
+    }
+    "No dictations yet — hold your hotkey and speak.".to_string()
 }
 
 fn try_recent_at(path: &Path, limit: usize) -> eyre::Result<Vec<Entry>> {
@@ -396,6 +439,53 @@ fn clear_at(path: &Path) -> eyre::Result<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression (UI-F25): a store that cannot be opened used to show the
+    /// same line as a store with nothing in it, so a user whose history was
+    /// unreachable was told they had never dictated anything.
+    #[test]
+    fn an_unreadable_history_says_so_instead_of_reading_as_empty() {
+        let empty = super::empty_state_text(None, false);
+        assert!(empty.contains("No dictations yet"), "{empty}");
+        let searched = super::empty_state_text(None, true);
+        assert!(searched.contains("match your search"), "{searched}");
+
+        let broken = super::empty_state_text(Some("file is not a database"), false);
+        assert!(broken.contains("could not be opened"), "{broken}");
+        assert!(broken.contains("left untouched"), "{broken}");
+        assert!(broken.contains("file is not a database"), "{broken}");
+        assert!(!broken.contains("No dictations yet"), "{broken}");
+        // The reason wins over the search wording too: a search that cannot
+        // reach the store has not "matched nothing".
+        let broken_search = super::empty_state_text(Some("database is locked"), true);
+        assert!(broken_search.contains("could not be opened"), "{broken_search}");
+    }
+
+    #[test]
+    fn a_missing_store_is_not_a_fault_but_a_corrupt_one_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ld-history-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("history.db");
+
+        // A fresh install has no history.db. "Nothing yet", not a fault.
+        assert_eq!(super::unreadable_reason_at(&path), None);
+
+        // A real store opens cleanly.
+        super::record_at(&path, "hello").unwrap();
+        assert_eq!(super::unreadable_reason_at(&path), None);
+
+        // Bytes that are not a database must be reported, not read as empty.
+        std::fs::write(&path, b"this is not a SQLite file, it is a text file").unwrap();
+        let reason = super::unreadable_reason_at(&path).expect("a corrupt store is a fault");
+        let line = super::empty_state_text(Some(&reason), false);
+        assert!(line.contains("could not be opened"), "{line}");
+        assert!(!line.contains("No dictations yet"), "{line}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
 
     /// An isolated DB path per test function. A distinct label keeps parallel

@@ -20,7 +20,7 @@
 //! socket can't be bound the daemon logs and carries on — losing remote control
 //! must never cost you the hotkey.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -311,7 +311,14 @@ where
 /// one verb answered here instead of dispatched — it only reads an atomic, so
 /// it stays off the daemon's channel entirely.
 fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
-    let mut reader = BufReader::new(stream);
+    // Connections are served one at a time on this thread, so a client that
+    // connects and never sends a newline used to block toggle, stop, cancel
+    // and status for every other caller, for the life of the daemon. A read
+    // timeout and a bounded line length end that: the stalled client is
+    // dropped, and the next one is served.
+    let _ = stream.set_read_timeout(Some(CONN_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(CONN_TIMEOUT));
+    let mut reader = BufReader::new(stream).take(MAX_COMMAND_BYTES);
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() {
         return;
@@ -335,9 +342,21 @@ fn serve_conn<F: Fn(Command)>(stream: UnixStream, dispatch: &F) {
         }
         None => format!("err unknown command {:?}\n", line.trim()),
     };
-    let mut stream = reader.into_inner();
+    let mut stream = reader.into_inner().into_inner();
     let _ = stream.write_all(reply.as_bytes());
 }
+
+/// How long one client gets to send its command word and take its reply.
+///
+/// A real caller writes its verb the moment it connects, so half a second is
+/// already generous on a local socket. It must stay well under the *client*
+/// timeout below, or a stalled connection would still outlast the next
+/// caller's patience and the queue would look blocked anyway.
+const CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The longest command line accepted. Every verb is a word, and the longest
+/// takes one numeric argument, so this is already far beyond any real caller.
+const MAX_COMMAND_BYTES: u64 = 256;
 
 /// `copy-last` answers honestly: with nothing dictated yet there is nothing to
 /// copy, and the daemon is not bothered.
@@ -611,6 +630,19 @@ mod tests {
                 .is_err(),
             "status must not reach the daemon's dispatch closure"
         );
+
+        // Regression (PB-F22): a client that connects and never sends a
+        // newline used to own the single IPC thread for the life of the
+        // daemon, so every other toggle / stop / cancel / status was dead.
+        // The read timeout drops it, and the next client is served.
+        let stalled = UnixStream::connect(&sock).expect("connect a silent client");
+        let served = send(Command::Stop).expect("a stalled client must not block the socket");
+        assert_eq!(served, "ok stop");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Command::Stop
+        );
+        drop(stalled);
 
         std::env::remove_var("DICTATE_CONTROL_SOCK");
         let _ = std::fs::remove_file(&sock);

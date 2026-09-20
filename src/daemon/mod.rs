@@ -275,6 +275,9 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // menu bar. Installed first so it covers everything below.
     crate::health::install_panic_hook();
 
+    // First line of every run: which build this log belongs to.
+    eprintln!("[boot] {}", crate::settings_window::version_line());
+
     if let Some(problem) = unsupported_architecture() {
         return Err(eyre::eyre!("{problem}"));
     }
@@ -945,6 +948,21 @@ pub(crate) fn stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_intel_mac_is_told_plainly_instead_of_failing_somewhere_deeper() {
+        // The bundle is arm64-only and the Swift MLX helper refuses to build
+        // anywhere else, so an x86 run used to end as a Finder "can't open
+        // this application" or a link error inside a build script.
+        assert_eq!(architecture_problem("aarch64"), None);
+        for arch in ["x86_64", "x86", "powerpc"] {
+            let problem = architecture_problem(arch).expect(arch);
+            assert!(problem.contains("Apple Silicon"), "{problem}");
+            assert!(problem.contains(arch), "{problem}");
+        }
+        // This build itself must be on a supported machine.
+        assert_eq!(unsupported_architecture(), None);
+    }
 
     #[test]
     fn a_limit_stop_resets_a_stuck_hold_so_the_next_press_starts_cleanly() {

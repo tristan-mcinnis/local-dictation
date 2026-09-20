@@ -564,12 +564,16 @@ pub(super) fn worker_loop(
                 // changed since the stream was built.
                 if engine.is_some() {
                     if warm_parked {
-                        let changed = engine
-                            .as_mut()
-                            .map(|e| e.device_changed())
-                            .unwrap_or(false);
-                        if changed {
-                            eprintln!("[audio] default input changed → rebuilt warm stream");
+                        // Not only a device change: a stream that cpal has
+                        // reported an error on is dead while the object is
+                        // alive, and `Instant` does not advance while the Mac
+                        // sleeps, so a lid closed overnight can leave a
+                        // "fresh" parked stream bound to a device that is gone.
+                        let changed = engine.as_mut().and_then(|e| {
+                            e.should_rebuild(Duration::from_millis(warm_window_ms as u64))
+                        });
+                        if let Some(why) = changed {
+                            eprintln!("[audio] {why} → rebuilt warm stream");
                             drop(engine.take());
                             consumer.take();
                             is_recording.take();
@@ -627,18 +631,23 @@ pub(super) fn worker_loop(
                     // we capture from the *current* device instead of silently
                     // recording the old one. Cheap host query; only the rare
                     // device-change case pays the rebuild.
-                    if always
-                        .as_ref()
-                        .map(|(ao, _)| ao.device_changed())
-                        .unwrap_or(false)
-                    {
+                    let always_stale = always.as_ref().and_then(|(ao, _)| {
+                        if ao.stream_failed() {
+                            Some("the always-on stream reported an error")
+                        } else if ao.device_changed() {
+                            Some("the default input changed")
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(why) = always_stale {
                         let preroll = crate::audio::preroll_samples(preroll_ms);
                         let (mut ao2, cons2) =
                             crate::audio::AlwaysOnCapture::new(preroll, BUFFER_CAPACITY);
                         match ao2.start() {
                             Ok(()) => {
                                 eprintln!(
-                                    "[audio] default input changed → rebuilt always-on stream on `{}`",
+                                    "[audio] {why} → rebuilt always-on stream on `{}`",
                                     ao2.device_name()
                                 );
                                 always = Some((ao2, cons2));

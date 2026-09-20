@@ -34,6 +34,42 @@ pub fn running_in_bundle() -> bool {
     bundle_resources_dir().is_some()
 }
 
+/// `<bundle>/Contents/Info.plist`, when running from a `.app`.
+pub fn bundle_info_plist() -> Option<PathBuf> {
+    Some(bundle_resources_dir()?.parent()?.join("Info.plist"))
+}
+
+/// The git commit this bundle was built from, as `scripts/build-app.sh` writes
+/// it into `Info.plist` under `LocalDictationBuiltFromCommit`.
+///
+/// Read from the plist rather than baked in with a `build.rs`, so a `cargo
+/// build` needs no git and the value can never be stale relative to the bundle
+/// it is shown in. `None` for a non-bundled run.
+pub fn build_commit() -> Option<String> {
+    let text = std::fs::read_to_string(bundle_info_plist()?).ok()?;
+    plist_string_value(&text, "LocalDictationBuiltFromCommit")
+}
+
+/// The value of a `<string>` entry in an XML property list, by key.
+///
+/// A hand-rolled scan rather than a plist crate or a `plutil` child process:
+/// one key, one format, and `build-app.sh` writes the file, so the shape is
+/// known. Returns `None` rather than guessing when the shape is not the
+/// expected `<key>…</key><string>…</string>` pair.
+pub fn plist_string_value(xml: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let after = &xml[xml.find(&needle)? + needle.len()..];
+    let open = after.find("<string>")?;
+    // Anything other than whitespace between the key and its value means the
+    // key's own value is not a string (the next key started first).
+    if !after[..open].trim().is_empty() {
+        return None;
+    }
+    let value = &after[open + "<string>".len()..];
+    let end = value.find("</string>")?;
+    Some(value[..end].trim().to_string())
+}
+
 /// `$HOME` as a path (None when unset). Every per-user location below is
 /// derived from this one accessor rather than re-reading the env var.
 pub fn home_dir() -> Option<PathBuf> {
@@ -175,6 +211,34 @@ mod tests {
             assert!(log.starts_with(home_dir().unwrap()));
             assert!(!log.starts_with("/tmp"));
         }
+    }
+
+    #[test]
+    fn the_build_commit_is_read_from_the_bundles_own_plist() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleShortVersionString</key>
+    <string>0.4.0</string>
+    <key>LocalDictationBuiltFromCommit</key>
+    <string>a6b9410</string>
+    <key>LSUIElement</key>
+    <true/>
+</dict>
+</plist>"#;
+        assert_eq!(
+            plist_string_value(plist, "LocalDictationBuiltFromCommit").as_deref(),
+            Some("a6b9410")
+        );
+        assert_eq!(
+            plist_string_value(plist, "CFBundleShortVersionString").as_deref(),
+            Some("0.4.0")
+        );
+        // A key that is not there, and a key whose value is not a string,
+        // report nothing rather than the next key's value.
+        assert_eq!(plist_string_value(plist, "CFBundleVersion"), None);
+        assert_eq!(plist_string_value(plist, "LSUIElement"), None);
+        assert_eq!(plist_string_value("", "anything"), None);
     }
 
     #[test]
