@@ -46,10 +46,12 @@ pub struct AudioCaptureEngine {
     // Set by cpal's error callback. A parked stream that has failed must be
     // rebuilt on the next press, not resumed into silence.
     stream_failed: Arc<AtomicBool>,
-    // Wall clock at stream open. `Instant` pauses while the Mac sleeps, so the
-    // warm-window deadline alone cannot tell a 20 ms gap from a lid closed
-    // overnight; this can.
+    // Wall clock at stream open, paired with the monotonic clock at the same
+    // instant. `Instant` pauses while the Mac sleeps and `SystemTime` does
+    // not, so the gap between the two is how much of this stream's life was
+    // spent asleep. See `slept_for`.
     opened_at: std::time::SystemTime,
+    opened_at_mono: std::time::Instant,
 }
 
 // cpal::Stream is not Send (CoreAudio invariant); we keep AudioCaptureEngine
@@ -71,6 +73,7 @@ impl AudioCaptureEngine {
                 device_name: String::new(),
                 stream_failed: Arc::new(AtomicBool::new(false)),
                 opened_at: std::time::SystemTime::UNIX_EPOCH,
+                opened_at_mono: std::time::Instant::now(),
             },
             consumer,
         )
@@ -130,6 +133,7 @@ impl AudioCaptureEngine {
         self.device_name = device_name.clone();
         self.stream_failed.store(false, Ordering::SeqCst);
         self.opened_at = std::time::SystemTime::now();
+        self.opened_at_mono = std::time::Instant::now();
         crate::health::clear(crate::health::Fault::AudioLost);
         eprintln!(
             "[audio] capturing on `{device_name}` @ {native_rate} Hz × {native_channels} ch ({:?}); resampling to {SAMPLE_RATE} Hz mono",
@@ -251,26 +255,27 @@ impl AudioCaptureEngine {
         self.stream_failed.load(Ordering::SeqCst)
     }
 
-    /// Wall-clock age of the open stream. `Instant` (which the warm-window
-    /// deadline uses) does not advance while the Mac is asleep, so a lid
-    /// closed overnight can leave a "20 ms old" parked stream bound to a
-    /// device that is long gone. This sees the real gap.
-    pub fn wall_age(&self) -> std::time::Duration {
-        self.opened_at
-            .elapsed()
-            .unwrap_or(std::time::Duration::ZERO)
+    /// How long this stream has existed by the wall clock, and by the
+    /// monotonic clock. The difference is sleep — see [`slept_for`].
+    pub fn age(&self) -> (std::time::Duration, std::time::Duration) {
+        (
+            self.opened_at
+                .elapsed()
+                .unwrap_or(std::time::Duration::ZERO),
+            self.opened_at_mono.elapsed(),
+        )
     }
 
     /// Must the parked stream be thrown away rather than resumed?
-    /// `warm_window` is how long a parked stream may be reused for.
-    pub fn should_rebuild(&self, warm_window: std::time::Duration) -> Option<&'static str> {
+    pub fn should_rebuild(&self) -> Option<&'static str> {
         if self.stream_failed() {
             return Some("the stream reported an error");
         }
         if self.device_changed() {
             return Some("the default input changed");
         }
-        if self.wall_age() > warm_window {
+        let (wall, mono) = self.age();
+        if slept_for(wall, mono) > SLEEP_SLACK {
             return Some("the Mac slept while the stream was parked");
         }
         None
@@ -292,9 +297,19 @@ pub enum Downmix {
 /// Picks one input channel per stream and then sticks to it.
 ///
 /// Switching channels mid-word would click, so the choice is made once: for a
-/// device with more than two inputs, the loudest channel over the first
-/// [`PROBE_MS`] of the stream, defaulting to channel 0 until then and if
-/// nothing is louder. One and two channel devices keep the mean.
+/// device with more than two inputs, the loudest channel of the first
+/// [`PROBE_MS`] window that actually carries sound. One and two channel
+/// devices keep the mean.
+///
+/// **The window must carry sound.** A stream opens before the user speaks —
+/// the always-on and warm-window streams open long before — so the first
+/// 200 ms is almost always silence, and locking onto the loudest channel of
+/// silence picks channel 0 by tie-break and keeps it for the life of the
+/// stream. On the very interface this exists to fix (the mic on input 3 of
+/// eight) that is a *silent* capture: worse than the averaging it replaced,
+/// which at least carried the voice at an eighth of its level. So a window
+/// below [`PICK_RMS_FLOOR`] is discarded and the next one is listened to,
+/// and the mean is used in the meantime.
 pub struct ChannelPicker {
     channels: usize,
     energy: Vec<f64>,
@@ -306,9 +321,35 @@ pub struct ChannelPicker {
 /// How much of a stream is listened to before its channel is fixed.
 pub const PROBE_MS: usize = 200;
 
+/// Quietest window that is allowed to decide the channel, as RMS. Well above
+/// digital silence and converter dither, well below any speech — a whisper at
+/// arm's length is an order of magnitude louder.
+pub const PICK_RMS_FLOOR: f64 = 0.004;
+
+/// The channel to listen to, given one probe window's summed squares per
+/// channel and how many frames went into it.
+///
+/// `None` when the window was too quiet to decide anything — the caller
+/// listens to another window rather than committing to a guess.
+pub fn pick_channel(energy: &[f64], frames: usize) -> Option<usize> {
+    if energy.is_empty() || frames == 0 {
+        return None;
+    }
+    // Strictly greater, so a tie — a duplicated signal across inputs — keeps
+    // the lowest channel rather than drifting to the last.
+    let mut best = 0usize;
+    for (channel, value) in energy.iter().enumerate() {
+        if *value > energy[best] {
+            best = channel;
+        }
+    }
+    let rms = (energy[best] / frames as f64).sqrt();
+    (rms >= PICK_RMS_FLOOR).then_some(best)
+}
+
 impl ChannelPicker {
     pub fn new(channels: usize, native_rate: u32) -> Self {
-        let probe_frames = native_rate as usize * PROBE_MS / 1000;
+        let probe_frames = (native_rate as usize * PROBE_MS / 1000).max(1);
         Self {
             channels,
             energy: vec![0.0; channels],
@@ -330,24 +371,39 @@ impl ChannelPicker {
         }
         self.frames_seen += interleaved.len() / self.channels.max(1);
         if self.frames_seen < self.probe_frames {
-            // Channel 0 while we listen: deterministic, and at full level.
-            return Downmix::Channel(0);
+            // The mean while we listen: never silence, whatever the wiring.
+            return Downmix::Mean;
         }
-        // Strictly greater, so a tie — silence on every input, or a duplicated
-        // signal — keeps the lowest channel rather than drifting to the last.
-        let mut best = 0usize;
-        for (channel, energy) in self.energy.iter().enumerate() {
-            if *energy > self.energy[best] {
-                best = channel;
-            }
-        }
-
+        let decided = pick_channel(&self.energy, self.frames_seen);
+        self.energy.iter_mut().for_each(|e| *e = 0.0);
+        self.frames_seen = 0;
+        let Some(best) = decided else {
+            // Nothing but room tone in that window. Keep listening.
+            return Downmix::Mean;
+        };
         eprintln!("[audio] listening on input channel {best} of {}", self.channels);
         let chosen = Downmix::Channel(best);
         self.chosen = Some(chosen);
         chosen
     }
 }
+
+/// How much of `wall` a stream spent asleep, from the wall-clock and monotonic
+/// ages of the same stream.
+///
+/// `Instant` does not advance while the Mac is asleep and `SystemTime` does,
+/// so the difference is the sleep. Comparing the wall-clock age against the
+/// warm window instead — which is what this replaced — called every stream
+/// that had simply been *open* longer than the window a sleep, including one
+/// that had just carried a long dictation, and logged a lie about it.
+pub fn slept_for(wall: std::time::Duration, mono: std::time::Duration) -> std::time::Duration {
+    wall.saturating_sub(mono)
+}
+
+/// How much clock skew is tolerated before a gap is read as a sleep. Comfortably
+/// over any NTP correction or scheduling jitter, far under a lid closed for a
+/// coffee.
+pub const SLEEP_SLACK: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Fold one interleaved frame to a single sample under `mix`.
 pub fn fold_frame(frame: &[f32], mix: Downmix) -> f32 {
@@ -424,6 +480,41 @@ fn push_resampled(
 mod tests {
     use super::{fold_frame, ChannelPicker, Downmix};
 
+    /// Regression: the parked-stream check compared the stream's WALL-CLOCK
+    /// age against the warm window, so a stream that had simply been open
+    /// longer than the window — a two-minute dictation, say — was rebuilt and
+    /// the log claimed the Mac had slept. Sleep is the wall clock running on
+    /// while the monotonic clock does not, and nothing else.
+    #[test]
+    fn only_a_real_sleep_reads_as_a_sleep() {
+        use super::{slept_for, SLEEP_SLACK};
+        use std::time::Duration;
+
+        // A long-lived stream, both clocks in step: no sleep, however old.
+        for age in [1u64, 60, 3_600, 86_400] {
+            let d = Duration::from_secs(age);
+            assert_eq!(slept_for(d, d), Duration::ZERO, "{age}s awake");
+            assert!(slept_for(d, d) <= SLEEP_SLACK);
+        }
+
+        // A lid closed overnight: eight hours of wall clock over two minutes
+        // of uptime.
+        let slept = slept_for(Duration::from_secs(8 * 3_600), Duration::from_secs(120));
+        assert!(slept > SLEEP_SLACK, "{slept:?}");
+
+        // Small skew (an NTP correction, scheduler jitter) is not a sleep.
+        assert!(
+            slept_for(Duration::from_secs(65), Duration::from_secs(60)) <= SLEEP_SLACK,
+            "a few seconds of skew must not throw the stream away"
+        );
+        // And a monotonic clock ahead of the wall clock saturates at zero
+        // rather than underflowing.
+        assert_eq!(
+            slept_for(Duration::from_secs(1), Duration::from_secs(9)),
+            Duration::ZERO
+        );
+    }
+
     #[test]
     fn a_one_and_two_channel_microphone_keeps_the_mean() {
         // Both capsules of a stereo mic carry the same voice, so averaging is
@@ -451,8 +542,9 @@ mod tests {
         for frame in buffer.chunks_exact_mut(channels) {
             frame[3] = 0.4;
         }
-        // While it listens, channel 0 at full level — never the mean.
-        assert_eq!(picker.observe(&buffer[..channels * 8]), Downmix::Channel(0));
+        // While it listens, the mean: it carries the voice, quietly, rather
+        // than betting on a channel it has not heard yet.
+        assert_eq!(picker.observe(&buffer[..channels * 8]), Downmix::Mean);
         assert_eq!(picker.observe(&buffer), Downmix::Channel(3));
         // And the choice sticks: it must not move channel mid-word.
         let mut louder = vec![0.0f32; channels * frames];
@@ -470,15 +562,42 @@ mod tests {
         assert_eq!(fold_frame(&frame, Downmix::Channel(99)), 0.0);
     }
 
+    /// Regression: the picker used to commit to the loudest channel of the
+    /// FIRST 200 ms whatever was in it. A stream opens before anyone speaks
+    /// (the always-on stream opens minutes before), so that window is silence,
+    /// the tie-break picked channel 0, and the choice stuck for the life of
+    /// the stream — on an interface with the microphone on input 3 that is a
+    /// silent recording, strictly worse than the averaging it replaced.
     #[test]
-    fn silence_on_every_input_leaves_the_pick_on_channel_zero() {
-        let channels = 4;
-        let mut picker = ChannelPicker::new(channels, 16_000);
-        let frames = 16_000 * super::PROBE_MS / 1000;
-        assert_eq!(
-            picker.observe(&vec![0.0; channels * frames]),
-            Downmix::Channel(0)
-        );
+    fn a_silent_probe_window_decides_nothing_and_the_mean_carries_on() {
+        use super::{pick_channel, PICK_RMS_FLOOR};
+        let channels = 8;
+        let rate = 16_000u32;
+        let frames = rate as usize * super::PROBE_MS / 1000;
+        let mut picker = ChannelPicker::new(channels, rate);
+
+        // Several windows of room tone: no decision, and never channel 0.
+        let quiet = vec![0.000_1f32; channels * frames];
+        for _ in 0..5 {
+            assert_eq!(picker.observe(&quiet), Downmix::Mean);
+        }
+
+        // Then the user speaks, on input 3. Now it decides, and sticks.
+        let mut speech = vec![0.0f32; channels * frames];
+        for frame in speech.chunks_exact_mut(channels) {
+            frame[3] = 0.4;
+        }
+        assert_eq!(picker.observe(&speech), Downmix::Channel(3));
+        assert_eq!(picker.observe(&quiet), Downmix::Channel(3));
+
+        // The floor itself: exactly at it decides, just under it does not.
+        let at_floor = vec![PICK_RMS_FLOOR * PICK_RMS_FLOOR; 2];
+        assert_eq!(pick_channel(&at_floor, 1), Some(0));
+        let under = vec![0.0, (PICK_RMS_FLOOR * 0.9) * (PICK_RMS_FLOOR * 0.9)];
+        assert_eq!(pick_channel(&under, 1), None);
+        // And the degenerate inputs are answers, not panics.
+        assert_eq!(pick_channel(&[], 4), None);
+        assert_eq!(pick_channel(&[1.0], 0), None);
     }
 
     #[test]
@@ -1019,8 +1138,10 @@ pub struct AlwaysOnCapture {
     // As on `AudioCaptureEngine`: cpal's error callback sets this so a dead
     // always-on stream is rebuilt instead of reused into silence.
     stream_failed: Arc<AtomicBool>,
-    // Wall clock at stream open, for the same sleep/wake reason.
+    // Wall clock and monotonic clock at stream open, for the same sleep/wake
+    // reason. See `slept_for`.
     opened_at: std::time::SystemTime,
+    opened_at_mono: std::time::Instant,
 }
 
 unsafe impl Sync for AlwaysOnCapture {}
@@ -1043,6 +1164,7 @@ impl AlwaysOnCapture {
                 device_name: String::new(),
                 stream_failed: Arc::new(AtomicBool::new(false)),
                 opened_at: std::time::SystemTime::UNIX_EPOCH,
+                opened_at_mono: std::time::Instant::now(),
             },
             consumer,
         )
@@ -1090,6 +1212,7 @@ impl AlwaysOnCapture {
         self.device_name = device_name.clone();
         self.stream_failed.store(false, Ordering::SeqCst);
         self.opened_at = std::time::SystemTime::now();
+        self.opened_at_mono = std::time::Instant::now();
         crate::health::clear(crate::health::Fault::AudioLost);
         eprintln!(
             "[audio] always-on on `{device_name}` @ {native_rate} Hz × {native_channels} ch ({:?}); \
@@ -1207,26 +1330,27 @@ impl AlwaysOnCapture {
         self.stream_failed.load(Ordering::SeqCst)
     }
 
-    /// Wall-clock age of the open stream. `Instant` (which the warm-window
-    /// deadline uses) does not advance while the Mac is asleep, so a lid
-    /// closed overnight can leave a "20 ms old" parked stream bound to a
-    /// device that is long gone. This sees the real gap.
-    pub fn wall_age(&self) -> std::time::Duration {
-        self.opened_at
-            .elapsed()
-            .unwrap_or(std::time::Duration::ZERO)
+    /// How long this stream has existed by the wall clock, and by the
+    /// monotonic clock. The difference is sleep — see [`slept_for`].
+    pub fn age(&self) -> (std::time::Duration, std::time::Duration) {
+        (
+            self.opened_at
+                .elapsed()
+                .unwrap_or(std::time::Duration::ZERO),
+            self.opened_at_mono.elapsed(),
+        )
     }
 
     /// Must the parked stream be thrown away rather than resumed?
-    /// `warm_window` is how long a parked stream may be reused for.
-    pub fn should_rebuild(&self, warm_window: std::time::Duration) -> Option<&'static str> {
+    pub fn should_rebuild(&self) -> Option<&'static str> {
         if self.stream_failed() {
             return Some("the stream reported an error");
         }
         if self.device_changed() {
             return Some("the default input changed");
         }
-        if self.wall_age() > warm_window {
+        let (wall, mono) = self.age();
+        if slept_for(wall, mono) > SLEEP_SLACK {
             return Some("the Mac slept while the stream was parked");
         }
         None

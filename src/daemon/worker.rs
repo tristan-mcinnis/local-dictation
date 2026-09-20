@@ -579,9 +579,7 @@ pub(super) fn worker_loop(
                         // alive, and `Instant` does not advance while the Mac
                         // sleeps, so a lid closed overnight can leave a
                         // "fresh" parked stream bound to a device that is gone.
-                        let changed = engine.as_mut().and_then(|e| {
-                            e.should_rebuild(Duration::from_millis(warm_window_ms as u64))
-                        });
+                        let changed = engine.as_mut().and_then(|e| e.should_rebuild());
                         if let Some(why) = changed {
                             eprintln!("[audio] {why} → rebuilt warm stream");
                             drop(engine.take());

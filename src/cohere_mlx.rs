@@ -279,7 +279,7 @@ impl CohereMlxWorker {
             }
         };
         if let Err(e) = check_response(&response, &request_id) {
-            return Err(Failure::Reply(e));
+            return Err(classify_reply_failure(&e));
         }
         if let Some(timings) = &response.timings_ms {
             if let Some(total) = timings.get("total") {
@@ -353,11 +353,31 @@ fn check_response(response: &Response, request_id: &str) -> eyre::Result<()> {
     }
     if response.request_id.as_deref() != Some(request_id) {
         return Err(eyre::eyre!(
-            "Cohere MLX response id mismatch (sent {request_id}, got {:?})",
+            "Cohere MLX {MISMATCH} (sent {request_id}, got {:?})",
             response.request_id
         ));
     }
     Ok(())
+}
+
+/// Marker inside the id-mismatch message, so the one string decides both the
+/// wording and the recovery.
+const MISMATCH: &str = "response id mismatch";
+
+/// Does a rejected reply mean "the helper said no" or "the stream is out of
+/// step"?
+///
+/// An id mismatch is not an answer, it is a desynchronised transport: every
+/// later request would read the reply before it, for as long as the process
+/// lived. [`Failure::Reply`] deliberately does not restart, so a mismatch
+/// classified as one was a permanently dead helper that nothing ever
+/// replaced. Treated as [`Failure::Gone`] it costs one respawn and the
+/// utterance still lands.
+fn classify_reply_failure(error: &eyre::Report) -> Failure {
+    if error.to_string().contains(MISMATCH) {
+        return Failure::Gone(eyre::eyre!("{error}"));
+    }
+    Failure::Reply(eyre::eyre!("{error}"))
 }
 
 fn response_error(context: &str, response: &Response) -> eyre::Report {
@@ -483,5 +503,30 @@ mod tests {
         assert!(check_response(&ok, "7").is_ok());
         let err = check_response(&ok, "8").unwrap_err().to_string();
         assert!(err.contains("mismatch"), "{err}");
+    }
+
+    /// Regression: an id mismatch means the reply stream is one line out of
+    /// step, so every later request would read the previous request's answer.
+    /// It used to be a `Reply` failure, which deliberately never restarts the
+    /// helper — a permanently broken transport with no way back short of
+    /// relaunching the app. It has to be recoverable.
+    #[test]
+    fn a_desynchronised_reply_stream_replaces_the_helper_instead_of_wedging() {
+        let stale: Response =
+            serde_json::from_str(r#"{"ok":true,"request_id":"7","text":"hi"}"#).unwrap();
+        let mismatch = check_response(&stale, "8").unwrap_err();
+        assert!(
+            matches!(classify_reply_failure(&mismatch), Failure::Gone(_)),
+            "a mismatch must restart and retry, not be reported as the answer"
+        );
+
+        // The helper genuinely answering "no" is still a Reply: restarting
+        // would only get the same refusal, slower.
+        let refused: Response = serde_json::from_str(
+            r#"{"ok":false,"request_id":"8","error_code":"model","error_message":"audio too short"}"#,
+        )
+        .unwrap();
+        let said_no = check_response(&refused, "8").unwrap_err();
+        assert!(matches!(classify_reply_failure(&said_no), Failure::Reply(_)));
     }
 }
