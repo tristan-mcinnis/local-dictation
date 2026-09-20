@@ -139,8 +139,26 @@ pub(crate) fn microphone_state(grant: Grant) -> RowState {
     }
 }
 
+/// The one chip title that means "restart the daemon": both the Accessibility
+/// and the Models row can reach a state that only a relaunch clears, and
+/// [`row_action`] keys off this string so they cannot drift apart.
+pub(crate) const RELAUNCH: &str = "Relaunch";
+
 /// The Accessibility row.
-pub(crate) fn accessibility_state(trusted: bool) -> RowState {
+///
+/// `install_failed` is the awkward third state: macOS says this process is
+/// trusted, but creating the event tap still failed (the TCC change can be
+/// reported before it has propagated). The grant is on, so "Open Settings"
+/// would send the user to a switch that is already correct; the hotkey is dead
+/// until the tap is created again, and the tap can only be created at startup.
+pub(crate) fn accessibility_state(trusted: bool, install_failed: bool) -> RowState {
+    if trusted && install_failed {
+        return RowState {
+            satisfied: false,
+            detail: "Allowed, but the hotkey did not start. Relaunch to try again.".to_string(),
+            action: Some(RELAUNCH.to_string()),
+        };
+    }
     if trusted {
         return RowState {
             satisfied: true,
@@ -175,16 +193,18 @@ pub(crate) fn models_state(
             // The worker loads its models once at boot, so a model that only
             // just landed is on disk but not in memory. Say so, rather than
             // leaving the user to wonder why the hotkey is still dead.
-            Some(model_fetch::Phase::Done) => {
-                "Ready · relaunch from the menu to load it".to_string()
-            }
+            Some(model_fetch::Phase::Done) => "Downloaded · relaunch to load it".to_string(),
             Some(model_fetch::Phase::Failed(why)) => format!("Ready · last attempt: {why}"),
             _ => "Ready".to_string(),
         };
+        // A model that only just landed is on disk but not in memory, so the
+        // row stays actionable: telling the user to relaunch without giving
+        // them the button is the kind of dead end this window exists to remove.
+        let action = matches!(phase, Some(model_fetch::Phase::Done)).then(|| RELAUNCH.to_string());
         return RowState {
             satisfied: true,
             detail: note,
-            action: None,
+            action,
         };
     }
     // One row, so it speaks for the first thing that is missing; fixing it
@@ -227,7 +247,10 @@ pub(crate) fn current_states() -> Vec<RowState> {
     let phase = model_fetch::fetch_phase();
     vec![
         microphone_state(permissions::microphone_status()),
-        accessibility_state(permissions::accessibility_trusted()),
+        accessibility_state(
+            permissions::accessibility_trusted(),
+            permissions::accessibility_install_failed(),
+        ),
         models_state(&statuses, phase.as_ref()),
     ]
 }
@@ -536,6 +559,16 @@ pub(super) fn row_action(tag: isize) {
     let Some(requirement) = Requirement::from_tag(tag) else {
         return;
     };
+    // Whatever the row, a chip reading "Relaunch" relaunches: the row already
+    // decided that nothing else can clear its state.
+    if current_states()
+        .get(requirement.tag() as usize)
+        .and_then(|r| r.action.as_deref())
+        == Some(RELAUNCH)
+    {
+        super::relaunch_daemon();
+        return;
+    }
     match requirement {
         Requirement::Microphone => match permissions::microphone_status() {
             // Only "not asked yet" can be answered in-app; once the user has
@@ -685,12 +718,37 @@ mod tests {
 
     #[test]
     fn the_accessibility_row_promises_no_restart() {
-        let off = accessibility_state(false);
+        let off = accessibility_state(false, false);
         assert!(!off.satisfied);
         assert_eq!(off.action.as_deref(), Some("Open Settings"));
         assert!(off.detail.contains("no restart"), "{}", off.detail);
-        let on = accessibility_state(true);
+        let on = accessibility_state(true, false);
         assert!(on.satisfied && on.action.is_none());
+    }
+
+    /// Regression: a granted permission whose tap install failed used to read
+    /// "Allowed" with no action, so the row said everything was fine while the
+    /// hotkey was dead and nothing on screen could revive it.
+    #[test]
+    fn a_granted_permission_whose_tap_failed_offers_a_relaunch() {
+        let stuck = accessibility_state(true, true);
+        assert!(!stuck.satisfied);
+        assert_eq!(stuck.action.as_deref(), Some(RELAUNCH));
+        assert!(stuck.detail.contains("Relaunch"), "{}", stuck.detail);
+        // It must not send the user to a switch that is already on.
+        assert!(!stuck.detail.contains("Open Settings"));
+    }
+
+    /// Regression: a model that has just downloaded is on disk but not in
+    /// memory. The row said "relaunch from the menu" and gave no button.
+    #[test]
+    fn a_freshly_downloaded_model_offers_the_relaunch_it_asks_for() {
+        let ready = [present(model_fetch::ASR, true), present(model_fetch::CLEANUP, true)];
+        let after = models_state(&ready, Some(&model_fetch::Phase::Done));
+        assert!(after.satisfied);
+        assert_eq!(after.action.as_deref(), Some(RELAUNCH));
+        // A steady state offers nothing: the button appears only after a fetch.
+        assert!(models_state(&ready, None).action.is_none());
     }
 
     #[test]
@@ -772,7 +830,7 @@ mod tests {
     fn the_window_opens_by_itself_only_when_something_is_missing() {
         let ready = vec![
             microphone_state(Grant::Granted),
-            accessibility_state(true),
+            accessibility_state(true, false),
             models_state(&[present(model_fetch::ASR, true)], None),
         ];
         assert!(
@@ -783,7 +841,7 @@ mod tests {
 
         let one_off = vec![
             microphone_state(Grant::Granted),
-            accessibility_state(false),
+            accessibility_state(false, false),
             models_state(&[present(model_fetch::ASR, true)], None),
         ];
         assert!(should_open_on_launch(&one_off));
@@ -791,7 +849,7 @@ mod tests {
 
         let fresh = vec![
             microphone_state(Grant::Undecided),
-            accessibility_state(false),
+            accessibility_state(false, false),
             models_state(&[absent(model_fetch::ASR, true)], None),
         ];
         assert_eq!(headline(&fresh), "3 things left.");

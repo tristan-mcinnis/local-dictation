@@ -61,8 +61,16 @@ struct Response {
 /// Metal shader compile happen inside a request.
 const MIN_READ_BUDGET: Duration = Duration::from_secs(15);
 
-/// How long the helper gets to load its model and announce itself.
+/// How long the helper gets to load its model and announce itself at boot,
+/// when the 1.5 GB checkpoint may still be coming off a cold disk.
 const READY_BUDGET: Duration = Duration::from_secs(120);
+
+/// The same wait during a restart. A restart happens inside `transcribe` on the
+/// worker thread, so the boot budget would freeze a press for two minutes with
+/// the pill stuck on "Transcribing". The weights are in the page cache by then,
+/// so a helper that has not announced itself in this long is wedged, not slow:
+/// give up, report, and let the next press try again.
+const RESTART_READY_BUDGET: Duration = Duration::from_secs(20);
 
 /// How many restarts in a row before the failure is declared to the user.
 const RESTARTS_BEFORE_FAULT: u32 = 3;
@@ -98,6 +106,10 @@ struct Helper {
 
 impl Helper {
     fn spawn(config: &CohereMlxConfig) -> eyre::Result<Self> {
+        Self::spawn_with_budget(config, READY_BUDGET)
+    }
+
+    fn spawn_with_budget(config: &CohereMlxConfig, ready_budget: Duration) -> eyre::Result<Self> {
         let mut child = Command::new(&config.helper_path)
             .args([
                 "--model-dir",
@@ -126,7 +138,7 @@ impl Helper {
             stdin,
             replies,
         };
-        let ready = helper.read_response(READY_BUDGET)?;
+        let ready = helper.read_response(ready_budget)?;
         if !ready.ok || ready.event.as_deref() != Some("ready") {
             return Err(response_error(
                 "Cohere MLX helper did not become ready",
@@ -298,7 +310,7 @@ impl CohereMlxWorker {
         if !delay.is_zero() {
             std::thread::sleep(delay);
         }
-        match Helper::spawn(&self.config) {
+        match Helper::spawn_with_budget(&self.config, RESTART_READY_BUDGET) {
             Ok(helper) => {
                 eprintln!("[cohere] helper restarted");
                 self.helper = Some(helper);
@@ -391,6 +403,21 @@ fn response_error(context: &str, response: &Response) -> eyre::Report {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a restart happens inside `transcribe`, on the worker thread,
+    /// so reusing the 120 s boot budget meant one wedged helper froze a key
+    /// press for two minutes with the pill stuck on "Transcribing". A restart
+    /// reloads weights that are already in the page cache, so its budget has to
+    /// be short enough that the user gets an answer, and still comfortably
+    /// longer than a warm load.
+    #[test]
+    fn a_restart_waits_far_less_than_a_cold_boot() {
+        assert!(RESTART_READY_BUDGET < READY_BUDGET);
+        assert!(RESTART_READY_BUDGET <= Duration::from_secs(30));
+        // Longer than one reply's floor, or a slow warm load would be read as
+        // a wedge and restarted in a loop.
+        assert!(RESTART_READY_BUDGET > MIN_READ_BUDGET);
+    }
 
     #[test]
     fn request_is_stable_ndjson() {

@@ -178,8 +178,17 @@ pub fn poll_pending_accessibility() {
 
 fn finish_accessibility_task(task: PendingTask) {
     match task() {
-        Ok(()) => crate::health::clear(crate::health::Fault::AccessibilityMissing),
-        Err(why) => crate::health::raise(crate::health::Fault::AccessibilityMissing, why),
+        Ok(()) => {
+            INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::health::clear(crate::health::Fault::AccessibilityMissing)
+        }
+        Err(why) => {
+            // The task is spent either way (it owns the tap's callback), so a
+            // failure here cannot be retried in place. Record it so the Setup
+            // window offers the one thing that does work: a relaunch.
+            INSTALL_FAILED.store(accessibility_trusted(), std::sync::atomic::Ordering::SeqCst);
+            crate::health::raise(crate::health::Fault::AccessibilityMissing, why)
+        }
     }
 }
 
@@ -187,6 +196,19 @@ fn finish_accessibility_task(task: PendingTask) {
 /// can say "the hotkey starts working as soon as you turn this on".
 pub fn accessibility_task_pending() -> bool {
     PENDING.with(|slot| slot.borrow().is_some())
+}
+
+/// Set when the deferred task ran under a granted permission and still failed.
+/// The tap can only be created at startup, so this state is not recoverable in
+/// place; the Setup window turns it into a Relaunch button.
+static INSTALL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Did the event-tap install fail although Accessibility is granted? macOS can
+/// report the process as trusted before the TCC change has reached the window
+/// server, and `CGEventTapCreate` then returns NULL: the grant looks correct
+/// and the hotkey is dead, which without this is a silent dead end.
+pub fn accessibility_install_failed() -> bool {
+    INSTALL_FAILED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
