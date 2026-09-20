@@ -30,7 +30,7 @@ pub fn play_stop() {
     }
 }
 
-/// Text was accepted and injected: a clear descending answer to the start cue.
+/// Text was accepted and injected: a soft, weighty landing thud.
 pub fn play_success() {
     play(Cue::Success);
 }
@@ -288,7 +288,7 @@ mod tests {
         for (name, bytes, seconds) in [
             ("start", START, 0.115),
             ("stop", STOP, 0.125),
-            ("success", SUCCESS, 0.140),
+            ("success", SUCCESS, 0.220),
             ("cancel", CANCEL, 0.135),
             ("latch", LATCH, 0.090),
             ("error", ERROR, 0.145),

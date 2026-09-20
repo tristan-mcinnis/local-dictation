@@ -36,6 +36,33 @@ def tone(seconds: float, notes: list[tuple[float, float, float]], gain: float = 
     return [max(-0.9, min(0.9, sample)) for sample in samples]
 
 
+def landing_thud(seconds: float = 0.220) -> list[float]:
+    """A soft, weighty impact: pitched body plus a very short felt-like tap."""
+    length = int(seconds * RATE)
+    samples: list[float] = []
+    noise_state = 0x4C44  # fixed seed: the asset must be byte-reproducible
+    phase = 0.0
+    for index in range(length):
+        t = index / RATE
+        # A fast downward pitch bend gives the impact weight without sounding
+        # like a bass note. The long exponential tail makes it feel as though
+        # the text has settled into place.
+        frequency = 112.0 + 128.0 * math.exp(-t / 0.036)
+        phase += 2 * math.pi * frequency / RATE
+        attack = min(1.0, t / 0.003)
+        body = 0.16 * attack * math.exp(-t / 0.064) * (
+            math.sin(phase) + 0.22 * math.sin(2 * phase)
+        )
+
+        # A deterministic, quickly damped tap supplies the physical edge of a
+        # muted wooden/felt impact. It is deliberately quieter than the body.
+        noise_state = (1103515245 * noise_state + 12345) & 0x7FFFFFFF
+        noise = noise_state / 0x3FFFFFFF - 1.0
+        tap = 0.026 * noise * math.exp(-t / 0.009)
+        samples.append(max(-0.9, min(0.9, body + tap)))
+    return samples
+
+
 def write(name: str, samples: list[float]) -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     with wave.open(str(OUT / name), "wb") as file:
@@ -51,10 +78,8 @@ def main() -> None:
     # interval rather than an alarm-like blast.
     write("start.wav", tone(0.115, [(620, 0.000, 0.048), (830, 0.046, 0.069)]))
     write("stop.wav", tone(0.125, [(760, 0.000, 0.052), (520, 0.044, 0.081)]))
-    # The landed cue answers the start cue with the same notes in reverse. It is
-    # equally loud, but slightly longer and descending, so it reads as a clear
-    # completion rather than a second "start" or a sharp notification.
-    write("success.wav", tone(0.140, [(830, 0.000, 0.060), (620, 0.052, 0.088)]))
+    # Completion is a soft, low thud: text landing in place, not another chime.
+    write("success.wav", landing_thud())
     write("cancel.wav", tone(0.135, [(300, 0.000, 0.060), (220, 0.052, 0.083)], 0.11))
     write("latch.wav", tone(0.090, [(540, 0.000, 0.075)], 0.105))
     write("error.wav", tone(0.145, [(260, 0.000, 0.068), (195, 0.064, 0.078)], 0.105))
