@@ -450,6 +450,9 @@ stack:
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `hotkeys::DEFAULT_KEYCODE` = `0x3D` Right Option; decimal or `0x` hex) |
 | `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key). The held modifiers must equal the mask (an extra Shift is the transform gesture). A plain typing key with no modifier is refused (`Hotkey::problem`) and falls back to the default; only a modifier key or F1–F20 may stand alone |
 | `DICTATE_DOUBLE_TAP_LATCH` | Double-tap the hotkey to latch hands-free (`0`/`false`/`off` disables) |
+| `DICTATE_COPY_LAST_HOTKEY` | Second global hotkey that copies the last dictation to the clipboard, written like `ctrl+cmd+v`. Empty string = off; unset = the `copy_last_hotkey` JSON key, itself unset by default. Validated against the push-to-talk hotkey |
+| `DICTATE_COPY_ON_PASTE_FAILURE` | Put the transcript on the clipboard when insertion is refused or fails, default on (`0`/`false`/`off` disables). The text is never lost either way: the pill and "Copy last dictation" still hold it |
+| `DICTATE_MAX_RECORDING_MINUTES` | Stop a recording that reaches this many minutes, so a lost key-up cannot record forever (default 10; `0` = no limit) |
 | `DICTATE_WHISPER_MODE` | Lower VAD speech threshold for quiet speech |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
 | `DICTATE_TRANSLATION_TARGETS` / `DICTATE_ACTIVE_TRANSLATION_TARGET` | Translate-mode target list (comma-separated) and the active one |
@@ -464,6 +467,8 @@ stack:
 | `DICTATE_PASTE_SETTLE_MS` | Override the clipboard-paste settle (ms) that waits for the target app to consume the Cmd+V before the background clipboard restore. Default is length-scaled (280 ms base +1 ms/3 chars, capped 1000); `0` disables the wait for the lowest latency |
 | `DICTATE_LISTEN_MODE=1` + `DICTATE_WAKE_WORD` | Hands-free wake-word listen mode (default wake word `computer`) |
 | `DICTATE_QUIET` | Mute audio cues |
+| `DICTATE_STOP_CUE` | Also play a cue when a recording stops (default off; the landed cue already marks the end) |
+| `DICTATE_RENDER_UI` | Render-proof harness only: write pill / window PNGs from invented fixtures and exit, never touching user data |
 | `DICTATE_DEBUG_STREAM` | Per-segment `⟫ seg` stream logging (default off) |
 | `DICTATE_LOG_TEXT` | Debug only: log dictated text, spoken instructions and screen terms verbatim. Default off — the log carries lengths and timings only |
 | `DICTATE_NO_MUTE` | Do not duck other audio during capture |

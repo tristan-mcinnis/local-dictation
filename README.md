@@ -40,9 +40,13 @@ Also included: optional always-on pre-roll (`DICTATE_PREROLL_MS`) so the first w
 
 ## Install
 
-Requires macOS 14 or later on Apple Silicon. This personal build expects the
-locally installed Superwhisper Cohere Q4 and S1-mini checkpoints; the app itself
-never downloads anything. Model bytes are never committed.
+Requires macOS 14 or later on Apple Silicon. Model bytes are never committed.
+`./scripts/download-models.sh` prepares the stack: it downloads the cleanup
+model, "S1-mini" by "Superwhisper", from Hugging Face and verifies its SHA-256
+(a local Superwhisper install is used instead when present, since the bytes are
+identical). The Cohere Q4 speech model still comes from a local 4-bit MLX
+checkpoint, so that part is not yet a clean-room install for a stranger. The app
+itself never downloads anything at runtime.
 
 Local builds use an available Apple Development signing identity. Keep the same identity across updates to preserve macOS permission grants.
 
@@ -166,12 +170,22 @@ for current-machine numbers.
 
 | Model | Size | Role |
 | --- | ---: | --- |
-| Cohere Transcribe Q4 MLX | about 1.5 GB | Fixed speech-to-text model |
-| S1-mini Q4_K_M | about 462 MB | Fixed cleanup model |
+| [Cohere Transcribe 03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) Q4 MLX, by Cohere Labs | about 1.5 GB | Fixed speech-to-text model |
+| [S1-mini](https://huggingface.co/superwhisper/s1-mini) Q4_K_M, by Superwhisper | about 462 MB | Fixed cleanup model |
+
+Both models are open weights under Apache-2.0. S1-mini adds a naming clause: the
+model keeps the name **"S1-mini" by "Superwhisper"** wherever it is used. Local
+Dictation loads the released weights unmodified and supplies its own prompts and
+guards. GGUF builds are published at
+[superwhisper/s1-mini-GGUF](https://huggingface.co/superwhisper/s1-mini-GGUF);
+the persistent llama.cpp worker loads one of them.
 
 The Cohere setup script re-keys Safetensors metadata for the public
-`mlx-audio-swift` module; tensor bytes are unchanged. S1-mini is linked from the
-local installation and loaded by the persistent llama.cpp worker.
+`mlx-audio-swift` module; tensor bytes are unchanged, so the result is a derived
+work of the Apache-2.0 model.
+
+Full attribution for models, native packages and crates is in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Compared to the alternatives
 
