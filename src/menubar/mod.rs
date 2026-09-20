@@ -205,6 +205,10 @@ struct UiGlobals {
     show_processing_detail: bool,
     reduced_motion: bool,
     last_state: AtomicU8,
+    /// What the status item last showed about health (see
+    /// `pill::health_signature`). Most faults arrive and clear without moving
+    /// `UiState`, so without this the glyph and tooltip went stale.
+    last_health: AtomicU8,
     /// Frame counter for the poll timer's once-a-second checks.
     slow_tick: std::sync::atomic::AtomicU32,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
@@ -714,6 +718,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         show_processing_detail: settings.resolve_show_processing_detail(),
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
+        last_health: AtomicU8::new(255),
         slow_tick: std::sync::atomic::AtomicU32::new(0),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
         icon_idle: built.icon_idle,

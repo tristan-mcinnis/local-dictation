@@ -503,6 +503,17 @@ pub(super) fn install_poll_timer() {
             }
             crate::permissions::refresh_microphone_health();
             super::setup::refresh();
+            // The status item is only repainted on a UiState transition, and
+            // most health changes do not move UiState: "Starting up…" clears
+            // when the worker is ready, a microphone grant lands in System
+            // Settings, the helper dies between utterances. Without this the
+            // icon and its tooltip kept whatever the last transition painted
+            // — an app that had finished booting still wore the danger glyph
+            // and said "Starting up…" until the first dictation.
+            let health = health_signature(crate::health::current().as_ref());
+            if globals.last_health.swap(health, Ordering::SeqCst) != health {
+                apply_state_transition(globals, state);
+            }
             crate::key_layout::refresh();
             if let Some(on) = crate::secure_input::refresh() {
                 eprintln!(
@@ -536,6 +547,19 @@ pub(super) fn install_poll_timer() {
         let run_loop = CFRunLoop::main().expect("main run loop");
         run_loop.add_timer(Some(&timer), kCFRunLoopCommonModes);
         std::mem::forget(timer);
+    }
+}
+
+/// One byte standing for what the status item currently says about health:
+/// `0` for "nothing wrong", otherwise the fault's discriminant plus one.
+///
+/// Only a fault that blocks dictation reaches the status item, so only those
+/// move the signature — a lost microphone stream or a missing cleanup model
+/// must not make the menu bar repaint once a second.
+pub(super) fn health_signature(problem: Option<&crate::health::Problem>) -> u8 {
+    match problem {
+        Some(p) if p.fault.blocks_dictation() => p.fault as u8 + 1,
+        _ => 0,
     }
 }
 
@@ -1034,6 +1058,55 @@ pub(super) fn position_pill_at_cursor_screen(window: &NSWindow) {
         // Sit close to the bottom edge so the pill stays out of the way.
         let y = chosen.origin.y + SPACE_XXL;
         window.setFrameOrigin(NSPoint::new(x, y));
+    }
+}
+
+#[cfg(test)]
+mod health_signature_tests {
+    use super::health_signature;
+    use crate::health::{Fault, Problem};
+
+    fn problem(fault: Fault) -> Problem {
+        Problem {
+            fault,
+            detail: String::new(),
+        }
+    }
+
+    /// Regression: the status item was repainted only on a `UiState`
+    /// transition, and most health changes do not move `UiState`. The
+    /// signature is what makes the once-a-second tick notice one.
+    #[test]
+    fn every_blocking_fault_has_its_own_signature_and_nothing_else_moves_it() {
+        assert_eq!(health_signature(None), 0);
+
+        let mut seen = vec![0u8];
+        for fault in [
+            Fault::AccessibilityMissing,
+            Fault::MicrophoneBlocked,
+            Fault::ModelsMissing,
+            Fault::EngineFailed,
+            Fault::HelperFailed,
+            Fault::Booting,
+        ] {
+            let signature = health_signature(Some(&problem(fault)));
+            assert_ne!(signature, 0, "{fault:?} blocks dictation and must show");
+            assert!(!seen.contains(&signature), "{fault:?} collides");
+            seen.push(signature);
+        }
+
+        // The two non-blocking faults never reach the status item, so they
+        // must read the same as "nothing wrong" — otherwise an unplugged mic
+        // would repaint the menu bar with a danger glyph it does not deserve.
+        for fault in [Fault::AudioLost, Fault::CleanupUnavailable] {
+            assert_eq!(health_signature(Some(&problem(fault))), 0, "{fault:?}");
+        }
+
+        // The whole point: boot → ready is a change the tick can see.
+        assert_ne!(
+            health_signature(Some(&problem(Fault::Booting))),
+            health_signature(None)
+        );
     }
 }
 
