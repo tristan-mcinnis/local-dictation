@@ -8,13 +8,32 @@ pub(super) fn worker_loop(
     crate::history::initialize_recovery();
     cues::preload();
     let t_load = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
+    // The ASR model IS the app: a failure here is fatal to the worker, but it
+    // now leaves behind a named fault instead of an idle icon over a dead
+    // hotkey. `?` still returns — `run` catches it and publishes EngineFailed.
+    let mut worker = LocalInferenceWorker::initialize(&config.asr).map_err(|e| {
+        crate::health::raise(
+            if crate::model_fetch::ASR
+                .present_at(&std::path::PathBuf::from(&config.asr.model_dir))
+            {
+                crate::health::Fault::EngineFailed
+            } else {
+                crate::health::Fault::ModelsMissing
+            },
+            format!("speech model: {e}"),
+        );
+        e
+    })?;
     eprintln!(
         "[boot] asr         loaded in {:>4} ms · {}",
         ms(t_load.elapsed()),
         config.asr.describe()
     );
 
+    // The cleanup model is OPTIONAL (CP-01/CP-11). A moved, corrupt or
+    // template-less GGUF used to take the whole worker down with `?`, which
+    // left the menu bar alive and every key press going nowhere. Now it is a
+    // visible warning and dictation carries on with the raw transcript.
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
         let pretty = std::path::Path::new(&config.llm_model_path)
@@ -22,12 +41,24 @@ pub(super) fn worker_loop(
             .and_then(|s| s.to_str())
             .unwrap_or(&config.llm_model_path);
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&config.llm_model_path)?;
-        eprintln!(
-            "[boot] cleaner     loaded in {:>4} ms · {pretty}",
-            ms(t.elapsed())
-        );
-        Some(c)
+        match TextCleanupEngine::initialize(&config.llm_model_path) {
+            Ok(c) => {
+                eprintln!(
+                    "[boot] cleaner     loaded in {:>4} ms · {pretty}",
+                    ms(t.elapsed())
+                );
+                crate::health::clear(crate::health::Fault::CleanupUnavailable);
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("[warn] cleaner     failed to load ({pretty}): {e}");
+                crate::health::raise(
+                    crate::health::Fault::CleanupUnavailable,
+                    format!("cleanup model: {e}"),
+                );
+                None
+            }
+        }
     } else {
         eprintln!("[boot] cleaner     disabled (--no-cleanup)");
         None
@@ -51,6 +82,10 @@ pub(super) fn worker_loop(
         "[boot] warm-up     done   in {:>4} ms",
         ms(t_warm.elapsed())
     );
+    // The engine is live. Anything still raised (a permission, a missing
+    // cleanup model) stays raised and stays visible; only "Starting up…"
+    // ends here.
+    crate::health::clear(crate::health::Fault::Booting);
 
     // Load personal corrections dictionary (no-op if no file) and wrap it in
     // the refiner that applies corrections + voice-command parsing in the

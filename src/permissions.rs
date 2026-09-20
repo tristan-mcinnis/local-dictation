@@ -112,6 +112,83 @@ pub fn request_microphone(then: impl Fn(Grant) + Send + 'static) {
     imp::request_microphone(then);
 }
 
+/// Update the microphone health fault from the current status. Returns the
+/// status so a caller can act on it too.
+pub fn refresh_microphone_health() -> Grant {
+    let grant = microphone_status();
+    if grant.is_usable() {
+        crate::health::clear(crate::health::Fault::MicrophoneBlocked);
+    } else {
+        crate::health::raise(crate::health::Fault::MicrophoneBlocked, grant.label());
+    }
+    grant
+}
+
+// ─── Deferred work that needs Accessibility ─────────────────────────────
+
+/// Work that is waiting for the Accessibility grant.
+///
+/// The event tap must be created on the thread that owns the CFRunLoop AppKit
+/// pumps, i.e. the main thread, so the pending task is kept in a thread-local
+/// rather than a `Send` static: [`run_when_accessibility_granted`] and
+/// [`poll_pending_accessibility`] are both main-thread calls and the value
+/// never crosses a thread boundary.
+type PendingTask = Box<dyn FnOnce() -> Result<(), String>>;
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Option<PendingTask>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `task` as soon as this process is trusted for Accessibility.
+///
+/// Granted already: `task` runs now. Not granted: the fault is raised, the
+/// menu bar and the Setup window say so, and `task` runs the moment
+/// [`poll_pending_accessibility`] sees the grant land — with no relaunch. The
+/// daemon must never exit over a missing grant; that is how a first launch
+/// used to end with a permission dialog and then nothing at all.
+pub fn run_when_accessibility_granted(task: impl FnOnce() -> Result<(), String> + 'static) {
+    if accessibility_trusted() {
+        finish_accessibility_task(Box::new(task));
+        return;
+    }
+    crate::health::raise(
+        crate::health::Fault::AccessibilityMissing,
+        "not trusted — waiting for the grant",
+    );
+    PENDING.with(|slot| *slot.borrow_mut() = Some(Box::new(task)));
+}
+
+/// Poll the grant and run any pending task. Called about once a second from
+/// the menu-bar timer, on the main thread. Cheap: one non-prompting syscall.
+pub fn poll_pending_accessibility() {
+    let waiting = PENDING.with(|slot| slot.borrow().is_some());
+    if !waiting {
+        return;
+    }
+    if !accessibility_trusted() {
+        return;
+    }
+    let Some(task) = PENDING.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    eprintln!("[perm] Accessibility granted — continuing without a relaunch");
+    finish_accessibility_task(task);
+}
+
+fn finish_accessibility_task(task: PendingTask) {
+    match task() {
+        Ok(()) => crate::health::clear(crate::health::Fault::AccessibilityMissing),
+        Err(why) => crate::health::raise(crate::health::Fault::AccessibilityMissing, why),
+    }
+}
+
+/// Is something still waiting for the grant? Used by the Setup window so it
+/// can say "the hotkey starts working as soon as you turn this on".
+pub fn accessibility_task_pending() -> bool {
+    PENDING.with(|slot| slot.borrow().is_some())
+}
+
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 mod imp {
     use super::Grant;
@@ -249,6 +326,55 @@ mod tests {
         );
         // And the silent Accessibility check runs without prompting.
         let _ = accessibility_trusted();
+    }
+
+    /// The deferred install is the difference between "grant it, then find
+    /// the app has quit" and "grant it, and the hotkey starts working". The
+    /// grant itself cannot be faked in a test, so this covers the mechanics:
+    /// a task queued while untrusted is held, runs exactly once, and reports
+    /// its own failure as the fault detail.
+    #[test]
+    fn a_task_waiting_on_accessibility_runs_once_and_reports_its_result() {
+        let _serial = crate::health::test_lock();
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        // On a build with no AX check, `accessibility_trusted()` is true, so
+        // the task runs immediately — which is also the behaviour a granted
+        // Mac gets.
+        let runs = Rc::new(Cell::new(0));
+        let counter = runs.clone();
+        run_when_accessibility_granted(move || {
+            counter.set(counter.get() + 1);
+            Ok(())
+        });
+        if accessibility_trusted() {
+            assert_eq!(runs.get(), 1, "a granted Mac installs the tap at boot");
+            assert!(!accessibility_task_pending());
+        } else {
+            assert_eq!(runs.get(), 0, "an untrusted Mac must not run it yet");
+            assert!(accessibility_task_pending());
+            assert!(crate::health::is_raised(
+                crate::health::Fault::AccessibilityMissing
+            ));
+            // Polling while still untrusted must keep waiting, not give up.
+            poll_pending_accessibility();
+            assert!(accessibility_task_pending());
+            PENDING.with(|slot| *slot.borrow_mut() = None);
+            crate::health::clear(crate::health::Fault::AccessibilityMissing);
+        }
+
+        // A task that fails leaves the fault raised, carrying its own reason.
+        run_when_accessibility_granted(|| Err("tap refused".to_string()));
+        if accessibility_trusted() {
+            let problem = crate::health::current().expect("a failed install is a fault");
+            assert_eq!(problem.fault, crate::health::Fault::AccessibilityMissing);
+            assert_eq!(problem.detail, "tap refused");
+            crate::health::clear(crate::health::Fault::AccessibilityMissing);
+        } else {
+            PENDING.with(|slot| *slot.borrow_mut() = None);
+            crate::health::clear(crate::health::Fault::AccessibilityMissing);
+        }
     }
 
     #[test]

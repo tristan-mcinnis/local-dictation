@@ -27,6 +27,7 @@ mod history;
 mod history_detail;
 mod pill;
 mod render_ui;
+pub(crate) mod setup;
 pub(crate) mod slate;
 use dictionary::*;
 use history::*;
@@ -516,6 +517,19 @@ define_class!(
         fn import_csv(&self, _sender: *mut AnyObject) {
             import_dictionary_csv();
         }
+
+        // "Setup & permissions…" — the checklist window.
+        #[unsafe(method(openSetup:))]
+        fn open_setup(&self, _sender: *mut AnyObject) {
+            setup::show_setup_window();
+        }
+
+        // A Setup row's action chip. Its `tag` names the requirement.
+        #[unsafe(method(setupRowAction:))]
+        fn setup_row_action(&self, sender: *mut AnyObject) {
+            let tag: isize = unsafe { msg_send![sender, tag] };
+            setup::row_action(tag);
+        }
     }
 );
 
@@ -712,6 +726,13 @@ pub fn init_and_run() -> eyre::Result<()> {
     };
     let _ = GLOBALS.set(globals);
 
+    // A launch that cannot dictate opens the checklist by itself. A launch
+    // that can never sees it — the item stays in the menu either way.
+    if setup::should_open_on_launch(&setup::current_states()) {
+        eprintln!("[boot] setup      needed — opening Setup & permissions");
+        setup::show_setup_window();
+    }
+
     install_poll_timer();
     app.run();
     Ok(())
@@ -883,6 +904,14 @@ fn build_status_item(
     last_item.setEnabled(false);
     menu.addItem(&last_item);
 
+    // The fault row: hidden while everything works, first in the menu when
+    // something is wrong, and a route straight to the window that fixes it.
+    // `refresh_recovery_items` decides each time the menu opens.
+    let health_item = action_item(mtm, "", sel!(openSetup:), "", actions);
+    health_item.setTag(TAG_HEALTH);
+    health_item.setHidden(true);
+    menu.insertItem_atIndex(&health_item, 0);
+
     // Hidden unless Secure Input is on; `refresh_recovery_items` decides each
     // time the menu opens.
     let secure_item = unsafe {
@@ -927,6 +956,16 @@ fn build_status_item(
     // warmed Cohere MLX transcriber followed by S1-mini).
     let settings_item = action_item(mtm, "Settings…", sel!(openSettings:), ",", actions);
     menu.addItem(&settings_item);
+
+    // Always reachable, not only when something is broken: it is also where
+    // the permission status and the model state are stated.
+    menu.addItem(&action_item(
+        mtm,
+        "Setup & permissions…",
+        sel!(openSetup:),
+        "",
+        actions,
+    ));
 
     let more_parent = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -1342,6 +1381,7 @@ fn build_hotkey_submenu(
     submenu
 }
 
+const TAG_HEALTH: isize = 9100;
 const TAG_COPY_LAST: isize = 9101;
 const TAG_PASTE_LAST: isize = 9102;
 const TAG_SECURE_INPUT: isize = 9103;
@@ -1358,6 +1398,17 @@ fn copy_last_title(hotkey: Option<&crate::hotkeys::Hotkey>) -> String {
 /// Copy / Paste enabled only when there is a dictation, and the Secure Input
 /// line shown only while it applies.
 fn refresh_recovery_items(menu: &NSMenu) {
+    // Fault first: what is wrong, then the one thing to do about it.
+    if let Some(item) = menu.itemWithTag(TAG_HEALTH) {
+        match crate::health::current() {
+            Some(problem) => {
+                item.setTitle(&NSString::from_str(&problem.pill_line()));
+                item.setEnabled(true);
+                item.setHidden(false);
+            }
+            None => item.setHidden(true),
+        }
+    }
     let have_text = !ui_channel::last_dictation().trim().is_empty();
     for tag in [TAG_COPY_LAST, TAG_PASTE_LAST] {
         if let Some(item) = menu.itemWithTag(tag) {

@@ -36,9 +36,12 @@ pub enum Fault {
     HelperFailed = 4,
     /// The microphone stream failed mid-session; it is rebuilt on next press.
     AudioLost = 5,
+    /// The cleanup model could not load. Dictation still works: the raw
+    /// transcript is used, so this is a degradation, not a blocker.
+    CleanupUnavailable = 6,
     /// Models are still loading. Lowest priority: any real fault replaces it
     /// in [`current`], and it clears itself when the worker is ready.
-    Booting = 6,
+    Booting = 7,
 }
 
 impl Fault {
@@ -52,6 +55,7 @@ impl Fault {
             Fault::EngineFailed => "Dictation engine stopped",
             Fault::HelperFailed => "Speech helper stopped",
             Fault::AudioLost => "Microphone disconnected",
+            Fault::CleanupUnavailable => "Cleanup is unavailable",
             Fault::Booting => "Starting up…",
         }
     }
@@ -65,6 +69,7 @@ impl Fault {
             Fault::EngineFailed => "Open the log, then relaunch from the menu.",
             Fault::HelperFailed => "Open the log, then relaunch from the menu.",
             Fault::AudioLost => "Check the microphone, then press the key again.",
+            Fault::CleanupUnavailable => "Dictation works; the raw transcript is used.",
             Fault::Booting => "The hotkey works as soon as the models are loaded.",
         }
     }
@@ -72,7 +77,7 @@ impl Fault {
     /// True while dictation cannot produce text at all. `AudioLost` is not
     /// blocking: the next press rebuilds the stream.
     pub fn blocks_dictation(self) -> bool {
-        !matches!(self, Fault::AudioLost)
+        !matches!(self, Fault::AudioLost | Fault::CleanupUnavailable)
     }
 }
 
@@ -102,6 +107,15 @@ impl Problem {
 
 /// Every fault currently raised, at most one per [`Fault`] kind.
 static FAULTS: Mutex<Vec<Problem>> = Mutex::new(Vec::new());
+
+/// Serializes the tests that mutate the process-wide fault store — here and in
+/// `permissions`, which raises `AccessibilityMissing`. Without it those tests
+/// race each other on a parallel test runner.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ─── Writer side ────────────────────────────────────────────────────────
 
@@ -207,6 +221,7 @@ mod tests {
     /// rather than racing each other across parallel test threads.
     #[test]
     fn the_user_is_always_pointed_at_the_fault_to_fix_first() {
+        let _serial = test_lock();
         for fault in [
             Fault::AccessibilityMissing,
             Fault::MicrophoneBlocked,
@@ -214,6 +229,7 @@ mod tests {
             Fault::EngineFailed,
             Fault::HelperFailed,
             Fault::AudioLost,
+            Fault::CleanupUnavailable,
             Fault::Booting,
         ] {
             clear(fault);
@@ -277,6 +293,9 @@ mod tests {
         // but the next key press rebuilds the stream, so it must not read as
         // "dictation is impossible".
         assert!(!Fault::AudioLost.blocks_dictation());
+        // Same rule for a missing cleanup model: the raw transcript still
+        // lands, so the app must not present itself as unusable (CP-11).
+        assert!(!Fault::CleanupUnavailable.blocks_dictation());
         for fault in [
             Fault::AccessibilityMissing,
             Fault::MicrophoneBlocked,
@@ -298,6 +317,7 @@ mod tests {
             Fault::EngineFailed,
             Fault::HelperFailed,
             Fault::AudioLost,
+            Fault::CleanupUnavailable,
             Fault::Booting,
         ] {
             assert!(!fault.headline().is_empty(), "{fault:?}");

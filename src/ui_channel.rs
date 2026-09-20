@@ -71,6 +71,12 @@ pub enum UiState {
     LimitReachedCopied = 14,
     /// "Copy last dictation" was asked for and there is nothing to copy.
     NothingToCopy = 15,
+    /// A hotkey press arrived while dictation cannot work — no Accessibility,
+    /// no microphone, no model, or a dead engine. The reason and the next step
+    /// come from `crate::health`, which owns the text; this variant only says
+    /// "show it". Before it, the press went into a channel nobody was reading
+    /// and the user saw nothing at all.
+    Unavailable = 16,
 }
 
 impl UiState {
@@ -126,6 +132,7 @@ impl UiState {
             13 => UiState::LimitReached,
             14 => UiState::LimitReachedCopied,
             15 => UiState::NothingToCopy,
+            16 => UiState::Unavailable,
             _ => UiState::Idle,
         }
     }
@@ -561,7 +568,7 @@ mod tests {
 
     #[test]
     fn every_state_round_trips_through_its_byte() {
-        for v in 0..=15u8 {
+        for v in 0..=16u8 {
             assert_eq!(UiState::from_u8(v) as u8, v);
         }
         assert_eq!(UiState::from_u8(200), UiState::Idle);
@@ -581,9 +588,19 @@ mod tests {
             assert!(!s.is_active());
             assert!(!s.is_cancellable());
         }
-        for s in [UiState::Idle, UiState::Success, UiState::Copied, UiState::NothingToCopy, UiState::Error] {
+        for s in [
+            UiState::Idle,
+            UiState::Success,
+            UiState::Copied,
+            UiState::NothingToCopy,
+            UiState::Error,
+            UiState::Unavailable,
+        ] {
             assert!(!s.is_kept_result());
         }
+        // A press that could not start anything must not read as an utterance.
+        assert!(!UiState::Unavailable.is_active());
+        assert!(!UiState::Unavailable.is_processing());
     }
 
     #[test]

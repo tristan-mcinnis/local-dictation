@@ -493,6 +493,16 @@ pub(super) fn install_poll_timer() {
         // notice Secure Input, which silences the hotkeys.
         let tick = globals.slow_tick.fetch_add(1, Ordering::Relaxed);
         if tick % SLOW_TICK_FRAMES == 0 {
+            // The grant can land at any moment in System Settings. Installing
+            // the event tap here is what makes "turn it on and it works"
+            // true, with no relaunch.
+            let was_waiting = crate::permissions::accessibility_task_pending();
+            crate::permissions::poll_pending_accessibility();
+            if was_waiting && !crate::permissions::accessibility_task_pending() {
+                apply_state_transition(globals, state);
+            }
+            crate::permissions::refresh_microphone_health();
+            super::setup::refresh();
             crate::key_layout::refresh();
             if let Some(on) = crate::secure_input::refresh() {
                 eprintln!(
@@ -535,10 +545,15 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         None => return,
     };
 
+    // A fault outranks the utterance state: an idle-looking icon over a dead
+    // hotkey is the one thing the menu bar must never show. The rule allows
+    // `danger` on the status item for exactly this and for recording.
+    let fault = crate::health::current().filter(|p| p.fault.blocks_dictation());
+
     // One glyph family — the waveform, matching the app icon. Idle is the
     // template ink; recording is the same shape tinted `danger`; processing is
     // the template at 40 %, which is the rule's "busy" treatment.
-    let icon = if state == UiState::Recording {
+    let icon = if state == UiState::Recording || fault.is_some() {
         &globals.icon_recording
     } else if state.is_processing() || (state == UiState::Error || state.is_kept_result()) {
         &globals.icon_processing
@@ -549,7 +564,9 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         if let Some(img) = icon {
             button.setImage(Some(img));
         } else {
-            button.setTitle(&NSString::from_str(if state == UiState::Recording {
+            button.setTitle(&NSString::from_str(if fault.is_some() {
+                "!"
+            } else if state == UiState::Recording {
                 "●"
             } else if state.is_processing() {
                 "◌"
@@ -569,10 +586,13 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         });
         button.setToolTip(Some(&NSString::from_str(&format!(
             "Local Dictation · {}",
-            if paused {
-                crate::secure_input::PAUSED_TEXT
-            } else {
-                pill_status(state, globals.show_processing_detail)
+            match (&fault, paused) {
+                // A word beside the colour: the rule never lets a state be
+                // carried by the tint alone.
+                (Some(problem), _) => problem.pill_line(),
+                (None, true) => crate::secure_input::PAUSED_TEXT.to_string(),
+                (None, false) =>
+                    pill_status(state, globals.show_processing_detail).to_string(),
             }
         ))));
     }
@@ -655,6 +675,7 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .pill
                 .hint
                 .setStringValue(&NSString::from_str("History"));
+            set_hint_action(globals, sel!(openHistory:), "Open Dictation History");
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
@@ -664,6 +685,22 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .status
                 .setStringValue(&NSString::from_str(NOTHING_TO_COPY_TEXT));
             set_pill_layout(globals, PillLayout::Copied);
+            show_pill(globals);
+        }
+        UiState::Unavailable => {
+            // The reason lives in the health channel, not in the state byte.
+            let line = crate::health::current()
+                .map(|p| p.pill_line())
+                .unwrap_or_else(|| "Dictation is not ready".to_string());
+            globals.pill.status.setStringValue(&NSString::from_str(&line));
+            globals
+                .pill
+                .hint
+                .setStringValue(&NSString::from_str("Setup"));
+            // The same hint slot, pointed at the window that fixes it rather
+            // than at History, which holds nothing relevant here.
+            set_hint_action(globals, sel!(openSetup:), "Open Setup & permissions");
+            set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
         UiState::NoEditableField
@@ -684,10 +721,24 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .pill
                 .hint
                 .setStringValue(&NSString::from_str("History"));
+            set_hint_action(globals, sel!(openHistory:), "Open Dictation History");
             set_pill_layout(globals, PillLayout::Error);
             show_pill(globals);
         }
     }
+}
+
+/// Point the error pill's hint button at one action. The slot is shared by the
+/// kept-result pills (History) and the not-ready pill (Setup), so it is always
+/// set explicitly rather than left on whatever the previous state wanted.
+fn set_hint_action(globals: &UiGlobals, action: objc2::runtime::Sel, tooltip: &str) {
+    unsafe {
+        let _: () = msg_send![&*globals.pill.history, setAction: action];
+    }
+    globals
+        .pill
+        .history
+        .setToolTip(Some(&NSString::from_str(tooltip)));
 }
 
 /// Pill text when "Copy last dictation" has nothing to copy.
@@ -868,6 +919,7 @@ pub(super) fn pill_status(state: UiState, details: bool) -> &'static str {
         UiState::NoEditableField | UiState::HeldCopied => "No text field selected",
         UiState::LimitReached | UiState::LimitReachedCopied => "Recording limit reached",
         UiState::NothingToCopy => NOTHING_TO_COPY_TEXT,
+        UiState::Unavailable => "Not ready",
         UiState::Idle => "Ready",
     }
 }

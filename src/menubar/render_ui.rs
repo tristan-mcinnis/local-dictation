@@ -36,6 +36,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
     let detail = build_history_detail(mtm);
     let detail_audio = write_history_audio_fixture(out_dir)?;
     let dictionary = build_dictionary_window(mtm);
+    let setup = setup::build_setup_window(mtm);
     let settings = crate::settings_window::build_for_render(mtm);
 
     // Six rows over two days, matching the mockup's sample list. The same
@@ -64,6 +65,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             &*history.window as &NSWindow,
             &*detail.window as &NSWindow,
             &*dictionary.window,
+            &*setup.window,
             &*settings.window,
         ] {
             w.setAppearance(Some(&appearance));
@@ -380,6 +382,25 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 0.0,
             )?);
         }
+        // ── Setup & permissions ─────────────────────────────────────────
+        // Both ends of the checklist, on invented rows: the fresh install a
+        // stranger meets, and the same window once everything is granted.
+        // Nothing here reads this Mac's permissions or model directory.
+        for (name, states) in [
+            ("setup-fresh", setup_fresh_fixture()),
+            ("setup-ready", setup_ready_fixture()),
+        ] {
+            setup::apply_for_render(&setup, &states);
+            written.push(snapshot(
+                mtm,
+                &setup.panel,
+                out_dir,
+                &format!("{name}-{suffix}"),
+                None,
+                0.0,
+            )?);
+        }
+
         crate::settings_window::scroll_to_top_for_render(&settings);
 
         // The Dictionary pane carries the term list, so prove that pane too.
@@ -468,6 +489,49 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
 
     slate::set_opaque_materials(false);
     Ok(written)
+}
+
+/// A fresh install: nothing asked for, nothing granted, no model on disk.
+fn setup_fresh_fixture() -> Vec<setup::RowState> {
+    vec![
+        setup::RowState {
+            satisfied: false,
+            detail: "Not asked yet — nothing is recorded until you allow it.".to_string(),
+            action: Some("Allow".to_string()),
+        },
+        setup::RowState {
+            satisfied: false,
+            detail: "Off. The hotkey starts working the moment you turn it on — no restart."
+                .to_string(),
+            action: Some("Open Settings".to_string()),
+        },
+        setup::RowState {
+            satisfied: false,
+            detail: "Downloading… 42%".to_string(),
+            action: Some("Cancel".to_string()),
+        },
+    ]
+}
+
+/// The same window on a Mac that is ready: three satisfied rows, no actions.
+fn setup_ready_fixture() -> Vec<setup::RowState> {
+    vec![
+        setup::RowState {
+            satisfied: true,
+            detail: "Allowed".to_string(),
+            action: None,
+        },
+        setup::RowState {
+            satisfied: true,
+            detail: "Allowed".to_string(),
+            action: None,
+        },
+        setup::RowState {
+            satisfied: true,
+            detail: "Ready".to_string(),
+            action: None,
+        },
+    ]
 }
 
 /// The slate backdrop the mockups sit a floating panel on, so the glass edge
