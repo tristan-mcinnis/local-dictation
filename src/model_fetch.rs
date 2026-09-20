@@ -150,17 +150,27 @@ impl ModelStatus {
 
 /// Status of the whole stack.
 ///
-/// `llm_path` is the *resolved* cleanup model, not the manifest default: the
-/// model picker saves an absolute path, and requiring the manifest file when
-/// the user chose another GGUF reported a missing model that was not missing.
+/// `asr_path` and `llm_path` are the *resolved* model locations, not the
+/// manifest defaults. Both have documented env overrides
+/// (`DICTATE_COHERE_MLX_MODEL_DIR`, `DICTATE_LLM_MODEL_PATH`) and the cleanup
+/// model also has a settings key the picker writes, so checking the manifest
+/// default instead reported a missing model on a Mac where the daemon loads
+/// one perfectly well. `None` means "use the manifest default under `base`",
+/// which is what `fetch-models <dir>` wants.
 /// `cleanup_enabled` false makes the cleanup row optional (CP-11): a missing
 /// LLM alone must never dead-end the app.
-pub fn stack_status(base: &Path, llm_path: Option<&Path>, cleanup_enabled: bool) -> Vec<ModelStatus> {
+pub fn stack_status(
+    base: &Path,
+    asr_path: Option<&Path>,
+    llm_path: Option<&Path>,
+    cleanup_enabled: bool,
+) -> Vec<ModelStatus> {
     MANIFEST
         .iter()
         .map(|entry| {
-            let path = match (entry.role, llm_path) {
-                (Role::Cleanup, Some(p)) => p.to_path_buf(),
+            let path = match (entry.role, asr_path, llm_path) {
+                (Role::Asr, Some(p), _) => p.to_path_buf(),
+                (Role::Cleanup, _, Some(p)) => p.to_path_buf(),
                 _ => entry.path_in(base),
             };
             let present = entry.present_at(&path);
@@ -179,34 +189,84 @@ pub fn stack_status(base: &Path, llm_path: Option<&Path>, cleanup_enabled: bool)
 }
 
 /// True when every model the current configuration needs is on disk.
-pub fn models_present(base: &Path, llm_path: Option<&Path>, cleanup_enabled: bool) -> bool {
-    !stack_status(base, llm_path, cleanup_enabled)
+pub fn models_present(
+    base: &Path,
+    asr_path: Option<&Path>,
+    llm_path: Option<&Path>,
+    cleanup_enabled: bool,
+) -> bool {
+    !stack_status(base, asr_path, llm_path, cleanup_enabled)
         .iter()
         .any(ModelStatus::is_blocking)
 }
 
-/// Boot check. Raises [`crate::health::Fault::ModelsMissing`] rather than only
-/// writing a log line nobody reads, so the menu bar and the Setup window can
-/// say what is missing.
-pub fn ensure_models_on_first_run() {
-    let base = crate::app_paths::models_base_dir();
+/// The stack as *this* Mac resolves it: the same paths the daemon loads from,
+/// including every documented override. The one place that resolution lives —
+/// the boot check, the Setup window and the Models action all read it, so they
+/// can never disagree about whether a model is there.
+pub fn resolved_status() -> Vec<ModelStatus> {
     let settings = crate::settings::Settings::load();
     let cleanup_enabled = settings.resolve_cleanup_enabled(false);
+    let asr = PathBuf::from(crate::app_paths::cohere_mlx_default_dir());
     let llm = PathBuf::from(settings.resolve_llm_model(&crate::app_paths::llm_default_path()));
-    let statuses = stack_status(&base, Some(&llm), cleanup_enabled);
-    let missing: Vec<&ModelStatus> = statuses.iter().filter(|s| s.is_blocking()).collect();
-    if missing.is_empty() {
-        crate::health::clear(crate::health::Fault::ModelsMissing);
-        return;
-    }
-    let names: Vec<String> = missing
+    stack_status(
+        &crate::app_paths::models_base_dir(),
+        Some(&asr),
+        Some(&llm),
+        cleanup_enabled,
+    )
+}
+
+/// Boot check. Raises a health fault rather than only writing a log line
+/// nobody reads, so the menu bar and the Setup window can say what is missing.
+///
+/// The two models are *not* the same kind of problem, and were reported as one
+/// until this split: a missing speech model stops dictation
+/// ([`crate::health::Fault::ModelsMissing`], which blocks a press), while a
+/// missing cleanup model only costs the polish
+/// ([`crate::health::Fault::CleanupUnavailable`], which does not) — exactly
+/// what the worker does when it loads them (CP-11). Raising the blocking fault
+/// for a missing GGUF left a fresh install with the speech model but no
+/// cleanup model unable to dictate at all.
+///
+/// `CleanupUnavailable` is raised here but never cleared: once the worker has
+/// tried to load the file it owns that verdict, and a model that has landed on
+/// disk since boot is still not in memory until a relaunch.
+pub fn ensure_models_on_first_run() {
+    let statuses = resolved_status();
+    let blocking: Vec<&ModelStatus> = statuses.iter().filter(|s| s.is_blocking()).collect();
+    let describe = |rows: &[&ModelStatus]| {
+        rows.iter()
+            .map(|s| format!("{} ({})", s.entry.id, s.path.display()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let asr: Vec<&ModelStatus> = blocking
         .iter()
-        .map(|s| format!("{} ({})", s.entry.id, s.path.display()))
+        .copied()
+        .filter(|s| s.entry.role == Role::Asr)
         .collect();
-    crate::health::raise(
-        crate::health::Fault::ModelsMissing,
-        format!("not on disk: {}", names.join(", ")),
-    );
+    if asr.is_empty() {
+        crate::health::clear(crate::health::Fault::ModelsMissing);
+    } else {
+        crate::health::raise(
+            crate::health::Fault::ModelsMissing,
+            format!("not on disk: {}", describe(&asr)),
+        );
+    }
+
+    let cleanup: Vec<&ModelStatus> = blocking
+        .iter()
+        .copied()
+        .filter(|s| s.entry.role == Role::Cleanup)
+        .collect();
+    if !cleanup.is_empty() {
+        crate::health::raise(
+            crate::health::Fault::CleanupUnavailable,
+            format!("not on disk: {}", describe(&cleanup)),
+        );
+    }
 }
 
 // ─── Download ───────────────────────────────────────────────────────────
@@ -731,24 +791,84 @@ mod tests {
         let llm = base.join("llm/chosen/other.gguf");
 
         assert!(
-            models_present(&base, Some(&llm), false),
+            models_present(&base, None, Some(&llm), false),
             "cleanup off ⇒ a missing cleanup model is not a problem"
         );
-        assert!(!models_present(&base, Some(&llm), true));
+        assert!(!models_present(&base, None, Some(&llm), true));
 
         // And the check follows the RESOLVED path, not the manifest default:
         // the picker saves an absolute path to whatever GGUF the user chose.
         std::fs::create_dir_all(llm.parent().unwrap()).unwrap();
         std::fs::write(&llm, b"gguf").unwrap();
-        assert!(models_present(&base, Some(&llm), true));
+        assert!(models_present(&base, None, Some(&llm), true));
         assert!(
-            !models_present(&base, Some(&base.join("llm/missing.gguf")), true),
+            !models_present(&base, None, Some(&base.join("llm/missing.gguf")), true),
             "a chosen model that is gone must still be reported"
         );
 
         // The ASR model is never optional.
         std::fs::remove_file(asr.join("model.safetensors")).unwrap();
-        assert!(!models_present(&base, Some(&llm), false));
+        assert!(!models_present(&base, None, Some(&llm), false));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression: the speech model has a documented env override
+    /// (`DICTATE_COHERE_MLX_MODEL_DIR`) that `app_paths::cohere_mlx_default_dir`
+    /// honours and the readiness check did not, so a Mac whose daemon loads a
+    /// checkpoint from elsewhere was told its speech model was missing — and
+    /// `ModelsMissing` blocks every hotkey press.
+    #[test]
+    fn the_speech_model_is_found_where_the_daemon_actually_loads_it() {
+        let base = scratch("asr-override");
+        let elsewhere = base.join("somewhere/else/cohere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        for name in ASR.required_files {
+            std::fs::write(elsewhere.join(name), b"x").unwrap();
+        }
+        // Nothing at the manifest default…
+        assert!(!models_present(&base, None, None, false));
+        // …but the resolved path is where the model really is.
+        assert!(models_present(&base, Some(&elsewhere), None, false));
+        let rows = stack_status(&base, Some(&elsewhere), None, false);
+        let asr = rows.iter().find(|s| s.entry.role == Role::Asr).unwrap();
+        assert_eq!(asr.path, elsewhere);
+        assert!(asr.present);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression (CP-11): a missing cleanup model used to raise the blocking
+    /// `ModelsMissing` fault, so a fresh install that had the speech model but
+    /// not the GGUF could not dictate at all — even though the worker treats
+    /// the cleanup model as optional and falls back to the raw transcript.
+    #[test]
+    fn a_missing_cleanup_model_is_a_degradation_not_a_dead_hotkey() {
+        use crate::health::Fault;
+        let _serial = crate::health::test_lock();
+        for fault in [Fault::ModelsMissing, Fault::CleanupUnavailable] {
+            crate::health::clear(fault);
+        }
+
+        let base = scratch("fault-split");
+        let asr = ASR.path_in(&base);
+        std::fs::create_dir_all(&asr).unwrap();
+        for name in ASR.required_files {
+            std::fs::write(asr.join(name), b"x").unwrap();
+        }
+        let llm = CLEANUP.path_in(&base);
+
+        // Present speech model, missing cleanup model, cleanup on.
+        let rows = stack_status(&base, Some(&asr), Some(&llm), true);
+        let blocking: Vec<&ModelStatus> = rows.iter().filter(|s| s.is_blocking()).collect();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].entry.role, Role::Cleanup);
+        // Which fault that becomes is the whole point: the cleanup one, which
+        // `blocks_dictation` says false to.
+        assert!(!Fault::CleanupUnavailable.blocks_dictation());
+        assert!(Fault::ModelsMissing.blocks_dictation());
+
+        for fault in [Fault::ModelsMissing, Fault::CleanupUnavailable] {
+            crate::health::clear(fault);
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

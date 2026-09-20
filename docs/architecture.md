@@ -188,10 +188,16 @@ and the menu bar.
   invented rows that never read the user's permissions or model directory.
 - **Audio resilience** (`src/audio.rs`). cpal's error callback sets a flag and raises `AudioLost`,
   so a parked warm stream that died is rebuilt on the next press rather than resumed into
-  silence; `AudioCaptureEngine::should_rebuild` also compares a **wall-clock** age, because
-  `Instant` does not advance while the Mac sleeps. Multi-channel input picks one sticky channel
-  per stream (`ChannelPicker`: loudest over the first 200 ms, ties to channel 0) instead of
-  averaging every channel, which cost a one-channel mic on an 8-in interface about 18 dB.
+  silence; `AudioCaptureEngine::should_rebuild` also throws away a stream the Mac slept through,
+  detected as the **gap between the wall clock and the monotonic clock** (`audio::slept_for`),
+  because `Instant` does not advance while the Mac sleeps and `SystemTime` does. Comparing the
+  wall-clock age against the warm window instead called every stream that had merely been open
+  longer than the window a sleep. Multi-channel input picks one sticky channel per stream
+  (`ChannelPicker`: the loudest channel of the first 200 ms window that carries sound, above
+  `PICK_RMS_FLOOR`) instead of averaging every channel, which cost a one-channel mic on an 8-in
+  interface about 18 dB. The window has to carry sound: a stream opens before anyone speaks, so
+  deciding from silence would tie-break onto channel 0 and stick there for the stream's life —
+  on that same interface, a silent recording. The mean is used until a window decides.
 
 ## Models: the manifest and the one download
 
@@ -208,9 +214,18 @@ path under the models base, URL, byte count, SHA-256, licence and the credit the
 - **The ASR model has no URL.** No public 4-bit MLX conversion of Cohere Transcribe exists, so the
   manifest entry deliberately carries none and the Models row says what is missing, where to put
   it, and offers a folder picker for a checkpoint the user already has.
-- **Readiness follows the resolved cleanup model**, not the manifest default, and the cleanup row
-  is only required when cleanup is on — a missing LLM alone never dead-ends the app, and a cleanup
-  model that fails to load is a warning (`CleanupUnavailable`), not a dead worker.
+- **Readiness follows the resolved paths**, not the manifest defaults. `model_fetch::resolved_status`
+  is the single place that resolution lives: the ASR checkpoint through
+  `app_paths::cohere_mlx_default_dir` (which honours `DICTATE_COHERE_MLX_MODEL_DIR`) and the cleanup
+  model through `settings::resolve_llm_model`, exactly as the daemon loads them. The boot check, the
+  Setup window and the Models action all read it, so they cannot disagree — checking the manifest
+  default instead reported a missing speech model on a Mac whose daemon loads one perfectly well,
+  and `ModelsMissing` refuses every hotkey press.
+- **The two models are not the same kind of problem.** A missing speech model is
+  `ModelsMissing`, which blocks a press; a missing cleanup model is `CleanupUnavailable`, which
+  does not — the same split the worker makes (CP-11). The cleanup row is only required when
+  cleanup is on, so a missing LLM alone never dead-ends the app, and a cleanup model that fails to
+  load is a warning, not a dead worker.
 
 ## Feature flags are the architecture
 

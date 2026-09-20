@@ -221,15 +221,9 @@ pub(crate) fn headline(rows: &[RowState]) -> String {
 
 /// Read the live state of all three rows, in row order.
 pub(crate) fn current_states() -> Vec<RowState> {
-    let settings = Settings::load();
-    let cleanup_enabled = settings.resolve_cleanup_enabled(false);
-    let llm =
-        std::path::PathBuf::from(settings.resolve_llm_model(&crate::app_paths::llm_default_path()));
-    let statuses = model_fetch::stack_status(
-        &crate::app_paths::models_base_dir(),
-        Some(&llm),
-        cleanup_enabled,
-    );
+    // `resolved_status` is the one place model paths are resolved, so this
+    // window can never disagree with the daemon about what is on disk.
+    let statuses = model_fetch::resolved_status();
     let phase = model_fetch::fetch_phase();
     vec![
         microphone_state(permissions::microphone_status()),
@@ -565,12 +559,8 @@ fn model_action() {
         model_fetch::cancel_fetch();
         return;
     }
-    let settings = Settings::load();
-    let cleanup_enabled = settings.resolve_cleanup_enabled(false);
-    let llm =
-        std::path::PathBuf::from(settings.resolve_llm_model(&crate::app_paths::llm_default_path()));
     let base = crate::app_paths::models_base_dir();
-    let statuses = model_fetch::stack_status(&base, Some(&llm), cleanup_enabled);
+    let statuses = model_fetch::resolved_status();
     let Some(missing) = statuses.iter().find(|s| s.is_blocking()) else {
         return;
     };

@@ -254,7 +254,10 @@ fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
     println!("[fetch-models] target: {}", base.display());
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let mut blocked = Vec::new();
-    for status in model_fetch::stack_status(&base, None, true) {
+    // Manifest defaults under `base`, deliberately: `fetch-models <dir>`
+    // populates that directory, it does not report on whatever this Mac's
+    // env overrides point at.
+    for status in model_fetch::stack_status(&base, None, None, true) {
         let entry = status.entry;
         if status.present {
             println!("[fetch-models] {:<8} present · {}", entry.id, status.path.display());
