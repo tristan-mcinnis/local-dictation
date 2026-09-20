@@ -236,10 +236,13 @@ fn refine_for_cli(cleaned: &str) -> String {
     refined.text
 }
 
-/// Download the default models (Cohere Q4 + S1-mini) into a target dir
-/// dir — the same fetch the slim shipped app runs on first launch. With no
-/// argument it uses the writable Application Support models dir (where the app
-/// resolves them); pass an explicit dir to fetch elsewhere. Idempotent.
+/// Report the model stack under a target dir and fetch whatever the manifest
+/// can legitimately fetch — the same work the Setup window's Models row does.
+/// With no argument it uses the writable Application Support models dir (where
+/// the app resolves them); pass an explicit dir to fetch elsewhere. Idempotent.
+///
+/// A model with no published artefact (the ASR checkpoint) is reported with
+/// what to do about it. It is never invented a URL for.
 fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
     use fast_dictate_backend::{app_paths, model_fetch};
     let base = match target {
@@ -249,16 +252,39 @@ fn run_fetch_models(target: Option<String>) -> eyre::Result<()> {
             .ok_or_else(|| eyre::eyre!("$HOME unset — pass an explicit target dir"))?,
     };
     println!("[fetch-models] target: {}", base.display());
-    let fetched = model_fetch::ensure_default_models(&base)?;
-    println!(
-        "[fetch-models] {}",
-        if fetched {
-            "done — all default models present."
-        } else {
-            "already present — nothing to download."
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let mut blocked = Vec::new();
+    for status in model_fetch::stack_status(&base, None, true) {
+        let entry = status.entry;
+        if status.present {
+            println!("[fetch-models] {:<8} present · {}", entry.id, status.path.display());
+            continue;
         }
-    );
-    Ok(())
+        if !entry.is_fetchable() {
+            println!("[fetch-models] {:<8} MISSING  · {}", entry.id, status.path.display());
+            println!("               {}", entry.manual_hint);
+            blocked.push(entry.id);
+            continue;
+        }
+        println!("[fetch-models] {:<8} fetching · {}", entry.id, entry.credit);
+        match model_fetch::fetch(&entry, &status.path, &cancel, &|phase| {
+            println!("               {}", phase.label());
+        }) {
+            Ok(()) => println!("[fetch-models] {:<8} ready    · {}", entry.id, status.path.display()),
+            Err(e) => {
+                println!("[fetch-models] {:<8} failed   · {e}", entry.id);
+                blocked.push(entry.id);
+            }
+        }
+    }
+    if blocked.is_empty() {
+        println!("[fetch-models] the stack is complete.");
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "still missing: {}. See README.md",
+        blocked.join(", ")
+    ))
 }
 
 /// Open the daemon log in the user's default text editor / Console.app.

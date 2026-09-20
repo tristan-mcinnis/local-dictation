@@ -27,6 +27,7 @@ pub mod refiner;
 pub mod screen_context;
 pub mod secure_input;
 pub mod settings;
+pub mod sha256;
 pub mod shutdown;
 pub mod single_instance;
 pub mod smart_pad;
