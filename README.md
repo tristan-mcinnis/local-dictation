@@ -60,6 +60,25 @@ Accessibility and Models. Turn Accessibility on in System Settings and the
 hotkey starts working immediately, with no relaunch. A waveform icon with no
 warning means it is ready.
 
+### Released builds
+
+A published build is signed with a Developer ID Application certificate, runs
+under the hardened runtime, is notarized and stapled, and updates itself in-app
+through Sparkle 2. It can be installed two ways:
+
+- **Direct download** — the notarized DMG from the releases page; the app checks
+  an HTTPS appcast and installs signed updates itself.
+- **Homebrew** — `brew install --cask <tap>/local-dictation`. The cask installs
+  the same app; Sparkle still owns in-app updates.
+
+Neither path is published yet. The pipeline that produces both is owned by this
+repository and is exercised offline by `./scripts/release/dry-run.sh`; the
+remaining work is credentialed, human-gated packaging. See
+[`docs/release/direct-distribution.md`](docs/release/direct-distribution.md) and
+[`docs/release/homebrew.md`](docs/release/homebrew.md). Public-release readiness,
+including the open blockers, is recorded in
+[`docs/public-release-audit-20260921.md`](docs/public-release-audit-20260921.md).
+
 **Build from source.**
 
 ```bash
@@ -270,7 +289,8 @@ installed model files; check their terms before broader distribution.
 Built with [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026),
 [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift),
 [MLX Swift](https://github.com/ml-explore/mlx-swift),
-[llama.cpp](https://github.com/ggml-org/llama.cpp), `cpal`, `objc2`, and `rusqlite`.
+[llama.cpp](https://github.com/ggml-org/llama.cpp),
+[Sparkle](https://github.com/sparkle-project/Sparkle), `cpal`, `objc2`, and `rusqlite`.
 
 ---
 

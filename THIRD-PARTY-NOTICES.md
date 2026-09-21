@@ -45,9 +45,14 @@ carries the same licence and attribution.
 | [swift-transformers](https://github.com/huggingface/swift-transformers), [swift-huggingface](https://github.com/huggingface/swift-huggingface), [swift-jinja](https://github.com/huggingface/swift-jinja) | Apache-2.0 |
 | [swift-collections](https://github.com/apple/swift-collections), [swift-numerics](https://github.com/apple/swift-numerics), [swift-crypto](https://github.com/apple/swift-crypto), [swift-asn1](https://github.com/apple/swift-asn1), [swift-syntax](https://github.com/swiftlang/swift-syntax) (Apple) | Apache-2.0 |
 | [EventSource](https://github.com/mattt/EventSource) | MIT |
+| [Sparkle](https://github.com/sparkle-project/Sparkle) (Sparkle Project) | MIT |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp), via [llama-cpp-2](https://crates.io/crates/llama-cpp-2) | MIT |
 
-Exact revisions are pinned in `native/cohere-mlx/Package.resolved`.
+Exact revisions are pinned in `native/cohere-mlx/Package.resolved`. Sparkle is
+not committed or linked: `scripts/build-app.sh --release` embeds it from
+`SPARKLE_FRAMEWORK` at build time and `src/updater.rs` loads it at runtime only
+for a build that carries a feed. The release pipeline's Ed25519 signer uses
+Apple's CryptoKit, part of the system, with no bundled third-party code.
 
 ## Rust crates
 

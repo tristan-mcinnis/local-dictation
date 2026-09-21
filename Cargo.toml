@@ -38,7 +38,12 @@ ax-inject = [
     "dep:block2",
 ]
 # The one-user production stack: Cohere MLX + S1-mini + native Mac UI/output.
-full = ["cohere-mlx", "cleaner", "ax-inject"]
+full = ["cohere-mlx", "cleaner", "ax-inject", "sparkle"]
+# Sparkle 2 in-app updates for a direct-download build. The framework is loaded
+# at runtime (`src/updater.rs`), never linked, so a build without it still
+# compiles and runs. A Homebrew cask install carries no feed keys, so this is a
+# no-op there.
+sparkle = ["ax-inject"]
 
 [dependencies]
 ringbuf = "0.4"

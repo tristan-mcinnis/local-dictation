@@ -19,8 +19,19 @@
 #                                           #   Defaults to --bundle-models (self-
 #                                           #   contained); pair with --slim for a
 #                                           #   small DMG with no models in it.
+#   ./scripts/build-app.sh --release        # distribute build: hardened runtime,
+#                                           #   Developer ID signing, entitlements.
+#                                           #   Requires SIGN_IDENTITY, SU_FEED_URL,
+#                                           #   SU_PUBLIC_ED_KEY and a clean tree.
+#                                           #   Driven by scripts/release/; see
+#                                           #   docs/release/direct-distribution.md.
 #
 # Flags combine, e.g.  ./scripts/build-app.sh --slim --dmg
+#
+# Optional release env:
+#   SPARKLE_FRAMEWORK=/path/Sparkle.framework  embed + re-sign Sparkle 2
+#   SU_FEED_URL=https://.../appcast.xml        Sparkle feed (Info.plist)
+#   SU_PUBLIC_ED_KEY=<base64>                  Sparkle EdDSA public key
 #
 # Model resolution at runtime (see src/app_paths.rs):
 #   DICTATE_MODELS_DIR env > <app>/Contents/Resources/models
@@ -74,15 +85,37 @@ BUNDLE_MODELS=0
 SLIM=0
 INSTALL=0
 MAKE_DMG=0
+RELEASE=0
 for arg in "$@"; do
   case "$arg" in
     --bundle-models) BUNDLE_MODELS=1 ;;
     --slim)          SLIM=1 ;;
     --install)       INSTALL=1 ;;
     --dmg)           MAKE_DMG=1 ;;
+    --release)       RELEASE=1 ;;
     *) echo "unknown flag: $arg" >&2; exit 2 ;;
   esac
 done
+
+# A release build is the only build that may ship the hardened runtime and a
+# Developer ID signature, and the only one that must carry a Sparkle feed. The
+# gates live here as well as in scripts/release/ so a hand-run cannot skip them.
+ENTITLEMENTS_PLIST="$REPO_ROOT/scripts/release/entitlements.plist"
+if [ "$RELEASE" -eq 1 ]; then
+  case "${SIGN_IDENTITY:-}" in
+    "Developer ID Application:"*) ;;
+    "") echo "--release needs SIGN_IDENTITY (a Developer ID Application identity)" >&2; exit 1 ;;
+    *)  echo "--release refuses SIGN_IDENTITY '$SIGN_IDENTITY' (not a Developer ID Application identity)" >&2; exit 1 ;;
+  esac
+  [ -f "$ENTITLEMENTS_PLIST" ] || { echo "missing $ENTITLEMENTS_PLIST" >&2; exit 1; }
+  if [ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then
+    echo "--release refuses a dirty working tree" >&2
+    git -C "$REPO_ROOT" status --short >&2
+    exit 1
+  fi
+  : "${SU_FEED_URL:?--release needs SU_FEED_URL}"
+  : "${SU_PUBLIC_ED_KEY:?--release needs SU_PUBLIC_ED_KEY}"
+fi
 
 if [ "$SLIM" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 1 ]; then
   echo "--slim and --bundle-models are mutually exclusive" >&2; exit 2
@@ -141,6 +174,20 @@ cp "$COHERE_PRODUCTS/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib" 
    "$RES_DIR/mlx.metallib"
 
 # ── 3. Info.plist ────────────────────────────────────────────────────────────
+# Sparkle 2 keys are written only when a feed is configured, so a dev/self
+# build stays a plain, non-updating app. Release mode above requires both.
+SPARKLE_PLIST=""
+if [ -n "${SU_FEED_URL:-}" ] && [ -n "${SU_PUBLIC_ED_KEY:-}" ]; then
+  case "$SU_FEED_URL" in
+    https://*) ;;
+    *) echo "SU_FEED_URL must be HTTPS: $SU_FEED_URL" >&2; exit 1 ;;
+  esac
+  SPARKLE_PLIST="    <key>SUFeedURL</key>                <string>$SU_FEED_URL</string>
+    <key>SUPublicEDKey</key>              <string>$SU_PUBLIC_ED_KEY</string>
+    <key>SUEnableAutomaticChecks</key>    <true/>
+    <key>SUScheduledCheckInterval</key>   <integer>86400</integer>"
+fi
+
 cat > "$CONTENTS/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -161,6 +208,7 @@ cat > "$CONTENTS/Info.plist" <<PLIST
     <key>LSUIElement</key>                 <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Local Dictation transcribes your speech on-device when you hold the push-to-talk key.</string>
+$SPARKLE_PLIST
 </dict>
 </plist>
 PLIST
@@ -193,6 +241,23 @@ else
   fi
 fi
 
+# ── 5b. embed Sparkle 2 (optional) ───────────────────────────────────────────
+# The framework is never committed: it is supplied at build time from the
+# Sparkle release. Re-signed below with the app's own identity so hardened
+# runtime library validation passes without weakening it.
+if [ -n "${SPARKLE_FRAMEWORK:-}" ]; then
+  [ -d "$SPARKLE_FRAMEWORK" ] || { echo "SPARKLE_FRAMEWORK is not a directory: $SPARKLE_FRAMEWORK" >&2; exit 1; }
+  echo "• embedding Sparkle.framework…"
+  mkdir -p "$CONTENTS/Frameworks"
+  rm -rf "$CONTENTS/Frameworks/Sparkle.framework"
+  cp -R "$SPARKLE_FRAMEWORK" "$CONTENTS/Frameworks/Sparkle.framework"
+  # The Rust binary loads Sparkle at runtime from @rpath; add the bundle rpath
+  # once, so a repeat build does not stack duplicate LC_RPATH entries.
+  if ! otool -l "$MACOS_DIR/$EXEC_NAME" | grep -q "@executable_path/../Frameworks"; then
+    install_name_tool -add_rpath "@executable_path/../Frameworks" "$MACOS_DIR/$EXEC_NAME"
+  fi
+fi
+
 # ── 6. code signature ────────────────────────────────────────────────────────
 # A stable signing identity keeps the Accessibility/Microphone grants across
 # rebuilds (TCC keys them to the signature). Default: the first "Apple
@@ -203,9 +268,40 @@ if [ -z "${SIGN_IDENTITY:-}" ]; then
   SIGN_IDENTITY=${SIGN_IDENTITY:--}
 fi
 echo "• code-signing with: $SIGN_IDENTITY"
-codesign --force --deep --sign "$SIGN_IDENTITY" "$APP" >/dev/null 2>&1 || \
-  codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+
+CODESIGN_FLAGS=(--force --sign "$SIGN_IDENTITY")
+if [ "$RELEASE" -eq 1 ]; then
+  CODESIGN_FLAGS+=(--options runtime --timestamp --entitlements "$ENTITLEMENTS_PLIST")
+fi
+
+if [ "$RELEASE" -eq 1 ]; then
+  # Sign inside-out, never with --deep (Sparkle's own guidance: --deep is a
+  # common source of sandbox/notarization failures). Sparkle 2 lays its helpers
+  # out under Versions/B/, so discover the version dir rather than hardcoding it.
+  [ -f "$RES_DIR/cohere-mlx-bridge" ] && codesign "${CODESIGN_FLAGS[@]}" "$RES_DIR/cohere-mlx-bridge"
+  if [ -d "$CONTENTS/Frameworks/Sparkle.framework" ]; then
+    FW="$CONTENTS/Frameworks/Sparkle.framework"
+    VER_DIR="$(ls -d "$FW"/Versions/[A-Z] 2>/dev/null | head -1 || true)"
+    [ -n "$VER_DIR" ] || { echo "Sparkle.framework has no Versions/<X> directory" >&2; exit 1; }
+    for part in \
+      "$VER_DIR/XPCServices/Installer.xpc" \
+      "$VER_DIR/XPCServices/Downloader.xpc" \
+      "$VER_DIR/Autoupdate" \
+      "$VER_DIR/Updater.app" \
+      "$VER_DIR/Sparkle"; do
+      [ -e "$part" ] && codesign "${CODESIGN_FLAGS[@]}" "$part"
+    done
+    codesign "${CODESIGN_FLAGS[@]}" "$FW"
+  fi
+  codesign "${CODESIGN_FLAGS[@]}" "$APP"
+else
+  codesign "${CODESIGN_FLAGS[@]}" --deep "$APP" >/dev/null 2>&1 || \
+    codesign "${CODESIGN_FLAGS[@]}" --deep "$APP"
+fi
 codesign --verify --deep --strict "$APP" && echo "  signature OK"
+if [ "$RELEASE" -eq 1 ]; then
+  codesign -dvv "$APP" 2>&1 | grep -E 'Authority|Runtime Version|Timestamp' | sed 's/^/  /' >&2 || true
+fi
 
 echo "✓ built: $APP"
 

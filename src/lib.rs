@@ -49,6 +49,12 @@ pub mod clipboard_paste;
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub mod menubar;
 
+// Sparkle 2 auto-update bootstrap for direct-download builds. No link-time
+// dependency: the framework is loaded at runtime, and only when the bundle
+// carries a feed.
+#[cfg(all(target_os = "macos", feature = "sparkle"))]
+pub mod updater;
+
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub mod settings_window;
 

@@ -1,0 +1,37 @@
+# Local Dictation — Homebrew cask template.
+#
+# This file is a template. scripts/release/update-cask.sh fills the three
+# @PLACEHOLDER@ values from a signed, notarized DMG and writes the final cask.
+# Do not edit a copy inside a tap by hand: regenerate it from a release, so the
+# sha256 always matches the artifact the URL serves.
+cask "local-dictation" do
+  version "@VERSION@"
+  sha256 "@SHA256@"
+
+  url "@URL@",
+      verified: "github.com/tristan-mcinnis/local-dictation/"
+  name "Local Dictation"
+  desc "Private, on-device dictation for Apple Silicon"
+  homepage "https://github.com/tristan-mcinnis/local-dictation"
+
+  livecheck do
+    url :url
+    strategy :github_latest
+  end
+
+  # The app updates itself through Sparkle; Homebrew should not also manage it.
+  auto_updates true
+  depends_on arch: :arm64
+  depends_on macos: :sonoma
+
+  app "Local Dictation.app"
+
+  uninstall quit: "com.tristanmcinnis.local-dictation"
+
+  zap trash: [
+    "~/.config/local-dictation",
+    "~/Library/Application Support/Local Dictation",
+    "~/Library/Logs/Local Dictation",
+    "~/Library/Preferences/com.tristanmcinnis.local-dictation.plist",
+  ]
+end

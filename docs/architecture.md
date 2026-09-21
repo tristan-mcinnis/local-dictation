@@ -102,8 +102,13 @@ or with `SIGN_IDENTITY=-`), `LSMinimumSystemVersion` 14.0, `Info.plist` carries 
 `resources/AppIcon.icns` (rendered by design-system/icons/make-icon.py --glyph waveform). Because it's a stable signed bundle, macOS attributes Microphone +
 Accessibility to the app itself (granted once), instead of to whatever terminal launched it.
 With a development identity the grants survive rebuilds. An *ad-hoc* signature changes on every
-rebuild, so macOS re-asks. Neither is notarized, so a copy sent to another Mac is blocked by
-Gatekeeper until a Developer ID + notarization step exists. When bundled, the daemon redirects stdout/stderr to
+rebuild, so macOS re-asks. A development build is not notarized, so a copy sent to another Mac is
+blocked by Gatekeeper. A published release is different: `scripts/build-app.sh --release` signs with
+a Developer ID Application certificate under the hardened runtime, embeds and re-signs
+`Sparkle.framework`, and the notarize/staple/appcast steps run from `scripts/release/`. The app
+checks an HTTPS appcast through Sparkle 2 (`src/updater.rs`, loaded at runtime) and updates itself in
+place. The pipeline and its human gates are documented in `docs/release/direct-distribution.md`.
+When bundled, the daemon redirects stdout/stderr to
 `~/Library/Logs/Local Dictation/daemon.log` (no terminal to print to; see Debugging).
 
 **Model resolution** (`src/app_paths.rs`). The *base* directory, in order:

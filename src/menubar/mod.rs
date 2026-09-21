@@ -748,6 +748,16 @@ pub fn init_and_run() -> eyre::Result<()> {
     }
 
     install_poll_timer();
+
+    // Direct-download builds update themselves through Sparkle 2. This is a
+    // no-op outside a bundle that carries an HTTPS feed and the embedded
+    // framework, so cask and dev builds are unaffected. Sparkle must be started
+    // on the main thread, right before the run loop takes over.
+    #[cfg(feature = "sparkle")]
+    if crate::updater::start() {
+        eprintln!("[boot] updater    Sparkle started");
+    }
+
     app.run();
     Ok(())
 }
