@@ -630,6 +630,15 @@ pub fn is_wechat_pid(pid: i32) -> bool {
     classify_pid(pid).is_wechat
 }
 
+/// True when the app is an Electron / Chromium web view. Used only to decide
+/// whether to flip Chromium's on-demand accessibility switch before treating a
+/// missing focused element as final (see
+/// `imp::wake_electron_ax_and_retry_focus`). It never widens who may receive a
+/// paste — the editability gate still owns that.
+pub fn is_electron_pid(pid: i32) -> bool {
+    classify_pid(pid).is_electron
+}
+
 /// PIDs whose AX write we've *verified* actually rendered (read the value
 /// back and saw our text). Once a PID is here we trust its AX path and skip
 /// the post-write verification read on every subsequent utterance.
@@ -666,6 +675,33 @@ fn mark_clipboard_only(pid: i32) {
         } else {
             cache.push((pid, PidClass { is_electron: true, is_terminal: false, is_wechat: false }));
         }
+    }
+}
+
+/// Chromium/Electron apps build no accessibility tree until a client asks for
+/// one, so their `AXFocusedUIElement` answers `kAXErrorNoValue` (-25212) until
+/// the on-demand switch is set. We flip it at most once per app process; this
+/// records the PIDs already asked, so a later miss never re-triggers the wake
+/// and its short retry loop.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+static ELECTRON_AX_WAKE_CLAIMED: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+/// Claim the one-time Chromium AX wake for `pid`. True only on the first call
+/// for a PID. Pure bookkeeping — the AX attribute write lives in `imp`.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+fn claim_electron_ax_wake(pid: i32) -> bool {
+    match ELECTRON_AX_WAKE_CLAIMED.lock() {
+        Ok(mut claimed) => {
+            if claimed.contains(&pid) {
+                false
+            } else {
+                claimed.push(pid);
+                true
+            }
+        }
+        // A poisoned lock must not disable the fix; the attribute write is
+        // idempotent, so allowing repeated attempts is safe.
+        Err(_) => true,
     }
 }
 
@@ -796,6 +832,21 @@ mod imp {
     /// Menu opening runs on AppKit's main thread. Keep its focus snapshot
     /// bounded; any deeper context reads happen later on the recovery worker.
     const MENU_AX_MESSAGING_TIMEOUT_SECS: f32 = 0.2;
+    /// Chromium on-demand accessibility attributes. `AXManualAccessibility` is
+    /// the modern switch Chromium/Electron read; `AXEnhancedUserInterface` is
+    /// the older AppKit one VoiceOver and Safari set. Both are set so the wake
+    /// holds across Chromium versions.
+    const AX_MANUAL_ACCESSIBILITY: &str = "AXManualAccessibility";
+    const AX_ENHANCED_UI: &str = "AXEnhancedUserInterface";
+    /// Bounded retry after the Chromium AX wake. The first enable is the slow
+    /// one: Chromium builds the tree asynchronously, so the initial read can
+    /// keep missing for a few hundred milliseconds while the tree populates.
+    /// Poll on a wall-clock budget (not a fixed attempt count) so a slow first
+    /// build is waited out, while a hung renderer still cannot pin us: each
+    /// query is separately bounded by `AX_WAKE_MESSAGING_TIMEOUT_SECS`.
+    const AX_WAKE_POLL_BUDGET_MS: u64 = 900;
+    const AX_WAKE_POLL_INTERVAL_MS: u64 = 40;
+    const AX_WAKE_MESSAGING_TIMEOUT_SECS: f32 = 0.3;
 
     /// Best-effort: set the AX messaging timeout on an element so a slow or hung
     /// target app can't pin the daemon on an AX call. Ignores the AXError — if
@@ -807,6 +858,75 @@ mod imp {
 
     unsafe fn bound_messaging_timeout(el: AXUIElementRef) {
         set_messaging_timeout(el, AX_MESSAGING_TIMEOUT_SECS);
+    }
+
+    /// Chromium/Electron builds no accessibility tree until a client asks for
+    /// one, so Slack, Cursor, VS Code and the rest answer
+    /// `AXFocusedUIElement` with `kAXErrorNoValue` (-25212) until the on-demand
+    /// switch is set. Flip it once per app process, then re-read the focused
+    /// element within a bounded window.
+    ///
+    /// Returns the focused element on success, or null. This is a *look*, not
+    /// a write: whatever comes back still has to pass the editability gate
+    /// before any text moves, so waking an app never enables a blind paste.
+    ///
+    /// Cost sits on the miss path only: one attribute set per app process
+    /// (claimed by `claim_electron_ax_wake`), then a few short retries. Steady
+    /// dictation never calls it. The app-internal price is Chromium keeping an
+    /// AX tree, the same cost VoiceOver imposes for as long as the app runs.
+    unsafe fn wake_electron_ax_and_retry_focus(
+        app: AXUIElementRef,
+        pid: Option<i32>,
+        restore_timeout_secs: f32,
+    ) -> CFTypeRef {
+        let Some(pid) = pid else {
+            return ptr::null();
+        };
+        // A native app's tree is always live; only Chromium needs the switch.
+        // Claimed once per process, so a later miss never re-triggers the wait.
+        if !super::is_electron_pid(pid) || !super::claim_electron_ax_wake(pid) {
+            return ptr::null();
+        }
+        // `AXManualAccessibility` is Chromium/Electron's on-demand switch;
+        // `AXEnhancedUserInterface` is the older AppKit signal. A refusal is
+        // "unsupported", not fatal.
+        for attr in [AX_MANUAL_ACCESSIBILITY, AX_ENHANCED_UI] {
+            let a = CFString::new(attr);
+            let value = CFBoolean::true_value();
+            let _ = AXUIElementSetAttributeValue(
+                app,
+                a.as_concrete_TypeRef(),
+                value.as_concrete_TypeRef() as CFTypeRef,
+            );
+        }
+        // Chromium populates the tree asynchronously once the switch is on.
+        // Poll on a wall-clock budget under a short AX timeout so the first
+        // (slow) enable is waited out, while a hung renderer still costs only
+        // a few bounded queries. Later utterances find the tree already live
+        // and pass on the very first query.
+        set_messaging_timeout(app, AX_WAKE_MESSAGING_TIMEOUT_SECS);
+        let focused_attr = CFString::new(kAXFocusedUIElementAttribute);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(AX_WAKE_POLL_BUDGET_MS);
+        let mut focused_ref: CFTypeRef = ptr::null();
+        loop {
+            let mut attempt_ref: CFTypeRef = ptr::null();
+            let err = AXUIElementCopyAttributeValue(
+                app,
+                focused_attr.as_concrete_TypeRef(),
+                &mut attempt_ref,
+            );
+            if err == kAXErrorSuccess && !attempt_ref.is_null() {
+                focused_ref = attempt_ref;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(AX_WAKE_POLL_INTERVAL_MS));
+        }
+        set_messaging_timeout(app, restore_timeout_secs);
+        focused_ref
     }
 
     pub fn ensure_trusted_or_prompt() -> bool {
@@ -1000,6 +1120,18 @@ mod imp {
             eprintln!("[inject-prof] get_focused_element: {:?}", t.elapsed());
         }
         if err != kAXErrorSuccess || focused_ref.is_null() {
+            // Chromium/Electron builds no AX tree until a client asks for one,
+            // so Slack, Cursor and VS Code answer this exact query with
+            // kAXErrorNoValue (-25212). Flip Chromium's on-demand switch once
+            // and re-read before calling the miss final. This is a look, not a
+            // write: the element still has to pass the editability gate below.
+            focused_ref = wake_electron_ax_and_retry_focus(
+                root,
+                expected_app.or_else(super::frontmost_pid),
+                AX_MESSAGING_TIMEOUT_SECS,
+            );
+        }
+        if focused_ref.is_null() {
             // AX can transiently lose the focused element while a status menu
             // is tracking or while Electron reshuffles its accessibility tree.
             // A retained target is usable only when it carried positive
@@ -1546,6 +1678,16 @@ mod imp {
             &mut focused_ref,
         );
         if err != kAXErrorSuccess || focused_ref.is_null() {
+            // Same Chromium on-demand wake as the write ladder: without it a
+            // Slack/Electron capture at key-press would retain no field, so the
+            // write-time fallback could never rescue the utterance.
+            focused_ref = wake_electron_ax_and_retry_focus(
+                root,
+                expected_pid,
+                messaging_timeout_secs,
+            );
+        }
+        if focused_ref.is_null() {
             return Err(eyre::eyre!(
                 "no focused UI element (AXError {err}); click into a text field first"
             ));
@@ -2253,6 +2395,20 @@ mod tests {
             "/applications/safari.app/contents/macos/safari"
         ));
         assert!(!is_ax_blind_chat_app_comm(""));
+    }
+
+    // ORCHESTRATION (2026-09-23): a Chromium/Electron app (Slack was the
+    // reproduced case) answers AXFocusedUIElement with -25212 until its
+    // accessibility tree is requested. The wake is claimed at most once per
+    // app process; a second claim must be refused so a later miss can't spin
+    // the retry loop again.
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    #[test]
+    fn electron_ax_wake_is_claimed_once_per_pid() {
+        let pid = 990_001;
+        assert!(claim_electron_ax_wake(pid), "first claim wins");
+        assert!(!claim_electron_ax_wake(pid), "second claim is refused");
+        assert!(claim_electron_ax_wake(990_002), "a different app may claim");
     }
 
     // ── decide_inject / finalize_utterance: observable-sink behaviour ──────

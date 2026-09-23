@@ -108,19 +108,32 @@ audio fixtures).
 
 ### No-blind-paste focus gate — `src/injector.rs`
 `classify_focus_editability(role, subrole, value_settable, selected_settable,
-is_terminal)` maps a focused surface to `FocusEditability`:
+paste_safe)` maps a focused surface to `FocusEditability`:
 - `Editable` — text-entry AX role **and** a writable `AXValue`/`AXSelectedText`.
-- `PasteSafe` — the **narrow, justified** fallback: a genuine *terminal* whose
-  focused element discloses no clearly non-input role, including a text-entry
-  role whose AX attributes are non-settable (Ghostty's clipboard-only grid).
-  The exception does not distinguish shell prompts from terminal pagers. **The app-level editor/compose blanket was removed** —
-  Slack, Discord, Figma, Notion, Obsidian, Outlook, Cursor, Zed, VS Code are NOT
-  paste-safe by name.
+- `PasteSafe` — the **narrow, justified** fallback: a genuine *terminal* or the
+  AX-blind native chat app WeChat, whose focused element discloses no clearly
+  non-input role, including a text-entry role whose AX attributes are
+  non-settable (Ghostty's clipboard-only grid). The terminal exception does not
+  distinguish shell prompts from terminal pagers. **The app-level editor/compose
+  blanket was removed** — Slack, Discord, Figma, Notion, Obsidian, Outlook,
+  Cursor, Zed, VS Code are NOT paste-safe by name.
 - `NotEditable` — a **positively non-input role** (`AXButton`/`AXWindow`/
   `AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio) denies injection
   **even for an allowlisted terminal**. Read-only text-entry fields and
   unknown/black-holed focus are denied in **non-terminal** apps. Never pastes. Owned and authored by
   the FOCUS role, never the app name.
+
+**Chromium/Electron on-demand AX wake** (`injector::wake_electron_ax_and_retry_focus`):
+Chromium builds no accessibility tree until a client asks for one, so Slack
+answers `AXFocusedUIElement` with `kAXErrorNoValue` (-25212) even with the
+caret in its composer — the same wall WeChat sits behind. On a failed
+focused-element query, and only for an app whose executable classifies as
+Electron, both the key-press capture and the write-time resolver set
+`AXManualAccessibility` (Chromium's on-demand switch) and re-read on a 0.9 s
+wall-clock budget under a short AX timeout. It is claimed once per app process,
+so later utterances skip it. The wake is a look, not a write: the element it
+exposes still has to clear the focus gate, so it never widens who may receive a
+paste.
 
 `finalize_utterance(cancel, editability, text, inject)` is the single tested seam;
 the worker calls it right before the write, **passing `None` editability** so the
