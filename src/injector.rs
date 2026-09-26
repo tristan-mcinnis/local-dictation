@@ -528,6 +528,10 @@ struct PidClass {
     /// caret visible. Paste-safe like a terminal, but prose cleanup still runs
     /// (chat messages benefit from cleanup; shell commands do not).
     is_wechat: bool,
+    /// A Chromium browser whose AX writes render (so it keeps the normal AX
+    /// route) but whose web accessibility tree is built on demand, like
+    /// Electron's. Only the one-time AX wake reads this; routing does not.
+    wakes_ax_only: bool,
 }
 
 static CLIPBOARD_ONLY_CACHE: Mutex<Vec<(i32, PidClass)>> = Mutex::new(Vec::new());
@@ -551,6 +555,17 @@ pub fn process_command_path(pid: i32) -> Option<String> {
 /// etc.).
 fn is_ax_blind_chat_app_comm(comm: &str) -> bool {
     comm.trim().to_lowercase().ends_with("/wechat")
+}
+
+/// Pure app-name check for a Chromium browser that needs the on-demand AX
+/// wake but is not on the clipboard-only list. Helium's executable
+/// (`/Applications/Helium.app/Contents/MacOS/Helium`) matches none of the
+/// `/chrome`, `/brave` or `/arc` names, so a focus miss there never woke its
+/// tree. Its writes keep the AX route: verify-after-write already falls back
+/// to the clipboard (and promotes the PID) when a write does not render, so
+/// forcing clipboard-only would only add the paste cost. Case-insensitive.
+fn is_on_demand_ax_browser_comm(comm: &str) -> bool {
+    comm.trim().to_lowercase().ends_with("/helium")
 }
 
 /// Classify a PID by its executable name into a [`PidClass`]. The `is_electron`
@@ -598,11 +613,12 @@ fn classify_pid(pid: i32) -> PidClass {
         || comm.contains("/kitty")
         || comm.contains("/alacritty");
     let is_wechat = is_ax_blind_chat_app_comm(&comm);
+    let wakes_ax_only = is_on_demand_ax_browser_comm(&comm);
     // The editor/compose blanket (VS Code, Slack, Notion, Obsidian, Figma, …)
     // is deliberately ABSENT from a paste-safe allowlist. A paste is justified
     // only by the FOCUSED element's AX role at write time, never by the app
     // name — so a Slack pane or a browser body never receives a blind paste.
-    let cls = PidClass { is_electron, is_terminal, is_wechat };
+    let cls = PidClass { is_electron, is_terminal, is_wechat, wakes_ax_only };
     if let Ok(mut cache) = CLIPBOARD_ONLY_CACHE.lock() {
         cache.push((pid, cls));
     }
@@ -630,13 +646,15 @@ pub fn is_wechat_pid(pid: i32) -> bool {
     classify_pid(pid).is_wechat
 }
 
-/// True when the app is an Electron / Chromium web view. Used only to decide
+/// True when the app is an Electron / Chromium web view, including a Chromium
+/// browser that keeps the AX write route (Helium). Used only to decide
 /// whether to flip Chromium's on-demand accessibility switch before treating a
 /// missing focused element as final (see
 /// `imp::wake_electron_ax_and_retry_focus`). It never widens who may receive a
 /// paste — the editability gate still owns that.
 pub fn is_electron_pid(pid: i32) -> bool {
-    classify_pid(pid).is_electron
+    let cls = classify_pid(pid);
+    cls.is_electron || cls.wakes_ax_only
 }
 
 /// PIDs whose AX write we've *verified* actually rendered (read the value
@@ -673,7 +691,15 @@ fn mark_clipboard_only(pid: i32) {
         if let Some(entry) = cache.iter_mut().find(|(p, _)| *p == pid) {
             entry.1.is_electron = true;
         } else {
-            cache.push((pid, PidClass { is_electron: true, is_terminal: false, is_wechat: false }));
+            cache.push((
+                pid,
+                PidClass {
+                    is_electron: true,
+                    is_terminal: false,
+                    is_wechat: false,
+                    wakes_ax_only: false,
+                },
+            ));
         }
     }
 }
@@ -2395,6 +2421,22 @@ mod tests {
             "/applications/safari.app/contents/macos/safari"
         ));
         assert!(!is_ax_blind_chat_app_comm(""));
+    }
+
+    #[test]
+    fn helium_gets_the_ax_wake_but_keeps_the_ax_route() {
+        // `ps -o comm=` for the running Helium main process.
+        assert!(is_on_demand_ax_browser_comm(
+            "/Applications/Helium.app/Contents/MacOS/Helium\n"
+        ));
+        // Its helpers are separate processes, never the frontmost app.
+        assert!(!is_on_demand_ax_browser_comm(
+            "/applications/helium.app/contents/frameworks/helium framework.framework/helpers/helium helper (renderer).app/contents/macos/helium helper (renderer)"
+        ));
+        assert!(!is_on_demand_ax_browser_comm(
+            "/applications/safari.app/contents/macos/safari"
+        ));
+        assert!(!is_on_demand_ax_browser_comm(""));
     }
 
     // ORCHESTRATION (2026-09-23): a Chromium/Electron app (Slack was the
