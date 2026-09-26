@@ -29,15 +29,81 @@
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::thread::JoinHandle;
 
-/// True while a PTT capture session currently owns the mute flag. Guards
-/// against double-mute on a spurious second StartRecording and against a
-/// restore() with no matching mute().
-static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// One capture session's hold on the system mute flag.
+///
+/// The read and the set are each an `osascript` launch (measured 110-400 ms
+/// apiece on 2026-09-26). They used to run on the dictation worker between
+/// the start cue and the recording pill, so the pill, the Escape cancel gate
+/// and the press-time focus capture all waited 0.2-0.8 s after every press.
+/// `mute` now hands the read+set to a background thread and returns at once;
+/// `restore` joins that thread first, so the unmute can never overtake the
+/// mute and the outcome cue that follows it is still audible.
+struct Ducker {
+    /// True while a PTT capture session owns the mute flag. Guards against
+    /// double-mute on a spurious second StartRecording and against a
+    /// restore() with no matching mute().
+    active: AtomicBool,
+    /// Whether output was already muted when we took over — restore() leaves
+    /// it muted in that case rather than un-muting audio the user had silenced.
+    was_muted: AtomicBool,
+    /// The in-flight background read+set, joined by the next restore.
+    pending: Mutex<Option<JoinHandle<()>>>,
+}
 
-/// Whether output was already muted when we took over — restore() leaves it
-/// muted in that case rather than un-muting audio the user had silenced.
-static WAS_MUTED: AtomicBool = AtomicBool::new(false);
+impl Ducker {
+    const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            was_muted: AtomicBool::new(false),
+            pending: Mutex::new(None),
+        }
+    }
+
+    /// Claim the session and mute in the background. `read` and `set` are
+    /// the device operations (injected so tests never touch real audio).
+    fn mute(&'static self, read: fn() -> Option<bool>, set: fn(bool)) {
+        // Claim ownership; if a session is already active, leave it untouched.
+        if self.active.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let handle = std::thread::spawn(move || {
+            // If we can't read the device's current state, leave it untouched
+            // rather than mute-then-restore — a failed read previously
+            // defaulted to "unmuted", which on restore would un-mute audio the
+            // user had muted themselves. Releasing ownership makes the
+            // matching restore() a no-op (it joins this thread first).
+            let Some(was_muted) = read() else {
+                self.active.store(false, Ordering::SeqCst);
+                return;
+            };
+            self.was_muted.store(was_muted, Ordering::SeqCst);
+            if should_change(was_muted) {
+                set(true);
+            }
+        });
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+    }
+
+    /// Wait for any in-flight mute, then put the device back.
+    fn restore(&'static self, set: fn(bool)) {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(handle) = pending {
+            let _ = handle.join();
+        }
+        // Release ownership; if we weren't active, there's nothing to restore.
+        if !self.active.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        if should_change(self.was_muted.load(Ordering::SeqCst)) {
+            set(false);
+        }
+    }
+}
+
+static DUCKER: Ducker = Ducker::new();
 
 /// Honour the opt-out env var.
 fn disabled() -> bool {
@@ -52,8 +118,8 @@ fn should_change(was_muted: bool) -> bool {
 
 /// Mute system output for the duration of a capture session, remembering the
 /// prior state. No-op if disabled, already active, or output was already
-/// muted. Blocks briefly (~one `osascript` round-trip); called off the hot
-/// event-tap thread, after the mic is already capturing.
+/// muted. Returns at once: the `osascript` read and set run on a background
+/// thread (see [`Ducker`]), so the caller's recording feedback is not held up.
 pub fn mute() {
     if disabled() {
         return;
@@ -66,43 +132,18 @@ pub fn mute() {
     if frontmost_is_conferencing() {
         return;
     }
-    // Claim ownership; if a session is already active, leave it untouched.
-    if ACTIVE.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    // If we can't read the device's current state, leave it untouched rather
-    // than mute-then-restore — a failed read previously defaulted to "unmuted",
-    // which on restore would un-mute audio the user had muted themselves.
-    let was_muted = match current_muted() {
-        Some(m) => m,
-        None => {
-            // Release the ownership we just claimed so a later restore() is a
-            // no-op (we never actually touched the device).
-            ACTIVE.store(false, Ordering::SeqCst);
-            return;
-        }
-    };
-    WAS_MUTED.store(was_muted, Ordering::SeqCst);
-    if should_change(was_muted) {
-        set_muted(true);
-    }
+    DUCKER.mute(current_muted, set_muted);
 }
 
 /// Restore output to its pre-capture state. No-op if we never muted (not
 /// active). Safe to call on every pipeline exit path — only the first call per
-/// session does anything.
+/// session does anything. Synchronous: it waits for a still-running mute, then
+/// unmutes, so a cue played right after it is audible.
 pub fn restore() {
     if disabled() {
         return;
     }
-    // Release ownership; if we weren't active, there's nothing to restore.
-    if !ACTIVE.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    let was_muted = WAS_MUTED.load(Ordering::SeqCst);
-    if should_change(was_muted) {
-        set_muted(false);
-    }
+    DUCKER.restore(set_muted);
 }
 
 /// RAII guard: restore output mute when dropped. Construct one at the top of a
@@ -244,12 +285,58 @@ mod tests {
     #[test]
     fn restore_without_mute_is_noop() {
         // A restore() with no active session must not touch the device. We
-        // assert via the ACTIVE flag rather than the audio system: with no
-        // prior mute(), ACTIVE is false, so the swap returns false and we bail
-        // before any osascript call. (Run in isolation; ACTIVE is global.)
-        ACTIVE.store(false, Ordering::SeqCst);
+        // assert via the session flag rather than the audio system: with no
+        // prior mute(), `active` is false, so the swap returns false and we
+        // bail before any osascript call. (The flag is global to DUCKER.)
+        DUCKER.active.store(false, Ordering::SeqCst);
         // Should return immediately without panicking or flipping state.
         restore();
-        assert!(!ACTIVE.load(Ordering::SeqCst));
+        assert!(!DUCKER.active.load(Ordering::SeqCst));
+    }
+
+    // Test-only device ops: a slow read (like one osascript launch) and a set
+    // that records what it was asked to do instead of touching real audio.
+    static SETS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+    fn slow_unmuted_read() -> Option<bool> {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        Some(false)
+    }
+    fn failed_read() -> Option<bool> {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        None
+    }
+    fn record_set(muted: bool) {
+        SETS.lock().unwrap().push(muted);
+    }
+
+    // SPEED (2026-09-26): the osascript read+set ran on the dictation worker
+    // before the recording pill showed. mute must return without waiting for
+    // the read, and restore must still unmute strictly after the mute landed.
+    #[test]
+    fn mute_does_not_wait_for_the_device_and_restore_keeps_the_order() {
+        static D: Ducker = Ducker::new();
+        SETS.lock().unwrap().clear();
+        let t = std::time::Instant::now();
+        D.mute(slow_unmuted_read, record_set);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(100),
+            "mute blocked for {:?}",
+            t.elapsed()
+        );
+        D.restore(record_set);
+        assert_eq!(*SETS.lock().unwrap(), vec![true, false], "mute, then unmute");
+        assert!(!D.active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn an_unreadable_device_is_left_alone_on_restore() {
+        static D: Ducker = Ducker::new();
+        static UNTOUCHED: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        fn record(muted: bool) {
+            UNTOUCHED.lock().unwrap().push(muted);
+        }
+        D.mute(failed_read, record);
+        D.restore(record);
+        assert!(UNTOUCHED.lock().unwrap().is_empty(), "nothing set when the read failed");
     }
 }
