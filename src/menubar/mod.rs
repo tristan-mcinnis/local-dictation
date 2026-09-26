@@ -1582,43 +1582,128 @@ pub(crate) fn open_corrections_folder() {
     }
 }
 
+/// True while an AppleScript file or folder picker is open, so a second menu
+/// click does not stack another dialog.
+static PICKER_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Show an AppleScript `choose file` / `choose folder` dialog without blocking
+/// the main thread, then hand the chosen POSIX path to `on_chosen` on the main
+/// thread. The dialog runs in `/usr/bin/osascript`, so waiting for it on the
+/// main thread froze the pill and the menu, and stalled the event tap that
+/// lives on the main run loop (every key press, including the ones typed into
+/// the dialog, waited for the tap to time out). A cancel or an error chooses
+/// nothing and calls nothing.
+pub(super) fn pick_path_with_osascript(script: &str, label: &'static str, on_chosen: fn(PathBuf)) {
+    if PICKER_OPEN.swap(true, Ordering::SeqCst) {
+        eprintln!("[menu] {label}: a picker is already open");
+        return;
+    }
+    let script = script.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("osascript-picker".into())
+        .spawn(move || {
+            let chosen = run_osascript_picker(&script, label);
+            PICKER_OPEN.store(false, Ordering::SeqCst);
+            if let Some(path) = chosen {
+                run_on_main(move || on_chosen(path));
+            }
+        });
+    if spawned.is_err() {
+        PICKER_OPEN.store(false, Ordering::SeqCst);
+        eprintln!("[menu] {label}: could not start the picker thread");
+    }
+}
+
+fn run_osascript_picker(script: &str, label: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("/usr/bin/osascript")
+        .args(["-e", script])
+        .output();
+    let Ok(out) = out else {
+        eprintln!("[menu] {label}: osascript failed to launch");
+        return None;
+    };
+    if !out.status.success() {
+        // User dismissed the dialog (AppleScript returns -128 on cancel) or
+        // the script errored. Nothing was chosen, so there's nothing to do.
+        eprintln!(
+            "[menu] {label} cancelled or failed (osascript exit {:?})",
+            out.status.code()
+        );
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// Run `work` once on the main run loop. Safe from any thread: it adds a
+/// one-shot timer, which Core Foundation allows from any thread, in the
+/// common modes so it also fires while a menu or modal is open.
+pub(super) fn run_on_main(work: impl FnOnce() + Send + 'static) {
+    type Work = Box<dyn FnOnce() + Send>;
+    unsafe extern "C-unwind" fn fire(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+        // SAFETY: `info` is the `Box<Work>` leaked below, and a one-shot
+        // timer fires exactly once.
+        let work = unsafe { Box::from_raw(info as *mut Work) };
+        work();
+    }
+    let info = Box::into_raw(Box::new(Box::new(work) as Work)) as *mut c_void;
+    let mut ctx = CFRunLoopTimerContext {
+        version: 0,
+        info,
+        retain: None,
+        release: None,
+        copyDescription: None,
+    };
+    // SAFETY: `fire` matches the callback signature and takes `info` back.
+    let timer = unsafe {
+        CFRunLoopTimer::new(
+            None,
+            CFAbsoluteTimeGetCurrent(),
+            0.0,
+            0,
+            0,
+            Some(fire),
+            &mut ctx,
+        )
+    };
+    match (timer, CFRunLoop::main()) {
+        (Some(timer), Some(main)) => {
+            main.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+            main.wake_up();
+        }
+        _ => {
+            // Never fired: take the work back so it is dropped, not leaked.
+            drop(unsafe { Box::from_raw(info as *mut Work) });
+            eprintln!("[menu] could not schedule work on the main thread");
+        }
+    }
+}
+
 /// Import entries from a user-picked CSV file into the personal vocabulary
 /// (corrections.json), then refresh the dictionary window's editor text and
 /// confirm via the window subtitle.
 ///
 /// The native file dialog is driven through AppleScript's `choose file` (which
 /// presents the same macOS open panel) because `NSOpenPanel` isn't compiled
-/// into this build — its `objc2-app-kit` cargo feature is not enabled, and
-/// adding it would mean editing Cargo.toml, which is out of scope for this UI
-/// change. A CSV is matched by its standard UTI (`public.comma-separated-
+/// into this build. The dialog runs off the main thread
+/// (`pick_path_with_osascript`); the merge runs on it once a file is chosen.
+/// A CSV is matched by its standard UTI (`public.comma-separated-
 /// values-text`) with a `public.text` fallback for pickers that don't register
 /// the specific type.
 fn import_dictionary_csv() {
+    pick_path_with_osascript(
+        "POSIX path of (choose file of type {\"public.comma-separated-values-text\", \"public.text\"} with prompt \"Choose a dictionary CSV to import\")",
+        "import CSV",
+        finish_dictionary_import,
+    );
+}
+
+/// Merge the chosen CSV into corrections.json and refresh the dictionary
+/// window. Runs on the main thread, after the picker closed.
+fn finish_dictionary_import(path: PathBuf) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-
-    let out = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            "POSIX path of (choose file of type {\"public.comma-separated-values-text\", \"public.text\"} with prompt \"Choose a dictionary CSV to import\")",
-        ])
-        .output();
-    let Ok(out) = out else {
-        eprintln!("[menu] import CSV: osascript failed to launch");
-        return;
-    };
-    if !out.status.success() {
-        // User dismissed the dialog (AppleScript returns -128 on cancel) or
-        // the script errored. Nothing was chosen, so there's nothing to do.
-        eprintln!("[menu] import CSV cancelled or failed (osascript exit {:?})", out.status.code());
-        return;
-    }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if path.is_empty() {
-        return;
-    }
-    let path = PathBuf::from(path);
 
     let mut corrections = match crate::corrections::Corrections::load_default() {
         Ok(c) => c,
@@ -1722,6 +1807,42 @@ pub(crate) fn open_prompts_file() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The picker's answer is the trimmed POSIX path; a cancel (AppleScript
+    /// error -128) or an empty answer chooses nothing. No dialog is shown.
+    #[test]
+    fn picker_reads_the_chosen_path_and_treats_cancel_as_nothing() {
+        assert_eq!(
+            run_osascript_picker("return \"/tmp/words.csv\"", "test"),
+            Some(PathBuf::from("/tmp/words.csv"))
+        );
+        assert_eq!(run_osascript_picker("error number -128", "test"), None);
+        assert_eq!(run_osascript_picker("return \"\"", "test"), None);
+    }
+
+    /// The picker runs off the main thread, and a second click while it is
+    /// open does not stack another dialog.
+    #[test]
+    fn picker_does_not_block_and_does_not_stack() {
+        fn never_on_main(_: PathBuf) {}
+        let started = std::time::Instant::now();
+        pick_path_with_osascript("delay 0.4\nreturn \"/tmp/a.csv\"", "test", never_on_main);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "returns before the dialog closes"
+        );
+        assert!(PICKER_OPEN.load(Ordering::SeqCst));
+        // A second request while one is open is refused, not queued.
+        pick_path_with_osascript("return \"/tmp/b.csv\"", "test", never_on_main);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while PICKER_OPEN.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            !PICKER_OPEN.load(Ordering::SeqCst),
+            "the flag clears when the picker closes"
+        );
+    }
 
     #[test]
     fn rows_empty() {

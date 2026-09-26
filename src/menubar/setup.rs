@@ -607,29 +607,30 @@ fn model_action() {
 /// Let the user point at a checkpoint they already have. Uses AppleScript's
 /// `choose folder` (the same macOS panel) because `NSOpenPanel` is not in this
 /// build's `objc2-app-kit` feature set — the identical reason the dictionary
-/// CSV import gives.
+/// CSV import gives. The dialog runs off the main thread; the link is made on
+/// it once a folder is chosen.
 fn choose_model_folder(missing: &model_fetch::ModelStatus) {
     let prompt = format!("Choose the folder holding {}", missing.entry.id);
     let script = format!(
         "POSIX path of (choose folder with prompt {})",
         applescript_string(&prompt)
     );
-    let output = std::process::Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .output();
-    let Ok(output) = output else {
-        eprintln!("[setup] could not open the folder picker");
+    if let Ok(mut pending) = PENDING_MODEL_FOLDER.lock() {
+        *pending = Some(missing.clone());
+    }
+    super::pick_path_with_osascript(&script, "model folder", link_chosen_model_folder);
+}
+
+/// The missing model the open folder picker is for.
+static PENDING_MODEL_FOLDER: std::sync::Mutex<Option<model_fetch::ModelStatus>> =
+    std::sync::Mutex::new(None);
+
+/// Main thread, after `choose_model_folder`'s picker returned a folder.
+fn link_chosen_model_folder(chosen: std::path::PathBuf) {
+    let Some(missing) = PENDING_MODEL_FOLDER.lock().ok().and_then(|mut p| p.take()) else {
         return;
     };
-    if !output.status.success() {
-        // The user cancelled; osascript exits non-zero. Nothing to report.
-        return;
-    }
-    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if chosen.is_empty() {
-        return;
-    }
-    let chosen = std::path::PathBuf::from(&chosen);
+    let missing = &missing;
     if !missing.entry.present_at(&chosen) {
         set_footer(&format!(
             "That folder has no {} in it.",
