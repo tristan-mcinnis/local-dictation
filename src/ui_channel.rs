@@ -181,6 +181,7 @@ impl Presentation {
         self.preview_enabled = false;
         self.capture = None;
         self.revision = self.revision.wrapping_add(1);
+        wake_ui();
         self.revision
     }
 
@@ -221,6 +222,7 @@ impl Presentation {
         }
         self.state = next;
         self.revision = self.revision.wrapping_add(1);
+        wake_ui();
         true
     }
 
@@ -295,6 +297,21 @@ impl Presentation {
         if self.revision == revision {
             self.set_state(UiState::Idle);
         }
+    }
+}
+
+/// Called on every state change so the UI poll, which slows down while idle,
+/// runs at once. Set by the menu bar; the other builds have no UI to wake.
+static WAKE_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Register the UI wake-up. The first registration wins.
+pub fn set_wake_hook(hook: fn()) {
+    let _ = WAKE_HOOK.set(hook);
+}
+
+fn wake_ui() {
+    if let Some(hook) = WAKE_HOOK.get() {
+        hook();
     }
 }
 
@@ -616,6 +633,34 @@ mod tests {
         ui.set_state(UiState::Success);
         assert!(!ui.dismiss_kept_on_key(std::time::Instant::now() + KEPT_PILL));
         assert_eq!(ui.state, UiState::Success);
+    }
+
+    /// The menu-bar poll slows to once a second while idle, so every state
+    /// change must wake it or the pill would show up to a second late.
+    #[test]
+    fn every_state_change_wakes_the_ui() {
+        static WAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn count() {
+            WAKES.fetch_add(1, Ordering::SeqCst);
+        }
+        set_wake_hook(count);
+        let gate = CancelGate::new();
+        let mut ui = Presentation::new();
+
+        let before = WAKES.load(Ordering::SeqCst);
+        let gen = ui.begin(&gate, UiState::Recording, false);
+        let after_begin = WAKES.load(Ordering::SeqCst);
+        assert!(after_begin > before, "begin (the press) wakes the UI");
+
+        assert!(ui.phase(&gate, gen, UiState::Transcribing));
+        let after_phase = WAKES.load(Ordering::SeqCst);
+        assert!(after_phase > after_begin, "a phase step wakes the UI");
+
+        ui.finish(&gate, gen);
+        assert!(
+            WAKES.load(Ordering::SeqCst) > after_phase,
+            "the return to idle wakes the UI"
+        );
     }
 
     #[test]

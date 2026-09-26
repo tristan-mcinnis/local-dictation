@@ -55,7 +55,7 @@ use objc2_app_kit::{
     NSWindowCollectionBehavior, NSWindowLevel, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_core_foundation::{
-    kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer,
+    kCFRunLoopCommonModes, CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer,
     CFRunLoopTimerContext,
 };
 use objc2_foundation::{
@@ -209,8 +209,9 @@ struct UiGlobals {
     /// `pill::health_signature`). Most faults arrive and clear without moving
     /// `UiState`, so without this the glyph and tooltip went stale.
     last_health: AtomicU8,
-    /// Frame counter for the poll timer's once-a-second checks.
-    slow_tick: std::sync::atomic::AtomicU32,
+    /// When the poll timer last ran its once-a-second checks
+    /// (`CFAbsoluteTime` bits).
+    last_slow_check: std::sync::atomic::AtomicU64,
     /// Per-bar smoothed height. Rises instantly to a new peak, decays
     /// slowly toward the new RMS sample — gives the snappy bouncing
     /// feel of real audio meters.
@@ -728,7 +729,7 @@ pub fn init_and_run() -> eyre::Result<()> {
         reduced_motion: reduced_motion_enabled(),
         last_state: AtomicU8::new(255),
         last_health: AtomicU8::new(255),
-        slow_tick: std::sync::atomic::AtomicU32::new(0),
+        last_slow_check: std::sync::atomic::AtomicU64::new(0),
         displayed_heights: Mutex::new(vec![BAR_MIN_H; BAR_COUNT]),
         icon_idle: built.icon_idle,
         icon_recording: built.icon_recording,

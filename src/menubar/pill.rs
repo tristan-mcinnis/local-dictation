@@ -491,8 +491,12 @@ pub(super) fn install_poll_timer() {
         // About once a second, on this main-thread timer: follow a keyboard
         // layout switch (Text Input Source calls are main-thread only) and
         // notice Secure Input, which silences the hotkeys.
-        let tick = globals.slow_tick.fetch_add(1, Ordering::Relaxed);
-        if tick % SLOW_TICK_FRAMES == 0 {
+        let now_time = CFAbsoluteTimeGetCurrent();
+        let last_slow = f64::from_bits(globals.last_slow_check.load(Ordering::Relaxed));
+        if now_time - last_slow >= SLOW_CHECK_SECONDS - POLL_ACTIVE_SECONDS / 2.0 {
+            globals
+                .last_slow_check
+                .store(now_time.to_bits(), Ordering::Relaxed);
             // The grant can land at any moment in System Settings. Installing
             // the event tap here is what makes "turn it on and it works"
             // true, with no relaunch.
@@ -524,6 +528,7 @@ pub(super) fn install_poll_timer() {
                 apply_state_transition(globals, state);
             }
         }
+        schedule_next_poll(state);
     }
 
     unsafe {
@@ -536,8 +541,8 @@ pub(super) fn install_poll_timer() {
         };
         let timer = CFRunLoopTimer::new(
             None,
-            CFAbsoluteTimeGetCurrent() + 0.033,
-            0.033, // 30 FPS
+            CFAbsoluteTimeGetCurrent() + POLL_ACTIVE_SECONDS,
+            POLL_ACTIVE_SECONDS,
             0,
             0,
             Some(timer_cb),
@@ -546,8 +551,76 @@ pub(super) fn install_poll_timer() {
         .expect("CFRunLoopTimer::new");
         let run_loop = CFRunLoop::main().expect("main run loop");
         run_loop.add_timer(Some(&timer), kCFRunLoopCommonModes);
-        std::mem::forget(timer);
+        // Kept for the life of the process (the run loop also retains it), so
+        // `wake_poll_timer` may use the pointer from any thread.
+        POLL_TIMER.store(
+            CFRetained::into_raw(timer).as_ptr() as usize,
+            Ordering::Release,
+        );
     }
+    ui_channel::set_wake_hook(wake_poll_timer);
+}
+
+/// The pill poll timer, stored once by `install_poll_timer` and never freed.
+static POLL_TIMER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set by `wake_poll_timer`, cleared by `schedule_next_poll`: a state change
+/// arrived while the timer callback was deciding its next fire date.
+static POLL_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Seconds between polls while an utterance or a result pill is on screen
+/// (30 FPS: waveform, hover, live preview).
+const POLL_ACTIVE_SECONDS: f64 = 1.0 / 30.0;
+
+/// Seconds between polls while idle. Nothing animates; the poll only runs
+/// the once-a-second checks. A state change wakes the timer at once through
+/// `wake_poll_timer`, so the pill still appears at the press.
+const POLL_IDLE_SECONDS: f64 = SLOW_CHECK_SECONDS;
+
+/// Seconds between the slow checks (permissions, health, key layout,
+/// Secure Input).
+const SLOW_CHECK_SECONDS: f64 = 1.0;
+
+/// How long until the next poll for a given state. Pure, for tests.
+pub(super) fn poll_interval(state: UiState) -> f64 {
+    if state == UiState::Idle {
+        POLL_IDLE_SECONDS
+    } else {
+        POLL_ACTIVE_SECONDS
+    }
+}
+
+/// Called at the end of each poll on the main thread. A repeating CF timer
+/// honours a later fire date set during its own callout, so idle polls drop
+/// to once a second. The pending check runs after the new date is set: a wake
+/// from another thread either lands after it (and wins) or set the flag
+/// before it (and is replayed here), so a press is never delayed.
+fn schedule_next_poll(state: UiState) {
+    let Some(timer) = poll_timer() else { return };
+    let now = CFAbsoluteTimeGetCurrent();
+    timer.set_next_fire_date(now + poll_interval(state));
+    if POLL_WAKE_PENDING.swap(false, Ordering::SeqCst) {
+        timer.set_next_fire_date(now);
+    }
+}
+
+/// Fire the poll timer now. Safe from any thread: `ui_channel` calls it on
+/// every state change, from the worker, the event tap and the audio path.
+fn wake_poll_timer() {
+    let Some(timer) = poll_timer() else { return };
+    POLL_WAKE_PENDING.store(true, Ordering::SeqCst);
+    timer.set_next_fire_date(CFAbsoluteTimeGetCurrent());
+    if let Some(main) = CFRunLoop::main() {
+        main.wake_up();
+    }
+}
+
+fn poll_timer() -> Option<&'static CFRunLoopTimer> {
+    let raw = POLL_TIMER.load(Ordering::Acquire);
+    // SAFETY: the pointer came from `CFRetained::into_raw` and is never
+    // released, so it stays valid for the process. CFRunLoop timer calls are
+    // thread-safe in Core Foundation.
+    (raw != 0).then(|| unsafe { &*(raw as *const CFRunLoopTimer) })
 }
 
 /// One byte standing for what the status item currently says about health:
@@ -767,9 +840,6 @@ fn set_hint_action(globals: &UiGlobals, action: objc2::runtime::Sel, tooltip: &s
 
 /// Pill text when "Copy last dictation" has nothing to copy.
 pub(super) const NOTHING_TO_COPY_TEXT: &str = "No dictation to copy yet";
-
-/// Poll-timer frames between slow checks (30 FPS, so about one second).
-const SLOW_TICK_FRAMES: u32 = 30;
 
 /// The menu-bar glyph's alpha while the pipeline works.
 const PROCESSING_ALPHA: f64 = 0.4;
@@ -1113,6 +1183,18 @@ mod health_signature_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Idle polls once a second; anything on screen keeps 30 FPS. The slow
+    /// checks still run about once a second in both.
+    #[test]
+    fn only_idle_slows_the_poll() {
+        assert_eq!(poll_interval(UiState::Idle), SLOW_CHECK_SECONDS);
+        for v in 1..=16u8 {
+            let state = UiState::from_u8(v);
+            assert_eq!(poll_interval(state), POLL_ACTIVE_SECONDS, "{state:?}");
+        }
+        assert!(POLL_IDLE_SECONDS >= SLOW_CHECK_SECONDS - POLL_ACTIVE_SECONDS / 2.0);
+    }
 
     #[test]
     fn recovery_failure_is_visible_without_exposing_the_transcript_or_blocking_work() {
