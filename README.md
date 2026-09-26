@@ -52,9 +52,10 @@ public conversion exists to download, so that part is not yet a clean-room
 install for a stranger. Setup & permissions says so and offers a folder picker
 for a checkpoint you already have. The app never invents a download.
 
-Model bytes live in the shared `~/Models` store (the repo's `models/` entries are
-symlinks into it), but both models run in-process inside this app. Local
-Dictation does not send audio or text through the Local Models daemon.
+`download-models.sh` keeps the model bytes in the shared `~/Models` store (the
+repo's `models/` entries are symlinks into it), but both models run in-process
+inside this app. Local Dictation does not send audio or text through the Local
+Models daemon.
 
 Local builds use an available Apple Development signing identity. Keep the same identity across updates to preserve macOS permission grants.
 
