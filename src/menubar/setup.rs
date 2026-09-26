@@ -615,10 +615,15 @@ fn choose_model_folder(missing: &model_fetch::ModelStatus) {
         "POSIX path of (choose folder with prompt {})",
         applescript_string(&prompt)
     );
-    if let Ok(mut pending) = PENDING_MODEL_FOLDER.lock() {
-        *pending = Some(missing.clone());
+    // Record the model only once the picker is really open: a click refused
+    // because a picker is already up must not re-aim that picker's answer at
+    // a different model. The answer reaches the main thread later, so this
+    // is set before it can be read.
+    if super::pick_path_with_osascript(&script, "model folder", link_chosen_model_folder) {
+        if let Ok(mut pending) = PENDING_MODEL_FOLDER.lock() {
+            *pending = Some(missing.clone());
+        }
     }
-    super::pick_path_with_osascript(&script, "model folder", link_chosen_model_folder);
 }
 
 /// The missing model the open folder picker is for.

@@ -1592,11 +1592,16 @@ static PICKER_OPEN: AtomicBool = AtomicBool::new(false);
 /// main thread froze the pill and the menu, and stalled the event tap that
 /// lives on the main run loop (every key press, including the ones typed into
 /// the dialog, waited for the tap to time out). A cancel or an error chooses
-/// nothing and calls nothing.
-pub(super) fn pick_path_with_osascript(script: &str, label: &'static str, on_chosen: fn(PathBuf)) {
+/// nothing and calls nothing. Returns false, and calls nothing, when a picker
+/// is already open or could not start.
+pub(super) fn pick_path_with_osascript(
+    script: &str,
+    label: &'static str,
+    on_chosen: fn(PathBuf),
+) -> bool {
     if PICKER_OPEN.swap(true, Ordering::SeqCst) {
         eprintln!("[menu] {label}: a picker is already open");
-        return;
+        return false;
     }
     let script = script.to_string();
     let spawned = std::thread::Builder::new()
@@ -1611,7 +1616,9 @@ pub(super) fn pick_path_with_osascript(script: &str, label: &'static str, on_cho
     if spawned.is_err() {
         PICKER_OPEN.store(false, Ordering::SeqCst);
         eprintln!("[menu] {label}: could not start the picker thread");
+        return false;
     }
+    true
 }
 
 fn run_osascript_picker(script: &str, label: &str) -> Option<PathBuf> {
@@ -1691,7 +1698,7 @@ pub(super) fn run_on_main(work: impl FnOnce() + Send + 'static) {
 /// values-text`) with a `public.text` fallback for pickers that don't register
 /// the specific type.
 fn import_dictionary_csv() {
-    pick_path_with_osascript(
+    let _ = pick_path_with_osascript(
         "POSIX path of (choose file of type {\"public.comma-separated-values-text\", \"public.text\"} with prompt \"Choose a dictionary CSV to import\")",
         "import CSV",
         finish_dictionary_import,
@@ -1826,14 +1833,22 @@ mod tests {
     fn picker_does_not_block_and_does_not_stack() {
         fn never_on_main(_: PathBuf) {}
         let started = std::time::Instant::now();
-        pick_path_with_osascript("delay 0.4\nreturn \"/tmp/a.csv\"", "test", never_on_main);
+        assert!(pick_path_with_osascript(
+            "delay 0.4\nreturn \"/tmp/a.csv\"",
+            "test",
+            never_on_main
+        ));
         assert!(
             started.elapsed() < std::time::Duration::from_millis(200),
             "returns before the dialog closes"
         );
         assert!(PICKER_OPEN.load(Ordering::SeqCst));
         // A second request while one is open is refused, not queued.
-        pick_path_with_osascript("return \"/tmp/b.csv\"", "test", never_on_main);
+        assert!(!pick_path_with_osascript(
+            "return \"/tmp/b.csv\"",
+            "test",
+            never_on_main
+        ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while PICKER_OPEN.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
