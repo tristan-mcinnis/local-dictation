@@ -57,6 +57,9 @@ over a dead hotkey.
   before adding anything on the critical path. No OCR, vision LLMs, or
   whole-window scraping.
 - The cleanup model gets the tightest relevant context only.
+- Both models run in this process, never through the local-models daemon.
+  That is a deliberate exception to the house serving layer, for latency;
+  only `download-models.sh` shares the `~/Models` weight store.
 - One macOS floor: 14.0, set by the Swift helper (`Package.swift`
   `.macOS(.v14)`). `scripts/build-app.sh` `MIN_MACOS` (plist +
   `MACOSX_DEPLOYMENT_TARGET`) and the `install.sh` check follow it; change
