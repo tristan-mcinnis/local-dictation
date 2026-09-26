@@ -1339,9 +1339,16 @@ mod imp {
         // Focus gate: no positive editable evidence → hold, never paste blindly.
         // A hold never claims write authorization.
         if editability == FocusEditability::NotEditable {
+            // Name the focused role/subrole (never its value), so a hold in a
+            // browser can be told apart from a focus miss without a live
+            // INJECT_DIAG repro. An empty key means no element or no role.
             eprintln!(
-                "[inject] no editable field focused ({:?}) — holding transcript (never paste blindly)",
-                editability
+                "[inject] no editable field focused (role {}) — holding transcript (never paste blindly)",
+                if focused.is_null() {
+                    "none".to_string()
+                } else {
+                    verification_role_key(focused)
+                }
             );
             return Ok(InjectOutcome::NoEditableField);
         }
