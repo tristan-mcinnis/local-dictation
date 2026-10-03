@@ -9,12 +9,30 @@
 # 4-bit MLX conversion by beshkenadze, pinned to one revision and verified by
 # SHA-256. A local Superwhisper install, when present, is re-keyed instead and
 # saves the 1.5 GB download. Cleanup model: "S1-mini" by "Superwhisper".
+#
+# Two modes:
+#   Source tree (default): bytes go to ~/Models, the repo's models/ entries are
+#     symlinks to them, and the native MLX helper is built.
+#   App mode: the copy inside "Local Dictation.app/Contents/Resources" (also
+#     `--app`). No repo, no Xcode: bytes go straight to the folder the app reads,
+#     ~/Library/Application Support/Local Dictation/models (DICTATE_MODELS_DIR
+#     overrides it). Use this after installing a downloaded build.
 set -euo pipefail
 
-repo_root="${0:A:h:h}"
-cd "$repo_root"
+script_dir="${0:A:h}"
+app_mode=0
+[[ "${1:-}" == "--app" ]] && app_mode=1
+if [[ ! -f "$script_dir/../Cargo.toml" ]]; then app_mode=1; fi
 
-models_home="${LOCAL_MODELS_HOME:-$HOME/Models}"
+if (( app_mode )); then
+  repo_root="$script_dir"                       # LICENSE-APACHE sits beside this script
+  app_models="${DICTATE_MODELS_DIR:-$HOME/Library/Application Support/Local Dictation/models}"
+  models_home="$app_models"
+else
+  repo_root="${0:A:h:h}"
+  cd "$repo_root"
+  models_home="${LOCAL_MODELS_HOME:-$HOME/Models}"
+fi
 super_root="${SUPERWHISPER_SUPPORT_DIR:-$HOME/Library/Application Support/superwhisper}"
 cohere_source="${SUPERWHISPER_COHERE_DIR:-$super_root/models/cohere-transcribe/cohere-transcribe-q4}"
 s1_source="${S1_MODEL_PATH:-$super_root/s1-mini.gguf}"
@@ -42,10 +60,14 @@ cohere_files=(
 )
 file_ok() { [[ -f "$1" && $(stat -f %z "$1") == "$2" && $(shasum -a 256 "$1" | cut -d' ' -f1) == "$3" ]] }
 
-cohere_dest="$models_home/cohere-mlx-q4"
+if (( app_mode )); then
+  cohere_dest="$app_models/dictation/cohere-mlx-q4"
+else
+  cohere_dest="$models_home/cohere-mlx-q4"
+fi
 if [[ -f "$cohere_dest/model.safetensors" && -f "$cohere_dest/config.json" ]]; then
   print "Cohere Transcribe Q4 already in place ($cohere_dest)."
-elif [[ -f "$cohere_source/model.safetensors" ]]; then
+elif (( ! app_mode )) && [[ -f "$cohere_source/model.safetensors" ]]; then
   # A local Superwhisper install: re-key its header names for mlx-audio-swift.
   python3 scripts/models/convert_superwhisper_cohere.py "$cohere_source" "$cohere_dest"
   print "Re-keyed Cohere Transcribe Q4 from $cohere_source."
@@ -72,12 +94,23 @@ else
     > "$cohere_dest/NOTICE"
   print "Downloaded Cohere Transcribe Q4 with its licence."
 fi
-mkdir -p "$repo_root/models/dictation"
-ln -sfn "$cohere_dest" "$repo_root/models/dictation/cohere-mlx-q4"
+if (( ! app_mode )); then
+  mkdir -p "$repo_root/models/dictation"
+  ln -sfn "$cohere_dest" "$repo_root/models/dictation/cohere-mlx-q4"
+fi
 
 # S1-mini: local copy if there is one, else download; verify the digest either way.
-s1_dest="$models_home/gguf/s1-mini.gguf"
-mkdir -p "$models_home/gguf" "$repo_root/models/llm/s1-mini"
+if (( app_mode )); then
+  s1_dir="$app_models/llm/s1-mini"
+  s1_dest="$s1_dir/s1-mini.gguf"
+  s1_license="$s1_dir/LICENSE.txt"; s1_notice="$s1_dir/NOTICE.txt"
+else
+  s1_dir="$models_home/gguf"
+  s1_dest="$s1_dir/s1-mini.gguf"
+  s1_license="$s1_dir/s1-mini-LICENSE.txt"; s1_notice="$s1_dir/s1-mini-NOTICE.txt"
+  mkdir -p "$repo_root/models/llm/s1-mini"
+fi
+mkdir -p "$s1_dir"
 s1_ok() { [[ -f "$1" && $(stat -f %z "$1") == "$s1_bytes" && $(shasum -a 256 "$1" | cut -d' ' -f1) == "$s1_sha256" ]] }
 
 if s1_ok "$s1_dest"; then
@@ -92,13 +125,18 @@ else
   mv "$s1_dest.part" "$s1_dest"
   s1_ok "$s1_dest" || { print -u2 "Downloaded S1-mini does not match the published digest."; exit 2 }
   # The model's licence requires its LICENSE and NOTICE to travel with it.
-  curl -fsL -o "$models_home/gguf/s1-mini-LICENSE.txt" \
+  curl -fsL -o "$s1_license" \
     "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/main/LICENSE"
-  curl -fsL -o "$models_home/gguf/s1-mini-NOTICE.txt" \
+  curl -fsL -o "$s1_notice" \
     "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/main/NOTICE"
   print "Downloaded \"S1-mini\" by \"Superwhisper\" with its LICENSE and NOTICE."
 fi
-ln -sfn "$s1_dest" "$repo_root/models/llm/s1-mini/s1-mini.gguf"
+if (( app_mode )); then
+  print "Fixed Cohere MLX + S1-mini stack is ready in $app_models."
+  print "Quit and reopen Local Dictation (menu bar icon, Quit) to load the models."
+else
+  ln -sfn "$s1_dest" "$repo_root/models/llm/s1-mini/s1-mini.gguf"
 
-native/cohere-mlx/build.sh >/dev/null
-print "Fixed Cohere MLX + S1-mini stack is ready (bytes in $models_home, repo symlinked)."
+  native/cohere-mlx/build.sh >/dev/null
+  print "Fixed Cohere MLX + S1-mini stack is ready (bytes in $models_home, repo symlinked)."
+fi

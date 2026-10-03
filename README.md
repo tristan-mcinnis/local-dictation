@@ -71,16 +71,54 @@ prompts in plain JSON.
 
 - macOS 14 or later on an Apple Silicon Mac (M1 or later). Intel Macs are not
   supported.
-- Full Xcode (the MLX helper builds a Metal resource bundle), the Rust stable
-  toolchain, and cmake. `install.sh` offers to install Rust and cmake.
-- About 2 GB of disk for the two models, and a network connection for the first
-  build (SwiftPM fetches packages) and the model download.
+- About 2 GB of disk for the two models, and a network connection for the model
+  download.
+- To build from source only: full Xcode (the MLX helper builds a Metal resource
+  bundle), the Rust stable toolchain, and cmake. `install.sh` offers to install
+  Rust and cmake. The first build needs a network connection too (SwiftPM
+  fetches packages).
 - No other House app is needed.
 
 ## Install
 
-There is no signed download yet, so you build it from source. `install.sh` does
-everything:
+### Download
+
+Get the latest DMG from
+[Releases](https://github.com/tristan-mcinnis/local-dictation/releases/latest). The file is
+`Local-Dictation-<version>-macos-arm64.dmg`, for Apple Silicon Macs on macOS 14 or later.
+Open it and drag Local Dictation to Applications.
+
+#### First open (macOS will warn you)
+
+Local Dictation is not notarized. It is a free project, and it has no paid Apple Developer ID. So macOS blocks the first open. Only open it if you downloaded it from the Releases page of this repository.
+
+1. Open the DMG and drag Local Dictation to Applications.
+2. Open Local Dictation once. macOS says it cannot verify the app. Click Done.
+3. Open System Settings, then Privacy & Security. Scroll down and click Open Anyway next to Local Dictation. Confirm.
+
+If you prefer Terminal, run this once, then open the app:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Local Dictation.app"
+```
+
+Each release is signed ad hoc. So macOS may ask again for permissions such as Accessibility or Microphone after an update. Grant them again when asked.
+
+This build has no models inside it. On first run, the Setup window lists what is
+missing. Click Get model for the cleanup model. For the speech model, run this once in
+Terminal (no Xcode needed), then quit and reopen the app:
+
+```bash
+"/Applications/Local Dictation.app/Contents/Resources/download-models.sh"
+```
+
+This free build does not update itself. To update, download the new DMG from Releases
+and replace the app. Each release lists a SHA-256 you can check with
+`shasum -a 256 -c SHA256SUMS`.
+
+### Build from source
+
+`install.sh` does everything:
 
 ```bash
 git clone https://github.com/tristan-mcinnis/local-dictation
@@ -106,18 +144,8 @@ repo's `models/` entries are symlinks to them. If you already have Superwhisper
 installed, the script reuses its local copies instead of downloading.
 
 Inside the app, Setup can fetch the cleanup model for you. It cannot fetch the
-speech model yet; run the script, or choose a folder that holds
-`model.safetensors` and `config.json`.
-
-**Permissions.** On launch the menu-bar icon appears and a **Setup &
-permissions** window lists what is still needed: Microphone, Accessibility and
-Models. Turn Accessibility on in System Settings and the hotkey starts working
-at once, with no relaunch. A waveform icon with no warning means it is ready.
-
-Local builds sign with the first Apple Development identity in your keychain, so
-permission grants survive rebuilds. With no identity the build falls back to
-ad-hoc signing, and macOS may ask for Microphone and Accessibility again after
-each rebuild.
+speech model yet; run the script (a copy sits inside the downloaded app, see
+Download), or choose a folder that holds `model.safetensors` and `config.json`.
 
 <details>
 <summary><b>Hand it to an AI agent</b> (paste into Claude Code, Codex, or Cursor)</summary>
@@ -137,12 +165,29 @@ Hotkey: hold Right Option to dictate and release to transcribe.
 
 </details>
 
-### Released builds (not published yet)
+### Permissions
 
-The repository holds a release pipeline for a Developer ID signed, notarized
-build that updates itself through Sparkle 2, as a DMG or a Homebrew cask. It is
-exercised offline by `./scripts/release/dry-run.sh`. Nothing is published yet:
-the remaining steps need signing credentials. See
+On launch the menu-bar icon appears and a **Setup &
+permissions** window lists what is still needed: Microphone, Accessibility and
+Models. Turn Accessibility on in System Settings and the hotkey starts working
+at once, with no relaunch. A waveform icon with no warning means it is ready.
+
+Local builds sign with the first Apple Development identity in your keychain, so
+permission grants survive rebuilds. With no identity the build falls back to
+ad-hoc signing, and macOS may ask for Microphone and Accessibility again after
+each rebuild. Downloaded releases are ad hoc, so the same applies after an update.
+
+### Making a release
+
+`./scripts/make-dmg.sh` builds the slim app with ad-hoc signing, wraps it in
+`Local-Dictation-<version>-macos-arm64.dmg`, writes `SHA256SUMS` and
+`RELEASE_NOTES.md`, and checks the image without launching the app. It never
+uploads. See [`docs/release/github-release.md`](docs/release/github-release.md).
+
+The repository also holds a pipeline for a Developer ID signed, notarized build
+that updates itself through Sparkle 2, as a DMG or a Homebrew cask. It needs a
+paid Apple Developer ID and is not in use. It is exercised offline by
+`./scripts/release/dry-run.sh`. See
 [`docs/release/direct-distribution.md`](docs/release/direct-distribution.md) and
 [`docs/release/homebrew.md`](docs/release/homebrew.md).
 
@@ -258,7 +303,7 @@ your own numbers.
 | Editable prompts | Yes (JSON) | No | No | No |
 | Price | Free | Free | Subscription | Paid or freemium |
 | Account or signup | None | None | Usually | Varies |
-| One-click install | No (build from source) | Yes | Yes | Yes |
+| One-click install | Download, plus a first-open step and a model download | Yes | Yes | Yes |
 
 If you want zero setup and a maintained app, the others win. If you want low
 latency and full control of the model's behaviour in a text file, this is for
@@ -280,8 +325,8 @@ you.
   cleanup; the clipboard, saved and restored around a paste fallback.
 - **Sent:** nothing while you dictate. The network is used only when you start
   a model download (Setup's Get model, `fetch-models`, or
-  `download-models.sh`), which talks to huggingface.co. Released builds would
-  also check an HTTPS appcast for updates; none are published yet.
+  `download-models.sh`), which talks to huggingface.co. The free download build
+  never checks for updates.
 - **Stored, on your Mac only:** dictation history in `history.db`, recovery
   audio (30 days by default) and text versions, your settings, dictionary and
   corrections in `~/.config/local-dictation/`, and a daemon log that records
@@ -308,6 +353,7 @@ native/cohere-mlx/build.sh
 ./scripts/build-app.sh --install        # build, copy to /Applications, login item, launch
 ./scripts/build-app.sh --slim           # app without models (supply them separately)
 ./scripts/build-app.sh --bundle-models --dmg
+./scripts/make-dmg.sh                   # the GitHub release DMG (slim, ad hoc, arm64)
 ```
 
 Tests:
@@ -316,7 +362,7 @@ Tests:
 cargo test                   # core unit and integration tests, plus the scrub gate; no models needed
 cargo test --features full   # adds the menu bar, history, injector and cleaner suites
 native/cohere-mlx/test.sh    # Swift bridge protocol tests
-scripts/release/dry-run.sh   # release pipeline, offline
+scripts/release/dry-run.sh   # Developer ID release pipeline, offline
 cargo run --release --features cleaner --example s1_mini_eval   # needs the models
 ```
 

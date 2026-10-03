@@ -11,6 +11,10 @@ build:
    (`auto_updates true`, so Homebrew does not fight it). See
    [`homebrew.md`](homebrew.md).
 
+This is the paid-credentials lane and it is not in use. The free lane (ad-hoc
+signed DMG on GitHub Releases, no Developer ID) is in
+[`github-release.md`](github-release.md).
+
 This document is the direct-download half. Everything here is owned by this
 repository: the bundle identity, the signing identity, the notarization
 credentials, the Sparkle key, the appcast and the release artifacts. Nothing is

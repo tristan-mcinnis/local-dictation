@@ -37,6 +37,9 @@ build — a plain `swift build` compiles but fails at runtime. Protocol referenc
 
 ```bash
 ./scripts/download-models.sh                  # one-time: prepare the fixed Cohere Q4 + S1-mini stack
+# A built app carries a copy of that script in Contents/Resources; run outside a source tree it
+# writes the models to ~/Library/Application Support/Local Dictation/models (no repo, no Xcode).
+# scripts/make-dmg.sh packages the free GitHub release DMG (docs/release/github-release.md).
 cargo build --features full --release         # the real build — see the feature flags below
 ./target/release/fast-dictate-backend daemon  # run the push-to-talk daemon
 

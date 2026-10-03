@@ -102,9 +102,10 @@ pub const ASR: ModelEntry = ModelEntry {
     licence: "Apache-2.0",
     licence_link: "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026",
     source: None,
-    manual_hint: "The app cannot download this model yet. Run \
-scripts/download-models.sh from the source tree (it fetches a pinned public 4-bit MLX \
-build), or choose a folder that holds model.safetensors and config.json.",
+    manual_hint: "The app cannot download this model yet. In Terminal, run \
+\"/Applications/Local Dictation.app/Contents/Resources/download-models.sh\" (or \
+scripts/download-models.sh from the source tree). It fetches a pinned public 4-bit MLX \
+build. Or choose a folder that holds model.safetensors and config.json.",
 };
 
 /// Cleanup model. Open weights with a published digest, so the app can get it.

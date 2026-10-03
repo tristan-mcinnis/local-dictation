@@ -220,6 +220,10 @@ cp "$REPO_ROOT/resources/AppIcon.icns" "$RES_DIR/Icon.icns"
 # Apache-2.0 dependencies (crates, mlx-swift, mlx-audio-swift) require it.
 cp "$REPO_ROOT/LICENSE-MIT" "$REPO_ROOT/LICENSE-APACHE" \
    "$REPO_ROOT/THIRD_PARTY_NOTICES.md" "$RES_DIR/"
+# The model downloader travels with the app, so a download-only user can fetch
+# the speech model without cloning the repo (it detects it is inside a bundle).
+cp "$REPO_ROOT/scripts/download-models.sh" "$RES_DIR/download-models.sh"
+chmod +x "$RES_DIR/download-models.sh"
 
 # ── 5. models ────────────────────────────────────────────────────────────────
 if [ "$BUNDLE_MODELS" -eq 1 ]; then
@@ -279,30 +283,28 @@ if [ "$RELEASE" -eq 1 ]; then
   CODESIGN_FLAGS+=(--options runtime --timestamp --entitlements "$ENTITLEMENTS_PLIST")
 fi
 
-if [ "$RELEASE" -eq 1 ]; then
-  # Sign inside-out, never with --deep (Sparkle's own guidance: --deep is a
-  # common source of sandbox/notarization failures). Sparkle 2 lays its helpers
-  # out under Versions/B/, so discover the version dir rather than hardcoding it.
-  [ -f "$RES_DIR/cohere-mlx-bridge" ] && codesign "${CODESIGN_FLAGS[@]}" "$RES_DIR/cohere-mlx-bridge"
-  if [ -d "$CONTENTS/Frameworks/Sparkle.framework" ]; then
-    FW="$CONTENTS/Frameworks/Sparkle.framework"
-    VER_DIR="$(ls -d "$FW"/Versions/[A-Z] 2>/dev/null | head -1 || true)"
-    [ -n "$VER_DIR" ] || { echo "Sparkle.framework has no Versions/<X> directory" >&2; exit 1; }
-    for part in \
-      "$VER_DIR/XPCServices/Installer.xpc" \
-      "$VER_DIR/XPCServices/Downloader.xpc" \
-      "$VER_DIR/Autoupdate" \
-      "$VER_DIR/Updater.app" \
-      "$VER_DIR/Sparkle"; do
-      [ -e "$part" ] && codesign "${CODESIGN_FLAGS[@]}" "$part"
-    done
-    codesign "${CODESIGN_FLAGS[@]}" "$FW"
-  fi
-  codesign "${CODESIGN_FLAGS[@]}" "$APP"
-else
-  codesign "${CODESIGN_FLAGS[@]}" --deep "$APP" >/dev/null 2>&1 || \
-    codesign "${CODESIGN_FLAGS[@]}" --deep "$APP"
+# Sign inside-out, never with --deep (a --deep pass can re-sign nested code with
+# the wrong flags or entitlements). The Swift helper in Resources is nested
+# code, so it is signed before the app seals it, and so are Sparkle's parts when
+# the framework is embedded. Sparkle 2 lays its helpers out under Versions/B/,
+# so discover the version dir rather than hardcoding it. CODESIGN_FLAGS already
+# carries the hardened runtime and entitlements for a --release build.
+[ -f "$RES_DIR/cohere-mlx-bridge" ] && codesign "${CODESIGN_FLAGS[@]}" "$RES_DIR/cohere-mlx-bridge"
+if [ -d "$CONTENTS/Frameworks/Sparkle.framework" ]; then
+  FW="$CONTENTS/Frameworks/Sparkle.framework"
+  VER_DIR="$(ls -d "$FW"/Versions/[A-Z] 2>/dev/null | head -1 || true)"
+  [ -n "$VER_DIR" ] || { echo "Sparkle.framework has no Versions/<X> directory" >&2; exit 1; }
+  for part in \
+    "$VER_DIR/XPCServices/Installer.xpc" \
+    "$VER_DIR/XPCServices/Downloader.xpc" \
+    "$VER_DIR/Autoupdate" \
+    "$VER_DIR/Updater.app" \
+    "$VER_DIR/Sparkle"; do
+    [ -e "$part" ] && codesign "${CODESIGN_FLAGS[@]}" "$part"
+  done
+  codesign "${CODESIGN_FLAGS[@]}" "$FW"
 fi
+codesign "${CODESIGN_FLAGS[@]}" "$APP"
 codesign --verify --deep --strict "$APP" && echo "  signature OK"
 if [ "$RELEASE" -eq 1 ]; then
   codesign -dvv "$APP" 2>&1 | grep -E 'Authority|Runtime Version|Timestamp' | sed 's/^/  /' >&2 || true

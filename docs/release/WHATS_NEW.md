@@ -1,0 +1,7 @@
+- First download build on GitHub Releases. Before this, you had to build it from source.
+- First-run Setup window. A missing permission or model never stops the app from starting. The menu bar and the Setup window say what is missing and what to do next.
+- Models are checked. The speech model comes from a public pinned 4-bit conversion, and every file is checked against a SHA-256. Setup can fetch the cleanup model for you.
+- Recovery history keeps the audio and the text versions of every capture on your Mac.
+- Dictation works in more apps: Slack, Electron apps and Helium now expose their text fields.
+- Selectable start and completion sounds.
+- Licences and third-party notices ship inside the app, and a scrub gate keeps private content out of the repository.
