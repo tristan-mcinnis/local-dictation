@@ -2197,7 +2197,7 @@ mod tests {
         // CJK is BMP: one unit per char.
         assert_eq!(char_index_from_utf16("你好世界", 2), 2);
         // Each emoji is two UTF-16 units but one char.
-        let s = "😀😀😀😀😀 Jenifer";
+        let s = "😀😀😀😀😀 Beatrix";
         assert_eq!(char_index_from_utf16(s, 10), 5);
         assert_eq!(char_index_from_utf16(s, 11), 6);
         // Inside a surrogate pair rounds down to the emoji itself.

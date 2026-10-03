@@ -1,6 +1,6 @@
 # Why long dictations lose text (2026-09-09)
 
-The user reported dictation "cutting off a lot of text at the end". It is real,
+The author reported dictation "cutting off a lot of text at the end". It is real,
 it is reproducible, and it is not the hotkey, the tail capture or the injector.
 
 ## Root cause
@@ -11,7 +11,7 @@ returns a shorter, plausible transcript.
 
 Measured with a 177 s `say`-generated script of 40 numbered markers, fed to the
 shipped helper (`dist/Local Dictation.app/Contents/Resources/cohere-mlx-bridge`,
-`/Users/user/Models/cohere-mlx-q4`):
+`~/Models/cohere-mlx-q4`):
 
 | audio in one request | words out | markers found | markers missing |
 |---|---|---|---|
@@ -59,7 +59,7 @@ Two guards exist and both are off:
 - 19 of 501 utterances carried more than 40 s of audio per ASR request.
 - About 1440 words never arrived, against 14787 words injected: roughly 9%.
 - Worst case: a 135 s hold returned 109 words, ending mid-thought, with a
-  repeated clause ("I have my Vault, which has all of my ... I have my Vault").
+  repeated clause ("I have my notes, which has all of my ... I have my notes").
   Repeated clauses and stalled endings are the signature of this failure.
 
 ## The fix

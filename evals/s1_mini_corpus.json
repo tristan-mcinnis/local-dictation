@@ -58,11 +58,11 @@
   {
     "id": "all-clauses-preserved",
     "category": "content-preservation",
-    "input": "send the draft to Lumen and block thirty minutes tomorrow morning",
+    "input": "send the draft to Aoife and block thirty minutes tomorrow morning",
     "must_contain": ["send the draft", "block", "tomorrow morning"],
     "must_not_contain": [],
-    "preserve_exact": ["Lumen"],
-    "known_vocabulary": ["Lumen"],
+    "preserve_exact": ["Aoife"],
+    "known_vocabulary": ["Aoife"],
     "require_terminal_punctuation": true
   },
   {
@@ -80,7 +80,7 @@
     "category": "no-hallucination",
     "input": "the user's name was",
     "must_contain": ["user's name"],
-    "must_not_contain": ["John", "Sarah", "Sally", "Tristan"],
+    "must_not_contain": ["John", "Sarah", "Sally", "Michael"],
     "preserve_exact": [],
     "max_expansion_ratio": 2.5,
     "require_terminal_punctuation": false
@@ -107,11 +107,11 @@
   {
     "id": "short-greeting",
     "category": "content-preservation",
-    "input": "hey Lumen thanks for your help",
+    "input": "hey Aoife thanks for your help",
     "must_contain": ["thanks", "help"],
     "must_not_contain": [],
-    "preserve_exact": ["Lumen"],
-    "known_vocabulary": ["Lumen"],
+    "preserve_exact": ["Aoife"],
+    "known_vocabulary": ["Aoife"],
     "require_terminal_punctuation": true
   },
   {

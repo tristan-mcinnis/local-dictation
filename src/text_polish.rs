@@ -1737,9 +1737,9 @@ mod tests {
         // it, but a run of content words ("amazing nice looking designs") is gone.
         let raw = "So I forked this repo and now this is me I'm working on it. So actually \
             what I would like is there are a lot of amazing nice looking designs in here. \
-            I would like to make an HTML template design for the example co slide master that we have";
+            I would like to make an HTML template design for the acme labs slide master that we have";
         let gutted = "So I forked this repo and now I'm working on it. Actually, I would like \
-            to create an HTML template design for the Example Co slide master that we have.";
+            to create an HTML template design for the Acme Labs slide master that we have.";
         assert!(cleanup_dropped_content(raw, gutted));
     }
 

@@ -1474,9 +1474,9 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     let dictionary = new_pane();
     let mut card = card_begin(mtm, &dictionary, SPACE_MD, "Add a term");
     let dictionary_heard_field = text_row(mtm, &mut card, "What dictation hears", "");
-    dictionary_heard_field.setPlaceholderString(Some(&NSString::from_str("e.g. exampleco")));
+    dictionary_heard_field.setPlaceholderString(Some(&NSString::from_str("e.g. acmelabs")));
     let dictionary_correct_field = text_row(mtm, &mut card, "Correct to", "");
-    dictionary_correct_field.setPlaceholderString(Some(&NSString::from_str("e.g. Example Co")));
+    dictionary_correct_field.setPlaceholderString(Some(&NSString::from_str("e.g. Acme Labs")));
     action_button_row(
         mtm,
         &mut card,

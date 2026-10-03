@@ -1,7 +1,7 @@
 //! Flat known-vocabulary list (`~/.config/local-dictation/dictionary.json`).
 //!
 //! Companion to [`crate::corrections`]. Where `corrections.json` does *from→to*
-//! replacement (`lings → Lumen`), this is a plain list of words/phrases that
+//! replacement (`eefa → Aoife`), this is a plain list of words/phrases that
 //! are *already spelled the way you want* — names, products, domain terms — that
 //! you just want the cleanup model to preserve rather than "correct" into a
 //! similar common word. It's a soft hint (fed to the prompt), not a hard
@@ -12,7 +12,7 @@
 //!
 //! ```json
 //! ["_ names + domain terms the model should keep verbatim",
-//!  "Lumen", "Parakeet", "CGEventTap", "Anthropic"]
+//!  "Aoife", "Parakeet", "CGEventTap", "Anthropic"]
 //! ```
 //!
 //! Path priority: `DICTATE_DICTIONARY_PATH` env var, else
@@ -112,7 +112,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dictionary.json");
-        let broken = "[\"Parakeet\", \"Lumen\"";
+        let broken = "[\"Parakeet\", \"Aoife\"";
         std::fs::write(&path, broken).unwrap();
         assert!(load_from(&path).is_empty());
         assert!(save_to(&path, &["Todoist".to_string()]).is_err());
@@ -122,12 +122,12 @@ mod tests {
 
     #[test]
     fn parses_array_trims_and_drops_blanks_and_comments() {
-        let body = r#"["_ a comment", "Parakeet", "  Lumen  ", "", "  ", "CGEventTap"]"#;
+        let body = r#"["_ a comment", "Parakeet", "  Aoife  ", "", "  ", "CGEventTap"]"#;
         assert_eq!(
             parse(body),
             vec![
                 "Parakeet".to_string(),
-                "Lumen".to_string(),
+                "Aoife".to_string(),
                 "CGEventTap".to_string()
             ]
         );
@@ -154,14 +154,14 @@ mod tests {
             &path,
             &[
                 "Parakeet".into(),
-                "  Lumen  ".into(),
+                "  Aoife  ".into(),
                 "".into(),
                 "_ignore".into(),
             ],
         )
         .unwrap();
         let loaded = load_from(&path);
-        assert_eq!(loaded, vec!["Parakeet".to_string(), "Lumen".to_string()]);
+        assert_eq!(loaded, vec!["Parakeet".to_string(), "Aoife".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

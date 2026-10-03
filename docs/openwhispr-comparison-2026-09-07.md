@@ -56,7 +56,7 @@ Wins for us:
 - Provider-agnostic STT/LLM layers.
 - Offline transcript-upgrade lane on retained WAV legs.
 - Screen-privacy deny-list + `sharingType = .none`.
-- Vault archiving + LaunchAgent drain. Everything stays local to the vault.
+- Local archiving into a private notes store, drained by a LaunchAgent.
 
 Wins for them:
 - Local speaker diarization + cross-meeting voice fingerprinting
@@ -78,5 +78,5 @@ Both fit the existing local-models daemon; no Electron, no duplicate runtime.
 
 - Nothing real. Engine choice was a deliberate fixed-stack pivot (Cohere Q4).
 - Cross-platform and notarization are outside software-of-one scope.
-- Notes/semantic-search, team sharing, API/MCP belong to the vault layer
-  (Neon index), not the dictation app.
+- Notes/semantic-search, team sharing, API/MCP belong to a separate notes
+  layer, not the dictation app.

@@ -1,7 +1,7 @@
 //! Screen-context vocabulary harvesting.
 //!
 //! The cleanup model spells proper nouns blind: it has no idea the person you're
-//! dictating about is "Lumen" not "Lindsay", or that the project is "Parakeet".
+//! dictating about is "Aoife" not "Eva", or that the project is "Parakeet".
 //! But the correct spelling is usually *already on screen* — in the text field
 //! you're editing and the window title. This module turns that visible text into
 //! a short "known vocabulary" list fed to the cleanup prompt (via
@@ -72,7 +72,7 @@ pub fn window_around(text: &str, caret: usize, radius: usize) -> &str {
 /// Ranking rules (each one is a bug that let ordinary words outrank names):
 ///   * a word capitalised ONLY at the start of a sentence ("Please", "Sounds")
 ///     ranks below a word capitalised mid-sentence; it is demoted, not dropped,
-///     because a name can open a line ("Jenifer said…");
+///     because a name can open a line ("Beatrix said…");
 ///   * a repeated term ranks higher; length gives no credit, so "Wednesday"
 ///     cannot beat "Amy";
 ///   * a run of three or more ALL-CAPS words is shouting, not vocabulary.
@@ -177,9 +177,9 @@ fn shouting_mask(raws: &[&str]) -> Vec<bool> {
 }
 
 /// The candidate pieces inside one whitespace-split token. Usually the token
-/// itself; a markdown link contributes its label (`[Lumen](http://…)` →
-/// `Lumen`), and a short slash pair of names contributes each side
-/// (`Jenifer/Tristan`). URLs and paths still yield the whole token, which
+/// itself; a markdown link contributes its label (`[Aoife](http://…)` →
+/// `Aoife`), and a short slash pair of names contributes each side
+/// (`Priya/Marcus`). URLs and paths still yield the whole token, which
 /// `is_candidate` rejects.
 fn token_pieces(raw: &str) -> Vec<&str> {
     if let (Some(open), Some(close)) = (raw.find('['), raw.find("](")) {
@@ -210,7 +210,7 @@ fn trim_token(raw: &str) -> Option<&str> {
     if t.is_empty() {
         return None;
     }
-    // Drop a trailing possessive so "Lumen's" contributes "Lumen".
+    // Drop a trailing possessive so "Aoife's" contributes "Aoife".
     let t = t
         .strip_suffix("'s")
         .or_else(|| t.strip_suffix("'S"))
@@ -287,10 +287,10 @@ mod tests {
 
     #[test]
     fn pulls_proper_nouns_and_domain_terms() {
-        let text = "I talked to Lumen about the Parakeet model on macOS \
+        let text = "I talked to Aoife about the Parakeet model on macOS \
                     and we'll push it to GitHub after standup.";
         let terms = extract_terms(text, 16);
-        assert!(terms.contains(&"Lumen".to_string()));
+        assert!(terms.contains(&"Aoife".to_string()));
         assert!(terms.contains(&"Parakeet".to_string()));
         assert!(terms.contains(&"macOS".to_string()));
         assert!(terms.contains(&"GitHub".to_string()));
@@ -320,10 +320,10 @@ mod tests {
 
     #[test]
     fn strips_punctuation_and_possessive() {
-        let terms = extract_terms("(Parakeet), \"GitHub\" — Lumen's repo", 16);
+        let terms = extract_terms("(Parakeet), \"GitHub\" — Aoife's repo", 16);
         assert!(terms.contains(&"Parakeet".to_string()));
         assert!(terms.contains(&"GitHub".to_string()));
-        assert!(terms.contains(&"Lumen".to_string()));
+        assert!(terms.contains(&"Aoife".to_string()));
         assert!(!terms.iter().any(|t| t.contains('\'')));
     }
 
@@ -366,12 +366,12 @@ mod tests {
     #[test]
     fn window_then_extract_keeps_only_nearby_names() {
         // Names far from the caret must NOT be harvested — only the caret window.
-        let text = "FarawayProject discussion ... talking about Lumen and Parakeet here";
-        let caret = text.find("Lumen").unwrap_or(0);
+        let text = "FarawayProject discussion ... talking about Aoife and Parakeet here";
+        let caret = text.find("Aoife").unwrap_or(0);
         // char index of the caret (find returns a byte index; ASCII here so equal)
         let win = window_around(text, caret, 20);
         let terms = extract_terms(win, 16);
-        assert!(terms.contains(&"Lumen".to_string()));
+        assert!(terms.contains(&"Aoife".to_string()));
         assert!(terms.contains(&"Parakeet".to_string()));
         assert!(
             !terms.contains(&"FarawayProject".to_string()),
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn curly_apostrophe_possessive_is_stripped() {
         // U+2019 is what macOS smart quotes type.
-        assert_eq!(extract_terms("Lumen\u{2019}s repo", 16), vec!["Lumen".to_string()]);
+        assert_eq!(extract_terms("Aoife\u{2019}s repo", 16), vec!["Aoife".to_string()]);
     }
 
     #[test]
@@ -393,8 +393,8 @@ mod tests {
         let terms = extract_terms(text, 16);
         assert_eq!(terms[0], "Amy", "got {terms:?}");
         // Demoted, not dropped: a name that only ever opens a line survives.
-        let chat = extract_terms("Jenifer said it works. Tobias agreed.", 16);
-        assert!(chat.contains(&"Jenifer".to_string()) && chat.contains(&"Tobias".to_string()));
+        let chat = extract_terms("Beatrix said it works. Tobias agreed.", 16);
+        assert!(chat.contains(&"Beatrix".to_string()) && chat.contains(&"Tobias".to_string()));
         // …and one mid-sentence sighting lifts the demotion.
         let both = extract_terms("Okafor called. Reply soon. I told Okafor yes.", 1);
         assert_eq!(both, vec!["Okafor".to_string()]);
@@ -442,12 +442,12 @@ mod tests {
 
     #[test]
     fn slash_pairs_and_markdown_links_yield_their_names() {
-        let terms = extract_terms("cc Jenifer/Tristan and [Lumen](http://x.y/z) on and/or this", 16);
-        for want in ["Jenifer", "Tristan", "Lumen"] {
+        let terms = extract_terms("cc Priya/Marcus and [Aoife](http://x.y/z) on and/or this", 16);
+        for want in ["Priya", "Marcus", "Aoife"] {
             assert!(terms.contains(&want.to_string()), "{want} missing from {terms:?}");
         }
         assert_eq!(terms.len(), 3, "{terms:?}");
         // Emails stay out (low trust, and an address is not a spelling).
-        assert!(extract_terms("jenifer.smith@acme.com", 16).is_empty());
+        assert!(extract_terms("beatrix.smith@acme.com", 16).is_empty());
     }
 }

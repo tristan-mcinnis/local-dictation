@@ -590,12 +590,12 @@ mod tests {
         let db = test_db("search_basic");
         let now = unix_now();
         insert_at(&db, "Call Sam about Acme", now - 60).unwrap();
-        insert_at(&db, "acme air force one", now).unwrap();
+        insert_at(&db, "acme rocket skates", now).unwrap();
         insert_at(&db, "unrelated note", now - 30).unwrap();
 
         let hits = try_search_at(&db, "acme", 10).unwrap();
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].text, "acme air force one", "newest first");
+        assert_eq!(hits[0].text, "acme rocket skates", "newest first");
         assert_eq!(hits[1].text, "Call Sam about Acme");
     }
 

@@ -192,7 +192,7 @@ pub fn combined_vocabulary(static_capped: &[String], screen: &[String]) -> Vec<S
 ///
 /// This is the dictionary-aware-cleanup borrow: telling the model the user's
 /// proper nouns, names, and domain casing up front stops it from "correcting"
-/// them away (lowercasing `macOS`, turning `Lumen` into `Lindsay`) — a
+/// them away (lowercasing `macOS`, turning `Aoife` into `Eva`) — a
 /// complement to the post-cleanup substitution in [`crate::corrections`].
 /// Terms are de-duplicated case-insensitively and capped at [`MAX_VOCAB_TERMS`].
 pub fn vocabulary_suffix(terms: &[String]) -> Option<String> {
@@ -411,7 +411,7 @@ mod tests {
         // corrections file evicted every dictionary.json term, and which
         // corrections survived changed per launch.
         let targets: Vec<String> = (0..100).map(|i| format!("Target{i:03}")).collect();
-        let dictionary = vec!["Okafor".to_string(), "Lumen".to_string()];
+        let dictionary = vec!["Okafor".to_string(), "Aoife".to_string()];
         let block = curated_vocabulary(&dictionary, &targets);
         assert_eq!(block.len(), MAX_VOCAB_TERMS - SCREEN_VOCAB_SLOTS);
         assert_eq!(&block[..2], &dictionary[..]);
@@ -422,15 +422,15 @@ mod tests {
     #[test]
     fn the_curated_prefix_is_identical_across_utterances() {
         // KV prefix reuse depends on this: only the tail may vary.
-        let capped = cap_static_vocab(&["Todoist".into(), " todoist ".into(), "Lumen".into(), "".into()]);
-        assert_eq!(capped, vec!["Todoist".to_string(), "Lumen".to_string()]);
-        let a = vocabulary_suffix(&combined_vocabulary(&capped, &["Jenifer".into()])).unwrap();
-        let b = vocabulary_suffix(&combined_vocabulary(&capped, &["Okafor".into(), "LUMEN".into()])).unwrap();
+        let capped = cap_static_vocab(&["Todoist".into(), " todoist ".into(), "Aoife".into(), "".into()]);
+        assert_eq!(capped, vec!["Todoist".to_string(), "Aoife".to_string()]);
+        let a = vocabulary_suffix(&combined_vocabulary(&capped, &["Beatrix".into()])).unwrap();
+        let b = vocabulary_suffix(&combined_vocabulary(&capped, &["Okafor".into(), "AOIFE".into()])).unwrap();
         let none = vocabulary_suffix(&combined_vocabulary(&capped, &[])).unwrap();
         let prefix = none.trim_end_matches('.');
         assert!(a.starts_with(prefix), "{a}");
         assert!(b.starts_with(prefix), "{b}");
-        assert!(!b.contains("LUMEN"), "a screen term already curated is not repeated");
+        assert!(!b.contains("AOIFE"), "a screen term already curated is not repeated");
     }
 
     #[test]
@@ -561,11 +561,11 @@ mod tests {
         let terms = vec![
             "macOS".to_string(),
             "macos".to_string(), // case-insensitive duplicate of macOS
-            "Lumen".to_string(),
+            "Aoife".to_string(),
         ];
         let s = vocabulary_suffix(&terms).expect("non-empty");
         assert!(s.contains("macOS"));
-        assert!(s.contains("Lumen"));
+        assert!(s.contains("Aoife"));
         // Duplicate folded away: "macOS" appears once, "macos" not at all.
         assert_eq!(s.matches("macOS").count(), 1);
         assert!(!s.contains("macos,") && !s.contains(", macos"));

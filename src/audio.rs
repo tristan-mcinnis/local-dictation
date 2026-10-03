@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn bluetooth_device_detection() {
-        assert!(is_bluetooth_device("the user's AirPods Pro"));
+        assert!(is_bluetooth_device("Sam's AirPods Pro"));
         assert!(is_bluetooth_device("Beats Studio Buds"));
         assert!(is_bluetooth_device("Sony Bluetooth Headphones"));
         // Built-in / wired inputs must NOT trip the warning.

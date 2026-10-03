@@ -229,7 +229,7 @@ mod tests {
             &gate,
             gen,
             &[0.2],
-            |_| Ok("Ship the build to Lumen today.".into()),
+            |_| Ok("Ship the build to Aoife today.".into()),
             Some(&mut cleanup),
             |_| {},
             |kind, text| versions.borrow_mut().push((kind, text.to_string())),
@@ -238,11 +238,11 @@ mod tests {
                 Ok(())
             },
         );
-        assert_eq!(result, Outcome::Copied("Ship the build to Lumen today.".into()));
-        assert_eq!(copies, vec!["Ship the build to Lumen today."]);
+        assert_eq!(result, Outcome::Copied("Ship the build to Aoife today.".into()));
+        assert_eq!(copies, vec!["Ship the build to Aoife today."]);
         assert_eq!(
             *versions.borrow(),
-            vec![(Version::Raw, "Ship the build to Lumen today.".to_string())],
+            vec![(Version::Raw, "Ship the build to Aoife today.".to_string())],
             "no Cleaned version is invented"
         );
     }

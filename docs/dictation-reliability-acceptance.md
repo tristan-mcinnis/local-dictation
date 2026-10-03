@@ -211,7 +211,7 @@ check.
 
 ## 3. Historical automated verification (before this recovery change)
 
-Run from the repo root (`/Users/user/Documents/code/house/local-dictation`),
+Run from the repo root,
 on `main` (HEAD `69fff3e`), against a clean tree at start.
 
 | Command | Result |

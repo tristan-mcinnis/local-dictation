@@ -316,18 +316,18 @@ mod tests {
 
     #[test]
     fn personal_replacement_is_deterministic_for_raw_and_cleaned_text() {
-        let r = refiner(&[("exampleco", "Example Co")]);
+        let r = refiner(&[("acmelabs", "Acme Labs")]);
 
         // Terminal and no-cleanup paths hand the raw transcript to refine().
-        let raw = r.refine("make an exampleco template");
-        assert_eq!(raw.text, "make an Example Co template");
+        let raw = r.refine("make an acmelabs template");
+        assert_eq!(raw.text, "make an Acme Labs template");
 
         // The cleanup path may change surrounding prose, but the same canonical
         // tail must still enforce the personal replacement afterwards.
-        let cleaned = r.refine("Please use the exampleco PowerPoint template.");
+        let cleaned = r.refine("Please use the acmelabs PowerPoint template.");
         assert_eq!(
             cleaned.text,
-            "Please use the Example Co PowerPoint template."
+            "Please use the Acme Labs PowerPoint template."
         );
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Lets the user define word-level substitutions that get applied after
 //! the LLM cleanup, before injection. Use case: proper nouns that
-//! Parakeet doesn't know (`Lings → Lumen`), domain-specific casing
+//! Parakeet doesn't know (`Eefa → Aoife`), domain-specific casing
 //! (`postgres → Postgres`), common transcription errors (`teh → the`),
 //! or any personal vocabulary tweak.
 //!
@@ -10,8 +10,8 @@
 //!
 //! ```json
 //! {
-//!     "lings": "Lumen",
-//!     "tristan": "Tristan",
+//!     "eefa": "Aoife",
+//!     "todoist": "Todoist",
 //!     "postgres": "Postgres",
 //!     "macos": "macOS",
 //!     "github": "GitHub"
@@ -27,8 +27,8 @@
 //!   2. `~/.config/local-dictation/corrections.json`
 //!   3. otherwise: no corrections (returns an empty dictionary)
 //!
-//! Matching is word-boundary aware — `lings` won't match inside
-//! `lingsworth` — and supports multi-word keys: `to twist → Todoist` matches
+//! Matching is word-boundary aware — `eefa` won't match inside
+//! `eefaworth` — and supports multi-word keys: `to twist → Todoist` matches
 //! the words "to twist" (or "to-twist") as a unit. Punctuation, whitespace, and
 //! other non-alphanumeric characters delimit words; a phrase's words may be
 //! joined only by spaces or hyphens, so a key never matches across a comma or
@@ -81,7 +81,7 @@ impl Corrections {
     }
 
     /// The distinct replacement values — i.e. the *target* spellings the user
-    /// cares about (`Lumen`, `macOS`, `GitHub`, …). Feeding these to the
+    /// cares about (`Aoife`, `macOS`, `GitHub`, …). Feeding these to the
     /// cleanup model as a "known vocabulary" hint stops it from "correcting"
     /// them away before the post-cleanup substitution even runs. Sorted
     /// (case-insensitive) so the result is stable across launches; duplicates
@@ -367,7 +367,7 @@ impl Corrections {
 
     /// Apply corrections to `text`, matching both single words and multi-word
     /// phrases (`to twist → Todoist`). Lookup is case-insensitive and
-    /// word-boundary aware — `lings` won't match inside `lingsworth`, and a
+    /// word-boundary aware — `eefa` won't match inside `eefaworth`, and a
     /// phrase only matches a run of whole words joined by spaces or hyphens
     /// (never across sentence punctuation). The longest phrase anchored at a
     /// word wins; replacements use the dictionary value verbatim.
@@ -626,10 +626,10 @@ mod tests {
         // Regression: a parse error opened the editor empty, and Save replaced
         // the user's whole dictionary with the one term they had just added.
         let path = scratch_file("corrupt");
-        let broken = "{ \"to twist\": \"Todoist\",, \"lumen\": \"Lumen\" }";
+        let broken = "{ \"to twist\": \"Todoist\",, \"aoife\": \"Aoife\" }";
         std::fs::write(&path, broken).unwrap();
         assert!(Corrections::load_from(&path).is_err());
-        let one = Corrections::from_editor_text("Jenifer");
+        let one = Corrections::from_editor_text("Beatrix");
         let err = one.save_to(&path).unwrap_err().to_string();
         assert!(err.contains("could not be read"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
@@ -646,7 +646,7 @@ mod tests {
         .unwrap();
         let mut c = Corrections::load_from(&path).unwrap();
         assert_eq!(c.len(), 1);
-        c.import_csv("lumen,Lumen\n").unwrap();
+        c.import_csv("aoife,Aoife\n").unwrap();
         c.save_to(&path).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("names from the Q3 project"), "{body}");
@@ -662,7 +662,7 @@ mod tests {
         let path = scratch_file("blank");
         std::fs::write(&path, " \n").unwrap();
         assert_eq!(Corrections::load_from(&path).unwrap().len(), 0);
-        Corrections::from_editor_text("Jenifer").save_to(&path).unwrap();
+        Corrections::from_editor_text("Beatrix").save_to(&path).unwrap();
         assert_eq!(Corrections::load_from(&path).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -670,7 +670,7 @@ mod tests {
     #[test]
     fn save_creates_a_missing_file() {
         let path = scratch_file("fresh");
-        Corrections::from_editor_text("Jenifer").save_to(&path).unwrap();
+        Corrections::from_editor_text("Beatrix").save_to(&path).unwrap();
         assert_eq!(Corrections::load_from(&path).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
@@ -693,11 +693,11 @@ mod tests {
 
     #[test]
     fn entries_are_key_sorted_pairs() {
-        let c = dict(&[("teh", "the"), ("lings", "Lumen"), ("macos", "macOS")]);
+        let c = dict(&[("teh", "the"), ("eefa", "Aoife"), ("macos", "macOS")]);
         assert_eq!(
             c.entries(),
             vec![
-                ("lings".to_string(), "Lumen".to_string()),
+                ("eefa".to_string(), "Aoife".to_string()),
                 ("macos".to_string(), "macOS".to_string()),
                 ("teh".to_string(), "the".to_string()),
             ]
@@ -706,11 +706,11 @@ mod tests {
 
     #[test]
     fn search_matches_either_side_and_blank_matches_all() {
-        let c = dict(&[("lings", "Lumen"), ("teh", "the"), ("macos", "macOS")]);
+        let c = dict(&[("eefa", "Aoife"), ("teh", "the"), ("macos", "macOS")]);
         // The heard side.
         assert_eq!(
-            c.search("ling"),
-            vec![("lings".to_string(), "Lumen".to_string())]
+            c.search("eef"),
+            vec![("eefa".to_string(), "Aoife".to_string())]
         );
         // The replacement side, case-insensitively.
         assert_eq!(
@@ -735,15 +735,15 @@ mod tests {
     fn edit_round_trip_replaces_the_original_key() {
         // What the Dictionary pane does on a row click + Add: drop the key it
         // pulled into the fields, then re-add the edited line.
-        let mut c = dict(&[("exampleco", "Example Co")]);
-        c.remove("exampleco");
-        let line = quick_add_line("inner chapta", "Example Co").unwrap();
+        let mut c = dict(&[("acmelabs", "Acme Labs")]);
+        c.remove("acmelabs");
+        let line = quick_add_line("acme labbs", "Acme Labs").unwrap();
         let mut lines = c.to_editor_lines();
         lines.push(line);
         c = Corrections::from_editor_text(&lines.join("\n"));
         assert_eq!(
             c.entries(),
-            vec![("inner chapta".to_string(), "Example Co".to_string())]
+            vec![("acme labbs".to_string(), "Acme Labs".to_string())]
         );
     }
 
@@ -755,30 +755,30 @@ mod tests {
 
     #[test]
     fn basic_word_replacement() {
-        let c = dict(&[("lings", "Lumen")]);
+        let c = dict(&[("eefa", "Aoife")]);
         assert_eq!(
-            c.apply("Hello lings how are you"),
-            "Hello Lumen how are you"
+            c.apply("Hello eefa how are you"),
+            "Hello Aoife how are you"
         );
     }
 
     #[test]
     fn replacement_is_case_insensitive_match() {
-        let c = dict(&[("lings", "Lumen")]);
-        assert_eq!(c.apply("LINGS Lings lings"), "Lumen Lumen Lumen");
+        let c = dict(&[("eefa", "Aoife")]);
+        assert_eq!(c.apply("EEFA Eefa eefa"), "Aoife Aoife Aoife");
     }
 
     #[test]
     fn does_not_match_inside_other_words() {
-        let c = dict(&[("lings", "Lumen")]);
-        assert_eq!(c.apply("lingsworth lingsmith"), "lingsworth lingsmith");
+        let c = dict(&[("eefa", "Aoife")]);
+        assert_eq!(c.apply("eefaworth eefamith"), "eefaworth eefamith");
     }
 
     #[test]
     fn punctuation_is_a_word_boundary() {
-        let c = dict(&[("lings", "Lumen")]);
-        assert_eq!(c.apply("Hi, lings!"), "Hi, Lumen!");
-        assert_eq!(c.apply("(lings)"), "(Lumen)");
+        let c = dict(&[("eefa", "Aoife")]);
+        assert_eq!(c.apply("Hi, eefa!"), "Hi, Aoife!");
+        assert_eq!(c.apply("(eefa)"), "(Aoife)");
     }
 
     #[test]
@@ -863,7 +863,7 @@ mod tests {
     #[test]
     fn editor_lines_render_fixes_and_bare_words() {
         let c = dict(&[
-            ("lings", "Lumen"),
+            ("eefa", "Aoife"),
             ("github", "GitHub"),
             ("parakeet", "Parakeet"),
         ]);
@@ -872,7 +872,7 @@ mod tests {
         assert!(lines.contains(&"Parakeet".to_string()), "{lines:?}");
         assert!(lines.contains(&"GitHub".to_string()), "{lines:?}");
         // Only a genuine phonetic fix (different letters) shows "from → to".
-        assert!(lines.contains(&"lings → Lumen".to_string()), "{lines:?}");
+        assert!(lines.contains(&"eefa → Aoife".to_string()), "{lines:?}");
     }
 
     #[test]
@@ -902,8 +902,8 @@ mod tests {
         assert_eq!(quick_add_line("Julian", "   "), None);
         // Inputs are trimmed.
         assert_eq!(
-            quick_add_line("  lings ", " Lumen "),
-            Some("lings → Lumen".to_string())
+            quick_add_line("  eefa ", " Aoife "),
+            Some("eefa → Aoife".to_string())
         );
     }
 
@@ -917,10 +917,10 @@ mod tests {
 
     #[test]
     fn editor_round_trip_preserves_behavior() {
-        let c = dict(&[("lings", "Lumen"), ("macos", "macOS")]);
+        let c = dict(&[("eefa", "Aoife"), ("macos", "macOS")]);
         let text = c.to_editor_lines().join("\n");
         let c2 = Corrections::from_editor_text(&text);
-        assert_eq!(c2.apply("lings"), "Lumen");
+        assert_eq!(c2.apply("eefa"), "Aoife");
         assert_eq!(c2.apply("macos"), "macOS");
     }
 
@@ -964,8 +964,8 @@ mod tests {
     #[test]
     fn import_csv_two_column_substitution() {
         let mut c = Corrections::empty();
-        assert_eq!(c.import_csv("lings,Lumen").unwrap(), 1);
-        assert_eq!(c.apply("hello lings"), "hello Lumen");
+        assert_eq!(c.import_csv("eefa,Aoife").unwrap(), 1);
+        assert_eq!(c.apply("hello eefa"), "hello Aoife");
     }
 
     #[test]
@@ -978,9 +978,9 @@ mod tests {
     #[test]
     fn import_csv_skips_header_row() {
         let mut c = Corrections::empty();
-        assert_eq!(c.import_csv("from,to\nlings,Lumen").unwrap(), 1);
+        assert_eq!(c.import_csv("from,to\neefa,Aoife").unwrap(), 1);
         assert_eq!(c.len(), 1);
-        assert_eq!(c.apply("lings"), "Lumen");
+        assert_eq!(c.apply("eefa"), "Aoife");
     }
 
     #[test]
@@ -993,23 +993,23 @@ mod tests {
     #[test]
     fn import_csv_skips_blank_lines() {
         let mut c = Corrections::empty();
-        assert_eq!(c.import_csv("\n\nlings,Lumen\n\n").unwrap(), 1);
+        assert_eq!(c.import_csv("\n\neefa,Aoife\n\n").unwrap(), 1);
         assert_eq!(c.len(), 1);
     }
 
     #[test]
     fn import_csv_merges_without_wiping_existing() {
         let mut c = dict(&[("teh", "the")]);
-        assert_eq!(c.import_csv("lings,Lumen").unwrap(), 1);
+        assert_eq!(c.import_csv("eefa,Aoife").unwrap(), 1);
         assert_eq!(c.len(), 2);
-        assert_eq!(c.apply("teh lings"), "the Lumen");
+        assert_eq!(c.apply("teh eefa"), "the Aoife");
     }
 
     #[test]
     fn import_csv_count_returns_net_new_entries() {
         let mut c = Corrections::empty();
         let n = c
-            .import_csv("from,to\nlings,Lumen\nfoo,Bar\n\n")
+            .import_csv("from,to\neefa,Aoife\nfoo,Bar\n\n")
             .unwrap();
         assert_eq!(n, 2); // header + blank skipped
         assert_eq!(c.apply("foo"), "Bar");
@@ -1017,10 +1017,10 @@ mod tests {
 
     #[test]
     fn import_csv_overwrites_existing_key_without_counting() {
-        let mut c = dict(&[("lings", "Lumen")]);
+        let mut c = dict(&[("eefa", "Aoife")]);
         // Same key, new value → 0 added (net-new only).
-        assert_eq!(c.import_csv("lings,Ling2").unwrap(), 0);
-        assert_eq!(c.apply("lings"), "Ling2");
+        assert_eq!(c.import_csv("eefa,Ling2").unwrap(), 0);
+        assert_eq!(c.apply("eefa"), "Ling2");
         assert_eq!(c.len(), 1);
     }
 

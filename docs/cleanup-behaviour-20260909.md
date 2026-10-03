@@ -1,6 +1,6 @@
 # Is the S1-mini cleanup actually doing anything? (2026-09-09)
 
-Short answer: yes, it works, and it almost never runs for the user.
+Short answer: yes, it works, and it almost never runs for the author.
 
 ## When cleanup is activated
 
@@ -28,7 +28,7 @@ Four gates, in order (`daemon/worker.rs`, the `final_text` block):
 | reached the LLM | 21 | 4% |
 | diff-guard fired | 0 | 0% |
 
-The user works in Ghostty, so four dictations in five never touch cleanup at all.
+The author works in Ghostty, so four dictations in five never touch cleanup at all.
 Every "cleanup did nothing" impression is that rule, not a broken model.
 
 ## Before and after, on 429 of his own raw transcripts
@@ -129,9 +129,9 @@ separate, deliberately permissive prompt, and that one IS overridden in his
    Reproducible three times out of three:
 
    - in: "…the section for that given whatever **it is. I mean,** go back and
-     look at what we did for Acme Amplify."
+     look at what we did for the Acme launch."
    - out: "…the section for that given whatever **it** go back and look at what
-     we did for Acme Amplify."
+     we did for the Acme launch."
 
    `cleanup_dropped_content` only fires on a whole missing clause, so a
    three-word drop passes. Hits mail, Slack and browser fields; terminals are

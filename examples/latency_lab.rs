@@ -43,7 +43,7 @@ async fn main() -> eyre::Result<()> {
         ),
         (
             "names",
-            "i talked to lumen and tristan about the parakeet model on macos and \
+            "i talked to aoife and sam about the parakeet model on macos and \
              we're gonna push it to github after the uh standup",
         ),
     ];
@@ -51,8 +51,8 @@ async fn main() -> eyre::Result<()> {
     // Synthetic known-vocab terms (plausible proper nouns / domain casing), to
     // measure the token cost of the vocabulary suffix at two cap levels.
     let pool: Vec<String> = [
-        "Lumen",
-        "Tristan McInnis",
+        "Aoife",
+        "Sam Rivera",
         "Parakeet",
         "macOS",
         "ONNX",

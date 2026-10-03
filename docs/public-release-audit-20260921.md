@@ -1,5 +1,13 @@
 # Public-release readiness audit — 2026-09-21
 
+> **Status 2026-10-03.** The tracked-file items below are fixed at HEAD:
+> `.memory/` is untracked and gitignored, `prompts-lab/cleanup_stream.json` is
+> deleted, personal names and paths are neutralised, `tests/scrub.sh` guards the
+> tree, and `scripts/download-models.sh` fetches a public Cohere 4-bit MLX
+> conversion. Still open: the same material remains in Git history (publish
+> from a fresh history or run `git filter-repo`), the test voice needs recorded
+> consent, and there is no Developer ID certificate yet.
+
 An evidence-backed audit of Local Dictation for public, direct-distribution
 release: secrets, licences, personal and machine-specific data, dependencies,
 permissions, onboarding, bundle identity, signing and release assumptions. It
@@ -70,14 +78,14 @@ Decision: **no secret remediation required.**
 repo contract, but they are agent session notes containing machine layout,
 absolute paths, model-registry contents, a personal `superwhisper` path and
 workflow detail. Example: `.memory/…/local-dictation.md:8` names
-`/Users/user/Documents/code/local-dictation`, and a `result.json` records the
+the old repo path under the author's home folder, and a `result.json` records the
 contents of `~/Models`. This is private working context, not product
 documentation, and must not ship in a public repository.
 
 ### BLOCKER — real dictation text in `prompts-lab/cleanup_stream.json`
 
 The file's own header states its `GOLD` values are "real history.db dictation
-text (verbatim)", including project and client content (a Acme slide-review
+text (verbatim)", including project and client content (a client slide-review
 segment; a speaker-ID planning segment). `prompts-lab/lab.json` is authored test
 copy and is fine. Publishing a user's real dictated speech — even lightly
 rendered — is a privacy breach.
@@ -85,13 +93,12 @@ rendered — is a privacy breach.
 ### Other personal/machine traces — clean up before public
 
 - Absolute machine paths in docs: `docs/dictation-reliability-acceptance.md:201`
-  (`/Users/user/Documents/code/house/local-dictation`) and
-  `docs/truncation-diagnosis-20260909.md:14` (`/Users/user/Models/cohere-mlx-q4`).
-- Personal names in code tests, examples and docs: `examples/latency_lab.rs:46`
-  ("lumen and tristan") and `:55` ("Tristan McInnis"), `src/audio.rs:659`
-  ("the user's AirPods Pro"), `src/cues.rs:454`, `src/corrections.rs:14`, and
-  `docs/cleanup-behaviour-20260909.md` (names the "Acme Amplify" client project).
-  `src/history.rs` uses "Acme" in test fixtures.
+  (the repo path under the author's home folder) and
+  `docs/truncation-diagnosis-20260909.md:14` (the author's model folder).
+- Personal names in code tests, examples and docs: `examples/latency_lab.rs`
+  (a colleague's and the author's names), `src/audio.rs`, `src/cues.rs`,
+  `src/corrections.rs`, and `docs/cleanup-behaviour-20260909.md` (a client
+  project name). `src/history.rs` used a client brand in test fixtures.
 - `testdata/dictation_sample.wav` is 8.35 s of a real human voice (its transcript
   is quoted in `docs/superwhisper-comparison-2026-08-25.md`). Publishing it needs
   the speaker's consent, or it should be replaced with a synthetic sample.

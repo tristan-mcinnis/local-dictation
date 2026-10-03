@@ -10,7 +10,7 @@
 //! default; see [`START_SOUNDS`] and [`COMPLETION_SOUNDS`]. The start variants
 //! are original local synthesis; of the completion set twelve are original
 //! local synthesis and eight are CC0 by Kenney Vleugels (attribution in
-//! `THIRD-PARTY-NOTICES.md`).
+//! `THIRD_PARTY_NOTICES.md`).
 //!
 //! Samples are embedded in the binary and registered with macOS' native
 //! system-sound service on first use. Playback is asynchronous, so a cue never
@@ -451,7 +451,7 @@ mod macos {
     //! Playback goes through `NSSound`, the same path Superwhisper uses, so the
     //! cues follow the normal output volume. The previous
     //! `AudioServicesPlaySystemSound` route played on the *alert* channel, and
-    //! a Mac with alert volume at 0 (the user's, 2026-09-09) never heard a cue.
+    //! a Mac with alert volume at 0 (the developer's, 2026-09-09) never heard a cue.
     //! Driven through the Objective-C runtime directly so this module stays
     //! free of the optional objc2 crates and the featureless build links.
     use super::Cue;
