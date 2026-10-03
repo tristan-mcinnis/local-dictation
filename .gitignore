@@ -42,3 +42,9 @@ testdata/vad-model/
 # Python bytecode from release tooling
 __pycache__/
 *.pyc
+
+# Agent session notes stay local (never published)
+.memory/
+
+# Private scrub patterns (client and personal names) for tests/scrub.sh
+.scrub-private

@@ -102,8 +102,10 @@ over a dead hotkey.
 
 ## Repo hygiene
 
-- `.memory/` is agent session notes (project context only, no secrets) and
-  is tracked in git on purpose; the owner can untrack it at any time.
+- `.memory/` is agent session notes. It stays on disk and is gitignored:
+  never commit it, because notes carry local paths and project context.
+- `tests/scrub.sh` must pass before every commit: no personal paths, key
+  shapes, or names from the untracked `.scrub-private` list in tracked files.
 
 ## Privacy
 
