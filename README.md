@@ -380,6 +380,7 @@ Local Dictation is one of a small family of free, local-first Mac tools that sha
 | [Local TTS](https://github.com/tristan-mcinnis/local-tts) | Fast on-device voice cloning and text-to-speech. |
 | [Local Models](https://github.com/tristan-mcinnis/local-models) | One local daemon that serves a fleet of small models to every app. |
 | [Usage](https://github.com/tristan-mcinnis/usage-menubar) | One menu-bar gauge for every AI subscription and API key. |
+| [RTI](https://github.com/tristan-mcinnis/rti) | Meeting recorder with live transcription and a real-time copilot. |
 
 Local Dictation runs both of its models inside its own process rather than
 through Local Models, on purpose: a daemon round trip would sit on the
