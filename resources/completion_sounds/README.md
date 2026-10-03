@@ -35,5 +35,5 @@ are CC0 sounds by Kenney Vleugels, decoded to 48 kHz WAV with no further lossy
 step. The default when no selection is saved is the existing tight completion
 thud (`resources/sounds/success.wav`), not one of the twenty.
 
-Attribution for the CC0 files lives in `THIRD-PARTY-NOTICES.md` at the repo
+Attribution for the CC0 files lives in `THIRD_PARTY_NOTICES.md` at the repo
 root. All twenty were level-matched for a fair audition.

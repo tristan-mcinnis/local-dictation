@@ -216,6 +216,10 @@ PLIST
 # ── 4. icon ──────────────────────────────────────────────────────────────────
 # Rendered by design-system/icons/make-icon.py --glyph waveform (house icon rule).
 cp "$REPO_ROOT/resources/AppIcon.icns" "$RES_DIR/Icon.icns"
+# Licence texts and third-party notices travel with the binary: the MIT and
+# Apache-2.0 dependencies (crates, mlx-swift, mlx-audio-swift) require it.
+cp "$REPO_ROOT/LICENSE-MIT" "$REPO_ROOT/LICENSE-APACHE" \
+   "$REPO_ROOT/THIRD_PARTY_NOTICES.md" "$RES_DIR/"
 
 # ── 5. models ────────────────────────────────────────────────────────────────
 if [ "$BUNDLE_MODELS" -eq 1 ]; then

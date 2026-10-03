@@ -117,7 +117,7 @@ Attribution is a licence obligation, not a courtesy: the cleanup model is
 **"S1-mini" by "Superwhisper"** (Apache-2.0 with a naming clause that requires
 that exact capitalization wherever the model is used), and the speech model is
 Cohere Transcribe 03-2026 by Cohere Labs (Apache-2.0). Keep both names, their
-Hugging Face links and `THIRD-PARTY-NOTICES.md` accurate; `download-models.sh`
+Hugging Face links and `THIRD_PARTY_NOTICES.md` accurate; `download-models.sh`
 saves the model's own LICENSE and NOTICE next to the weights.
 
 Recovery audio and transcript versions are user data: private local files only,
