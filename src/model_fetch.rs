@@ -9,9 +9,9 @@
 //! Everything the app is allowed to fetch is named in [`MANIFEST`]: the URL,
 //! the exact byte count, the SHA-256, and the licence. A file whose digest
 //! does not match the manifest is deleted, never loaded. The ASR model has no
-//! entry for a URL, because no public 4-bit MLX conversion of Cohere
-//! Transcribe exists to point at — so its row asks the user to choose a folder
-//! instead of inventing a link.
+//! URL entry yet: its public 4-bit MLX conversion is several files and this
+//! fetcher handles one. `scripts/download-models.sh` fetches it (pinned
+//! revision, per-file SHA-256); in the app its row asks for a folder.
 //!
 //! The download itself is `/usr/bin/curl` driven with an argument array (repo
 //! rule: no shell interpolation), resuming into a `.part` file, verified with
@@ -89,8 +89,10 @@ fn non_empty_file(path: &Path) -> bool {
 }
 
 /// Speech model. Fixed by the repo contract: Cohere Transcribe Q4 on the
-/// public MLX Swift runtime. No public 4-bit conversion is published, so there
-/// is deliberately no URL here — inventing one would be worse than saying so.
+/// public MLX Swift runtime. The public 4-bit conversion
+/// (beshkenadze/cohere-transcribe-03-2026-mlx-4bit) is several files, and
+/// `Source` describes one, so there is no URL here yet; download-models.sh
+/// fetches it with the same pinning and digest rules.
 pub const ASR: ModelEntry = ModelEntry {
     id: "asr",
     role: Role::Asr,
@@ -100,9 +102,9 @@ pub const ASR: ModelEntry = ModelEntry {
     licence: "Apache-2.0",
     licence_link: "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026",
     source: None,
-    manual_hint: "No public 4-bit MLX build of this model exists yet, so it cannot be \
-downloaded. Put a converted checkpoint (model.safetensors and config.json) in this \
-folder, or choose the folder that already holds one.",
+    manual_hint: "The app cannot download this model yet. Run \
+scripts/download-models.sh from the source tree (it fetches a pinned public 4-bit MLX \
+build), or choose a folder that holds model.safetensors and config.json.",
 };
 
 /// Cleanup model. Open weights with a published digest, so the app can get it.

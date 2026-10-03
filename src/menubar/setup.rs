@@ -774,7 +774,7 @@ mod tests {
             None,
         );
         assert_eq!(state.action.as_deref(), Some("Choose model folder…"));
-        assert!(state.detail.contains("cannot be downloaded"), "{}", state.detail);
+        assert!(state.detail.contains("cannot download"), "{}", state.detail);
     }
 
     #[test]

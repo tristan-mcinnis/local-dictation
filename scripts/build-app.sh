@@ -8,10 +8,10 @@
 #                                           #   from the repo via a symlink
 #   ./scripts/build-app.sh --bundle-models  # ship build: copy the recommended
 #                                           #   model stack into the app (~1.7 GB)
-#   ./scripts/build-app.sh --slim           # ship build: NO models bundled; the
-#                                           #   app never downloads anything, so
-#                                           #   the user must supply the model
-#                                           #   stack (it logs what is missing)
+#   ./scripts/build-app.sh --slim           # ship build: NO models bundled. The
+#                                           #   Setup window can fetch the cleanup
+#                                           #   model; the speech model must be
+#                                           #   supplied (download-models.sh)
 #   ./scripts/build-app.sh --install        # also copy to /Applications, add a
 #                                           #   Login Item, and launch it
 #   ./scripts/build-app.sh --dmg            # wrap the app in a distributable
@@ -143,9 +143,9 @@ fi
 
 # A DMG is meant to be moved/shared, so a dev symlink into the repo would dangle
 # the moment the .app leaves this machine. Either carry the models (default) or
-# go --slim (the app fetches them on first run) — but never ship the symlink.
+# go --slim (the user supplies them) — but never ship the symlink.
 if [ "$MAKE_DMG" -eq 1 ] && [ "$BUNDLE_MODELS" -eq 0 ] && [ "$SLIM" -eq 0 ]; then
-  echo "• --dmg defaults to --bundle-models (a portable DMG must be self-contained; use --slim to fetch on first run)"
+  echo "• --dmg defaults to --bundle-models (a portable DMG must be self-contained; use --slim to ship without models)"
   BUNDLE_MODELS=1
 fi
 
@@ -221,14 +221,15 @@ cp "$REPO_ROOT/resources/AppIcon.icns" "$RES_DIR/Icon.icns"
 if [ "$BUNDLE_MODELS" -eq 1 ]; then
   echo "• bundling model stack into the app (recommended stack only)…"
   mkdir -p "$RES_DIR/models/dictation" "$RES_DIR/models/llm"
-  cp -R "$REPO_ROOT/models/$COHERE_REL" "$RES_DIR/models/$COHERE_REL"
+  # -L: models/ entries are symlinks into ~/Models; copy the bytes, not the link.
+  cp -RL "$REPO_ROOT/models/$COHERE_REL" "$RES_DIR/models/$COHERE_REL"
   cp -RL "$REPO_ROOT/models/$LLM_REL"   "$RES_DIR/models/$LLM_REL"
   echo "  bundled: $(du -sh "$RES_DIR/models" | cut -f1)"
 elif [ "$SLIM" -eq 1 ]; then
-  # Ship NO models and NO dev symlink: on a clean machine the app resolves no
-  # model base, so the daemon fetches the defaults into Application Support on
-  # first launch (src/model_fetch.rs). Keeps the app/DMG to a few MB.
-  echo "• slim ship build: no models bundled — the app downloads them on first run."
+  # Ship NO models and NO dev symlink. On a clean machine the Setup window can
+  # fetch the cleanup model into Application Support (src/model_fetch.rs); the
+  # speech model must be supplied (scripts/download-models.sh or a folder).
+  echo "• slim ship build: no models bundled; the speech model must be supplied."
 else
   echo "• dev build: linking shared models via Application Support…"
   mkdir -p "$APP_SUPPORT"

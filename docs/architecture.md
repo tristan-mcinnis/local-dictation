@@ -116,8 +116,10 @@ When bundled, the daemon redirects stdout/stderr to
 `~/Library/Application Support/Local Dictation/models` (dev symlink → repo) > `./models`
 (repo-relative, for `cargo run`). Under that base:
 - **Cohere Q4 checkpoint** (`cohere_mlx_default_dir`): `DICTATE_COHERE_MLX_MODEL_DIR` env >
-  `<base>/dictation/cohere-mlx-q4`. Converted by `scripts/models/convert_superwhisper_cohere.py`
-  from the locally installed Superwhisper checkpoint.
+  `<base>/dictation/cohere-mlx-q4`. `scripts/download-models.sh` downloads the public 4-bit MLX
+  conversion (`beshkenadze/cohere-transcribe-03-2026-mlx-4bit`, pinned revision, per-file
+  SHA-256). When a local Superwhisper install is present it re-keys that checkpoint instead with
+  `scripts/models/convert_superwhisper_cohere.py`; tensor bytes are unchanged either way.
 - **S1-mini GGUF** (`llm_default_path`, resolved by `Settings::resolve_llm_model`):
   `DICTATE_LLM_MODEL_PATH` env > `S1_MODEL_PATH` env (alias) > `GEMMA_MODEL_PATH` env (deprecated,
   warns once) > `settings.json` `llm_model` > `<base>/llm/s1-mini/s1-mini.gguf`.
@@ -219,9 +221,11 @@ path under the models base, URL, byte count, SHA-256, licence and the credit the
   cancellation, then a SHA-256 check (`src/sha256.rs`, in-tree, checked against the FIPS 180-4
   vectors) before one atomic rename. Bytes that do not match the manifest are deleted, never
   loaded. The model's own LICENSE and NOTICE are saved beside the weights.
-- **The ASR model has no URL.** No public 4-bit MLX conversion of Cohere Transcribe exists, so the
-  manifest entry deliberately carries none and the Models row says what is missing, where to put
-  it, and offers a folder picker for a checkpoint the user already has.
+- **The ASR model has no URL in the app yet.** Its public 4-bit MLX conversion
+  (`beshkenadze/cohere-transcribe-03-2026-mlx-4bit`) is several files and `Source` describes one,
+  so the manifest entry carries none. `scripts/download-models.sh` fetches it from a pinned
+  revision with per-file SHA-256 checks. In the app the Models row says what is missing, where to
+  put it, and offers a folder picker for a checkpoint the user already has.
 - **Readiness follows the resolved paths**, not the manifest defaults. `model_fetch::resolved_status`
   is the single place that resolution lives: the ASR checkpoint through
   `app_paths::cohere_mlx_default_dir` (which honours `DICTATE_COHERE_MLX_MODEL_DIR`) and the cleanup
