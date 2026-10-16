@@ -325,8 +325,11 @@ pub(super) fn execute_trailing_action(action: &TrailingAction) {
     use crate::clipboard_paste::{
         synthesize_escape, synthesize_return, synthesize_tab, synthesize_undo,
     };
-    let result = match action {
-        TrailingAction::None | TrailingAction::Cancel => return,
+    if matches!(action, TrailingAction::None | TrailingAction::Cancel) { return; }
+    // Shared by ordinary dictation, retries, listen mode and bare commands.
+    // No trailing key may overtake a pending clipboard consume/restore window.
+    let result = crate::clipboard_paste::after_pending_transaction(|| match action {
+        TrailingAction::None | TrailingAction::Cancel => Ok(()),
         TrailingAction::PressEnter => synthesize_return(),
         TrailingAction::NewParagraph => {
             // Two Returns, with a beat between so apps that debounce key
@@ -338,7 +341,7 @@ pub(super) fn execute_trailing_action(action: &TrailingAction) {
         TrailingAction::PressTab => synthesize_tab(),
         TrailingAction::PressEscape => synthesize_escape(),
         TrailingAction::Undo => synthesize_undo(),
-    };
+    });
     match (action, result) {
         (_, Ok(())) => eprintln!("  ↵    {action:?} sent"),
         (_, Err(e)) => eprintln!("  ✗    {action:?} failed: {e:?}"),

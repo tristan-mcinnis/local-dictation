@@ -264,6 +264,14 @@ pub fn wait_for_pending_transaction() {
     drop(permit);
 }
 
+/// Order a trailing keyboard action after paste consumption and restoration,
+/// keeping other app clipboard writes behind the action. The callback must
+/// only emit keys, never re-enter a clipboard writer.
+pub fn after_pending_transaction<T>(emit: impl FnOnce() -> T) -> T {
+    let _permit = clipboard_gate().acquire();
+    emit()
+}
+
 /// True when the pasteboard's `changeCount` advanced past our own write — so we
 /// must NOT restore our snapshot (it would clobber a user's fresh copy). A
 /// `None` on either side keeps the old unconditional-replace behaviour. Pure —
@@ -926,6 +934,32 @@ mod tests {
     fn global_gate_test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn trailing_key_waits_for_restore_and_keeps_the_transaction_order() {
+        use std::sync::mpsc;
+        let _serial = global_gate_test_lock();
+        let pending = clipboard_gate().acquire();
+        let (events_tx, events_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let key_events = events_tx.clone();
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            after_pending_transaction(|| {
+                assert!(transaction_pending(), "key emission must retain the gate");
+                key_events.send("key").unwrap();
+            });
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(events_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "trailing key must not precede the pending paste restore");
+        events_tx.send("restored").unwrap();
+        drop(pending);
+        assert_eq!(events_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "restored");
+        assert_eq!(events_rx.recv_timeout(Duration::from_secs(2)).unwrap(), "key");
+        sender.join().unwrap();
+        assert!(!transaction_pending());
     }
 
     /// `transaction_pending` reports true for a transaction's whole lifetime and
