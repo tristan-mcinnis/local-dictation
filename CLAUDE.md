@@ -57,9 +57,10 @@ over a dead hotkey.
   before adding anything on the critical path. No OCR, vision LLMs, or
   whole-window scraping.
 - The cleanup model gets the tightest relevant context only.
-- Both models run in this process, never through the local-models daemon.
-  That is a deliberate exception to the house serving layer, for latency;
-  only `download-models.sh` shares the `~/Models` weight store.
+- Speech inference runs in a resident native Swift child helper. Cleanup and
+  optional instruction inference run in this Rust process through llama.cpp.
+  Neither uses the local-models daemon. This is a deliberate latency exception
+  to the house serving layer; model files share the `~/Models` weight store.
 - One macOS floor: 14.0, set by the Swift helper (`Package.swift`
   `.macOS(.v14)`). `scripts/build-app.sh` `MIN_MACOS` (plist +
   `MACOSX_DEPLOYMENT_TARGET`) and the `install.sh` check follow it; change

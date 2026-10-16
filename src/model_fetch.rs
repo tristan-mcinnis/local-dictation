@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 pub enum Role {
     Asr,
     Cleanup,
+    Instruction,
 }
 
 /// Where a model may legitimately be fetched from. `None` on an entry means
@@ -128,8 +129,29 @@ pub const CLEANUP: ModelEntry = ModelEntry {
 Cleanup off in Settings and the raw transcript is used.",
 };
 
-/// Every model the app knows about.
-pub const MANIFEST: &[ModelEntry] = &[ASR, CLEANUP];
+/// Optional instruction model. The permissive text-only GGUF needs no vision
+/// projector; it is only fetched on an explicit model-download action.
+pub const INSTRUCTIONS: ModelEntry = ModelEntry {
+    id: "instructions",
+    role: Role::Instruction,
+    credit: "Qwen3.5-2B by Qwen, GGUF conversion by Unsloth (Apache-2.0)",
+    relative_path: "llm/instruction-default.gguf",
+    required_files: &[],
+    licence: "Apache-2.0",
+    licence_link: "https://huggingface.co/Qwen/Qwen3.5-2B",
+    source: Some(Source {
+        url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf",
+        bytes: 1_280_835_840,
+        sha256: "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+        licence_url: "https://huggingface.co/Qwen/Qwen3.5-2B/raw/main/LICENSE",
+        notice_url: None,
+    }),
+    manual_hint: "Optional: used for rewrites, translations and custom formats. Plain dictation works without it.",
+};
+
+/// Every model the app knows about. Instruction work is optional and never
+/// turns a missing secondary model into a blocking dictation fault.
+pub const MANIFEST: &[ModelEntry] = &[ASR, CLEANUP, INSTRUCTIONS];
 
 // ─── Readiness ──────────────────────────────────────────────────────────
 
@@ -180,6 +202,7 @@ pub fn stack_status(
             let required = match entry.role {
                 Role::Asr => true,
                 Role::Cleanup => cleanup_enabled,
+                Role::Instruction => false,
             };
             ModelStatus {
                 entry: *entry,
@@ -212,12 +235,20 @@ pub fn resolved_status() -> Vec<ModelStatus> {
     let cleanup_enabled = settings.resolve_cleanup_enabled(false);
     let asr = PathBuf::from(crate::app_paths::cohere_mlx_default_dir());
     let llm = PathBuf::from(settings.resolve_llm_model(&crate::app_paths::llm_default_path()));
-    stack_status(
+    let mut statuses = stack_status(
         &crate::app_paths::models_base_dir(),
         Some(&asr),
         Some(&llm),
         cleanup_enabled,
-    )
+    );
+    let default = crate::app_paths::instruction_default_path();
+    if let Some(path) = settings.resolve_instruction_model(default.as_deref()) {
+        if let Some(status) = statuses.iter_mut().find(|status| status.entry.role == Role::Instruction) {
+            status.path = PathBuf::from(path);
+            status.present = status.entry.present_at(&status.path);
+        }
+    }
+    statuses
 }
 
 /// Boot check. Raises a health fault rather than only writing a log line

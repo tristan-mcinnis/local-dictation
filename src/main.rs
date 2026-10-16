@@ -431,13 +431,12 @@ async fn run_bench(wav_path: &str) -> eyre::Result<()> {
 
     #[cfg(feature = "cleaner")]
     let final_text = {
-        use fast_dictate_backend::cleaner::TextCleanupEngine;
         let llm_path = llm_model_path();
         println!();
         println!("[bench] llm model: {llm_path}");
 
         let t_g_load = Instant::now();
-        let cleaner = TextCleanupEngine::initialize(&llm_path)?;
+        let cleaner = initialize_text_engine(&llm_path)?;
         println!(
             "[bench] llm loaded in {:?} (one-time cost)",
             t_g_load.elapsed()
@@ -481,10 +480,9 @@ async fn run_dictate(duration_ms: u64) -> eyre::Result<()> {
 
     #[cfg(feature = "cleaner")]
     let cleaner = {
-        use fast_dictate_backend::cleaner::TextCleanupEngine;
         let llm_path = llm_model_path();
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&llm_path)?;
+        let c = initialize_text_engine(&llm_path)?;
         println!("[dictate] llm     loaded in {:?}", t.elapsed());
         c
     };
@@ -552,7 +550,16 @@ fn llm_model_path() -> String {
     Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path())
 }
 
-/// `transform "<instruction>" "<text>"` — run the warm-Gemma transform path on
+#[cfg(feature = "cleaner")]
+fn initialize_text_engine(path: &str) -> eyre::Result<fast_dictate_backend::cleaner::TextCleanupEngine> {
+    let default = fast_dictate_backend::app_paths::instruction_default_path();
+    let instruction = fast_dictate_backend::settings::Settings::load().resolve_instruction_model(default.as_deref());
+    fast_dictate_backend::cleaner::TextCleanupEngine::initialize_with_instruction_model(
+        path, instruction.as_deref().map(std::path::Path::new),
+    )
+}
+
+/// `transform "<instruction>" "<text>"` — run the local instruction path on
 /// the command line, no audio/AX. Lets transform-mode prompting be eyeballed
 /// (and tuned) without speaking into the daemon.
 #[cfg(feature = "cleaner")]
@@ -565,9 +572,11 @@ async fn run_transform(instruction: Option<String>, text: Option<String>) -> eyr
             "usage: transform \"<instruction>\" \"<text to transform>\""
         ));
     };
-    let llm =
-        Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path());
-    println!("[transform] llm: {llm}");
+    let settings = Settings::load();
+    let instruction_default = fast_dictate_backend::app_paths::instruction_default_path();
+    let llm = settings.resolve_instruction_model(instruction_default.as_deref())
+        .unwrap_or_else(|| settings.resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path()));
+    println!("[transform] instruction model: {llm}");
     let t = std::time::Instant::now();
     let cleaner = TextCleanupEngine::initialize(&llm)?;
     println!("[transform] loaded in {:?}", t.elapsed());

@@ -41,9 +41,21 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
     #[cfg(feature = "cleaner")]
     let cleaner = if !config.no_cleanup {
         let t = Instant::now();
-        let c = TextCleanupEngine::initialize(&config.llm_model_path)?;
-        eprintln!("[boot] cleaner     loaded in {:>4} ms", ms(t.elapsed()));
-        Some(c)
+        match TextCleanupEngine::initialize_with_instruction_model(
+            &config.llm_model_path,
+            config.instruction_model_path.as_deref().map(std::path::Path::new),
+        ) {
+            Ok(c) => {
+                eprintln!("[boot] cleaner     loaded in {:>4} ms", ms(t.elapsed()));
+                crate::health::clear(crate::health::Fault::CleanupUnavailable);
+                Some(c)
+            }
+            Err(error) => {
+                eprintln!("[warn] cleaner unavailable: {error}; continuing with raw dictation");
+                crate::health::raise(crate::health::Fault::CleanupUnavailable, error.to_string());
+                None
+            }
+        }
     } else {
         eprintln!("[boot] cleaner     disabled (--no-cleanup)");
         None

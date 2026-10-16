@@ -4,11 +4,11 @@
 //! at the bottom-center of the cursor's screen, containing a live
 //! waveform driven by mic RMS. Hidden when idle.
 //!
-//! The status-item menu is recovery-first and minimal at the top level: the
-//! last dictation (preview + Copy + an explicit "Paste last dictation" that
-//! re-inserts the already-captured text into the app that was frontmost before
-//! the menu opened — never a re-transcribe), Settings, a single "More" submenu
-//! that groups history / retranscribe / config / diagnostics, and Quit.
+//! The status-item menu leads with the actions that are used: Record/Stop,
+//! Cancel (live only while cancellable), Copy last text, Paste last text (the
+//! already-captured transcript — never a re-transcribe), Retry last audio
+//! (re-transcribe), History and Settings. A single "More" submenu keeps the
+//! config and diagnostics, and a read-only latency line sits above Quit.
 //! Settings-changing items write `settings.json` and relaunch the daemon
 //! so the change takes effect; the model load makes in-process swapping not
 //! worth the complexity.
@@ -423,6 +423,14 @@ define_class!(
         // useful after the text had already landed.)
         #[unsafe(method(undoPill:))]
         fn undo_pill(&self, _sender: *mut AnyObject) {
+            // A queued paste may still be settling: the visible text can belong
+            // to that write, so an early ⌘Z would revert unrelated prior
+            // content. The pill's Undo affordance is disabled while a
+            // transaction is pending; this is the race guard behind it.
+            if crate::clipboard_paste::transaction_pending() {
+                eprintln!("[pill] undo deferred: a clipboard transaction is still settling");
+                return;
+            }
             // ⌘Z is global: only send it while the app that received the text
             // is still frontmost, the same rule the paste itself follows.
             let injected = crate::ui_channel::last_inject_pid();
@@ -443,6 +451,17 @@ define_class!(
         fn retry_last(&self, _sender: *mut AnyObject) {
             if let Err(e) = crate::ipc::send(crate::ipc::Command::Retry) {
                 eprintln!("[menu] retry last dictation failed: {e}");
+            }
+        }
+
+        // Start / stop dictation from the menu — the same control the CLI,
+        // Shortcuts and a foot pedal drive. `toggle` is resolved against the
+        // live recording state by the control socket, so the menu never has to
+        // guess which direction to fire.
+        #[unsafe(method(recordToggle:))]
+        fn record_toggle(&self, _sender: *mut AnyObject) {
+            if let Err(e) = crate::ipc::send(crate::ipc::Command::Toggle) {
+                eprintln!("[menu] toggle dictation failed: {e}");
             }
         }
 
@@ -952,6 +971,23 @@ fn build_status_item(
     secure_item.setHidden(true);
     menu.insertItem_atIndex(&secure_item, 0);
 
+    // Record / Stop + Cancel:
+    // The two actions most used next. Start/stop drives the same control the
+    // CLI and Shortcuts use; Cancel is enabled only while an utterance can
+    // still be cancelled.
+    let record_item = action_item(mtm, &record_toggle_title(), sel!(recordToggle:), "", actions);
+    record_item.setTag(TAG_RECORD);
+    menu.addItem(&record_item);
+
+    let cancel_item = action_item(mtm, "Cancel dictation", sel!(cancelPill:), "", actions);
+    cancel_item.setTag(TAG_CANCEL);
+    menu.addItem(&cancel_item);
+
+    menu.addItem(&*NSMenuItem::separatorItem(mtm));
+
+    // Last text: copy / repaste, then retry the audio. "Copy last text" and
+    // "Paste last text" reuse the already-captured transcript; "Retry last
+    // audio" deliberately re-transcribes the retained recording.
     let copy_last = action_item(
         mtm,
         &copy_last_title(crate::hotkeys::copy_last_from_settings().as_ref()),
@@ -967,9 +1003,21 @@ fn build_status_item(
     // re-transcribe — it does not touch audio or the pipeline, only re-inserts
     // the text (restoring + verifying the target; see `crate::recovery`). The
     // injector's focus gate still applies — never a blind paste.
-    let paste_last = action_item(mtm, "Paste last dictation", sel!(pasteLast:), "", actions);
+    let paste_last = action_item(mtm, "Paste last text", sel!(pasteLast:), "", actions);
     paste_last.setTag(TAG_PASTE_LAST);
     menu.addItem(&paste_last);
+
+    // Re-run the last utterance's audio (including a cancelled one) at the
+    // current cursor. Distinct from Paste last text: this re-transcribes.
+    let retry_last = action_item(
+        mtm,
+        "Retry last audio (re-transcribe)",
+        sel!(retryLast:),
+        "r",
+        actions,
+    );
+    retry_last.setTag(TAG_RETRY);
+    menu.addItem(&retry_last);
     refresh_recovery_items(&menu);
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
@@ -979,6 +1027,10 @@ fn build_status_item(
     // copy, paste), Settings, a single "More" that gathers everything else, and
     // Quit. Model choices are intentionally absent (this personal build is one
     // warmed Cohere MLX transcriber followed by S1-mini).
+    let history_item = action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions);
+    history_item.setTag(TAG_HISTORY);
+    menu.addItem(&history_item);
+
     let settings_item = action_item(mtm, "Settings…", sel!(openSettings:), ",", actions);
     menu.addItem(&settings_item);
 
@@ -1007,6 +1059,20 @@ fn build_status_item(
 
     menu.addItem(&*NSMenuItem::separatorItem(mtm));
 
+    // Latency (read-only): the app's own release-to-write timing, refreshed as
+    // the menu opens. Never a claim about another app's visible pixels.
+    let latency_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(&latency_label()),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    latency_item.setEnabled(false);
+    latency_item.setTag(TAG_LATENCY);
+    menu.addItem(&latency_item);
+
     // ── Quit (standard NSApp terminate: — works with nil target) ─────────
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -1030,10 +1096,10 @@ fn build_status_item(
     })
 }
 
-/// Build the "More" submenu: history · retranscribe · config · diagnostics.
-/// This keeps the previously-flat rows reachable while the top level stays
-/// minimal (last dictation, Settings, More, Quit). Pure NSMenu grouping with
-/// separators for the four groups — no new visual system.
+/// Build the "More" submenu: config and diagnostics.
+/// History and retranscribe now live on the root menu (most-used first); this
+/// keeps every other setting reachable. Pure NSMenu grouping with separators —
+/// no new visual system.
 fn build_more_submenu(
     mtm: MainThreadMarker,
     actions: &Retained<MenuActions>,
@@ -1044,9 +1110,8 @@ fn build_more_submenu(
     submenu.setAutoenablesItems(false);
 
     // ── History ─────────────────────────────────────────────────────────
-    // Browsable history of past dictations — the friendly counterpart to the
-    // verbose daemon log.
-    submenu.addItem(&action_item(mtm, "Dictation History…", sel!(openHistory:), "h", actions));
+    // The browsable history list moved to the root menu (most-used first);
+    // only the retention window stays here with the other config.
 
     // How long to keep dictation history (read per record, so no relaunch).
     let retention_parent = unsafe {
@@ -1064,11 +1129,8 @@ fn build_more_submenu(
 
     submenu.addItem(&*NSMenuItem::separatorItem(mtm));
 
-    // ── Retranscribe ─────────────────────────────────────────────────────
-    // Re-run the last recording (including a cancelled one): the pipeline
-    // replays the retained in-memory audio and injects the fresh transcript at
-    // the current cursor, obeying the same Escape + focus guard.
-    submenu.addItem(&action_item(mtm, "Retry and paste last recording", sel!(retryLast:), "r", actions));
+    // ── Language / format ────────────────────────────────────────────────
+    // (Retry last audio moved to the root menu, most-used first.)
 
     // Pick the active Translate-mode target (only meaningful when targets are
     // configured; reads settings per utterance, so no relaunch).
@@ -1410,12 +1472,35 @@ const TAG_HEALTH: isize = 9100;
 const TAG_COPY_LAST: isize = 9101;
 const TAG_PASTE_LAST: isize = 9102;
 const TAG_SECURE_INPUT: isize = 9103;
+const TAG_RECORD: isize = 9104;
+const TAG_CANCEL: isize = 9105;
+const TAG_RETRY: isize = 9106;
+const TAG_HISTORY: isize = 9107;
+const TAG_LATENCY: isize = 9108;
+
+/// "Start dictation" or "Stop and transcribe", read at menu-open time from the
+/// same flag the control socket resolves `toggle` against.
+fn record_toggle_title() -> String {
+    if crate::ipc::DAEMON_RECORDING.load(Ordering::SeqCst) {
+        "Stop and transcribe".to_string()
+    } else {
+        "Start dictation".to_string()
+    }
+}
+
+/// The read-only timing line. It reports the app's own release-to-write timing
+/// and never claims when another app's pixels became visible.
+fn latency_label() -> String {
+    crate::latency::last()
+        .map(|s| s.menu_label())
+        .unwrap_or_else(|| "No insertion timing yet".to_string())
+}
 
 /// The copy item names its global hotkey, so the chord is discoverable.
 fn copy_last_title(hotkey: Option<&crate::hotkeys::Hotkey>) -> String {
     match hotkey {
-        Some(h) => format!("Copy last dictation  ({})", h.display()),
-        None => "Copy last dictation".to_string(),
+        Some(h) => format!("Copy last text  ({})", h.display()),
+        None => "Copy last text".to_string(),
     }
 }
 
@@ -1442,6 +1527,18 @@ fn refresh_recovery_items(menu: &NSMenu) {
     }
     if let Some(item) = menu.itemWithTag(TAG_SECURE_INPUT) {
         item.setHidden(!crate::secure_input::query());
+    }
+    // Record/Stop follows the live capture flag the control socket resolves
+    // `toggle` against; Cancel is live only while an utterance can still be
+    // cancelled, so it never looks actionable when it would do nothing.
+    if let Some(item) = menu.itemWithTag(TAG_RECORD) {
+        item.setTitle(&NSString::from_str(&record_toggle_title()));
+    }
+    if let Some(item) = menu.itemWithTag(TAG_CANCEL) {
+        item.setEnabled(ui_channel::state().is_cancellable());
+    }
+    if let Some(item) = menu.itemWithTag(TAG_LATENCY) {
+        item.setTitle(&NSString::from_str(&latency_label()));
     }
     if let Some(globals) = GLOBALS.get() {
         globals
@@ -1521,15 +1618,13 @@ fn terminate_app() {
 
 // ─── Menu action helpers (plain Rust, no AppKit) ────────────────────────
 
-pub(crate) fn copy_to_clipboard(text: &str) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-    }
+/// Copy behind any pending paste transaction without blocking AppKit. Confirm
+/// on the main thread only after the clipboard write has actually succeeded.
+pub(crate) fn copy_to_clipboard(text: String, finished: impl FnOnce(bool) + Send + 'static) {
+    std::thread::spawn(move || {
+        let copied = crate::clipboard_paste::copy_only(&text).is_ok();
+        run_on_main(move || finished(copied));
+    });
 }
 
 /// Open the daemon log in the default text editor ("Open Log").

@@ -12,6 +12,11 @@ it over **newline-delimited JSON on stdin/stdout**:
 - Request: `{"op":"transcribe","request_id":"1","sample_rate":16000,"channels":1,"language":"en","max_tokens":256,"audio_f32_base64":"<base64 little-endian f32 PCM>"}`.
   Rust owns resampling/downmixing to mono 16 kHz (see `audio.rs`); the helper expects mono,
   finite, little-endian f32 PCM at exactly 16,000 Hz.
+- The decoder `language` is one of the 14 codes the fixed checkpoint supports
+  (`settings::COHERE_LANGUAGE_CHOICES`: `en`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `pl`, `el`, `ar`,
+  `ja`, `zh`, `vi`, `ko`), `en` by default. S1-mini's cleanup normalizer is English-only, so a
+  non-English speech language routes cleanup to the instruction model (see "The model-aware
+  cleanup contract").
 - Startup: the helper emits one `{"ok":true,"event":"ready",…}` line, which the worker waits for
   before admitting dictation work.
 - Response: one line per request, matched on `request_id`. `timings_ms.total` is helper-side
@@ -126,6 +131,12 @@ When bundled, the daemon redirects stdout/stderr to
 - **S1-mini GGUF** (`llm_default_path`, resolved by `Settings::resolve_llm_model`):
   `DICTATE_LLM_MODEL_PATH` env > `S1_MODEL_PATH` env (alias) > `GEMMA_MODEL_PATH` env (deprecated,
   warns once) > `settings.json` `llm_model` > `<base>/llm/s1-mini/s1-mini.gguf`.
+- **Instruction model** (`app_paths::instruction_default_path`, resolved by
+  `Settings::resolve_instruction_model`): `DICTATE_INSTRUCTION_MODEL_PATH` env > `settings.json`
+  `instruction_model` > `<base>/llm/instruction-default.gguf`; when that file is absent the
+  writable sidecar `~/Library/Application Support/Local Dictation/models/llm/instruction-default.gguf`
+  is offered instead. An explicit empty value disables it. Changing it needs a restart, like every
+  other model selection.
 - **Native helper** (`cohere_mlx_helper_path`): `DICTATE_COHERE_MLX_BRIDGE` env >
   `<bundle>/Resources/cohere-mlx-bridge` > `native/cohere-mlx/.build/xcode/Build/Products/Release/cohere-mlx-bridge`.
 
@@ -224,6 +235,15 @@ path under the models base, URL, byte count, SHA-256, licence and the credit the
   cancellation, then a SHA-256 check (`src/sha256.rs`, in-tree, checked against the FIPS 180-4
   vectors) before one atomic rename. Bytes that do not match the manifest are deleted, never
   loaded. The model's own LICENSE and NOTICE are saved beside the weights.
+- **The instruction model** (`llm/instruction-default.gguf`) is the optional second GGUF used for
+  selection transforms, translations and any free-form output instruction the S1-mini normalizer
+  cannot follow. It is a permissive text-only Qwen3.5-2B Q4_K_M GGUF (Apache-2.0; GGUF conversion
+  by Unsloth) pinned to one revision with a byte count and SHA-256 in the manifest, and
+  `fetch-models` can fetch it from the same manifest. It is never required: a missing instruction
+  model costs only the free-form paths (see "The model-aware cleanup contract"), and plain
+  dictation still runs. A user may point the instruction slot at their own GGUF instead, for
+  example Cohere Labs Tiny Aya, which is NonCommercial (CC-BY-NC-4.0 plus an acceptable-use
+  policy) and is never a shipped default; the picker marks it NonCommercial and personal-use only.
 - **The ASR model has no URL in the app yet.** Its public 4-bit MLX conversion
   (`beshkenadze/cohere-transcribe-03-2026-mlx-4bit`) is several files and `Source` describes one,
   so the manifest entry carries none. `scripts/download-models.sh` fetches it from a pinned
@@ -236,11 +256,11 @@ path under the models base, URL, byte count, SHA-256, licence and the credit the
   Setup window and the Models action all read it, so they cannot disagree — checking the manifest
   default instead reported a missing speech model on a Mac whose daemon loads one perfectly well,
   and `ModelsMissing` refuses every hotkey press.
-- **The two models are not the same kind of problem.** A missing speech model is
+- **The three roles are not the same kind of problem.** A missing speech model is
   `ModelsMissing`, which blocks a press; a missing cleanup model is `CleanupUnavailable`, which
   does not — the same split the worker makes (CP-11). The cleanup row is only required when
-  cleanup is on, so a missing LLM alone never dead-ends the app, and a cleanup model that fails to
-  load is a warning, not a dead worker.
+  cleanup is on, and the instruction row is never required, so a missing LLM alone never
+  dead-ends the app. A text model that fails to load is a warning, not a dead worker.
 
 ## Feature flags are the architecture
 
@@ -253,7 +273,8 @@ the real app. **Only three features exist** (plus `full`):
   (`src/cohere_mlx.rs`). This IS the ASR; `bench`/`dictate`/`daemon`/`listen` require it
   (`daemon`/`listen` also need `ax-inject`). Without it, `initialize` returns a "not compiled"
   error.
-- **`cleaner`** (`llama-cpp-2` with Metal, `encoding_rs`) — S1-mini cleanup via `src/cleaner.rs`.
+- **`cleaner`** (`llama-cpp-2` with Metal, `encoding_rs`) — S1-mini cleanup via `src/cleaner.rs`,
+  plus the optional instruction model (`src/llm_contract.rs` decides the contract and the routing).
   The `transform` subcommand and Shift+PTT transform mode also live here.
 - **`ax-inject`** (`accessibility-sys`, `core-foundation`, `core-graphics`, `arboard`, `objc2*`) —
   real macOS Accessibility text injection, clipboard fallback, menu-bar status item, floating
@@ -347,7 +368,13 @@ few milliseconds before the HID state commits it: a mismatch there is normal and
 is not evidence of a synthesized event. There is no silence or duration
 auto-stop in the push-to-talk daemon path.
 
-**Focus capture at key-press** (default on): the focused UI element + caret context (`kAXValue` + `kAXSelectedTextRange`, whose UTF-16 offset is converted to a char index by `injector::char_index_from_utf16`) are resolved from the frontmost application's own AX root on a background thread when recording *starts*, so the AX wake / cross-process cost is paid while the user is speaking rather than after the pipelines finish. At write time the injector still resolves the current field fresh, so a real same-app field change wins and an app switch cannot revive the old target. If that fresh lookup transiently returns no focused element (`-25212` is common while Electron reshuffles its AX tree), the retained field is a narrow fallback only when it had positive editable evidence, still reports `AXFocused=true`, and its owning PID is still the OS-frontmost app. A failed capture or changed app still holds/re-resolves normally. A very short hold just blocks on the capture join. The clipboard fallback's snapshot restore runs on a *detached* thread after the Cmd+V settle, so a slow restore can't pin the next dictation. The fallback's own pasteboard write carries the nspasteboard.org markers `org.nspasteboard.TransientType` + `org.nspasteboard.AutoGeneratedType` (empty data, declared on the same item as the text), so clipboard managers — Quick Launch's Clipboard History included — don't record dictated sentences; the snapshot saves and restores every flavour of every pasteboard item (images, RTF, file URLs), except lazily promised file data and anything past a 16 MB byte budget, which are dropped and logged.
+**Focus capture at key-press** (default on): the focused UI element + caret context (`kAXValue` + `kAXSelectedTextRange`, whose UTF-16 offset is converted to a char index by `injector::char_index_from_utf16`) are resolved from the frontmost application's own AX root on a background thread when recording *starts*, so the AX wake / cross-process cost is paid while the user is speaking rather than after the pipelines finish. At write time the injector still resolves the current field fresh, so a real same-app field change wins and an app switch cannot revive the old target. If that fresh lookup transiently returns no focused element (`-25212` is common while Electron reshuffles its AX tree), the retained field is a narrow fallback only when it had positive editable evidence, still reports `AXFocused=true`, and its owning PID is still the OS-frontmost app. A failed capture or changed app still holds/re-resolves normally. A very short hold just blocks on the capture join. The clipboard fallback posts Cmd+V and then hands the settle and the snapshot restore to a
+**background transaction that keeps holding a process-wide clipboard gate**. The dictation worker
+returns the moment Cmd+V is queued — it no longer sleeps through the settle — while the next
+clipboard writer (a later dictation, or an explicit recovery copy) waits on the same gate, so the
+settle and restore are never overlapped or clobbered. A `changeCount` that advanced past our own
+write (the user copied something during the settle) wins over our restore, and a restore thread
+that cannot spawn settles synchronously under the permit instead. The fallback's own pasteboard write carries the nspasteboard.org markers `org.nspasteboard.TransientType` + `org.nspasteboard.AutoGeneratedType` (empty data, declared on the same item as the text), so clipboard managers — Quick Launch's Clipboard History included — don't record dictated sentences; the snapshot saves and restores every flavour of every pasteboard item (images, RTF, file URLs), except lazily promised file data and anything past a 16 MB byte budget, which are dropped and logged.
 
 **Chromium/Electron on-demand AX wake** (`injector::wake_electron_ax_and_retry_focus`): Chromium builds no accessibility tree until a client asks for one, so Slack, Cursor, VS Code and the rest answer `AXFocusedUIElement` with `kAXErrorNoValue` (-25212) even with the caret visible — the same wall WeChat sits behind. Both the key-press capture and the write-time resolver now, on a failed focused-element query and only for an app its executable classifies as Electron (`injector::is_electron_pid`), set `AXManualAccessibility` (Chromium's on-demand switch) and re-read on a wall-clock budget (`AX_WAKE_POLL_BUDGET_MS`, 0.9 s) under a short AX timeout. The wake is claimed once per app process (`claim_electron_ax_wake`), so steady dictation and every later utterance skip it and pass on the first query. This is a **look, not a write**: the element it wakes must still clear the editability gate below, so waking an app never widens who may receive a paste. The app-internal price is Chromium maintaining an AX tree, the same cost VoiceOver imposes, for as long as the app runs.
 
@@ -385,13 +412,22 @@ release pipeline (so the streaming final-segment flush includes it). Skipped ent
 pre-roll (which already keeps rolling past release).
 
 **Warm-window mic reuse** (default on, 60 s): in the default press-to-open mode the engine was
-dropped — and the mic re-opened (~120 ms) — on every utterance. Now a stopped engine is *parked*
-(stream kept open, idle chunks dropped) for `DICTATE_WARM_WINDOW_MS`; a re-press within that window
-reuses the live stream instead of paying the open cost. A warm-window tick (the existing ~120 ms
-worker tick) closes the parked mic once idle past the deadline, and a re-press rebuilds the stream if
-the default input changed since it was built. `DICTATE_WARM_WINDOW_MS=0` restores today's exact
-cold-open behaviour; no-op under always-on pre-roll. No pre-press lookback (the plain SPSC ring isn't
-a rolling lookback; the win is skipping the open).
+dropped — and the mic re-opened (~120 ms) — on every utterance. Now a stopped engine is *parked*:
+its initialized `cpal` stream is **retained with its IO paused** (`stream.pause()`), so it runs no
+callback and captures no audio while parked, and the input device
+stays reserved so the next press **resumes** the same stream (`stream.play()`) instead of paying the
+cold open. A resume bumps the capture **epoch**, so the resample / channel state resets once the
+stream reports recording and no stale audio is ever replayed. A refused pause or play, a changed
+default input (`device_changed`), or a Mac sleep (wall-clock age past the monotonic one,
+`audio::slept_for`) drops the parked stream and forces a cold rebuild on the next press. A
+warm-window tick (the existing ~120 ms worker tick) closes the parked mic once idle past the
+deadline. `DICTATE_WARM_WINDOW_MS=0` restores today's exact cold-open behaviour; no-op under
+always-on pre-roll. No pre-press lookback (the plain SPSC ring isn't a rolling lookback; the win is
+skipping the open).
+
+The paused-stream reuse was measured in the capture lab with AirPods: about 728.5 ms for a cold
+open, about 13.8 ms to resume, about 23.1 ms to pause, and **zero callbacks over a 400 ms idle
+window**. Those are machine-specific engineering numbers for this Mac, not a general benchmark.
 
 Transform output replaces the user's selection, so it has two extra guards: a selection over
 `cleaner::MAX_TRANSFORM_CHARS` (6000) is refused up front, and a rewrite that stops at the token
@@ -401,15 +437,15 @@ prompt is decoded), so a failed job cannot leave the next one reusing a prefix t
 
 `cleaner.rs` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
 `LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in a
-struct). The worker tracks the resident token sequence and **reuses the shared KV-cache prefix**
+struct; each model slot owns its own context, so the cleanup and instruction models keep
+independent KV caches). The worker tracks the resident token sequence and **reuses the shared KV-cache prefix**
 with each new prompt (`common_prefix_len` + `clear_kv_cache_seq` wipes only the divergent tail),
 so the constant cleanup instruction block is decoded once at boot and reused on every utterance.
 Reuse is generic (token-sequence comparison, no hardcoded template) and verified bit-identical to
 a from-scratch decode by the parity test (`eval_cleanup_uncached` in `examples/latency_lab.rs`).
-S1-mini's merged Qwen3 template emits EOG immediately when given a separate system role, so its
-instruction and transcript are deliberately combined into **one user turn** (matching
-Superwhisper). Sampling is low-temperature fixed-seed (temp 0.2, seed 1234) so cleanup is
-deterministic. The context is capped at `MAX_CTX = 8192`.
+S1-mini's contract is model-aware (see the subsection below): it is driven with its exact trained
+system prompt and control line, greedy (`temperature = 0.0`), so cleanup is deterministic. The
+context is capped at `MAX_CTX = 8192`.
 
 **Guards around cleanup** (so the small model can't wreck text):
 - A deterministic **gate** (`text_polish::needs_llm_cleanup`): clean dictation (no contractions,
@@ -421,13 +457,49 @@ deterministic. The context is capped at `MAX_CTX = 8192`.
 - A **diff-guard** (`text_polish::cleanup_dropped_content`): if the model rewrote away real content
   (dropped a clause), the faithful deterministic result wins.
 
+### The model-aware cleanup contract
+
+`src/llm_contract.rs` is the one place that turns *what the user asked for* (an output format, an
+app tone, a custom prompt) into the exact prompt a model was trained on, and decides when the
+primary model must hand the request to the instruction model instead. `tests/model_contracts.rs`
+pins the literals to the publisher contract so a refactor cannot drift off it.
+
+- **S1-mini is a text normalizer, not a chat model.** It gets its fixed trained system prompt in a
+  **separate system role**, then a user message that is the trained control line
+  `[Styling: X] [Structure: Y] [Context: Z]`, a newline, and the raw transcript. Plain dictation
+  uses `[Styling: semi-formal] [Structure: prose] [Context: general]`. Decoding is **greedy
+  (`temperature = 0.0`)** with the model's non-thinking assistant prefill
+  (`<think>\n\n</think>\n\n`);
+  no axis value may change, and no extra instruction (vocabulary, tone or a custom prompt) may be
+  appended to the trained prompt.
+- **A generic instruction model uses its own embedded chat template untouched.** A Qwen 3 / 3.5
+  model receives its own non-thinking prefill; anything else (e.g. Cohere Aya) never receives Qwen
+  think tokens. General models sample at a low temperature (`0.2`).
+- **Routing** (`llm_contract::plan_cleanup`) never silently ignores a control it cannot serve:
+  - A configured speech language other than English is one S1-mini cannot normalize (it is
+    English-only): cleanup routes to the instruction model when one is configured, and otherwise
+    falls back to the raw transcript with a warning.
+  - A **compatible built-in format** maps onto S1-mini's trained axes: `bullets` → `Structure:
+    lists`, `email` → `Context: email`.
+  - A **custom cleanup prompt, a custom format, `numbered`/`code` (or any format outside the
+    trained set), an app tone with no S1-mini register, and every selection rewrite or translation**
+    are free-form instructions S1-mini was not trained to follow: they go to the instruction model
+    when one is configured, and otherwise surface an actionable refusal that names the setting.
+  - An **unknown or deleted format** is not a defined preset, so it is not treated as a control at
+    all: the request falls back to the ordinary default cleanup.
+- **The specialized normalizer never receives the dictionary or screen vocabulary.** Those hints
+  feed only the generic instruction prompts, because appending them would break S1-mini's trained
+  contract. The deterministic correction pass (`refiner`) still runs on the raw transcript before
+  cleanup and again afterwards, so personal corrections always apply.
+
 `ui_channel.rs` carries a generation/revision-guarded snapshot: recording state,
 bounded draft preview, capture flag, last output, and audio levels. States include
 Transcribing, Cleaning, Pasting, and Copied. `PasteFailed` is the write-failed result: the words are kept
 as the last dictation and as a "Not inserted" Output stage, and the pill says "Couldn’t paste ·
 Copy from menu" for 4 s with the History button ("Couldn’t transcribe" is for real ASR
 failures only). The success pill's Undo posts ⌘Z only while the app that received the text
-(`ui_channel::last_inject_pid`) is still frontmost. Only actual model/injection boundaries
+(`ui_channel::last_inject_pid`) is still frontmost, and its control and handler are disabled while
+a clipboard paste's settle/restore transaction is still pending. Only actual model/injection boundaries
 publish these phases; Pasting is beyond the cancellation commit point. Old
 completion timers and cancelled inference cannot clear or revive a newer pill.
 The preview uses existing sentence-based ASR results, capped at 320 Unicode
@@ -436,8 +508,11 @@ characters; it adds no decode calls. The UI displays a bounded recent-text tail.
 `menubar/pill.rs` uses a nonactivating, non-key panel with a fixed cancel target.
 Compact/Standard geometry, waveform sensitivity, processing detail and preview
 come from Settings. `waveform.rs` maps real RMS levels with a quiet gate and
-fast release. Reduced Motion is read from NSWorkspace; no decorative processing
-wave pretends to be microphone activity.
+fast release. Reduced Motion is read from NSWorkspace; the indeterminate working indicator is **three marching
+dots** shown **instead of** the live waveform while the pipeline works, so no processing wave ever
+pretends to be microphone activity, and the dots hold still under Reduced Motion. A real ASR
+failure offers a **Retry** quick action that runs only on a click, never on its own; a transform
+failure offers none and leaves the user's selection unchanged.
 
 ### Durable recovery
 
@@ -505,7 +580,7 @@ User config lives in `~/.config/local-dictation/` — the directory is resolved 
 (`app_paths::config_dir` / `config_file`), so every consumer (`settings.rs`, `prompts.rs`,
 `corrections.rs`, `history.rs`, `dictionary.rs`, the menu bar) shares the same location rather than
 re-joining the path:
-- `settings.json` (`settings.rs`) — written by the menu bar. Keys: `llm_model`, `hotkey_keycode`,
+- `settings.json` (`settings.rs`) — written by the menu bar. Keys: `llm_model`, `instruction_model`, `hotkey_keycode`,
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
@@ -565,6 +640,7 @@ stack:
 | `DICTATE_COHERE_MLX_BRIDGE` | Native MLX helper binary path |
 | `DICTATE_COHERE_LANG` | Decoder language hint (default `en`) |
 | `DICTATE_LLM_MODEL_PATH` | Cleanup-LLM GGUF path. `S1_MODEL_PATH` is an accepted alias; `GEMMA_MODEL_PATH` is deprecated (still honoured, warns once). New name wins when several are set |
+| `DICTATE_INSTRUCTION_MODEL_PATH` | Optional instruction model for rewrites, translations, custom formats and any format outside S1-mini's trained set. Resolved by `Settings::resolve_instruction_model` (env > `instruction_model` > `<base>/llm/instruction-default.gguf`, then the writable App Support sidecar). An explicit empty value disables it |
 | `DICTATE_HOTKEY_KEYCODE` | Push-to-talk key (default `hotkeys::DEFAULT_KEYCODE` = `0x3D` Right Option; decimal or `0x` hex) |
 | `DICTATE_HOTKEY_MODIFIERS` | CGEventFlags mask that turns the hotkey into a chord (default 0 = bare modifier key). The held modifiers must equal the mask (an extra Shift is the transform gesture). A plain typing key with no modifier is refused (`Hotkey::problem`) and falls back to the default; only a modifier key or F1–F20 may stand alone |
 | `DICTATE_DOUBLE_TAP_LATCH` | Double-tap the hotkey to latch hands-free (`0`/`false`/`off` disables) |
@@ -625,6 +701,12 @@ text verbatim; new log lines that carry user text must use the same helpers. (Un
 log was the shared, world-readable `/tmp/dictate-daemon.log`; that file is no longer written and
 can be deleted.) The first
 line of every run names the version and, for a bundle, the commit it was built from.
+
+Each release pipeline records a privacy-safe timing snapshot, printed as one `[latency]` line
+(`release_ms`, `tail_ms`, `capture_stop_ms`, `asr_ms`, `cleanup_ms`, `focus_wait_ms`,
+`insertion_return_ms`, `inserted`) and shown as the read-only line above Quit in the status menu.
+The numbers measure this app's own release-to-write work (when the insertion request returned),
+not when another application's pixels became visible.
 
 A first daemon run needs Microphone + Accessibility granted in System Settings. Neither is fatal
 any more: the menu bar comes up, the Setup window says which is missing, and the event tap

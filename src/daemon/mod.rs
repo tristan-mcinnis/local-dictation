@@ -200,8 +200,9 @@ pub struct DaemonConfig {
     pub asr: crate::transcriber::AsrConfig,
     #[cfg(feature = "cleaner")]
     pub llm_model_path: String,
-    /// If true, inject the raw ASR transcript without Gemma cleanup.
-    /// Saves ~860 ms per utterance.
+    #[cfg(feature = "cleaner")]
+    pub instruction_model_path: Option<String>,
+    /// If true, inject the raw ASR transcript without model cleanup.
     pub no_cleanup: bool,
     /// Hotkey keycode to watch on FlagsChanged.
     pub hotkey_keycode: i64,
@@ -221,6 +222,11 @@ impl DaemonConfig {
             asr,
             #[cfg(feature = "cleaner")]
             llm_model_path,
+            #[cfg(feature = "cleaner")]
+            instruction_model_path: {
+                let default = crate::app_paths::instruction_default_path();
+                crate::settings::Settings::load().resolve_instruction_model(default.as_deref())
+            },
             no_cleanup,
             hotkey_keycode,
         }

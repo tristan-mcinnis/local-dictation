@@ -665,14 +665,13 @@ fn perform_action(action: DetailAction) {
                 status(ui, "No text layer is available to copy.");
                 return;
             };
-            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(stage.text))
-            {
-                Ok(()) => status(ui, &format!("Copied {} to the clipboard.", stage.title)),
-                Err(_) => status(
-                    ui,
-                    "Could not copy this layer. Select the text and press ⌘C.",
-                ),
-            }
+            let message = format!("Copied {} to the clipboard.", stage.title);
+            status(ui, "Copying…");
+            copy_to_clipboard(stage.text, move |copied| {
+                if let Some(ui) = DETAIL_UI.get() {
+                    status(ui, if copied { &message } else { "Could not copy this layer. Select the text and press ⌘C." });
+                }
+            });
         }
         DetailAction::Play | DetailAction::Reveal => match validated_audio_path(ui) {
             Ok(path) if action == DetailAction::Play => play_file(ui, &path),

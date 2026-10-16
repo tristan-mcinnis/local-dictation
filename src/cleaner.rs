@@ -18,6 +18,7 @@
 //! sequences, so it works for any model/template and degrades gracefully (a
 //! cleanup→transform switch simply shares fewer tokens).
 
+use crate::llm_contract::{self, CleanupPlan, ModelFamily, ModelIdentity, S1Axes};
 use crate::prompts::Prompts;
 use eyre::Context;
 use llama_cpp_2::{
@@ -76,6 +77,10 @@ struct Job {
     /// its output REPLACES the user's selection, so a cut-off rewrite must never
     /// be returned as if it were complete.
     fail_on_truncation: bool,
+    /// Sampling temperature. S1-mini's normalizer is greedy (`0.0`); general
+    /// instruction models use a low temperature. Zero selects the greedy
+    /// sampler — no distribution, fully deterministic.
+    temperature: f32,
     reply: oneshot::Sender<eyre::Result<String>>,
 }
 
@@ -93,6 +98,19 @@ fn plan_reuse<T: PartialEq>(tokens: &[T], resident: &[T], no_reuse: bool) -> usi
         0
     } else {
         common_prefix_len(tokens, resident).min(tokens.len().saturating_sub(1))
+    }
+}
+
+/// How much KV prefix survives a clear attempt. `partial_cleared` is the
+/// memory implementation's answer: `Ok(true)` cleared the divergent tail,
+/// `Ok(false)`/`Err` refused (hybrid/recurrent memory cannot drop part of a
+/// sequence). On refusal, reuse NOTHING and reset the cache fully and re-prefill:
+/// reusing state the cache no longer holds produces silently wrong output.
+fn reuse_after_clear(partial_cleared: bool, reuse: usize) -> (usize, bool) {
+    if partial_cleared {
+        (reuse, false)
+    } else {
+        (0, true)
     }
 }
 
@@ -121,6 +139,40 @@ fn prompt_len_problem(prompt_len: usize) -> Option<String> {
     let limit = (MAX_CTX as usize).saturating_sub(MIN_GENERATION_ROOM);
     (prompt_len > limit)
         .then(|| format!("prompt is {prompt_len} tokens; the cleanup model's limit is {limit}"))
+}
+
+/// Generation budget for one cleanup call, sized off the raw transcript with
+/// headroom — cleanup tracks input length, and a fixed 256-token cap used to
+/// chop dictation past ~190 words mid-sentence.
+fn cleanup_budget(slot: &ChatSlot, raw: &str) -> i32 {
+    (slot.token_estimate(raw) as f32 * 1.3) as i32 + 64
+}
+
+/// True when every word of `raw` is a filler interjection. Such input carries
+/// no content to preserve, so an empty model output is valid rather than a
+/// runaway that must fall back.
+fn raw_is_filler_only(raw: &str) -> bool {
+    const FILLERS: &[&str] = &[
+        "um", "umm", "uhm", "uh", "uhh", "erm", "hmm", "hm", "mm", "mhm", "mmhmm", "ah",
+        "eh", "er",
+    ];
+    let words: Vec<String> = raw
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase())
+        .collect();
+    !words.is_empty() && words.iter().all(|w| FILLERS.contains(&w.as_str()))
+}
+
+/// The actionable message when the primary model is S1-mini and no instruction
+/// model is configured. It must name the setting, because the alternative —
+/// silently ignoring a custom prompt or format — is the defect this fixes.
+fn no_instruction_model_problem() -> String {
+    "no instruction model is configured; S1-mini only normalizes, so selection \
+     transforms and any custom prompt/format need a general chat model. Set the \
+     instruction model (settings `instruction_model`, or env \
+     DICTATE_INSTRUCTION_MODEL_PATH) to enable them."
+        .to_string()
 }
 
 /// True when cleanup output looks like a model runaway and the caller should
@@ -173,35 +225,59 @@ fn cleanup_ran_away(raw: &str, cleaned: &str) -> bool {
 }
 
 pub struct TextCleanupEngine {
-    model: Arc<LlamaModel>,
-    chat_template: Arc<LlamaChatTemplate>,
+    /// The configured cleanup model. Its family decides how the engine routes:
+    /// an S1-mini normalizer uses the trained contract, any other model follows
+    /// free-form instructions.
+    primary: ChatSlot,
+    /// Optional general chat model for instructions S1-mini was not trained on
+    /// (a custom prompt/format/tone, and selection transforms).
+    instruction: Option<ChatSlot>,
+    /// Why instructions are unavailable, or `None` when a slot can serve them.
+    /// Exposed through [`Self::instruction_problem`] for boot/status.
+    instruction_problem: Option<String>,
     /// Cleanup + transform system prompts, resolved once at init from
     /// env / prompts.json / built-in defaults.
     prompts: Prompts,
-    /// The cleanup system prompt instructions (default or active formatting
-    /// preset), WITHOUT any vocabulary suffix. This is the constant, cacheable
-    /// prefix the worker warms once at boot; per-utterance vocabulary is
-    /// appended after it (see [`Self::process_transcript_with_vocab`]).
-    cleanup_prompt: String,
     /// The user's curated "known vocabulary" (the target spellings in
-    /// corrections.json). Combined with any per-utterance screen-harvested
-    /// terms into the vocabulary block appended to each cleanup prompt.
+    /// corrections.json plus dictionary.json). Appended only on the generic
+    /// instruction path; S1-mini's published contract forbids extra text.
     static_vocab: Vec<String>,
-    /// True when an output-format preset (numbered / bullets / email / …) is
-    /// active. List-style presets need their line breaks preserved, so the
-    /// cleanup path keeps newlines instead of flattening to one line as plain
-    /// single-utterance dictation does.
+    /// The active output-format preset name, if any.
+    active_format: Option<String>,
+    /// True when a DEFINED output-format preset is applied. The daemon reads
+    /// this (not the raw setting) to decide whether clean speech may skip the
+    /// model, so the two can never disagree about an unknown preset name.
     format_active: bool,
-    /// Hand work to the persistent-context worker thread. `Option` so `Drop`
-    /// can close the channel (stopping the worker) before joining it.
+    /// True when the active preset came from the user's `prompts.json` (a
+    /// free-form instruction S1-mini cannot follow).
+    format_is_custom: bool,
+    /// True when the cleanup prompt came from env/file rather than the built-in
+    /// default (a free-form instruction S1-mini cannot follow).
+    cleanup_is_custom: bool,
+    language: String,
+}
+
+/// One resident llama.cpp model plus the worker thread that owns its context.
+/// Each slot keeps its own persistent context, so the KV prefix cache lifetime
+/// is independent between the cleanup model and the instruction model.
+struct ChatSlot {
+    model: Arc<LlamaModel>,
+    chat_template: Arc<LlamaChatTemplate>,
+    /// Decided once from verified GGUF metadata + filename.
+    family: ModelFamily,
+    /// True when the assistant turn needs the empty non-thinking prefill
+    /// (S1-mini's trained prefix; Qwen 3/3.5 chat templates).
+    prefill: bool,
+    /// `Option` so `Drop` can close the channel (stopping the worker) before
+    /// joining it.
     job_tx: Option<mpsc::UnboundedSender<Job>>,
-    /// The worker thread handle, joined on drop so its `LlamaContext` (and the
-    /// Metal buffers it holds) is freed before the process tears down ggml's
-    /// global Metal device — otherwise `ggml_metal_device_free` asserts at exit.
+    /// Joined on drop so its `LlamaContext` (and the Metal buffers it holds) is
+    /// freed before the process tears down ggml's global Metal device —
+    /// otherwise `ggml_metal_device_free` asserts at exit.
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for TextCleanupEngine {
+impl Drop for ChatSlot {
     fn drop(&mut self) {
         // Close the channel so the worker's blocking_recv returns None and it
         // drops its context, then wait for it. Ordering matters: the context
@@ -213,17 +289,25 @@ impl Drop for TextCleanupEngine {
     }
 }
 
-impl TextCleanupEngine {
-    pub fn initialize<P: AsRef<Path>>(model_path: P) -> eyre::Result<Self> {
-        let backend = backend()?;
+impl ChatSlot {
+    /// Load a model and spawn its persistent-context worker. `generic_system`
+    /// is the warm prefix for a general instruction model; an S1-mini model is
+    /// warmed with its exact trained system prompt instead (decided here, after
+    /// the family is known).
+    fn load(
+        backend: &Arc<LlamaBackend>,
+        model_path: &Path,
+        thread_name: &str,
+        generic_system: &str,
+    ) -> eyre::Result<Self> {
         // Offload everything to Metal. llama.cpp ignores layers beyond what
         // the model actually has, so a large number is safe.
         let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
         let model = Arc::new(
-            LlamaModel::load_from_file(&backend, model_path.as_ref(), &model_params)
+            LlamaModel::load_from_file(backend, model_path, &model_params)
                 .map_err(|e| eyre::eyre!("LlamaModel::load_from_file failed: {e:?}"))?,
         );
-        // Use the model's bundled chat template (Gemma / ChatML / Llama 3 /
+        // Use the model's bundled chat template (Gemma / ChatML / Cohere2 /
         // whatever the GGUF declares). Falls back to a no-op format if the
         // model has no template — in practice all instruct GGUFs do.
         let chat_template = Arc::new(
@@ -231,41 +315,191 @@ impl TextCleanupEngine {
                 .chat_template(None)
                 .map_err(|e| eyre::eyre!("chat_template lookup failed: {e:?}"))?,
         );
+        let family = detect_family(&model, model_path);
+        let template_text = model.meta_val_str("tokenizer.chat_template").unwrap_or_default();
+        let prefill = llm_contract::needs_non_thinking_prefill(family, &template_text);
+        // Warm the constant prefix the model will see every utterance. S1-mini
+        // warms its exact system prompt + default control line; a generic model
+        // warms the cleanup prompt + the "Raw transcript:" framing.
+        let (warm_system, warm_user) = if family == ModelFamily::S1Mini {
+            (
+                llm_contract::S1_SYSTEM_PROMPT.to_string(),
+                format!("{}\n", S1Axes::DEFAULT.control_line()),
+            )
+        } else {
+            (generic_system.to_string(), "Raw transcript:\n".to_string())
+        };
+        let warm_prompt =
+            render_prompt(&model, &chat_template, prefill, &warm_system, &warm_user).ok();
+
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<eyre::Result<()>>();
+        let worker = {
+            let backend = backend.clone();
+            let model = model.clone();
+            let thread_name = thread_name.to_string();
+            std::thread::Builder::new()
+                .name(thread_name.clone())
+                .spawn(move || run_worker(backend, model, job_rx, warm_prompt, ready_tx))
+                .map_err(|e| eyre::eyre!("spawn {thread_name} worker failed: {e}"))?
+        };
+        // Block until the worker has built its context (boot-time, so blocking
+        // is fine). Propagate a context-creation failure as an init error.
+        ready_rx
+            .recv()
+            .map_err(|_| eyre::eyre!("{thread_name} worker died during init"))??;
+
+        Ok(Self {
+            model,
+            chat_template,
+            family,
+            prefill,
+            job_tx: Some(job_tx),
+            worker: Some(worker),
+        })
+    }
+
+    /// Rough token count for sizing generation budgets / the context window.
+    fn token_estimate(&self, text: &str) -> usize {
+        self.model
+            .str_to_token(text, AddBos::Never)
+            .map(|t| t.len())
+            .unwrap_or_else(|_| text.chars().count() / 3)
+    }
+
+    /// Template `system` + `user` and hand the prompt to this slot's worker.
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        &self,
+        system: String,
+        user: String,
+        max_tokens: i32,
+        preserve_newlines: bool,
+        no_reuse: bool,
+        fail_on_truncation: bool,
+        temperature: f32,
+    ) -> eyre::Result<String> {
+        let prompt =
+            render_prompt(&self.model, &self.chat_template, self.prefill, &system, &user)?;
+        let (reply, rx) = oneshot::channel();
+        self.job_tx
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("cleanup worker is gone"))?
+            .send(Job {
+                prompt,
+                max_tokens,
+                preserve_newlines,
+                no_reuse,
+                fail_on_truncation,
+                temperature,
+                reply,
+            })
+            .map_err(|_| eyre::eyre!("cleanup worker is gone"))?;
+        rx.await
+            .map_err(|_| eyre::eyre!("cleanup worker dropped the reply"))?
+    }
+}
+
+/// Deciding authority for the model family: verified GGUF metadata first, with
+/// the filename as a secondary signal. Conservative — see
+/// [`llm_contract::detect_family`].
+fn detect_family(model: &LlamaModel, path: &Path) -> ModelFamily {
+    let meta = |key: &str| model.meta_val_str(key).ok();
+    let name = meta("general.name");
+    let basename = meta("general.basename");
+    let architecture = meta("general.architecture");
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    llm_contract::detect_family(&ModelIdentity {
+        filename: file_name,
+        meta_name: name.as_deref(),
+        meta_basename: basename.as_deref(),
+        meta_architecture: architecture.as_deref(),
+    })
+}
+
+/// Render a full prompt from separate system and user chat turns. S1-mini's
+/// published contract needs an exact system prompt and a control line, and its
+/// assistant turn must open with an empty think block. A generic model uses its
+/// own embedded template; only its own non-thinking prefill is appended when its
+/// template has a thinking branch, so Cohere Aya never receives Qwen tokens.
+fn render_prompt(
+    model: &LlamaModel,
+    chat_template: &LlamaChatTemplate,
+    prefill: bool,
+    system_msg: &str,
+    user_msg: &str,
+) -> eyre::Result<String> {
+    let messages = vec![
+        LlamaChatMessage::new("system".into(), system_msg.to_string())
+            .map_err(|e| eyre::eyre!("invalid system message: {e:?}"))?,
+        LlamaChatMessage::new("user".into(), user_msg.to_string())
+            .map_err(|e| eyre::eyre!("invalid user message: {e:?}"))?,
+    ];
+    let prompt = model
+        .apply_chat_template(chat_template, &messages, true)
+        .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))?;
+    Ok(llm_contract::non_thinking_prompt(prompt, prefill))
+}
+
+impl TextCleanupEngine {
+    /// Load the configured cleanup model. When that file is S1-mini the engine
+    /// uses the publisher's trained normalizer contract; a general chat model
+    /// gets free-form cleanup. Existing single-argument callers keep working.
+    pub fn initialize<P: AsRef<Path>>(model_path: P) -> eyre::Result<Self> {
+        Self::initialize_with_instruction_model(model_path, None)
+    }
+
+    /// Load the cleanup model and an optional instruction model.
+    ///
+    /// The instruction model serves selection transforms and any cleanup
+    /// control (a custom prompt/format, an app tone outside S1-mini's styling
+    /// registers) the primary model cannot follow. A failure to load it is NOT
+    /// fatal: normal S1-mini dictation keeps working, an actionable error is
+    /// exposed through [`Self::instruction_problem`], and no unsupported control
+    /// is silently dropped.
+    pub fn initialize_with_instruction_model(
+        model_path: impl AsRef<Path>,
+        instruction_model: Option<&Path>,
+    ) -> eyre::Result<Self> {
+        let backend = backend()?;
+        // Prompts are read once at engine start; edits take effect on relaunch.
         let prompts = Prompts::load();
 
         // Resolve the active formatting preset (env > settings.json > none) and
         // pick its cleanup prompt, falling back to the default. An unknown name
         // just yields the default cleanup — see `Prompts::cleanup_for`.
-        let active_format = crate::settings::Settings::load().resolve_format();
+        let settings = crate::settings::Settings::load();
+        let active_format = settings.resolve_format();
+        let language = settings.resolve_asr().language;
         let base_cleanup = prompts.cleanup_for(active_format.as_deref()).to_string();
         let format_active = prompts.format_is_defined(active_format.as_deref());
+        let format_is_custom = active_format
+            .as_deref()
+            .is_some_and(|name| prompts.is_custom_format(name));
         if let Some(name) = &active_format {
             eprintln!(
                 "[boot] format      {name} ({})",
                 if format_active {
-                    "applied"
+                    if format_is_custom {
+                        "custom — needs the instruction model"
+                    } else {
+                        "applied"
+                    }
                 } else {
                     "unknown — using default cleanup"
                 }
             );
         }
 
-        // Dictionary-aware cleanup: append the user's known vocabulary (the
-        // target spellings in corrections.json) so the model stops "correcting"
-        // proper nouns and domain casing away. Best-effort — a missing or
-        // unreadable corrections file just means no suffix.
-        // Curated vocabulary fed to the cleanup prompt: the target spellings
-        // from corrections.json (from→to fixes) plus the flat dictionary.json
-        // list (known words to preserve as-is). Both are soft hints; dedup +
-        // cap happen in `vocabulary_suffix`.
+        // Curated vocabulary fed to a generic cleanup prompt: the target
+        // spellings from corrections.json plus dictionary.json. S1-mini never
+        // receives this — its published contract forbids extra instructions;
+        // exact corrections still run outside the engine. Capped once at boot so
+        // the block is byte-identical on every utterance (KV prefix reuse).
         let correction_targets = crate::corrections::Corrections::load_default()
             .map(|c| c.replacement_values())
             .unwrap_or_default();
         let dictionary = crate::dictionary::load_default();
-        // Cap once, at boot: the curated block is then byte-identical on every
-        // utterance (KV prefix reuse) and always leaves room for screen terms.
-        // Dictionary terms go first so the cap cannot evict them (see
-        // `prompts::curated_vocabulary`).
         let curated_total = dictionary.len() + correction_targets.len();
         let static_vocab = crate::prompts::curated_vocabulary(&dictionary, &correction_targets);
         if curated_total > 0 {
@@ -277,67 +511,66 @@ impl TextCleanupEngine {
         }
         let cleanup_prompt = base_cleanup;
 
-        // Spawn the worker that owns the persistent context. Warm it with the
-        // cleanup *instructions* + framing (no vocabulary, empty transcript) so
-        // the constant instruction block is in the KV cache before the first
-        // dictation. Vocabulary is appended per-utterance after this prefix, so
-        // the worker still reuses the warmed instructions every time.
-        let warm_prompt =
-            Self::template_messages(&model, &chat_template, &cleanup_prompt, "Raw transcript:\n")
-                .ok();
+        // Primary cleanup model. `load` warms the worker from the detected
+        // family: S1-mini with its exact trained system prompt, a generic model
+        // with `cleanup_prompt` and the `Raw transcript:` framing.
+        let primary = ChatSlot::load(
+            &backend,
+            model_path.as_ref(),
+            "cleanup-worker",
+            &cleanup_prompt,
+        )?;
+        eprintln!(
+            "[boot] cleanup model {:?} · {}",
+            primary.family,
+            model_path.as_ref().display()
+        );
 
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<eyre::Result<()>>();
-        let worker = {
-            let backend = backend.clone();
-            let model = model.clone();
-            std::thread::Builder::new()
-                .name("gemma-cleanup".into())
-                .spawn(move || run_worker(backend, model, job_rx, warm_prompt, ready_tx))
-                .map_err(|e| eyre::eyre!("spawn cleanup worker failed: {e}"))?
+        // Optional instruction model. When the primary model is already a
+        // general instruction model it can serve instructions itself. A load
+        // failure only narrows the routes; it never disables S1-mini dictation.
+        let primary_is_general = primary.family != ModelFamily::S1Mini;
+        let same_model = instruction_model.is_some_and(|path| {
+            let first = std::fs::canonicalize(model_path.as_ref()).unwrap_or_else(|_| model_path.as_ref().to_path_buf());
+            let second = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            first == second
+        });
+        let (instruction, instruction_problem) = match instruction_model {
+            None if primary_is_general => (None, None),
+            None => (None, Some(no_instruction_model_problem())),
+            Some(_) if same_model && primary_is_general => (None, None),
+            Some(_) if same_model => (None, Some(llm_contract::s1_transform_refusal())),
+            Some(path) => match ChatSlot::load(&backend, path, "instruction-worker", &prompts.transform) {
+                Ok(slot) if slot.family == ModelFamily::S1Mini => (
+                    None, Some("the configured instruction model is a normalizer, not an instruction model".to_string()),
+                ),
+                Ok(slot) => {
+                    eprintln!("[boot] instruction  {:?} · {}", slot.family, path.display());
+                    (Some(slot), None)
+                },
+                Err(error) => {
+                    eprintln!("[warn] instruction model failed to load: {error}");
+                    (None, Some(format!("the instruction model failed to load: {error}")))
+                },
+            },
         };
-        // Block until the worker has built its context (boot-time, so blocking
-        // is fine). Propagate a context-creation failure as an init error.
-        ready_rx
-            .recv()
-            .map_err(|_| eyre::eyre!("cleanup worker died during init"))??;
+        if let Some(problem) = &instruction_problem {
+            eprintln!("[boot] instruction  unavailable — {problem}");
+        }
 
+        let cleanup_is_custom = prompts.cleanup_is_custom;
         Ok(Self {
-            model,
-            chat_template,
+            primary,
+            instruction,
+            instruction_problem,
             prompts,
-            cleanup_prompt,
             static_vocab,
+            active_format,
             format_active,
-            job_tx: Some(job_tx),
-            worker: Some(worker),
+            format_is_custom,
+            cleanup_is_custom,
+            language,
         })
-    }
-
-    /// Apply the model's chat template. S1-mini's merged Qwen3 template emits
-    /// EOG immediately when given a separate system role, so its instruction
-    /// and transcript deliberately share one user turn (matching Superwhisper).
-    ///
-    /// The assistant turn is prefilled with an EMPTY `<think></think>` block —
-    /// Qwen3's canonical non-thinking form. Without it S1-mini sometimes opens a
-    /// real reasoning block and burns the entire generation budget (sized ~1.3×
-    /// the transcript) inside it; the think-strip in `polish` then leaves nothing
-    /// and the runaway guard falls back to raw. The prefill makes generation
-    /// start at the answer: deterministic, faster, and no dead LLM calls.
-    fn template_messages(
-        model: &LlamaModel,
-        chat_template: &LlamaChatTemplate,
-        system_msg: &str,
-        user_msg: &str,
-    ) -> eyre::Result<String> {
-        let combined = format!("{system_msg}\n\n{user_msg}");
-        let messages = vec![LlamaChatMessage::new("user".into(), combined)
-            .map_err(|e| eyre::eyre!("invalid user message: {e:?}"))?];
-        let mut prompt = model
-            .apply_chat_template(chat_template, &messages, true)
-            .map_err(|e| eyre::eyre!("apply_chat_template failed: {e:?}"))?;
-        prompt.push_str("<think>\n\n</think>\n\n");
-        Ok(prompt)
     }
 
     /// True when a DEFINED output-format preset is applied. The daemon reads
@@ -345,6 +578,21 @@ impl TextCleanupEngine {
     /// model, so the two can never disagree about an unknown preset name.
     pub fn format_active(&self) -> bool {
         self.format_active
+    }
+
+    /// Whether the engine can serve free-form instructions (selection
+    /// transforms, custom prompts/formats, tones with no trained register).
+    /// True when the primary model is a general model or an instruction model
+    /// was loaded.
+    pub fn supports_instructions(&self) -> bool {
+        self.instruction_problem.is_none()
+    }
+
+    /// Why instructions are unavailable, or `None` when they are supported. For
+    /// boot/status: a missing or failed instruction model is a clear, actionable
+    /// state, never a silent one.
+    pub fn instruction_problem(&self) -> Option<&str> {
+        self.instruction_problem.as_deref()
     }
 
     /// Clean a raw dictation transcript for readability. Runs on the persistent
@@ -370,14 +618,10 @@ impl TextCleanupEngine {
             .await
     }
 
-    /// Like [`Self::process_transcript_with_vocab`], but optionally appends a
-    /// per-app tone directive to the cleanup prompt based on the app the user is
-    /// dictating into (see [`crate::app_tones`]). When `tone` is `None` the
-    /// behaviour is byte-for-byte identical to
-    /// [`Self::process_transcript_with_vocab`] — the default cleanup prompt. The
-    /// tone fragment is appended after the vocabulary block (and before the
-    /// "Raw transcript:" user message) so it reads as part of the instruction,
-    /// not the transcript.
+    /// Like [`Self::process_transcript_with_vocab`], but with a per-app tone
+    /// hint. S1-mini maps the tone onto its trained styling axes; a tone with no
+    /// trained register routes to the instruction model (or fails clearly).
+    /// General models keep the legacy free-form tone suffix.
     pub async fn process_transcript_with_vocab_tone(
         &self,
         raw_text: &str,
@@ -388,67 +632,19 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let mut prompt_body = self.cleanup_prompt.clone();
-        // Curated corrections first (high-trust, constant → cached prefix), then
-        // the screen-harvested terms in their reserved tail slots.
-        if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
-            let combined = crate::prompts::combined_vocabulary(&self.static_vocab, screen_vocab);
-            if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
-                prompt_body.push_str(&suffix);
+        match self.primary.family {
+            ModelFamily::S1Mini => match self.cleanup_plan(tone) {
+                CleanupPlan::S1(axes) => self.run_s1_cleanup(raw, axes).await,
+                CleanupPlan::Instruction { .. } => {
+                    let slot = self.instruction_slot()?;
+                    self.run_generic_cleanup(slot, raw, screen_vocab, tone).await
+                }
+                CleanupPlan::Refuse { reason } => Err(eyre::eyre!(reason)),
+            },
+            ModelFamily::QwenChat | ModelFamily::GenericInstruct => {
+                self.run_generic_cleanup(&self.primary, raw, screen_vocab, tone)
+                    .await
             }
-        }
-        // Per-app tone directive: appended after the vocabulary block and before
-        // the user transcript message so it steers the style of the whole
-        // cleanup. `None` leaves the default prompt untouched.
-        if let Some(tone) = tone {
-            prompt_body.push_str(&crate::app_tones::tone_suffix(tone));
-        }
-        // Cleanup never summarizes (the prompt forbids it), so the cleaned text
-        // tracks the input length — stripping filler makes it a touch shorter,
-        // expanding contractions a touch longer. Budget off the raw transcript
-        // with headroom instead of a fixed 256-token cap, which used to chop any
-        // dictation past ~190 words mid-sentence.
-        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        // Generate keeping the model's line breaks, then decide whether to keep
-        // them: an active format preset, or an AUTO-DETECTED list (the model
-        // formatted an enumeration as 1./2./3. or bullets), preserves structure;
-        // ordinary prose flattens to a single line as dictation always has.
-        let cleaned = self
-            .run_chat(
-                prompt_body,
-                format!("Raw transcript:\n{raw}"),
-                budget,
-                true,
-                false,
-            )
-            .await?;
-        // Deterministic mechanics the 1B does unreliably (leading "um", lone
-        // lowercase "i") — cheap, exact, and always safe on speech.
-        let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
-        let cleaned = if self.format_active || crate::text_polish::looks_like_list(&cleaned) {
-            cleaned
-        } else {
-            crate::text_polish::flatten_to_line(&cleaned)
-        };
-        let deterministic = crate::text_polish::fix_speech_mechanics(raw);
-        // Runaway guard: a 1B can occasionally hallucinate — drop everything, or
-        // balloon a short utterance into paragraphs, or leak chat-template
-        // markers past `polish`. Cleanup never legitimately expands much, so on
-        // any of those, fall back to the raw transcript rather than inject
-        // garbage. Near-zero cost; protects the worst case. (The daemon still
-        // logs the milder shrink case separately.)
-        if cleanup_ran_away(raw, &cleaned) {
-            eprintln!(
-                "[warn] cleanup runaway (raw {} → {} chars); using raw transcript",
-                raw.chars().count(),
-                cleaned.chars().count()
-            );
-            return Ok(deterministic);
-        }
-        if cleaned.trim() == raw && deterministic != raw {
-            Ok(deterministic)
-        } else {
-            Ok(cleaned)
         }
     }
 
@@ -456,16 +652,13 @@ impl TextCleanupEngine {
     /// cleaned so far as left-context. This is the streaming-cleanup primitive:
     /// the daemon can clean each sentence the moment a VAD pause closes it (during
     /// the hold), so on key release only the final segment is outstanding — the
-    /// post-release cleanup wait stops scaling with utterance length. Validated in
-    /// `examples/vad_stream_lab.rs`: per-segment + left-context tracks whole-buffer
-    /// cleanup quality, while naive context-free chunking does not.
+    /// post-release cleanup wait stops scaling with utterance length.
     ///
-    /// Identical framing/budget to [`Self::process_transcript_with_vocab`] (same
-    /// cached instruction prefix + vocab block), plus a short plain-text reference
-    /// to the tail of the prior cleaned text. The reference is deliberately NOT
-    /// quote-delimited: Gemma 1B echoes `"""`/`"` fences into its output (observed
-    /// as stray `""` in the lab). `prior_cleaned` empty ⇒ behaves like the first
-    /// segment (no context clause).
+    /// S1-mini's published contract has no room for a left-context clause
+    /// appended to the trained control line, so an S1 segment uses the exact
+    /// trained contract (the segment boundary is still streamed; only the generic
+    /// path feeds a prior-text tail). A general model keeps the left-context
+    /// clause that tracks whole-buffer cleanup quality.
     #[cfg(feature = "cleaner")]
     pub async fn process_segment_with_context(
         &self,
@@ -477,34 +670,43 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let mut prompt_body = self.cleanup_prompt.clone();
-        if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
-            let combined = crate::prompts::combined_vocabulary(&self.static_vocab, screen_vocab);
-            if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
-                prompt_body.push_str(&suffix);
+        match self.primary.family {
+            ModelFamily::S1Mini => match self.cleanup_plan(None) {
+                CleanupPlan::S1(axes) => self.run_s1_cleanup(raw, axes).await,
+                CleanupPlan::Instruction { .. } => {
+                    let slot = self.instruction_slot()?;
+                    self.run_generic_segment(slot, raw, screen_vocab, prior_cleaned)
+                        .await
+                }
+                CleanupPlan::Refuse { reason } => Err(eyre::eyre!(reason)),
+            },
+            ModelFamily::QwenChat | ModelFamily::GenericInstruct => {
+                self.run_generic_segment(&self.primary, raw, screen_vocab, prior_cleaned)
+                    .await
             }
         }
-        // Tail (~240 chars) of the cleaned-so-far text for casing/flow continuity.
-        let prior = prior_cleaned.trim();
-        if !prior.is_empty() {
-            let chars: Vec<char> = prior.chars().collect();
-            let start = chars.len().saturating_sub(240);
-            let tail: String = chars[start..].iter().collect();
-            prompt_body.push_str(&format!(
-                "\n\nFor context, the preceding text (already cleaned, do not repeat it) ended with: {tail}\nClean only the new fragment below and output just the cleaned new fragment."
-            ));
-        }
-        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
-        // Keep line breaks only if this segment is itself a list (a list spoken
-        // in one breath lands in one segment); otherwise flatten. Multi-segment
-        // lists (items separated by long pauses) won't unify — known limitation.
-        let cleaned = self
-            .run_chat(
-                prompt_body,
+    }
+
+    /// Clean one segment on a general model, with the prior cleaned tail as
+    /// plain-text context (the reference is deliberately NOT quote-delimited:
+    /// small models echo quote fences into their output).
+    async fn run_generic_segment(
+        &self,
+        slot: &ChatSlot,
+        raw: &str,
+        screen_vocab: &[String],
+        prior_cleaned: &str,
+    ) -> eyre::Result<String> {
+        let system = self.build_generic_prompt(screen_vocab, None, Some(prior_cleaned));
+        let cleaned = slot
+            .run(
+                system,
                 format!("Raw transcript:\n{raw}"),
-                budget,
+                cleanup_budget(slot, raw),
                 true,
                 false,
+                false,
+                llm_contract::GENERIC_TEMPERATURE,
             )
             .await?;
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
@@ -513,6 +715,9 @@ impl TextCleanupEngine {
         } else {
             crate::text_polish::flatten_to_line(&cleaned)
         };
+        if cleaned.trim().is_empty() && raw_is_filler_only(raw) {
+            return Ok(String::new());
+        }
         if cleanup_ran_away(raw, &cleaned) {
             eprintln!(
                 "[warn] segment cleanup runaway (raw {} → {} chars); using raw",
@@ -524,14 +729,153 @@ impl TextCleanupEngine {
         Ok(cleaned)
     }
 
-    /// Rough token count for sizing generation budgets / the context window.
-    /// Uses the model's own tokenizer; falls back to a chars/3 estimate if
-    /// tokenization fails (never on the hot path, but keeps this infallible).
-    fn token_estimate(&self, text: &str) -> usize {
-        self.model
-            .str_to_token(text, AddBos::Never)
-            .map(|t| t.len())
-            .unwrap_or_else(|_| text.chars().count() / 3)
+    /// The routing decision for one S1-mini cleanup call.
+    fn cleanup_plan(&self, tone: Option<&str>) -> CleanupPlan {
+        llm_contract::plan_cleanup(
+            &llm_contract::CleanupControls {
+                format: self.active_format.as_deref(),
+                format_is_custom: self.format_is_custom,
+                format_is_defined: self.format_active,
+                cleanup_prompt_is_custom: self.cleanup_is_custom,
+                tone,
+                language: &self.language,
+            },
+            self.supports_instructions(),
+        )
+    }
+
+    /// The instruction model, or an actionable error explaining why no
+    /// configured model can serve a free-form instruction.
+    fn instruction_slot(&self) -> eyre::Result<&ChatSlot> {
+        if let Some(slot) = self.instruction.as_ref() {
+            return Ok(slot);
+        }
+        if self.instruction_problem.is_none() && self.primary.family != ModelFamily::S1Mini {
+            return Ok(&self.primary);
+        }
+        Err(eyre::eyre!("{}", self.instruction_problem.as_deref().unwrap_or("no instruction model is configured")))
+    }
+
+    /// Run S1-mini's exact trained contract for one transcript.
+    async fn run_s1_cleanup(&self, raw: &str, axes: S1Axes) -> eyre::Result<String> {
+        let user = llm_contract::s1_user_message(axes, raw);
+        let budget = cleanup_budget(&self.primary, raw);
+        let cleaned = self
+            .primary
+            .run(
+                llm_contract::S1_SYSTEM_PROMPT.to_string(),
+                user,
+                budget,
+                true,
+                false,
+                false,
+                llm_contract::S1_TEMPERATURE,
+            )
+            .await?;
+        Ok(self.finish_cleanup(raw, &cleaned))
+    }
+
+    /// Run a free-form cleanup instruction on a general model.
+    async fn run_generic_cleanup(
+        &self,
+        slot: &ChatSlot,
+        raw: &str,
+        screen_vocab: &[String],
+        tone: Option<&str>,
+    ) -> eyre::Result<String> {
+        let system = self.build_generic_prompt(screen_vocab, tone, None);
+        let cleaned = slot
+            .run(
+                system,
+                format!("Raw transcript:\n{raw}"),
+                cleanup_budget(slot, raw),
+                true,
+                false,
+                false,
+                llm_contract::GENERIC_TEMPERATURE,
+            )
+            .await?;
+        Ok(self.finish_cleanup(raw, &cleaned))
+    }
+
+    /// Build the free-form cleanup system prompt: the active format/cleanup
+    /// prompt, the curated + screen vocabulary, an optional tone directive, and
+    /// an optional left-context clause.
+    fn build_generic_prompt(
+        &self,
+        screen_vocab: &[String],
+        tone: Option<&str>,
+        prior_cleaned: Option<&str>,
+    ) -> String {
+        let mut prompt_body = self
+            .prompts
+            .cleanup_for(self.active_format.as_deref())
+            .to_string();
+        // Curated corrections first (high-trust, constant → cached prefix), then
+        // the screen-harvested terms in their reserved tail slots.
+        if !self.static_vocab.is_empty() || !screen_vocab.is_empty() {
+            let combined = crate::prompts::combined_vocabulary(&self.static_vocab, screen_vocab);
+            if let Some(suffix) = crate::prompts::vocabulary_suffix(&combined) {
+                prompt_body.push_str(&suffix);
+            }
+        }
+        // Per-app tone directive: after the vocabulary block so it steers the
+        // style of the whole cleanup. `None` leaves the prompt untouched.
+        if let Some(tone) = tone {
+            prompt_body.push_str(&crate::app_tones::tone_suffix(tone));
+        }
+        // Tail (~240 chars) of the cleaned-so-far text for casing/flow
+        // continuity. Deliberately not quote-delimited: the model echoes quote
+        // fences into its output otherwise.
+        if let Some(prior) = prior_cleaned {
+            let prior = prior.trim();
+            if !prior.is_empty() {
+                let chars: Vec<char> = prior.chars().collect();
+                let start = chars.len().saturating_sub(240);
+                let tail: String = chars[start..].iter().collect();
+                prompt_body.push_str(&format!(
+                    "\n\nFor context, the preceding text (already cleaned, do not repeat it) ended with: {tail}\nClean only the new fragment below and output just the cleaned new fragment."
+                ));
+            }
+        }
+        prompt_body
+    }
+
+    /// Shared post-pass for a cleanup result: deterministic speech mechanics,
+    /// list/prose shaping, the filler-only empty allowance, and the runaway
+    /// guard.
+    fn finish_cleanup(&self, raw: &str, cleaned: &str) -> String {
+        let cleaned = crate::text_polish::fix_speech_mechanics(cleaned);
+        let cleaned = if self.format_active || crate::text_polish::looks_like_list(&cleaned) {
+            cleaned
+        } else {
+            crate::text_polish::flatten_to_line(&cleaned)
+        };
+        // Filler-only speech correctly normalizes to an empty string; that is a
+        // valid result, not a runaway. Any other empty output from non-empty
+        // input still trips the guard below.
+        if cleaned.trim().is_empty() && raw_is_filler_only(raw) {
+            return String::new();
+        }
+        let deterministic = crate::text_polish::fix_speech_mechanics(raw);
+        // Runaway guard: a small model can occasionally hallucinate — drop
+        // everything, balloon a short utterance into paragraphs, or leak
+        // chat-template markers past `polish`. Cleanup never legitimately
+        // expands much, so on any of those fall back to the raw transcript
+        // rather than inject garbage.
+        if cleanup_ran_away(raw, &cleaned) {
+            eprintln!(
+                "[warn] cleanup runaway (raw {} → {} chars); using raw transcript",
+                raw.chars().count(),
+                cleaned.chars().count()
+            );
+            return deterministic;
+        }
+        if cleaned.trim() == raw && deterministic != raw {
+            deterministic
+        } else {
+            cleaned
+        }
     }
 
     /// Evaluate an arbitrary candidate **cleanup** system prompt against a raw
@@ -552,14 +896,17 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
+        let budget = cleanup_budget(&self.primary, raw);
         let cleaned = self
-            .run_chat(
+            .primary
+            .run(
                 cleanup_prompt.to_string(),
                 format!("Raw transcript:\n{raw}"),
                 budget,
                 preserve_newlines,
                 false,
+                false,
+                llm_contract::GENERIC_TEMPERATURE,
             )
             .await?;
         // Mirror production: apply the same deterministic speech-mechanics pass
@@ -588,14 +935,17 @@ impl TextCleanupEngine {
         if raw.is_empty() {
             return Ok(String::new());
         }
-        let budget = (self.token_estimate(raw) as f32 * 1.3) as i32 + 64;
+        let budget = cleanup_budget(&self.primary, raw);
         let cleaned = self
-            .run_chat(
+            .primary
+            .run(
                 cleanup_prompt.to_string(),
                 format!("Raw transcript:\n{raw}"),
                 budget,
                 preserve_newlines,
                 true,
+                false,
+                llm_contract::GENERIC_TEMPERATURE,
             )
             .await?;
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
@@ -624,7 +974,16 @@ impl TextCleanupEngine {
         }
         let user_msg = format!("Instruction: {instruction}\n\nText:\n{selection}");
         let budget = (selection.chars().count() + 256).clamp(256, 1536) as i32;
-        self.run_chat(transform_prompt.to_string(), user_msg, budget, true, false)
+        self.instruction_slot()?
+            .run(
+                transform_prompt.to_string(),
+                user_msg,
+                budget,
+                true,
+                false,
+                false,
+                llm_contract::GENERIC_TEMPERATURE,
+            )
             .await
     }
 
@@ -632,7 +991,12 @@ impl TextCleanupEngine {
     /// This is the transform mode (Shift + push-to-talk): the user selects
     /// text, speaks an instruction ("make this concise", "translate to
     /// Spanish", "turn into bullet points"), and the model rewrites it in
-    /// place. Same warm Gemma engine as cleanup, different prompt.
+    /// place.
+    ///
+    /// An instruction-capable slot serves it: the primary model when it is a
+    /// general chat model, otherwise the configured instruction model. With
+    /// only an S1-mini normalizer loaded this returns an actionable error — it
+    /// never pretends a normalizer can follow a free-form instruction.
     pub async fn transform(&self, instruction: &str, selection: &str) -> eyre::Result<String> {
         let instruction = instruction.trim();
         if instruction.is_empty() || selection.is_empty() {
@@ -641,6 +1005,7 @@ impl TextCleanupEngine {
         if let Some(problem) = transform_input_problem(selection) {
             return Err(eyre::eyre!(problem));
         }
+        let slot = self.instruction_slot()?;
         let user_msg = format!("Instruction: {instruction}\n\nText:\n{selection}");
         // Give the output room for a rewrite that's somewhat longer than the
         // input (e.g. "expand this"), capped to keep within the context window.
@@ -648,60 +1013,16 @@ impl TextCleanupEngine {
         // Preserve line structure: transforms may legitimately be lists/paras.
         // The result replaces the selection, so a rewrite that stopped at the
         // token budget (not at the model's own end) is an error, not a result.
-        self.run_chat_with(
+        slot.run(
             self.prompts.transform.clone(),
             user_msg,
             budget,
             true,
             false,
             true,
+            llm_contract::GENERIC_TEMPERATURE,
         )
         .await
-    }
-
-    /// Build the templated prompt and hand it to the persistent-context worker,
-    /// awaiting the polished result. Works for Gemma / Llama 3 / Qwen-ChatML /
-    /// SmolLM without per-family hardcoding (the template comes from the GGUF).
-    async fn run_chat(
-        &self,
-        system_msg: String,
-        user_msg: String,
-        max_tokens: i32,
-        preserve_newlines: bool,
-        no_reuse: bool,
-    ) -> eyre::Result<String> {
-        self.run_chat_with(system_msg, user_msg, max_tokens, preserve_newlines, no_reuse, false)
-            .await
-    }
-
-    /// [`Self::run_chat`] with the truncation policy explicit (see
-    /// `Job::fail_on_truncation`).
-    async fn run_chat_with(
-        &self,
-        system_msg: String,
-        user_msg: String,
-        max_tokens: i32,
-        preserve_newlines: bool,
-        no_reuse: bool,
-        fail_on_truncation: bool,
-    ) -> eyre::Result<String> {
-        let prompt =
-            Self::template_messages(&self.model, &self.chat_template, &system_msg, &user_msg)?;
-        let (reply, rx) = oneshot::channel();
-        self.job_tx
-            .as_ref()
-            .ok_or_else(|| eyre::eyre!("cleanup worker is gone"))?
-            .send(Job {
-                prompt,
-                max_tokens,
-                preserve_newlines,
-                no_reuse,
-                fail_on_truncation,
-                reply,
-            })
-            .map_err(|_| eyre::eyre!("cleanup worker is gone"))?;
-        rx.await
-            .map_err(|_| eyre::eyre!("cleanup worker dropped the reply"))?
     }
 }
 
@@ -769,12 +1090,14 @@ fn run_worker(
             job.preserve_newlines,
             job.no_reuse,
             job.fail_on_truncation,
+            job.temperature,
         );
         let _ = job.reply.send(res);
     }
 }
 
 /// Decode one job against the persistent context, reusing the KV-cache prefix.
+#[allow(clippy::too_many_arguments)]
 fn run_job(
     model: &LlamaModel,
     ctx: &mut llama_cpp_2::context::LlamaContext,
@@ -784,6 +1107,7 @@ fn run_job(
     preserve_newlines: bool,
     no_reuse: bool,
     fail_on_truncation: bool,
+    temperature: f32,
 ) -> eyre::Result<String> {
     let tokens = model
         .str_to_token(&prompt, AddBos::Always)
@@ -803,13 +1127,29 @@ fn run_job(
     // Reuse the KV prefix shared with the last prompt. Cap at prompt_len-1 so at
     // least one prompt token is (re)decoded — we need fresh logits to sample
     // from even when the prompt is byte-identical to the previous one.
-    let reuse = plan_reuse(&tokens, resident, no_reuse);
+    let mut reuse = plan_reuse(&tokens, resident, no_reuse);
 
     // Wipe everything from `reuse` onward (the divergent tail of the previous
     // prompt plus whatever it generated). KV [0, reuse) holds identical tokens
-    // at identical positions, so it stays valid.
-    ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
-        .map_err(|e| eyre::eyre!("clear_kv_cache_seq failed: {e:?}"))?;
+    // at identical positions, so it stays valid. Hybrid/recurrent memory
+    // (Mamba, RWKV, linear-attention hybrids) cannot drop PART of a sequence:
+    // `clear_kv_cache_seq` reports `Ok(false)` and the state it would leave
+    // behind is not the prefix we think it is. In that case reset the whole
+    // cache and re-prefill from scratch — never reuse state the cache no longer
+    // holds.
+    if reuse == 0 {
+        ctx.clear_kv_cache();
+    } else {
+        let partial_cleared = match ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None) {
+            Ok(cleared) => cleared,
+            Err(_) => false,
+        };
+        let (next_reuse, full_reset) = reuse_after_clear(partial_cleared, reuse);
+        reuse = next_reuse;
+        if full_reset {
+            ctx.clear_kv_cache();
+        }
+    }
     // Bookkeeping follows the cache at every step. `resident` used to be
     // updated only on success, so a job that failed after this wipe left it
     // describing tokens that were gone, and the NEXT job reused a prefix the
@@ -835,10 +1175,16 @@ fn run_job(
     // Generated tokens sit beyond it and are wiped by the next job's clear.
     *resident = tokens;
 
-    // Low-temperature fixed-seed sampling is deterministic while avoiding the
-    // immediate EOG produced by greedy/default Qwen sampling on S1-mini.
-    let mut sampler =
-        LlamaSampler::chain_simple([LlamaSampler::temp(0.2), LlamaSampler::dist(1234)]);
+    // Greedy decoding is deterministic and is what S1-mini was trained for
+    // (`temperature == 0.0`). A general model gets a low-temperature fixed-seed
+    // sample. Never the model's metadata defaults (S1-mini inherits Qwen3's
+    // temp 0.6, which reintroduces variance the publisher explicitly warns
+    // against).
+    let mut sampler = if temperature <= 0.0 {
+        LlamaSampler::chain_simple([LlamaSampler::greedy()])
+    } else {
+        LlamaSampler::chain_simple([LlamaSampler::temp(temperature), LlamaSampler::dist(1234)])
+    };
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut out = String::new();
@@ -889,7 +1235,29 @@ fn run_job(
 #[cfg(test)]
 mod tests {
     use super::cleanup_ran_away;
-    use super::{plan_reuse, prompt_len_problem, transform_input_problem, MAX_CTX, MAX_TRANSFORM_CHARS};
+    use super::{
+        plan_reuse, prompt_len_problem, raw_is_filler_only, reuse_after_clear,
+        transform_input_problem, MAX_CTX, MAX_TRANSFORM_CHARS,
+    };
+
+    #[test]
+    fn hybrid_partial_clear_refusal_resets_the_whole_cache() {
+        // Normal memory: the divergent tail is cleared, the prefix is reused.
+        assert_eq!(reuse_after_clear(true, 7), (7, false));
+        // Hybrid/recurrent memory refused the partial removal: reuse nothing and
+        // reset fully, rather than trust state the cache no longer holds.
+        assert_eq!(reuse_after_clear(false, 7), (0, true));
+        assert_eq!(reuse_after_clear(false, 0), (0, true));
+    }
+
+    #[test]
+    fn filler_only_input_may_normalize_to_empty() {
+        assert!(raw_is_filler_only("um"));
+        assert!(raw_is_filler_only("  Um, uh... hmm "));
+        assert!(!raw_is_filler_only("um, ship it"));
+        assert!(!raw_is_filler_only(""));
+        assert!(!raw_is_filler_only("I mean it"));
+    }
 
     #[test]
     fn reuse_never_exceeds_what_a_failed_job_left_in_the_cache() {

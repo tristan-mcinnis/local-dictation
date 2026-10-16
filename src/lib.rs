@@ -3,6 +3,8 @@ pub mod app_tones;
 pub mod cancel;
 pub mod config_io;
 pub mod audio;
+pub mod llm_contract;
+pub mod latency;
 pub mod audio_duck;
 #[cfg(feature = "cohere-mlx")]
 pub mod cohere_mlx;

@@ -15,12 +15,20 @@
 //! budget. We also guard the restore with the pasteboard's `changeCount` so a
 //! user copying something during the paste-settle window isn't clobbered (see
 //! [`paste_via_clipboard`]).
+//!
+//! Latency: `paste_via_clipboard` *queues* the settle + restore on a background
+//! thread that keeps holding the clipboard gate, so the dictation worker returns
+//! as soon as Cmd+V is posted and can start the next capture/ASR instead of
+//! sleeping through the settle. The next clipboard write still waits on the gate
+//! until the restore finishes, so ordering and the "don't clobber a fresh copy"
+//! guard are unchanged. The settle is a *queued* deadline, not proof the text
+//! visibly landed.
 
 use arboard::Clipboard;
 use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Outcome of a clipboard paste attempt. The paste is a GLOBAL Cmd+V that lands
 /// in the OS-frontmost app, so the delivery guard decides whether it may fire.
@@ -76,21 +84,184 @@ fn paste_settle_ms(text_chars: usize) -> u64 {
     }
 }
 
-/// Serialises every exclusive pasteboard mutation by this process. A clipboard
-/// restore (run on a detached thread via [`restore_clipboard`]) must never
-/// interleave with a fresh paste's `set_text → Cmd+V` critical section — if it
-/// did, a restore could clobber the next dictation's text before its Cmd+V
-/// consumed it. Two concurrent restores must likewise not interleave (last one
-/// wins, never a torn write). The paste critical section and every restore hold
-/// this same lock, so the two kinds of write are fully ordered.
-static CLIPBOARD_WRITE_MUTEX: Mutex<()> = Mutex::new(());
+/// Serialises every exclusive pasteboard mutation by this process and keeps the
+/// post-`Cmd+V` settle + restore transaction ordered against the next write.
+///
+/// A plain `MutexGuard` cannot be handed to the restore thread (it is not
+/// `Send`), so the gate is a tiny hand-rolled semaphore: a `Mutex<bool>` plus a
+/// `Condvar`. [`ClipboardPermit`] is an owned, `Send` RAII handle that releases
+/// the gate on drop and can be moved into the background transaction.
+struct ClipboardGate {
+    held: Mutex<bool>,
+    idle: Condvar,
+}
+
+/// The process-wide gate every clipboard writer shares: `paste_via_clipboard`,
+/// `copy_only`, `copy_selection_via_clipboard` and the deferred restore all take
+/// it, so their pasteboard writes never interleave.
+static CLIPBOARD_GATE: OnceLock<Arc<ClipboardGate>> = OnceLock::new();
+
+fn clipboard_gate() -> &'static Arc<ClipboardGate> {
+    CLIPBOARD_GATE.get_or_init(ClipboardGate::shared)
+}
+
+impl ClipboardGate {
+    fn shared() -> Arc<Self> {
+        Arc::new(Self { held: Mutex::new(false), idle: Condvar::new() })
+    }
+
+    /// Block until the gate is free, then take it. The returned permit releases
+    /// it on drop and may be moved to another thread.
+    fn acquire(self: &Arc<Self>) -> ClipboardPermit {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            held = self.idle.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        *held = true;
+        ClipboardPermit { gate: Arc::clone(self) }
+    }
+
+    /// Wait at most `timeout` for the gate; `None` on timeout. Test seam: it lets
+    /// a test observe the release deterministically without a fixed sleep.
+    #[cfg(test)]
+    fn acquire_timeout(self: &Arc<Self>, timeout: Duration) -> Option<ClipboardPermit> {
+        let deadline = Instant::now() + timeout;
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, _timed_out) = self
+                .idle
+                .wait_timeout(held, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+            held = guard;
+        }
+        *held = true;
+        Some(ClipboardPermit { gate: Arc::clone(self) })
+    }
+
+    /// Take the gate only if it is free right now; `None` when a transaction
+    /// holds it. Test seam for asserting the gate stays held.
+    #[cfg(test)]
+    fn try_acquire(self: &Arc<Self>) -> Option<ClipboardPermit> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if *held {
+            return None;
+        }
+        *held = true;
+        Some(ClipboardPermit { gate: Arc::clone(self) })
+    }
+
+    /// Non-blocking, fail-closed: is the gate held right now (a paste in flight
+    /// or a settle + restore transaction pending)? Returns `true` if the state
+    /// cannot be read, so a caller errs toward "busy".
+    fn is_held(&self) -> bool {
+        match self.held.lock() {
+            Ok(held) => *held,
+            Err(_) => true,
+        }
+    }
+
+    fn release(&self) {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        *held = false;
+        self.idle.notify_all();
+    }
+}
+
+/// Owned RAII permit for [`ClipboardGate`]. `Send` (it holds an `Arc`, not a
+/// `MutexGuard`), so it can move to the background restore thread; always
+/// releases the gate on drop, including while unwinding from a panic.
+struct ClipboardPermit {
+    gate: Arc<ClipboardGate>,
+}
+
+impl Drop for ClipboardPermit {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+/// Work that must finish under the clipboard gate after `Cmd+V`: the settle wait
+/// and the snapshot restore. Boxed so the whole transaction can move to a
+/// background thread.
+type DeferredPaste = Box<dyn FnOnce() + Send + 'static>;
+
+/// A queued post-paste transaction. Holds the gate permit until `work` returns,
+/// so the next clipboard write is ordered after the restore (or after the
+/// settle, when there is nothing to restore).
+struct ClipboardTransaction {
+    _permit: ClipboardPermit,
+    work: DeferredPaste,
+}
+
+impl ClipboardTransaction {
+    fn new(permit: ClipboardPermit, work: DeferredPaste) -> Self {
+        Self { _permit: permit, work }
+    }
+
+    fn run(self) {
+        (self.work)();
+        // `self._permit` drops here, releasing the gate *after* the work.
+    }
+}
+
+/// Queue `tx` and return immediately, so the dictation worker is free to start
+/// the next capture/ASR instead of sleeping through the paste settle. The gate
+/// stays held until `work` finishes. If the thread cannot be created, run the
+/// transaction synchronously (still under the permit): the settle and restore
+/// still happen, the gate is still released, and nothing is clobbered. A panic
+/// inside `work` unwinds through [`ClipboardTransaction`], releasing the gate.
+fn run_transaction_async(tx: ClipboardTransaction) {
+    // The slot lets a failed spawn reclaim the transaction: the closure handed
+    // to `spawn` owns only this clone, not the transaction itself.
+    let slot = Arc::new(Mutex::new(Some(tx)));
+    let thread_slot = Arc::clone(&slot);
+    let spawned = std::thread::Builder::new()
+        .name("clipboard-restore".to_string())
+        .spawn(move || {
+            let tx = thread_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(tx) = tx {
+                tx.run();
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("[clipboard] restore thread spawn failed ({e}); settling synchronously");
+        if let Some(tx) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            tx.run();
+        }
+    }
+}
 
 /// A deliberate recovery copy: serialize with any pending pasteboard restore,
 /// write plain text, and never synthesize keys or activate a target app.
 pub fn copy_only(text: &str) -> eyre::Result<()> {
-    let _guard = CLIPBOARD_WRITE_MUTEX.lock().map_err(|_| eyre::eyre!("clipboard write lock unavailable"))?;
+    let _permit = clipboard_gate().acquire();
     let mut clipboard = Clipboard::new().map_err(|e| eyre::eyre!("clipboard unavailable: {e}"))?;
     clipboard.set_text(text.to_owned()).map_err(|e| eyre::eyre!("clipboard copy failed: {e}"))
+}
+
+/// Non-blocking, fail-closed: is a clipboard paste in flight, or is a settle +
+/// snapshot-restore transaction still pending? Callers that must not race a
+/// pending paste (the Undo render/handler in the UI worker) gate on
+/// `!transaction_pending()`.
+pub fn transaction_pending() -> bool {
+    clipboard_gate().is_held()
+}
+
+/// Block until any in-flight paste has posted Cmd+V and its settle +
+/// snapshot-restore transaction has finished, then return. Acquires and
+/// immediately releases the gate, so an idle gate is a no-op.
+///
+/// This waits out the *consume/restore window* only. It is **not pixel proof**
+/// that the pasted text visibly landed: the target app's render is not
+/// observable from here. Use it to order a trailing key (Enter/Tab) after a
+/// paste, never as a delivery guarantee.
+pub fn wait_for_pending_transaction() {
+    let permit = clipboard_gate().acquire();
+    drop(permit);
 }
 
 /// True when the pasteboard's `changeCount` advanced past our own write — so we
@@ -248,36 +419,52 @@ fn restore_pasteboard(snapshot: &ClipboardSnapshot) -> bool {
 /// so clipboard managers don't record the dictation. One `clearContents` →
 /// `declareTypes` → write cycle, exactly as nspasteboard.org specifies.
 fn write_text_transient(text: &str) -> eyre::Result<()> {
-    use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+    write_text_transient_tracked(text, &std::cell::Cell::new(None))
+}
+
+fn write_text_transient_tracked(text: &str, owned_count: &std::cell::Cell<Option<isize>>) -> eyre::Result<()> {
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSPasteboardWriting};
     use objc2_foundation::{NSArray, NSData, NSString};
 
-    let pb = NSPasteboard::generalPasteboard();
-    pb.clearContents();
-
+    // Prepare every flavour before touching the general pasteboard. A failed
+    // item write cannot erase the user's clipboard or publish half an item.
+    let item = NSPasteboardItem::new();
     let text_type = unsafe { NSPasteboardTypeString };
-    let types: Vec<_> = declared_write_types(&text_type.to_string())
-        .iter()
-        .map(|t| NSString::from_str(t))
-        .collect();
-    // SAFETY: no owner — we set every declared type's data below, so nothing
-    // is ever lazily requested from us.
-    unsafe { pb.declareTypes_owner(&NSArray::from_retained_slice(&types), None) };
-
-    if !pb.setString_forType(&NSString::from_str(text), text_type) {
-        return Err(eyre::eyre!("NSPasteboard setString:forType: failed"));
+    eyre::ensure!(item.setString_forType(&NSString::from_str(text), text_type), "could not prepare clipboard text");
+    for marker in declared_write_types(&text_type.to_string()).into_iter().skip(1) {
+        eyre::ensure!(item.setData_forType(&NSData::new(), &NSString::from_str(&marker)), "could not prepare clipboard marker");
     }
-    for marker in TRANSIENT_MARKER_TYPES {
-        // Empty data: the marker's presence is the whole signal.
-        pb.setData_forType(Some(&NSData::new()), &NSString::from_str(marker));
-    }
+    let writable: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*item);
+    let pb = NSPasteboard::generalPasteboard();
+    owned_count.set(Some(pb.clearContents()));
+    eyre::ensure!(pb.writeObjects(&NSArray::from_slice(&[writable])), "could not publish clipboard text");
+    owned_count.set(Some(pb.changeCount()));
     Ok(())
 }
 
+fn rollback_on_error<T, E>(operation: impl FnOnce() -> Result<T, E>, rollback: impl FnOnce()) -> Result<T, E> {
+    let result = operation();
+    if result.is_err() { rollback(); }
+    result
+}
+
+fn write_preserving_snapshot(text: &str, saved: &ClipboardSnapshot) -> eyre::Result<()> {
+    let owned_count = std::cell::Cell::new(None);
+    rollback_on_error(|| write_text_transient_tracked(text, &owned_count), || {
+        // Never guess ownership from a fresh count after a failed write: that
+        // could belong to a concurrent user copy. Use our recorded claim only.
+        if let Some(count) = owned_count.get() { restore_snapshot_if_owned(saved, Some(count)); }
+    })
+}
+
 pub fn paste_via_clipboard(text: &str, expected_pid: Option<i32>) -> eyre::Result<PasteOutcome> {
-    // Snapshot the whole pasteboard and set ours under the write lock. The
-    // lock keeps a pending background restore (from a previous dictation) from
-    // clobbering the pasteboard between our set and the target consuming it.
-    let _guard = CLIPBOARD_WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Take the gate before touching the pasteboard: if a previous dictation's
+    // settle + restore is still running, this waits for it. The wait is timed
+    // only for the timing log below.
+    let queued_at = Instant::now();
+    let permit = clipboard_gate().acquire();
+    let gate_wait_ms = queued_at.elapsed().as_millis();
 
     // Fail-closed foreground guard, immediately before the Cmd+V: a global
     // Cmd+V lands in the OS-frontmost app, so it must not be posted unless the
@@ -292,49 +479,65 @@ pub fn paste_via_clipboard(text: &str, expected_pid: Option<i32>) -> eyre::Resul
 
     let saved = snapshot_pasteboard();
 
-    write_text_transient(text)?;
+    write_preserving_snapshot(text, &saved)?;
 
     // changeCount right after our write. Cmd+V only reads the pasteboard, so this
     // stays put unless the user copies something during the settle wait below.
     let our_count = pasteboard_change_count();
 
-    // Pasteboard access can itself yield. Check again at the delivery boundary;
-    // on refusal leave the dictation available for a deliberate manual paste.
+    // Pasteboard access can itself yield. Check again at the delivery boundary.
+    // A refusal here means our transient text is already on the clipboard but no
+    // Cmd+V was sent, so put the user's snapshot back now, still under the
+    // permit — the changeCount guard means a concurrent user copy still wins.
     if !crate::injector::clipboard_target_is_frontmost(expected_pid, crate::injector::frontmost_pid()) {
+        eprintln!("[clipboard] refusing Cmd+V after write; restoring snapshot, no keys sent");
+        restore_clipboard_inner(saved, our_count);
         return Ok(PasteOutcome::RefusedForeground);
     }
-    synthesize_cmd_v()?;
+    rollback_on_error(synthesize_cmd_v, || restore_snapshot_if_owned(&saved, our_count))?;
 
-    // Let the OS + target app actually consume the Cmd+V before restoring. This
-    // stays on the worker: the consume-window also marshals the next dictation's
-    // set_text until this paste is consumed, so a quick follow-up can't overwrite
-    // text this paste hasn't pulled yet.
-    std::thread::sleep(Duration::from_millis(paste_settle_ms(text.chars().count())));
-    drop(_guard);
+    // Cmd+V is queued. Hand the settle + restore to a background thread that
+    // keeps holding `permit`, so this function returns now — the worker can start
+    // the next capture/ASR while the next clipboard write still waits on the gate
+    // for the restore. We do NOT claim the text visibly landed: only that Cmd+V
+    // was posted and the restore is ordered after the settle.
+    let settle_ms = paste_settle_ms(text.chars().count());
+    eprintln!("[clipboard] paste queued: gate_wait_ms={gate_wait_ms} settle_ms={settle_ms}");
 
-    if !saved.is_empty() {
-        // Detach the restore so the worker returns immediately — a ~1 s restore
-        // must not pin the next dictation or the UI clear. Re-reading the
-        // changeCount on the restore thread honours the "don't clobber a fresh
-        // copy" guard, and the write lock keeps restores/pastes fully ordered.
-        std::thread::spawn(move || restore_clipboard(saved, our_count));
-    }
-    // If the clipboard was empty before, leave our injected text on it (better
-    // than wiping it — gives the user a manual paste fallback).
+    let work: DeferredPaste = Box::new(move || {
+        if settle_ms > 0 {
+            std::thread::sleep(Duration::from_millis(settle_ms));
+        }
+        // If the clipboard was empty before, leave our injected text on it
+        // (better than wiping it — gives the user a manual paste fallback). The
+        // settle above still ran, so the gate stayed held for the consume window.
+        if !saved.is_empty() {
+            let restored_at = Instant::now();
+            restore_clipboard_inner(saved, our_count);
+            eprintln!(
+                "[clipboard] restore finished in {} ms",
+                restored_at.elapsed().as_millis()
+            );
+        }
+    });
+    run_transaction_async(ClipboardTransaction::new(permit, work));
     Ok(PasteOutcome::Delivered)
 }
 
-/// Detached clipboard restore. Runs on a background thread so a slow restore
-/// can't pin the dictation worker. Takes the write lock so it can't interleave
-/// with a concurrent paste (`write → Cmd+V`) or another restore; if the user
-/// copied during the paste-settle window, leave their copy intact.
-fn restore_clipboard(orig: ClipboardSnapshot, our_count: Option<isize>) {
-    let _guard = CLIPBOARD_WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+/// The clipboard restore itself. Runs on the deferred transaction thread while
+/// that transaction holds the gate permit — so it must NOT re-acquire the gate
+/// (that would deadlock). If the user copied during the paste-settle window,
+/// leave their copy intact.
+fn restore_clipboard_inner(orig: ClipboardSnapshot, our_count: Option<isize>) {
+    restore_snapshot_if_owned(&orig, our_count);
+}
+
+fn restore_snapshot_if_owned(orig: &ClipboardSnapshot, our_count: Option<isize>) {
     if user_copied_during_settle(our_count, pasteboard_change_count()) {
         eprintln!("[clipboard] user copied during paste; leaving their clipboard intact");
         return;
     }
-    if !restore_pasteboard(&orig) {
+    if !restore_pasteboard(orig) {
         eprintln!("[clipboard] restore: writeObjects failed; clipboard left as-is");
     }
 }
@@ -353,17 +556,18 @@ const COPY_SETTLE_MS: u64 = 140;
 /// distinguishable from a real empty selection.
 pub fn copy_selection_via_clipboard() -> eyre::Result<Option<String>> {
     const SENTINEL: &str = "\u{2063}__dictate_selection_probe__\u{2063}";
-    // Hold the write lock for the whole read round-trip so a pending background
-    // restore from a previous dictation can't clobber the sentinel between our
-    // set and the Cmd+C that reads it.
-    let _guard = CLIPBOARD_WRITE_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    // Hold the clipboard gate for the whole read round-trip so a pending
+    // background restore from a previous dictation can't clobber the sentinel
+    // between our set and the Cmd+C that reads it.
+    let _permit = clipboard_gate().acquire();
     let mut cb = Clipboard::new().map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
     let saved = snapshot_pasteboard();
 
     // The probe is one of our own writes too: mark it transient so clipboard
     // managers don't record the sentinel (or the selection Cmd+C pulls in).
-    write_text_transient(SENTINEL)?;
-    synthesize_cmd_c()?;
+    write_preserving_snapshot(SENTINEL, &saved)?;
+    let our_count = pasteboard_change_count();
+    rollback_on_error(synthesize_cmd_c, || restore_snapshot_if_owned(&saved, our_count))?;
     std::thread::sleep(Duration::from_millis(COPY_SETTLE_MS));
 
     let after = cb.get_text().unwrap_or_default();
@@ -391,11 +595,11 @@ fn synthesize_cmd_c() -> eyre::Result<()> {
     let down = CGEvent::new_keyboard_event(source.clone(), key_c, true)
         .map_err(|_| eyre::eyre!("Cmd+C keydown create failed"))?;
     down.set_flags(CGEventFlags::CGEventFlagCommand);
-    down.post(CGEventTapLocation::HID);
-
     let up = CGEvent::new_keyboard_event(source, key_c, false)
         .map_err(|_| eyre::eyre!("Cmd+C keyup create failed"))?;
     up.set_flags(CGEventFlags::CGEventFlagNull);
+    // An allocation error must not follow an already-queued copy.
+    down.post(CGEventTapLocation::HID);
     up.post(CGEventTapLocation::HID);
 
     Ok(())
@@ -408,12 +612,11 @@ fn synthesize_cmd_v() -> eyre::Result<()> {
     let key_down = CGEvent::new_keyboard_event(source.clone(), key_v, true)
         .map_err(|_| eyre::eyre!("CGEvent keydown create failed"))?;
     key_down.set_flags(CGEventFlags::CGEventFlagCommand);
-    key_down.post(CGEventTapLocation::HID);
-
     let key_up = CGEvent::new_keyboard_event(source, key_v, false)
         .map_err(|_| eyre::eyre!("CGEvent keyup create failed"))?;
-    // Clear the command flag on key-up so we don't leave a dangling modifier.
+    // Allocate both events before delivery so Err permits safe rollback.
     key_up.set_flags(CGEventFlags::CGEventFlagNull);
+    key_down.post(CGEventTapLocation::HID);
     key_up.post(CGEventTapLocation::HID);
 
     Ok(())
@@ -482,6 +685,24 @@ pub fn synthesize_undo() -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pre_delivery_steps_restore_once_and_success_never_rolls_back() {
+        use std::cell::Cell;
+        for failed_step in [0, 1] {
+            let restored = Cell::new(0);
+            let result = rollback_on_error(|| -> Result<(), &'static str> {
+                if failed_step == 0 { return Err("write refused"); }
+                Err("key allocation refused")
+            }, || restored.set(restored.get() + 1));
+            assert!(result.is_err());
+            assert_eq!(restored.get(), 1);
+        }
+        let restored = Cell::new(false);
+        let success = rollback_on_error(|| Ok::<_, ()>(()), || restored.set(true));
+        assert!(success.is_ok());
+        assert!(!restored.get());
+    }
 
     #[test]
     fn scaled_settle_scales_with_length_and_caps() {
@@ -559,5 +780,192 @@ mod tests {
         assert!(!fits_budget(0, 101, 100));
         // No overflow panic on absurd sizes.
         assert!(!fits_budget(usize::MAX, 1, SNAPSHOT_BUDGET_BYTES));
+    }
+
+    // --- Clipboard gate / deferred transaction ---------------------------------
+    //
+    // These exercise the public seam a fake pasteboard would use: the gate plus
+    // the deferred transaction, with a fake "settle + restore" closure. They must
+    // fail against the old design, where the settle sleep happened inline on the
+    // worker and the transaction was not deferred at all.
+
+    /// A `Send` permit is the whole point: a `std::sync::MutexGuard` cannot move
+    /// to the restore thread. Static assertion.
+    #[test]
+    fn clipboard_permit_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<ClipboardPermit>();
+    }
+
+    /// Queueing the transaction must return immediately while the gate stays held
+    /// until the deferred settle + restore actually finishes. A synchronous
+    /// (`tx.run()` inline) implementation fails assertion (1) below.
+    #[test]
+    fn queued_transaction_returns_immediately_and_holds_the_gate_until_done() {
+        use std::sync::mpsc;
+
+        let gate = ClipboardGate::shared();
+        let permit = gate.acquire();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        // Fake settle + restore: announce that the background work started, then
+        // block until the test releases it. The 2 s bound only matters for a
+        // synchronous implementation — it then fails assertion (1) rather than
+        // hanging the suite.
+        let work: DeferredPaste = Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+            let _ = done_tx.send(());
+        });
+
+        let queued_at = Instant::now();
+        run_transaction_async(ClipboardTransaction::new(permit, work));
+
+        // (1) Queueing did not wait for the settle/restore.
+        assert!(
+            queued_at.elapsed() < Duration::from_millis(500),
+            "queueing must not block on the settle/restore (sync design would)"
+        );
+        // (2) The gate is still held: the restore has not completed.
+        assert!(
+            gate.try_acquire().is_none(),
+            "the gate must stay held until the deferred restore completes"
+        );
+
+        // The work is running off-thread, inside the fake settle window.
+        started_rx.recv_timeout(Duration::from_secs(2)).expect("transaction thread started");
+        assert!(gate.try_acquire().is_none(), "gate held through the settle");
+
+        // Release the fake settle; the restore finishes and the permit drops.
+        release_tx.send(()).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).expect("work completed");
+
+        // (3) The next writer is served only after the restore completed.
+        let next = gate
+            .acquire_timeout(Duration::from_secs(2))
+            .expect("gate released after restore completed");
+        drop(next);
+    }
+
+    /// A panic in the deferred work must still release the gate (Drop while
+    /// unwinding), or every later dictation would block forever.
+    #[test]
+    fn panicking_transaction_releases_the_gate() {
+        let gate = ClipboardGate::shared();
+        let permit = gate.acquire();
+        let work: DeferredPaste = Box::new(|| panic!("synthetic transaction panic"));
+        run_transaction_async(ClipboardTransaction::new(permit, work));
+        let next = gate
+            .acquire_timeout(Duration::from_secs(2))
+            .expect("gate must be released after a panicking transaction");
+        drop(next);
+    }
+
+    /// A writer that blocks on `acquire` is served only after the transaction
+    /// releases the gate.
+    #[test]
+    fn blocked_writer_waits_for_the_transaction_then_proceeds() {
+        use std::sync::mpsc;
+
+        let gate = ClipboardGate::shared();
+        let permit = gate.acquire();
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let waiter_gate = Arc::clone(&gate);
+        let waiter = std::thread::spawn(move || {
+            let p = waiter_gate.acquire(); // blocks until the permit drops
+            let _ = acquired_tx.send(());
+            drop(p);
+        });
+
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "a blocked writer must not acquire while the transaction holds the gate"
+        );
+        drop(permit);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocked writer proceeds once the gate is released");
+        waiter.join().unwrap();
+    }
+
+    /// The non-blocking busy flag: false at rest, true while a permit is held and
+    /// while a deferred transaction owns it, false again once it completes.
+    #[test]
+    fn is_held_tracks_permit_and_transaction_lifetime() {
+        use std::sync::mpsc;
+
+        let gate = ClipboardGate::shared();
+        assert!(!gate.is_held(), "idle gate is not held");
+
+        let permit = gate.acquire();
+        assert!(gate.is_held(), "a live permit is held");
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let work: DeferredPaste = Box::new(move || {
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        run_transaction_async(ClipboardTransaction::new(permit, work));
+        assert!(gate.is_held(), "a deferred transaction is held");
+
+        release_tx.send(()).unwrap();
+        let next = gate
+            .acquire_timeout(Duration::from_secs(2))
+            .expect("transaction released the gate");
+        drop(next);
+        assert!(!gate.is_held(), "idle again after completion");
+    }
+
+    /// Serialises the tests that drive the process-wide gate through the public
+    /// `transaction_pending` / `wait_for_pending_transaction` APIs, since those
+    /// cannot take a local gate. Every other gate test uses its own local gate,
+    /// so the only contention is between these tests.
+    fn global_gate_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `transaction_pending` reports true for a transaction's whole lifetime and
+    /// `wait_for_pending_transaction` blocks until it completes — the seam the
+    /// trailing Enter/Tab ordering and Undo gating rely on.
+    #[test]
+    fn public_pending_and_wait_apis_reflect_the_global_transaction() {
+        use std::sync::mpsc;
+
+        let _serial = global_gate_test_lock();
+        assert!(!transaction_pending(), "no transaction at test start");
+
+        // Queue a transaction on the global gate directly; `paste_via_clipboard`
+        // would touch the real pasteboard, which these tests must not do.
+        let permit = clipboard_gate().acquire();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let work: DeferredPaste = Box::new(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(2));
+        });
+        run_transaction_async(ClipboardTransaction::new(permit, work));
+        started_rx.recv_timeout(Duration::from_secs(2)).expect("transaction started");
+        assert!(transaction_pending(), "pending is true while the transaction runs");
+
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            wait_for_pending_transaction();
+            let _ = returned_tx.send(());
+        });
+        assert!(
+            returned_rx.recv_timeout(Duration::from_millis(150)).is_err(),
+            "wait_for_pending_transaction must block while a transaction is pending"
+        );
+
+        release_tx.send(()).unwrap();
+        returned_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait returns once the transaction completes");
+        waiter.join().unwrap();
+        assert!(!transaction_pending(), "pending clears once the transaction completes");
     }
 }

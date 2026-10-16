@@ -49,6 +49,38 @@ wherever the model is used.
 Local Dictation loads the released weights unmodified and supplies its own
 prompts and guards.
 
+### Qwen3.5-2B, by Qwen (optional instruction model)
+
+The optional instruction model, used for selection rewrites, translations and
+custom output formats that the S1-mini normalizer cannot serve. It is a
+permissive text-only model and is never required: plain dictation runs without
+it.
+
+- Model: <https://huggingface.co/Qwen/Qwen3.5-2B>
+- Licence: Apache-2.0 (stated on the model card).
+- GGUF conversion the app fetches:
+  <https://huggingface.co/unsloth/Qwen3.5-2B-GGUF> by Unsloth (Q4_K_M), pinned
+  to revision `f6d5376be1edb4d416d56da11e5397a961aca8ae`. The compiled-in
+  manifest carries its byte count and SHA-256, and the app saves the model's own
+  LICENSE beside the weights.
+
+A user may instead point the instruction slot at any GGUF they already hold.
+
+### Cohere Labs Tiny Aya (optional instruction model, non-commercial)
+
+An optional instruction model a user may supply themselves. Cohere Labs Tiny
+Aya is **NonCommercial**: it is not a shipped default, the app never bundles or
+fetches it, and it must not be used commercially. The model picker marks it
+NonCommercial and personal-use only.
+
+- Model: <https://huggingface.co/CohereLabs/tiny-aya-global>
+- GGUF builds: <https://huggingface.co/CohereLabs/tiny-aya-global-GGUF>
+- Licence: the Cohere Labs CC-BY-NC licence (CC-BY-NC-4.0),
+  <https://cohere.com/cohere-labs-cc-by-nc-license>, together with the Cohere
+  Labs Acceptable Use Policy,
+  <https://docs.cohere.com/docs/cohere-labs-acceptable-use-policy>. A user who
+  supplies this model takes on those terms.
+
 ### Voice activity detection
 
 There is no VAD model. `src/vad.rs` is a small energy-based detector written
@@ -350,8 +382,9 @@ authorization of the copyright holder.
 
 ### Apache License 2.0
 
-Covers Cohere Transcribe, "S1-mini" by "Superwhisper", Qwen3-0.6B, the Apache
-Swift packages, metal-cpp, cpal, hound, and the crates offered under Apache-2.0.
+Covers Cohere Transcribe, "S1-mini" by "Superwhisper", Qwen3-0.6B, Qwen3.5-2B,
+the Apache Swift packages, metal-cpp, cpal, hound, and the crates offered under
+Apache-2.0.
 
 ```text
                                  Apache License

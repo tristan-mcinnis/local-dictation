@@ -65,6 +65,17 @@ pub(super) struct PillBuild {
     pub(super) cancel: Retained<NSButton>,
     pub(super) undo: Retained<NSButton>,
     pub(super) history: Retained<NSButton>,
+    /// The indeterminate working indicator: three dots that march while the
+    /// pipeline runs. Shown only in `PillLayout::Processing`; it reuses the
+    /// existing 30 FPS poll and never fakes audio levels (the live waveform is
+    /// separate and only visible while recording).
+    pub(super) progress: Retained<slate::SlateView>,
+    pub(super) progress_dots: Vec<Retained<slate::SlateView>>,
+    /// "Retry" quick action on a real ASR failure only (never on a transform
+    /// failure or on kept text), with its native hit target. It is a click, not
+    /// an automatic retry.
+    pub(super) retry_hint: Retained<NSTextField>,
+    pub(super) retry: Retained<NSButton>,
 }
 // SAFETY: UiGlobals keeps these AppKit objects alive; every read or mutation
 // runs on the main CFRunLoop. Worker threads use only ui_channel.
@@ -79,6 +90,10 @@ pub(super) enum PillLayout {
     Success,
     Copied,
     Error,
+    /// A real ASR failure: the same error surface, plus the one quick action
+    /// that makes sense for lost speech, Retry (re-run the retained audio).
+    /// Transform failures use `Error` instead and never offer Retry.
+    Retryable,
 }
 
 // A pill can be clicked without taking the keyboard or activating this app.
@@ -155,6 +170,30 @@ pub(super) fn build_pill_window(
     well.addSubview(&waveform);
     glass.addSubview(&well);
 
+    // ── Indeterminate working dots ─────────────────────────────────────
+    // Three dots in the leading control slot, shown while the pipeline works
+    // instead of the live waveform. `layout_pill` animates their alpha on the
+    // existing 30 FPS poll; nothing here reads audio levels, so the indicator
+    // never fakes microphone activity.
+    let cluster_w = PROGRESS_DOTS as f64 * slate::DOT + (PROGRESS_DOTS as f64 - 1.0) * SPACE_XXS;
+    let progress = slate::SlateView::new(
+        mtm,
+        NSRect::new(NSPoint::new(PILL_PAD, 0.0), NSSize::new(CANCEL_HIT, height)),
+        slate::Paint::None,
+        0.0,
+    );
+    let mut progress_dots = Vec::new();
+    for i in 0..PROGRESS_DOTS {
+        let x = (CANCEL_HIT - cluster_w) / 2.0 + i as f64 * (slate::DOT + SPACE_XXS);
+        let dot = slate::status_dot(mtm, true, x, height / 2.0);
+        dot.set_paint(slate::Paint::DotNeutral);
+        dot.setAlphaValue(PROGRESS_REST_ALPHA);
+        progress.addSubview(&dot);
+        progress_dots.push(dot);
+    }
+    progress.setHidden(true);
+    glass.addSubview(&progress);
+
     // ── Status line pieces ─────────────────────────────────────────────
     let dot = slate::status_dot(mtm, true, PILL_TEXT_PAD, height / 2.0);
     dot.setHidden(true);
@@ -171,6 +210,11 @@ pub(super) fn build_pill_window(
     let hint = slate::label(mtm, "", TYPE_META, WEIGHT_REGULAR, theme::text_tertiary());
     hint.setHidden(true);
     glass.addSubview(&hint);
+
+    // The ASR-failure pill's quick Retry label (hidden unless shown).
+    let retry_hint = slate::label(mtm, "", TYPE_META, WEIGHT_REGULAR, theme::text_secondary());
+    retry_hint.setHidden(true);
+    glass.addSubview(&retry_hint);
 
     // Only the real completion shortcut (⌘Z) needs key caps.
     let mut caps = Vec::new();
@@ -225,6 +269,29 @@ pub(super) fn build_pill_window(
     undo.setHidden(true);
     glass.addSubview(&undo);
 
+    // The Retry quick action on a real ASR failure. Same guarded `retryLast:`
+    // path as the menu item and IPC — it replays the retained audio through
+    // the normal pipeline; it is never fired automatically.
+    let retry: Retained<NSButton> = unsafe {
+        msg_send![
+            NSButton::alloc(mtm),
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0))
+        ]
+    };
+    retry.setTitle(&NSString::from_str(""));
+    retry.setBordered(false);
+    retry.setToolTip(Some(&NSString::from_str("Retry the last recording (re-transcribe)")));
+    unsafe {
+        let _: () = msg_send![&*retry, setTransparent: true];
+        let _: () = msg_send![&*retry, setRefusesFirstResponder: true];
+        let _: () = msg_send![&*retry, setTarget: &**actions];
+        let _: () = msg_send![&*retry, setAction: sel!(retryLast:)];
+        let _: () =
+            msg_send![&*retry, setAccessibilityLabel: &*NSString::from_str("Retry last recording")];
+    }
+    retry.setHidden(true);
+    glass.addSubview(&retry);
+
     let history = slate::click_overlay(
         mtm,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
@@ -274,6 +341,10 @@ pub(super) fn build_pill_window(
         cancel,
         undo,
         history,
+        progress,
+        progress_dots,
+        retry_hint,
+        retry,
     })
 }
 
@@ -297,6 +368,9 @@ pub(super) fn layout_pill(pill: &PillBuild, layout: PillLayout) -> f64 {
     pill.cancel_glyph.setHidden(true);
     pill.undo.setHidden(true);
     pill.history.setHidden(true);
+    pill.progress.setHidden(true);
+    pill.retry_hint.setHidden(true);
+    pill.retry.setHidden(true);
     let control_x = PILL_PAD;
     pill.cancel.setFrame(NSRect::new(
         NSPoint::new(control_x, 0.0),
@@ -340,12 +414,11 @@ pub(super) fn layout_pill(pill: &PillBuild, layout: PillLayout) -> f64 {
         }
         PillLayout::Processing => {
             pill.well.setHidden(true);
-            pill.dot.setHidden(false);
-            pill.dot.set_paint(slate::Paint::DotNeutral);
-            pill.dot.setFrameOrigin(NSPoint::new(
-                control_x + (CANCEL_HIT - slate::DOT) / 2.0,
-                mid - slate::DOT / 2.0,
-            ));
+            // The indeterminate working dots stand in for both the live
+            // waveform (hidden above) and the single status dot, so nothing
+            // here pretends to be microphone activity.
+            pill.dot.setHidden(true);
+            pill.progress.setHidden(false);
             pill.status.setHidden(false);
             pill.hint.setHidden(true);
             unsafe {
@@ -425,10 +498,42 @@ pub(super) fn layout_pill(pill: &PillBuild, layout: PillLayout) -> f64 {
             pill.history.setHidden(false);
             x + hit_width + PILL_TEXT_PAD
         }
+        PillLayout::Retryable => {
+            pill.well.setHidden(true);
+            pill.dot.setHidden(false);
+            pill.status.setHidden(false);
+            pill.retry_hint.setHidden(false);
+            pill.hint.setHidden(false);
+            pill.dot.set_paint(slate::Paint::DotDanger);
+            pill.dot.setFrameOrigin(NSPoint::new(
+                PILL_TEXT_PAD,
+                (mid - slate::DOT / 2.0).round(),
+            ));
+            let mut x = PILL_TEXT_PAD + slate::DOT + PILL_GAP;
+            x += slate::place_left(&pill.status, x, mid) + PILL_GAP;
+            // Retry is the first quick action; History follows.
+            let retry_text = slate::place_left(&pill.retry_hint, x + SPACE_XXS, mid);
+            let retry_hit = (retry_text + 2.0 * SPACE_XXS).max(CANCEL_HIT);
+            pill.retry.setFrame(NSRect::new(
+                NSPoint::new(x, 0.0),
+                NSSize::new(retry_hit, pill.height),
+            ));
+            pill.retry.setHidden(false);
+            x += retry_hit + PILL_GAP;
+            let hint_width = slate::place_left(&pill.hint, x + SPACE_XXS, mid);
+            let hit_width = (hint_width + 2.0 * SPACE_XXS).max(CANCEL_HIT);
+            pill.history.setFrame(NSRect::new(
+                NSPoint::new(x, 0.0),
+                NSSize::new(hit_width, pill.height),
+            ));
+            pill.history.setHidden(false);
+            x + hit_width + PILL_TEXT_PAD
+        }
     };
-    // The error pill is the one surface that takes a `danger` hairline, so the
+    // The failure pills are the surfaces that take a `danger` hairline, so a
     // failure reads at a glance without recolouring anything else.
-    pill.tint.set_danger_stroke(layout == PillLayout::Error);
+    pill.tint
+        .set_danger_stroke(matches!(layout, PillLayout::Error | PillLayout::Retryable));
     width.round()
 }
 
@@ -483,6 +588,17 @@ pub(super) fn install_poll_timer() {
         }
         if state == UiState::Recording {
             update_bars(globals);
+        }
+        if state.is_processing() {
+            update_progress_pulse(globals);
+        }
+        if state == UiState::Success {
+            // A settle can finish while the success pill is up; keep its Undo
+            // affordance in step with the clipboard transaction gate.
+            globals
+                .pill
+                .undo
+                .setEnabled(!crate::clipboard_paste::transaction_pending());
         }
         if state.is_active() {
             update_live_feedback(globals, state);
@@ -762,12 +878,40 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
                 .setStringValue(&NSString::from_str("Undo"));
             set_pill_layout(globals, PillLayout::Success);
             show_pill(globals);
+            // Undo is only safe once no clipboard transaction is still
+            // settling: while one is in flight the visible text may belong to
+            // that write, so an early ⌘Z would revert unrelated prior content.
+            globals
+                .pill
+                .undo
+                .setEnabled(!crate::clipboard_paste::transaction_pending());
         }
         UiState::Error => {
             globals
                 .pill
                 .status
                 .setStringValue(&NSString::from_str("Couldn’t transcribe"));
+            // A real ASR failure: offer the one quick action that helps,
+            // Retry. It is a click, never an automatic retry.
+            globals
+                .pill
+                .retry_hint
+                .setStringValue(&NSString::from_str("Retry"));
+            globals
+                .pill
+                .hint
+                .setStringValue(&NSString::from_str("History"));
+            set_hint_action(globals, sel!(openHistory:), "Open Dictation History");
+            set_pill_layout(globals, PillLayout::Retryable);
+            show_pill(globals);
+        }
+        UiState::RewriteFailed => {
+            // The transform failed; the selection was left untouched. Say that
+            // plainly instead of the generic transcription error. No Retry
+            // here: re-running ASR would not fix a rewrite failure.
+            globals.pill.status.setStringValue(&NSString::from_str(
+                "Couldn’t rewrite · Selection unchanged",
+            ));
             globals
                 .pill
                 .hint
@@ -881,7 +1025,14 @@ pub(super) fn set_cancel_hover(pill: &PillBuild, state: UiState, hovered: bool) 
     pill.cancel.setHidden(!cancellable);
     pill.cancel.setEnabled(cancellable);
     pill.cancel_glyph.setHidden(!cancellable || !hovered);
-    pill.dot.setHidden(cancellable && hovered);
+    if state.is_processing() {
+        // The working dots replace the single status dot; the hover cancel
+        // glyph takes the slot while the pointer is over the pill.
+        pill.dot.setHidden(true);
+        pill.progress.setHidden(hovered);
+    } else {
+        pill.dot.setHidden(cancellable && hovered);
+    }
     let label = if state == UiState::Recording {
         "Cancel recording"
     } else {
@@ -1009,6 +1160,7 @@ pub(super) fn pill_status(state: UiState, details: bool) -> &'static str {
         UiState::Copied => "Copied to clipboard",
         UiState::Success => "Landed",
         UiState::Error => "Couldn’t transcribe",
+        UiState::RewriteFailed => "Couldn’t rewrite",
         UiState::PasteFailed | UiState::PasteFailedCopied => "Couldn’t paste",
         UiState::NoEditableField | UiState::HeldCopied => "No text field selected",
         UiState::LimitReached | UiState::LimitReachedCopied => "Recording limit reached",
@@ -1097,6 +1249,40 @@ pub(super) fn collapse_bars(globals: &UiGlobals) {
         }
     }
     globals.pill.waveform.set_heights([BAR_MIN_H; BAR_COUNT]);
+}
+
+/// How many dots the indeterminate working indicator draws.
+pub(super) const PROGRESS_DOTS: usize = 3;
+/// Resting opacity of an unlit working dot (lit reaches 1.0).
+const PROGRESS_REST_ALPHA: f64 = 0.35;
+
+/// Opacity of each working dot for a pulse `phase` in `[0, 1)`. The pulse
+/// marches across the dots so the indicator reads as indeterminate progress,
+/// never as a percentage or as microphone levels. Under Reduce Motion there is
+/// no movement: every dot sits at a steady mid opacity (a fade-only treatment
+/// the design rule allows). Pure, so it is unit-tested.
+pub(super) fn stage_pulse_alphas(phase: f64, reduced_motion: bool) -> [f64; PROGRESS_DOTS] {
+    if reduced_motion {
+        return [0.6; PROGRESS_DOTS];
+    }
+    let phase = phase.rem_euclid(1.0);
+    std::array::from_fn(|i| {
+        let center = i as f64 / PROGRESS_DOTS as f64;
+        let d = (phase - center).abs();
+        let d = d.min(1.0 - d);
+        let bump = (1.0 - 2.0 * d).max(0.0);
+        PROGRESS_REST_ALPHA + (1.0 - PROGRESS_REST_ALPHA) * bump
+    })
+}
+
+/// Advance the working dots on the existing 30 FPS poll. Only called while a
+/// processing state is on screen, so it adds no timer work when idle.
+fn update_progress_pulse(globals: &UiGlobals) {
+    let phase = CFAbsoluteTimeGetCurrent().rem_euclid(1.0);
+    let alphas = stage_pulse_alphas(phase, globals.reduced_motion);
+    for (dot, alpha) in globals.pill.progress_dots.iter().zip(alphas) {
+        dot.setAlphaValue(alpha);
+    }
 }
 
 pub(super) fn position_pill_at_cursor_screen(window: &NSWindow) {
@@ -1189,7 +1375,7 @@ mod tests {
     #[test]
     fn only_idle_slows_the_poll() {
         assert_eq!(poll_interval(UiState::Idle), SLOW_CHECK_SECONDS);
-        for v in 1..=16u8 {
+        for v in 1..=17u8 {
             let state = UiState::from_u8(v);
             assert_eq!(poll_interval(state), POLL_ACTIVE_SECONDS, "{state:?}");
         }
@@ -1252,6 +1438,7 @@ mod tests {
         assert_eq!(pill_status(UiState::Cleaning, true), "Cleaning up…");
         assert_eq!(pill_status(UiState::Pasting, true), "Pasting…");
         assert_eq!(pill_status(UiState::Cleaning, false), "Working…");
+        assert_eq!(pill_status(UiState::RewriteFailed, true), "Couldn’t rewrite");
         assert!(
             UiState::Recording.is_cancellable()
                 && UiState::Transcribing.is_cancellable()
@@ -1259,5 +1446,42 @@ mod tests {
         );
         assert!(!UiState::Pasting.is_cancellable() && !UiState::Copied.is_cancellable());
         assert_eq!(pill_status(UiState::Copied, true), "Copied to clipboard");
+    }
+
+    /// The working indicator is a marching pulse that never leaves the
+    /// allowable opacity band, peaks at each dot's phase centre, and goes still
+    /// under Reduce Motion. The three dots fit the leading control slot.
+    #[test]
+    fn working_dots_pulse_indeterminately_and_respect_reduce_motion() {
+        let cluster =
+            PROGRESS_DOTS as f64 * slate::DOT + (PROGRESS_DOTS as f64 - 1.0) * SPACE_XXS;
+        assert!(
+            cluster <= CANCEL_HIT,
+            "the dots must fit the leading control slot"
+        );
+
+        // Reduce Motion: a steady fade-only treatment, no march.
+        assert_eq!(stage_pulse_alphas(0.42, true), [0.6; PROGRESS_DOTS]);
+
+        // Each dot reaches full opacity at its own phase centre.
+        for i in 0..PROGRESS_DOTS {
+            let center = i as f64 / PROGRESS_DOTS as f64;
+            assert_eq!(stage_pulse_alphas(center, false)[i], 1.0);
+        }
+
+        // At every sample the dots stay in band and are not all the same
+        // opacity, which is what makes the motion read as indeterminate.
+        for step in 0..30 {
+            let alphas = stage_pulse_alphas(step as f64 / 30.0, false);
+            for a in alphas {
+                assert!(
+                    (PROGRESS_REST_ALPHA..=1.0).contains(&a),
+                    "opacity {a} out of band"
+                );
+            }
+            let max = alphas.iter().cloned().fold(f64::MIN, f64::max);
+            let min = alphas.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(max - min > 0.1, "the dots should march, not sit flat");
+        }
     }
 }

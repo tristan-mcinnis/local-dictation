@@ -228,9 +228,17 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             ),
             (
                 "pill-error",
-                PillLayout::Error,
+                PillLayout::Retryable,
                 UiState::Error,
                 "Couldn’t transcribe",
+                false,
+                false,
+            ),
+            (
+                "pill-rewrite-failed",
+                PillLayout::Error,
+                UiState::RewriteFailed,
+                "Couldn’t rewrite · Selection unchanged",
                 false,
                 false,
             ),
@@ -243,6 +251,7 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 } else {
                     "Undo"
                 }));
+            pill.retry_hint.setStringValue(&NSString::from_str(if state == UiState::Error { "Retry" } else { "" }));
             pill.waveform.set_heights(if quiet {
                 waveform_targets(&[0.006; BAR_COUNT], WaveformSensitivity::Balanced)
             } else {
@@ -401,6 +410,17 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
             )?);
         }
 
+        crate::settings_window::scroll_to_top_for_render(&settings);
+
+        // The speech pane contains both independent model pickers. Prove its
+        // bottom as well, where the optional instruction model lives.
+        crate::settings_window::show_pane_for_render(&settings, 5);
+        for (name, bottom) in [("settings-speech", false), ("settings-speech-end", true)] {
+            if bottom { crate::settings_window::scroll_to_bottom_for_render(&settings); }
+            if let Some(content) = settings.window.contentView() {
+                written.push(snapshot(mtm, &content, out_dir, &format!("{name}-{suffix}"), None, 0.0)?);
+            }
+        }
         crate::settings_window::scroll_to_top_for_render(&settings);
 
         // The Dictionary pane carries the term list, so prove that pane too.

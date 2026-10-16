@@ -18,8 +18,12 @@
 //! the complexity — same apply-on-restart contract as the menu submenus, just
 //! batched so a window session with several edits costs one restart, not N).
 //! Closing without applying keeps the edits in-memory for the window's life but
-//! never writes them. Env-var locks (`DICTATE_*`) disable the matching control
-//! and show a footnote, mirroring the menu's "(locked by … env var)" notes.
+//! never writes them. The Dictionary pane is the one exception: Add and Remove
+//! write `corrections.json` immediately (so a term is never lost by closing the
+//! window); the daemon still only reads corrections at boot, so Apply & Restart
+//! is what makes a saved term active. Env-var locks (`DICTATE_*`) disable the
+//! matching control and show a footnote, mirroring the menu's "(locked by … env
+//! var)" notes.
 //!
 //! Appearance is the one setting that also applies live, because a preview you
 //! cannot see is not a preview.
@@ -178,6 +182,10 @@ pub struct SettingsUi {
     rail_rows: Vec<Retained<slate::SlateView>>,
     pane_title: Retained<NSTextField>,
     pane_subtitle: Retained<NSTextField>,
+    /// The footer's left-hand hint. On a failed Apply & Restart it carries the
+    /// reason (in warning ink) instead of the resting restart note, so a save
+    /// failure is not just a log line the user never sees.
+    footer_hint: Retained<NSTextField>,
     // General
     hotkey_popup: Retained<NSPopUpButton>,
     cleanup_switch: Retained<slate::InkToggle>,
@@ -187,6 +195,7 @@ pub struct SettingsUi {
     // Speech
     cohere_lang_popup: Retained<NSPopUpButton>,
     model_popup: Retained<NSPopUpButton>,
+    instruction_model_popup: Retained<NSPopUpButton>,
     // Advanced
     streaming_switch: Retained<slate::InkToggle>,
     streaming_hint: Retained<NSTextField>,
@@ -370,6 +379,16 @@ define_class!(
             with_pending(|p| p.llm_model = if path.is_empty() { None } else { Some(path) });
         }
 
+        #[unsafe(method(changeInstructionModel:))]
+        fn change_instruction_model(&self, sender: *mut AnyObject) {
+            let value = popup_selected_rep(sender);
+            with_pending(|p| p.instruction_model = match value.as_str() {
+                "__auto__" => None,
+                "__disabled__" => Some(String::new()),
+                _ => Some(value),
+            });
+        }
+
         #[unsafe(method(changeStreaming:))]
         fn change_streaming(&self, sender: *mut AnyObject) {
             let on = switch_on(sender);
@@ -424,34 +443,48 @@ define_class!(
             }
             let heard = ui.dictionary_heard_field.stringValue().to_string();
             let correct = ui.dictionary_correct_field.stringValue().to_string();
-            let Some(line) = crate::corrections::quick_add_line(&heard, &correct) else {
+            // A row click pulls an entry into the fields; saving it must drop
+            // the original key, or renaming the heard side leaves both. Keep
+            // the marker until the write lands, so a refused add can be retried.
+            let editing = ui.dictionary_editing.lock().unwrap().clone();
+            let Some(path) = crate::corrections::Corrections::config_path() else {
                 ui.dictionary_status.setStringValue(&NSString::from_str(
-                    "Type the spelling you want in ‘Correct to’.",
+                    "Not saved. The corrections file path could not be resolved.",
                 ));
-                ui.window.makeFirstResponder(Some(&*ui.dictionary_correct_field));
                 return;
             };
-            // A row click pulls an entry into the fields; saving it must drop
-            // the original key, or renaming the heard side leaves both.
-            let editing = ui.dictionary_editing.lock().unwrap().take();
-            let count = {
+            // Persist now, not at Apply & Restart: a term typed here must not be
+            // lost by closing the window. The daemon still reads corrections
+            // once at boot, so it takes effect after Apply & Restart.
+            let outcome = {
                 let mut corrections = ui.pending_corrections.lock().unwrap();
-                if let Some(key) = editing {
-                    corrections.remove(&key);
-                }
-                let mut lines = corrections.to_editor_lines();
-                lines.push(line);
-                *corrections =
-                    crate::corrections::Corrections::from_editor_text(&lines.join("\n"));
-                corrections.len()
+                corrections.add_and_save_to(editing.as_deref(), &heard, &correct, &path)
             };
-            ui.dictionary_heard_field.setStringValue(&NSString::from_str(""));
-            ui.dictionary_correct_field.setStringValue(&NSString::from_str(""));
-            ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
-                "Saved. {count} terms will be active after Apply & Restart.",
-            )));
-            refresh_dictionary_list(ui);
-            ui.window.makeFirstResponder(Some(&*ui.dictionary_heard_field));
+            match outcome {
+                Ok(crate::corrections::QuickAdd::NoTarget) => {
+                    ui.dictionary_status.setStringValue(&NSString::from_str(
+                        "Type the spelling you want in ‘Correct to’.",
+                    ));
+                    ui.window.makeFirstResponder(Some(&*ui.dictionary_correct_field));
+                }
+                Ok(crate::corrections::QuickAdd::Saved(count)) => {
+                    *ui.dictionary_editing.lock().unwrap() = None;
+                    ui.dictionary_heard_field.setStringValue(&NSString::from_str(""));
+                    ui.dictionary_correct_field.setStringValue(&NSString::from_str(""));
+                    ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                        "Saved. {count} terms will be active after Apply & Restart.",
+                    )));
+                    refresh_dictionary_list(ui);
+                    ui.window.makeFirstResponder(Some(&*ui.dictionary_heard_field));
+                }
+                Err(e) => {
+                    // Nothing was written; the list still shows the old state.
+                    ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                        "Not saved, and nothing was added. {e}",
+                    )));
+                    ui.window.makeFirstResponder(Some(&*ui.dictionary_correct_field));
+                }
+            }
         }
 
         #[unsafe(method(searchDictionary:))]
@@ -493,21 +526,39 @@ define_class!(
             let Some((key, value)) = dictionary_entry_at(ui, tag) else {
                 return;
             };
-            let count = {
-                let mut corrections = ui.pending_corrections.lock().unwrap();
-                corrections.remove(&key);
-                corrections.len()
+            let Some(path) = crate::corrections::Corrections::config_path() else {
+                ui.dictionary_status.setStringValue(&NSString::from_str(
+                    "Not removed. The corrections file path could not be resolved.",
+                ));
+                return;
             };
-            // Removing the entry that is open in the fields ends that edit.
-            let mut editing = ui.dictionary_editing.lock().unwrap();
-            if editing.as_deref() == Some(key.as_str()) {
-                *editing = None;
+            // Persist now, not at Apply & Restart (see add_dictionary_entry).
+            let outcome = {
+                let mut corrections = ui.pending_corrections.lock().unwrap();
+                corrections.remove_and_save_to(&key, &path)
+            };
+            match outcome {
+                Ok(true) => {
+                    // Removing the entry that is open in the fields ends that edit.
+                    let mut editing = ui.dictionary_editing.lock().unwrap();
+                    if editing.as_deref() == Some(key.as_str()) {
+                        *editing = None;
+                    }
+                    drop(editing);
+                    let count = ui.pending_corrections.lock().unwrap().len();
+                    ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                        "Removed “{value}”. {count} terms after Apply & Restart.",
+                    )));
+                    refresh_dictionary_list(ui);
+                }
+                // Already gone (for example a double click): nothing to save.
+                Ok(false) => refresh_dictionary_list(ui),
+                Err(e) => {
+                    ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
+                        "Not removed, and nothing was changed. {e}",
+                    )));
+                }
             }
-            drop(editing);
-            ui.dictionary_status.setStringValue(&NSString::from_str(&format!(
-                "Removed “{value}”. {count} terms after Apply & Restart.",
-            )));
-            refresh_dictionary_list(ui);
         }
 
         #[unsafe(method(searchHistory:))]
@@ -530,32 +581,30 @@ define_class!(
                 return;
             };
             let tag: isize = unsafe { msg_send![sender, tag] };
-            let Some((_, text)) = history_entry_at(ui, tag) else {
+            let Some((id, text)) = history_entry_at(ui, tag) else {
                 return;
             };
             if text.trim().is_empty() {
                 return;
             }
-            menubar::copy_to_clipboard(&text);
-            set_history_status(ui, &format!("Copied “{}”.", history_preview(&text)));
-            flash_history_row(ui, tag as usize);
-            // Cancel any un-flash already in flight, so a second copy restarts
-            // the full window rather than inheriting the first one's remainder.
-            unsafe {
-                let obj: &AnyObject = &*(self as *const Self as *const AnyObject);
-                let _: () = msg_send![
-                    objc2::class!(NSObject),
-                    cancelPreviousPerformRequestsWithTarget: obj,
-                    selector: sel!(clearHistoryFlash:),
-                    object: std::ptr::null::<AnyObject>(),
-                ];
-                let _: () = msg_send![
-                    self,
-                    performSelector: sel!(clearHistoryFlash:),
-                    withObject: std::ptr::null::<AnyObject>(),
-                    afterDelay: HISTORY_COPIED_FLASH_S,
-                ];
-            }
+            let message = format!("Copied “{}”.", history_preview(&text));
+            set_history_status(ui, "Copying…");
+            menubar::copy_to_clipboard(text, move |copied| {
+                let Some(ui) = SETTINGS_UI.get() else { return; };
+                set_history_status(ui, if copied { &message } else { "Could not copy this dictation." });
+                if !copied || !history_entry_at(ui, tag).is_some_and(|entry| entry.0 == id) { return; }
+                flash_history_row(ui, tag as usize);
+                // Start the confirmation window after the actual write, and
+                // never highlight another entry if filtering changed meanwhile.
+                unsafe {
+                    let controller = &*ui._controller;
+                    let obj: &AnyObject = &*(controller as *const SettingsController as *const AnyObject);
+                    let _: () = msg_send![objc2::class!(NSObject), cancelPreviousPerformRequestsWithTarget: obj,
+                        selector: sel!(clearHistoryFlash:), object: std::ptr::null::<AnyObject>()];
+                    let _: () = msg_send![controller, performSelector: sel!(clearHistoryFlash:),
+                        withObject: std::ptr::null::<AnyObject>(), afterDelay: HISTORY_COPIED_FLASH_S];
+                }
+            });
         }
 
         #[unsafe(method(toggleSidebar:))]
@@ -586,9 +635,14 @@ define_class!(
                 return;
             }
             let n = texts.len();
-            menubar::copy_to_clipboard(&texts.join("\n\n"));
-            let plural = if n == 1 { "dictation" } else { "dictations" };
-            set_history_status(ui, &format!("Copied {n} {plural}."));
+            set_history_status(ui, "Copying…");
+            menubar::copy_to_clipboard(texts.join("\n\n"), move |copied| {
+                if let Some(ui) = SETTINGS_UI.get() {
+                    let plural = if n == 1 { "dictation" } else { "dictations" };
+                    let message = if copied { format!("Copied {n} {plural}.") } else { "Could not copy the history.".to_string() };
+                    set_history_status(ui, &message);
+                }
+            });
         }
 
         #[unsafe(method(deleteHistoryEntry:))]
@@ -1838,24 +1892,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         "Fixed engine: Cohere Transcribe — native MLX (Q4)",
     );
     let cohere_lang_popup = popup_row(mtm, &mut card, "Cohere language");
-    const LANGS: &[(&str, &str)] = &[
-        ("en", "English (en)"),
-        ("de", "German (de)"),
-        ("es", "Spanish (es)"),
-        ("fr", "French (fr)"),
-        ("it", "Italian (it)"),
-        ("pt", "Portuguese (pt)"),
-        ("nl", "Dutch (nl)"),
-        ("ru", "Russian (ru)"),
-        ("zh", "Chinese (zh)"),
-        ("ja", "Japanese (ja)"),
-        ("ko", "Korean (ko)"),
-        ("ar", "Arabic (ar)"),
-        ("hi", "Hindi (hi)"),
-        ("tr", "Turkish (tr)"),
-        ("pl", "Polish (pl)"),
-    ];
-    for (code, l) in LANGS {
+    for (code, l) in settings::COHERE_LANGUAGE_CHOICES {
         popup_add_item(&cohere_lang_popup, l, None, Some(code));
     }
     select_popup_rep(&cohere_lang_popup, &resolved_asr.language);
@@ -1888,11 +1925,10 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         );
     } else {
         let default_llm = crate::app_paths::llm_default_path();
-        let effective = loaded.llm_model.clone().unwrap_or_else(|| {
-            std::fs::canonicalize(&default_llm)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(default_llm)
-        });
+        let selected = loaded.resolve_llm_model(&default_llm);
+        let effective = std::fs::canonicalize(&selected)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(selected);
         for choice in &models {
             let title = match &choice.hint {
                 Some(h) => format!("{} — {h}", choice.label),
@@ -1909,6 +1945,46 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     if let Some((name, _)) = model_env {
         env_hint(mtm, &mut card, name);
     }
+
+    let instruction_model_popup = popup_row(mtm, &mut card, "Instruction model");
+    let instruction_default = if render_fixture { None } else { crate::app_paths::instruction_default_path() };
+    let automatic_title = instruction_default.as_deref()
+        .and_then(|path| std::path::Path::new(path).file_name())
+        .map(|name| format!("Automatic — {}", name.to_string_lossy()))
+        .unwrap_or_else(|| "Automatic (no instruction model installed)".to_string());
+    popup_add_item(&instruction_model_popup, &automatic_title, None, Some("__auto__"));
+    popup_add_item(&instruction_model_popup, "Disabled", None, Some("__disabled__"));
+    for choice in &models {
+        let title = match &choice.hint {
+            Some(hint) => format!("{} — {hint}", choice.label),
+            None => choice.label.clone(),
+        };
+        popup_add_item(&instruction_model_popup, &title, None, Some(&choice.path));
+    }
+    let instruction_env = if render_fixture { None } else {
+        std::env::var(settings::INSTRUCTION_MODEL_PATH_ENV).ok()
+    };
+    let selected_instruction = instruction_env.as_deref().or(loaded.instruction_model.as_deref());
+    match selected_instruction {
+        None => select_popup_rep(&instruction_model_popup, "__auto__"),
+        Some(value) if value.trim().is_empty() => select_popup_rep(&instruction_model_popup, "__disabled__"),
+        Some(path) => {
+            let effective = std::fs::canonicalize(path)
+                .map(|value| value.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
+            if !models.iter().any(|choice| choice.path == effective) {
+                let name = std::path::Path::new(&effective).file_name()
+                    .map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Configured model".to_string());
+                popup_add_item(&instruction_model_popup, &format!("Current: {name}"), None, Some(&effective));
+            }
+            select_popup_rep(&instruction_model_popup, &effective);
+        }
+    }
+    finish_popup(&instruction_model_popup);
+    wire_popup(&instruction_model_popup, &controller, sel!(changeInstructionModel:), instruction_env.is_some());
+    if instruction_env.is_some() {
+        env_hint(mtm, &mut card, settings::INSTRUCTION_MODEL_PATH_ENV);
+    }
+    hint_line(mtm, &mut card, "For rewrites, translation and custom formats. Cleanup stays separate.");
     let _ = card_end(&card);
     finish_pane(&speech, &card);
 
@@ -2055,6 +2131,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         rail_rows,
         pane_title,
         pane_subtitle,
+        footer_hint,
         hotkey_popup,
         cleanup_switch,
         preroll_switch,
@@ -2062,6 +2139,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         appearance_popup,
         cohere_lang_popup,
         model_popup,
+        instruction_model_popup,
         streaming_switch,
         streaming_hint,
         processing_detail_switch,
@@ -3629,9 +3707,26 @@ fn refresh_live_preview_control() {
 const DICTIONARY_UNREADABLE: &str = "corrections.json could not be read, so it was left untouched. \
      Open the Corrections folder in About, fix or remove the file, then reopen Settings.";
 
+/// Show a failed Apply & Restart where the restart hint lives, instead of only
+/// a log line. The window stays open, so the in-memory edits are not lost.
+fn show_apply_error(ui: &SettingsUi, message: &str) {
+    ui.footer_hint.setStringValue(&NSString::from_str(message));
+    unsafe {
+        let _: () = msg_send![&*ui.footer_hint, setTextColor: &*theme::warning()];
+        // Bound the label so a long reason truncates before it runs under the
+        // Apply button; the full text stays on the tooltip.
+        let f = ui.footer_hint.frame();
+        ui.footer_hint.setFrame(NSRect::new(
+            f.origin,
+            NSSize::new(PANE_W - SPACE_MD - 190.0, f.size.height),
+        ));
+        let _: () = msg_send![&*ui.footer_hint, setToolTip: &*NSString::from_str(message)];
+    }
+}
+
 fn apply_and_restart(ui: &SettingsUi) {
     let pending = ui.pending.lock().unwrap().clone();
-    let corrections = ui.pending_corrections.lock().unwrap();
+    let corrections = ui.pending_corrections.lock().unwrap().clone();
     let corrections_changed = corrections.to_editor_lines() != ui.original_correction_lines;
     if pending == ui.original && !corrections_changed {
         // Nothing changed — don't restart for nothing.
@@ -3641,12 +3736,14 @@ fn apply_and_restart(ui: &SettingsUi) {
     if pending != ui.original {
         if let Err(e) = pending.save() {
             eprintln!("[settings] failed to save settings: {e}");
+            show_apply_error(ui, &format!("Settings not saved. {e}"));
             return;
         }
     }
     if corrections_changed {
         if let Err(e) = corrections.save() {
             eprintln!("[settings] failed to save dictionary: {e}");
+            show_apply_error(ui, &format!("Dictionary not saved. {e}"));
             ui.dictionary_status
                 .setStringValue(&NSString::from_str(&format!("Not saved. {e}")));
             return;

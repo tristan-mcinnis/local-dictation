@@ -439,21 +439,17 @@ pub(super) fn copy_history_entry_at(tag: isize) {
     if text.trim().is_empty() {
         return;
     }
-    copy_to_clipboard(&text);
-
-    // Confirm in the footer: "Copied “<short preview>…”".
-    if let Some(ui) = HISTORY_UI.get() {
-        let flat = text.replace('\n', " ");
-        let preview: String = flat.chars().take(42).collect();
-        let ellipsis = if flat.chars().count() > 42 { "…" } else { "" };
-        let msg = format!("Copied “{preview}{ellipsis}”");
-        ui.footer_status.setStringValue(&NSString::from_str(&msg));
-        slate::place_left(
-            &ui.footer_status,
-            SPACE_MD + slate::DOT + PILL_GAP,
-            CONTROL_FOOTER / 2.0,
-        );
-    }
+    let flat = text.replace('\n', " ");
+    let preview: String = flat.chars().take(42).collect();
+    let ellipsis = if flat.chars().count() > 42 { "…" } else { "" };
+    let message = format!("Copied “{preview}{ellipsis}”");
+    copy_to_clipboard(text, move |copied| {
+        if let Some(ui) = HISTORY_UI.get() {
+            let message = if copied { message.as_str() } else { "Could not copy this dictation." };
+            ui.footer_status.setStringValue(&NSString::from_str(message));
+            slate::place_left(&ui.footer_status, SPACE_MD + slate::DOT + PILL_GAP, CONTROL_FOOTER / 2.0);
+        }
+    });
     // Keep the row highlighted so the copied entry is obvious.
     if let Some(ui) = HISTORY_UI.get() {
         select_row(ui, tag);

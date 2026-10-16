@@ -28,9 +28,11 @@ box, where you talk, press Enter, and it sends.
 </p>
 
 **The speech model is fixed.** Local Dictation always uses Cohere Transcribe
-03-2026 in 4-bit MLX. There is no speech-model picker and no cloud provider.
-Only the cleanup model is selectable. This keeps the press-to-text path short
-and measurable.
+03-2026 in 4-bit MLX, run by a resident native Swift helper. There is no
+speech-model picker and no cloud provider. The two selectable models are both
+text models: the cleanup model (used by default) and an optional instruction
+model for rewrites, translations and custom formats. This keeps the
+press-to-text path short and measurable.
 
 ## Features
 
@@ -54,9 +56,13 @@ and measurable.
    dictation.
 8. **Edit selected text by voice.** Select a passage, hold Shift plus the key,
    speak an instruction ("make this concise", "translate to Spanish"), and it is
-   rewritten in place.
+   rewritten in place. These rewrites and translations use the optional
+   instruction model; without one the request is refused and the selection is
+   left untouched.
 9. **Output formats.** Numbered, bullets, email and code presets reshape a
-   dictation when you want structure. Off by default.
+   dictation when you want structure. Bullets and email run on the cleanup
+   model; numbered, code and any custom preset use the optional instruction
+   model. Off by default.
 10. **Recovery history.** Completed, cancelled, failed and interrupted captures
     keep their audio and text versions on your Mac. Play the audio, compare
     raw, cleaned and output text, copy a version, or recover to the clipboard.
@@ -71,7 +77,8 @@ prompts in plain JSON.
 
 - macOS 14 or later on an Apple Silicon Mac (M1 or later). Intel Macs are not
   supported.
-- About 2 GB of disk for the two models, and a network connection for the model
+- About 2 GB of disk for the two required models, plus about 1.3 GB more if you
+  add the optional instruction model, and a network connection for the model
   download.
 - To build from source only: full Xcode (the MLX helper builds a Metal resource
   bundle), the Rust stable toolchain, and cmake. `install.sh` offers to install
@@ -139,6 +146,12 @@ Item, and launches it.
   [superwhisper/s1-mini-GGUF](https://huggingface.co/superwhisper/s1-mini-GGUF),
   checked against its published SHA-256, with its LICENSE and NOTICE.
 
+A third model is optional: the **instruction model** (Qwen3.5-2B Q4_K_M,
+Apache-2.0; GGUF conversion by Unsloth). The script does not fetch it. Get it
+with `fetch-models`, or point the instruction slot at a GGUF you already have
+in Settings, Instruction model; it is used for selection rewrites,
+translations, numbered/code formats and a non-English speech language.
+
 The bytes go to `~/Models` (set `LOCAL_MODELS_HOME` to change that), and the
 repo's `models/` entries are symlinks to them. If you already have Superwhisper
 installed, the script reuses its local copies instead of downloading.
@@ -146,6 +159,8 @@ installed, the script reuses its local copies instead of downloading.
 Inside the app, Setup can fetch the cleanup model for you. It cannot fetch the
 speech model yet; run the script (a copy sits inside the downloaded app, see
 Download), or choose a folder that holds `model.safetensors` and `config.json`.
+The optional instruction model comes from `fetch-models`, or from a GGUF you
+select under Settings, Instruction model.
 
 <details>
 <summary><b>Hand it to an AI agent</b> (paste into Claude Code, Codex, or Cursor)</summary>
@@ -201,8 +216,12 @@ go of both keys, and keep talking. Tap Right Option once to stop.
 To edit existing text, select it, hold **Shift plus Right Option**, speak an
 instruction, and release.
 
-The menu-bar app holds the cleanup-model, hotkey, output-format and cleanup
-pickers, dictation history, and prompt and log tools. Settings, Dictionary has a
+Settings holds the cleanup-model and instruction-model pickers, the hotkey,
+output-format and cleanup controls. The menu-bar app also offers dictation
+history and prompt and log tools. Its root menu keeps the common actions first (Start or Stop, Cancel,
+Copy last text, Paste last text, Retry last audio, Dictation History and
+Settings), with the rest under a single More submenu and a read-only
+insertion-timing line above Quit. Settings, Dictionary has a
 form for personal terms and heard-to-correct replacements, above a searchable
 list of every term. Settings, History groups dictations by day and opens each
 record for playback, text versions and recovery.
@@ -261,6 +280,7 @@ transform prompts; `prompts.example.json`, `corrections.example.json` and
 | `DICTATE_COHERE_MLX_BRIDGE` | Native helper path override |
 | `DICTATE_COHERE_LANG` | Decoder language hint (`en` by default) |
 | `DICTATE_LLM_MODEL_PATH` | Cleanup model GGUF path (`S1_MODEL_PATH` alias, `GEMMA_MODEL_PATH` deprecated) |
+| `DICTATE_INSTRUCTION_MODEL_PATH` | Optional instruction model GGUF (rewrites, translations, custom formats); an empty string disables it |
 | `DICTATE_FORMAT` | Active output-format preset |
 | `DICTATE_QUIET` | Mute audio cues |
 | `DICTATE_SHOW_RESULT` | Show the "Landed · N words" pill for 2 s after each dictation (default off) |
@@ -311,9 +331,13 @@ you.
 
 ### Trade-offs
 
-- The speech model is fixed. Cohere is multilingual (14 languages), but the
-  prompts and eval corpus are English-first.
+- The speech model is fixed. Speech recognition covers 14 languages, but the
+  S1-mini cleanup model is English-only: in another speech language, cleanup
+  needs the optional instruction model, and without one the raw transcript is
+  used.
 - S1-mini is guarded; a failed quality check falls back to deterministic text.
+  It handles plain dictation and the bullets and email presets; rewrites,
+  translations, numbered/code and custom formats need the instruction model.
 - Recording is bounded by the key hold, not silence detection.
 - macOS 14 or later, Apple Silicon only.
 
@@ -382,10 +406,11 @@ Local Dictation is one of a small family of free, local-first Mac tools that sha
 | [Usage](https://github.com/tristan-mcinnis/usage-menubar) | One menu-bar gauge for every AI subscription and API key. |
 | [RTI](https://github.com/tristan-mcinnis/rti) | Meeting recorder with live transcription and a real-time copilot. |
 
-Local Dictation runs both of its models inside its own process rather than
-through Local Models, on purpose: a daemon round trip would sit on the
-press-to-text path. By default it shares the same `~/Models` folder for the
-weights.
+Local Dictation runs its own model stack rather than through Local Models, on
+purpose: a daemon round trip would sit on the press-to-text path. The speech
+model runs in a resident native Swift helper process, and the cleanup and
+instruction models run in-process on llama.cpp. By default it shares the same
+`~/Models` folder for the weights.
 
 ## Credits
 
@@ -393,6 +418,8 @@ Local Dictation stands on other people's work:
 
 - **Cohere Labs** for [Cohere Transcribe 03-2026](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) (Apache-2.0), and **beshkenadze** for the [4-bit MLX conversion](https://huggingface.co/beshkenadze/cohere-transcribe-03-2026-mlx-4bit) the install script downloads.
 - **Superwhisper** for the cleanup model, ["S1-mini" by "Superwhisper"](https://huggingface.co/superwhisper/s1-mini) (Apache-2.0 with a naming term), and **Alibaba Cloud** for its base, [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B).
+- **Qwen** for [Qwen3.5-2B](https://huggingface.co/Qwen/Qwen3.5-2B) (Apache-2.0), the base of the default instruction model, and **Unsloth** for its [GGUF conversion](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF).
+- Optionally, **Cohere Labs** for [Tiny Aya](https://huggingface.co/CohereLabs/tiny-aya-global) (CC-BY-NC-4.0 with an acceptable-use policy), which you can supply yourself as an instruction model; it is never a default and is not licensed for commercial use.
 - **Prince Canuma** and contributors for [mlx-audio-swift](https://github.com/Blaizzy/mlx-audio-swift), which carries the Cohere Transcribe port, and **Apple's ml-explore team** for [MLX](https://github.com/ml-explore/mlx) and [MLX Swift](https://github.com/ml-explore/mlx-swift).
 - **The ggml authors** for [llama.cpp](https://github.com/ggml-org/llama.cpp), and **utilityai** for the [llama-cpp-rs](https://github.com/utilityai/llama-cpp-rs) bindings.
 - The authors of [cpal](https://github.com/RustAudio/cpal), [objc2](https://github.com/madsmtm/objc2), [rusqlite](https://github.com/rusqlite/rusqlite) and SQLite, [tokio](https://tokio.rs), [serde](https://serde.rs), and the other crates and Swift packages listed in the notices.
@@ -410,5 +437,7 @@ Dual-licensed under MIT OR Apache-2.0, at your option. See
 Copyright (c) 2026 Tristan McInnis.
 
 Model weights are not part of this repository. They are downloaded from their
-publishers and keep their own licences (both Apache-2.0; S1-mini adds a naming
-term).
+publishers and keep their own licences: the speech, cleanup and default
+instruction models are Apache-2.0 (S1-mini adds a naming term), and Cohere Labs
+Tiny Aya, which you may supply yourself, is CC-BY-NC-4.0 with an acceptable-use
+policy and is not for commercial use.

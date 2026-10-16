@@ -6,30 +6,56 @@ use ringbuf::{
 };
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 
 pub const SAMPLE_RATE: u32 = 16_000;
-/// 5 min of headroom (16 000 samples/s · 300). The ring buffer is only drained
-/// after the key is released, so anything spoken past this cap is silently
-/// dropped — keep it generously larger than the longest realistic dictation.
-/// At f32 that's ~18 MB, which is fine.
+/// 5 min of headroom (16 000 samples/s · 300). The streaming path drains this
+/// ring every ~120 ms while the key is held (the worker's `recv_timeout`); the
+/// whole-buffer path drains it on release. The cap is headroom for a stalled
+/// drain, not the utterance length — the SPSC ring drops the *newest* sample
+/// once it is full, so past this point audio is silently lost. At f32 that's
+/// ~18 MB, which is fine.
 pub const BUFFER_CAPACITY: usize = 16_000 * 300;
 
 pub type HeapAudioConsumer = HeapCons<f32>;
 pub type HeapAudioProducer = HeapProd<f32>;
+
+/// The two operations the retained-stream lifecycle needs: stop delivering
+/// callbacks, and start again. Implemented for `cpal::Stream`; the deterministic
+/// lifecycle tests implement it with a fake, so the park/resume ordering — clear
+/// the flag before pausing, only claim recording after `play` succeeds, mark the
+/// stream failed on either error — is proven without a microphone.
+pub(crate) trait AudioStreamControl {
+    fn start_io(&self) -> Result<(), String>;
+    fn stop_io(&self) -> Result<(), String>;
+}
+
+impl AudioStreamControl for Stream {
+    fn start_io(&self) -> Result<(), String> {
+        StreamTrait::play(self).map_err(|e| e.to_string())
+    }
+    fn stop_io(&self) -> Result<(), String> {
+        StreamTrait::pause(self).map_err(|e| e.to_string())
+    }
+}
 
 /// Owns the cpal input Stream (held alive for the recording's duration) plus
 /// the recording flag. Drop the engine to stop capture and release the mic.
 ///
 /// Lifecycle is three-state so a warm-window can reuse the stream across
 /// back-to-back dictations instead of paying cpal's stream-open cost each time:
-///   * **active**  — `start_microphone`/`resume` have set `is_recording` true;
-///     the callback pushes every resampled chunk into the producer.
-///   * **parked**  — `park` set `is_recording` false but left `stream` alive; the
-///     callback now *drops* chunks (no producer push) but the mic stays open, so
-///     the next `resume` costs nothing. The mic indicator stays lit.
+///   * **active**  — `start_microphone`/`resume` set `is_recording` true *after*
+///     the stream is really running; the callback pushes every resampled chunk
+///     into the producer.
+///   * **parked**  — `park` cleared `is_recording` and *paused* the retained
+///     stream, so cpal stops delivering callbacks: nothing is captured and
+///     nothing is dropped. The initialized stream object, and with it the
+///     input device, is retained, so the next `resume` restarts the same stream
+///     instead of paying a cold open. A refused `pause`/`play` marks the stream
+///     [`stream_failed`](Self::stream_failed) for rebuild and raises an
+///     actionable audio fault rather than pretending to record.
 ///   * **dropped** — `stop_capture`/`Drop` released the stream entirely.
 pub struct AudioCaptureEngine {
     is_recording: Arc<AtomicBool>,
@@ -43,9 +69,15 @@ pub struct AudioCaptureEngine {
     // Needed so a warm-window reuse can detect the default input changing since
     // the stream was built, and rebuild instead of silently reusing a stale one.
     device_name: String,
-    // Set by cpal's error callback. A parked stream that has failed must be
-    // rebuilt on the next press, not resumed into silence.
+    // Set by cpal's error callback, or by a refused pause/play. A parked stream
+    // that has failed must be rebuilt on the next press, not resumed into
+    // silence.
     stream_failed: Arc<AtomicBool>,
+    // Bumped by `resume` before the recording flag goes true. The callback reads
+    // the flag first and this epoch second, so a callback that observes
+    // `recording == true` is guaranteed to read the new epoch and drop the
+    // previous utterance's fractional resample carry before it emits a sample.
+    epoch: Arc<AtomicU64>,
     // Wall clock at stream open, paired with the monotonic clock at the same
     // instant. `Instant` pauses while the Mac sleeps and `SystemTime` does
     // not, so the gap between the two is how much of this stream's life was
@@ -72,6 +104,7 @@ impl AudioCaptureEngine {
                 native_channels: 0,
                 device_name: String::new(),
                 stream_failed: Arc::new(AtomicBool::new(false)),
+                epoch: Arc::new(AtomicU64::new(0)),
                 opened_at: std::time::SystemTime::UNIX_EPOCH,
                 opened_at_mono: std::time::Instant::now(),
             },
@@ -146,13 +179,14 @@ impl AudioCaptureEngine {
             .expect("capture already started on this engine");
         let stride = native_rate as f64 / SAMPLE_RATE as f64;
         let channels = native_channels as usize;
-        // Carry: fractional sample position across callback boundaries.
-        let mut pos: f64 = 0.0;
-        let mut last: f32 = 0.0;
+        // Per-stream callback state: the fractional resample carry, the channel
+        // picker, and the epoch it was built at. Held in one value so the
+        // park/resume reset seam is a single method (`ResampleState`).
+        let epoch = self.epoch.clone();
+        let mut state = ResampleState::new(channels, native_rate, epoch.load(Ordering::SeqCst));
         // Grip the recording flag so the callback can gate pushes: while parked
-        // (warm-window idle) it must drop chunks, not fill the ring with silence.
+        // (warm-window idle) it must not fill the ring with captured room tone.
         let recording = self.is_recording.clone();
-        let mut picker = ChannelPicker::new(channels, native_rate);
         // A cpal error used to be a log line and nothing else, so an unplugged
         // mic, a default-device change or a sleep/wake left a dead stream that
         // the warm-window path happily reused: the user got silence and a
@@ -168,10 +202,7 @@ impl AudioCaptureEngine {
             SampleFormat::F32 => device.build_input_stream(
                 &config,
                 move |data: &[f32], _| {
-                    push_resampled(
-                        data, channels, stride, &mut pos, &mut last, &mut producer, &recording,
-                        &mut picker,
-                    );
+                    push_resampled(data, channels, stride, &mut state, &epoch, &mut producer, &recording);
                 },
                 err_fn,
                 None,
@@ -180,7 +211,7 @@ impl AudioCaptureEngine {
                 &config,
                 move |data: &[i16], _| {
                     let f: Vec<f32> = data.iter().map(|s| *s as f32 / 32_768.0).collect();
-                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording, &mut picker);
+                    push_resampled(&f, channels, stride, &mut state, &epoch, &mut producer, &recording);
                 },
                 err_fn,
                 None,
@@ -192,7 +223,7 @@ impl AudioCaptureEngine {
                         .iter()
                         .map(|s| (*s as f32 - 32_768.0) / 32_768.0)
                         .collect();
-                    push_resampled(&f, channels, stride, &mut pos, &mut last, &mut producer, &recording, &mut picker);
+                    push_resampled(&f, channels, stride, &mut state, &epoch, &mut producer, &recording);
                 },
                 err_fn,
                 None,
@@ -216,20 +247,45 @@ impl AudioCaptureEngine {
         self.stream.take();
     }
 
-    /// Park an idle engine: keep the stream (and thus the input device) open so a
-    /// follow-up dictation within the warm window can [`resume`](Self::resume)
-    /// without re-opening it, but drop incoming chunks so the ring doesn't fill
-    /// with silence. The recording flag goes false; the mic indicator stays lit.
-    pub fn park(&mut self) {
+    /// Park an idle engine: keep the initialized stream (and thus the input
+    /// device) retained so a follow-up dictation within the warm window can
+    /// [`resume`](Self::resume) without re-opening it, but **pause** its IO so
+    /// cpal stops delivering callbacks — nothing is captured and nothing is
+    /// dropped. The recording flag is cleared first, so even a backend that
+    /// refuses to pause cannot leave samples flowing into the ring.
+    ///
+    /// Returns `Err` if the stream could not be paused. The stream is then
+    /// marked [`stream_failed`](Self::stream_failed) and an actionable audio
+    /// fault is raised, so the caller rebuilds instead of trusting a stream
+    /// whose run state is unknown. Parking an engine that never opened a stream
+    /// is a successful no-op.
+    pub fn park(&mut self) -> eyre::Result<()> {
         self.is_recording.store(false, Ordering::SeqCst);
+        match self.stream.as_ref() {
+            Some(stream) => pause_retained(stream, &self.is_recording, &self.stream_failed),
+            // Never started, or already released: nothing to pause.
+            None => Ok(()),
+        }
     }
 
-    /// Reuse a parked engine: flip the recording flag back true so the callback
-    /// pushes live audio into the (still-consumable) ring. Returns the flag. No
-    /// stream re-open, so this costs ~0 ms versus `start_microphone`'s ~120 ms.
-    pub fn resume(&mut self) -> Arc<AtomicBool> {
-        self.is_recording.store(true, Ordering::SeqCst);
-        self.is_recording.clone()
+    /// Reuse a parked engine: restart the **retained** stream and, only once it
+    /// is really running, set the recording flag. Returns that flag so the
+    /// worker can hand it to the drain loop. No stream re-open, so this costs a
+    /// `StreamTrait::play` call rather than `start_microphone`'s cold open.
+    ///
+    /// Returns `Err` if there is no retained stream (the caller must cold-open)
+    /// or if `play` failed. On a `play` failure the recording flag is **not**
+    /// set: the stream is marked [`stream_failed`](Self::stream_failed) and an
+    /// actionable fault is raised, so the worker rebuilds instead of recording
+    /// silence from a stream that never restarted.
+    pub fn resume(&mut self) -> eyre::Result<Arc<AtomicBool>> {
+        let Some(stream) = self.stream.as_ref() else {
+            return Err(eyre::eyre!(
+                "no retained microphone stream to resume; a cold open is required"
+            ));
+        };
+        resume_retained(stream, &self.is_recording, &self.stream_failed, &self.epoch)?;
+        Ok(self.is_recording.clone())
     }
 
     /// Name of the input device this stream is bound to (empty before `start`).
@@ -280,6 +336,53 @@ impl AudioCaptureEngine {
         }
         None
     }
+}
+
+/// Stop a retained stream's IO. The recording flag is cleared *before* the
+/// pause, so a refused pause still cannot capture. On failure the stream is
+/// marked for rebuild and an actionable fault is raised: the caller must not
+/// keep a stream whose run state is unknown.
+fn pause_retained(
+    stream: &dyn AudioStreamControl,
+    recording: &AtomicBool,
+    failed: &AtomicBool,
+) -> eyre::Result<()> {
+    recording.store(false, Ordering::SeqCst);
+    if let Err(e) = stream.stop_io() {
+        failed.store(true, Ordering::SeqCst);
+        crate::health::raise(
+            crate::health::Fault::AudioLost,
+            format!("microphone stream could not pause: {e}"),
+        );
+        return Err(eyre::eyre!("stream.pause failed: {e}"));
+    }
+    Ok(())
+}
+
+/// Restart a retained stream's IO for a new utterance. The epoch is bumped
+/// first and the recording flag set *last*, so the flag is only true after the
+/// backend actually resumed and the callback is guaranteed to reset its
+/// resample carry (see [`ResampleState::begin_callback`]). On failure the flag
+/// stays false: the app never claims to record on a stream that did not start.
+fn resume_retained(
+    stream: &dyn AudioStreamControl,
+    recording: &AtomicBool,
+    failed: &AtomicBool,
+    epoch: &AtomicU64,
+) -> eyre::Result<()> {
+    // New utterance: signal the callback to drop the previous one's carry before
+    // the flag can say recording.
+    epoch.fetch_add(1, Ordering::SeqCst);
+    if let Err(e) = stream.start_io() {
+        failed.store(true, Ordering::SeqCst);
+        crate::health::raise(
+            crate::health::Fault::AudioLost,
+            format!("microphone stream could not resume: {e}"),
+        );
+        return Err(eyre::eyre!("stream.play failed: {e}"));
+    }
+    recording.store(true, Ordering::SeqCst);
+    Ok(())
 }
 
 /// How a multi-channel callback buffer becomes one mono sample per frame.
@@ -386,6 +489,18 @@ impl ChannelPicker {
         self.chosen = Some(chosen);
         chosen
     }
+
+    /// A new utterance is starting on this stream. Drop any partial probe
+    /// window — its accumulated energy belongs to the previous utterance — but
+    /// keep a channel that was already chosen: a device change forces a rebuild,
+    /// so the wiring has not changed, and re-probing would attenuate the first
+    /// 200 ms of every reused utterance on a multi-input interface.
+    pub fn reset_for_new_utterance(&mut self) {
+        if self.chosen.is_none() {
+            self.energy.iter_mut().for_each(|e| *e = 0.0);
+            self.frames_seen = 0;
+        }
+    }
 }
 
 /// How much of `wall` a stream spent asleep, from the wall-clock and monotonic
@@ -418,25 +533,73 @@ pub fn fold_frame(frame: &[f32], mix: Downmix) -> f32 {
     }
 }
 
+/// The per-stream state a capture callback carries across invocations: the
+/// fractional resample position, the previous mono sample (interpolated across
+/// a chunk boundary), the channel picker, and the epoch this state was last
+/// reset at. Held as one value so the "new utterance" reset is a single,
+/// testable method instead of three pieces of loose state in the callback.
+struct ResampleState {
+    pos: f64,
+    last: f32,
+    picker: ChannelPicker,
+    epoch: u64,
+}
+
+impl ResampleState {
+    fn new(channels: usize, native_rate: u32, epoch: u64) -> Self {
+        Self {
+            pos: 0.0,
+            last: 0.0,
+            picker: ChannelPicker::new(channels, native_rate),
+            epoch,
+        }
+    }
+
+    /// Called at the top of every recording callback with the stream's current
+    /// epoch. A changed epoch means [`resume`](AudioCaptureEngine::resume)
+    /// restarted a parked stream: this is a new utterance, so drop the previous
+    /// one's fractional carry and re-arm the channel probe. Without this the
+    /// first sample of the new utterance is interpolated against the last
+    /// sample of the old one — a click at the seam.
+    fn begin_callback(&mut self, stream_epoch: u64) {
+        if stream_epoch != self.epoch {
+            self.epoch = stream_epoch;
+            self.pos = 0.0;
+            self.last = 0.0;
+            self.picker.reset_for_new_utterance();
+        }
+    }
+}
+
 /// Downmix interleaved native samples to mono, then linearly resample at
-/// `stride = native_rate / 16000` and push to the SPSC ring buffer. `pos` and
-/// `last` carry fractional resample state across cpal callback invocations.
+/// `stride = native_rate / 16000` and push to the SPSC ring buffer.
+///
+/// `state` carries the fractional resample position, the last mono sample and
+/// the channel picker across cpal callback invocations. `epoch` is the engine's
+/// resume generation: it is read **after** the recording flag, so a callback
+/// that sees `recording == true` is guaranteed to read the epoch `resume`
+/// bumped and reset the carry before it emits a sample.
 fn push_resampled(
     interleaved: &[f32],
     channels: usize,
     stride: f64,
-    pos: &mut f64,
-    last: &mut f32,
+    state: &mut ResampleState,
+    epoch: &AtomicU64,
     producer: &mut HeapAudioProducer,
     recording: &AtomicBool,
-    picker: &mut ChannelPicker,
 ) {
     let frames = interleaved.len() / channels.max(1);
     if frames == 0 {
         return;
     }
 
-    let mix = picker.observe(interleaved);
+    // Recording first, epoch second — see the function docs. The reset only
+    // matters while recording; a parked stream delivers no callbacks at all.
+    if recording.load(Ordering::SeqCst) {
+        state.begin_callback(epoch.load(Ordering::SeqCst));
+    }
+
+    let mix = state.picker.observe(interleaved);
     // Reusable mono buffer.
     let mut mono = Vec::with_capacity(frames);
     if channels <= 1 {
@@ -455,25 +618,23 @@ fn push_resampled(
 
     // Linear-interpolate at `stride`. `pos` indexes into the mono buffer.
     // When pos crosses a frame boundary the carry advances by `stride` again.
-    // Always advance `pos`/`last` so a warm-window [AudioCaptureEngine::resume]
-    // continues from a consistent position, but only push to the producer while
-    // recording — a parked engine keeps the mic open but must not fill the ring
-    // with room tone.
-    while *pos < mono.len() as f64 {
-        let idx = pos.floor() as usize;
-        let frac = (*pos - idx as f64) as f32;
-        let a = if idx == 0 { *last } else { mono[idx - 1] };
+    // Always advance `pos`/`last` so the carry stays a consistent position, but
+    // only push to the producer while recording.
+    while state.pos < mono.len() as f64 {
+        let idx = state.pos.floor() as usize;
+        let frac = (state.pos - idx as f64) as f32;
+        let a = if idx == 0 { state.last } else { mono[idx - 1] };
         let b = mono[idx];
         let sample = a + (b - a) * frac;
         if recording.load(Ordering::SeqCst) {
             let _ = producer.try_push(sample);
         }
-        *pos += stride;
+        state.pos += stride;
     }
     // Subtract the consumed frames so `pos` stays a small fractional offset
     // into the next chunk.
-    *pos -= mono.len() as f64;
-    *last = *mono.last().unwrap();
+    state.pos -= mono.len() as f64;
+    state.last = *mono.last().unwrap();
 }
 
 #[cfg(test)]
@@ -605,13 +766,12 @@ mod tests {
         use super::*;
         let (mut producer, mut consumer) = HeapRb::<f32>::new(128).split();
         let recording = AtomicBool::new(true);
-        let mut pos = 0.0;
-        let mut last = 0.0;
-        let mut picker = ChannelPicker::new(1, 16_000);
-        push_resampled(&[0.2; 8], 1, 1.0, &mut pos, &mut last, &mut producer, &recording, &mut picker);
+        let epoch = AtomicU64::new(0);
+        let mut state = ResampleState::new(1, 16_000, 0);
+        push_resampled(&[0.2; 8], 1, 1.0, &mut state, &epoch, &mut producer, &recording);
         let before = consumer.occupied_len();
         recording.store(false, Ordering::SeqCst); // accepted out-of-band Cancel
-        push_resampled(&[0.9; 32], 1, 1.0, &mut pos, &mut last, &mut producer, &recording, &mut picker);
+        push_resampled(&[0.9; 32], 1, 1.0, &mut state, &epoch, &mut producer, &recording);
         assert_eq!(consumer.occupied_len(), before, "waiting for ASR must not capture post-cancel speech");
         let samples = drain_session(&mut consumer, &recording);
         assert_eq!(samples.len(), before);
@@ -986,6 +1146,225 @@ mod tests {
         let tail2 = recording_tail(&cons2, &[99.0_f32; 100], 1);
         assert_eq!(tail2.len(), 16);
         assert_eq!(tail2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]);
+    }
+}
+
+/// Deterministic proofs of the park/resume lifecycle against a fake backend,
+/// plus the resample-carry reset at the utterance seam. No microphone and no
+/// cpal stream: these exercise the exact `pause_retained`/`resume_retained`
+/// functions `AudioCaptureEngine::park`/`resume` call.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// A stand-in for `cpal::Stream` that records lifecycle calls and can be
+    /// told to refuse either one.
+    #[derive(Default)]
+    struct FakeStream {
+        playing: Cell<bool>,
+        fail_play: Cell<bool>,
+        fail_pause: Cell<bool>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl AudioStreamControl for FakeStream {
+        fn start_io(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("play");
+            if self.fail_play.get() {
+                return Err("play refused".into());
+            }
+            self.playing.set(true);
+            Ok(())
+        }
+        fn stop_io(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("pause");
+            if self.fail_pause.get() {
+                return Err("pause refused".into());
+            }
+            self.playing.set(false);
+            Ok(())
+        }
+    }
+
+    fn fresh_flags() -> (AtomicBool, AtomicBool, AtomicU64) {
+        (
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+            AtomicU64::new(0),
+        )
+    }
+
+    #[test]
+    fn pause_clears_recording_before_it_stops_the_stream() {
+        let stream = FakeStream::default();
+        let (recording, failed, _epoch) = fresh_flags();
+        recording.store(true, Ordering::SeqCst);
+        pause_retained(&stream, &recording, &failed).unwrap();
+        assert!(!recording.load(Ordering::SeqCst));
+        assert!(!failed.load(Ordering::SeqCst));
+        assert!(!stream.playing.get());
+        assert_eq!(&*stream.calls.borrow(), &["pause"]);
+    }
+
+    #[test]
+    fn a_refused_pause_clears_recording_and_marks_the_stream_for_rebuild() {
+        let _serial = crate::health::test_lock();
+        let stream = FakeStream {
+            fail_pause: Cell::new(true),
+            ..FakeStream::default()
+        };
+        let (recording, failed, _epoch) = fresh_flags();
+        recording.store(true, Ordering::SeqCst);
+        let err = pause_retained(&stream, &recording, &failed).unwrap_err();
+        assert!(err.to_string().contains("pause"), "{err}");
+        assert!(
+            !recording.load(Ordering::SeqCst),
+            "a refused pause must not leave the engine capturing"
+        );
+        assert!(
+            failed.load(Ordering::SeqCst),
+            "the caller must rebuild, not trust a stream it could not pause"
+        );
+        assert!(crate::health::is_raised(crate::health::Fault::AudioLost));
+        crate::health::clear(crate::health::Fault::AudioLost);
+    }
+
+    #[test]
+    fn resume_claims_recording_only_after_the_stream_really_plays() {
+        let stream = FakeStream::default();
+        let (recording, failed, epoch) = fresh_flags();
+        resume_retained(&stream, &recording, &failed, &epoch).unwrap();
+        assert!(stream.playing.get());
+        assert!(recording.load(Ordering::SeqCst));
+        assert!(!failed.load(Ordering::SeqCst));
+        assert_eq!(epoch.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_refused_resume_never_claims_recording_and_marks_the_stream_for_rebuild() {
+        let _serial = crate::health::test_lock();
+        let stream = FakeStream {
+            fail_play: Cell::new(true),
+            ..FakeStream::default()
+        };
+        let (recording, failed, epoch) = fresh_flags();
+        let err = resume_retained(&stream, &recording, &failed, &epoch).unwrap_err();
+        assert!(err.to_string().contains("play"), "{err}");
+        assert!(
+            !recording.load(Ordering::SeqCst),
+            "a failed resume must not look like recording"
+        );
+        assert!(failed.load(Ordering::SeqCst));
+        assert!(!stream.playing.get());
+        assert!(crate::health::is_raised(crate::health::Fault::AudioLost));
+        crate::health::clear(crate::health::Fault::AudioLost);
+    }
+
+    /// The epoch must be bumped *before* `play`, and the flag set only *after*:
+    /// that is what lets the callback's recording-first/epoch-second load order
+    /// reset the carry before it emits the first sample of the new utterance.
+    #[test]
+    fn resume_signals_the_new_utterance_epoch_before_it_starts_the_stream() {
+        struct OrderStream<'a> {
+            recording: &'a AtomicBool,
+            epoch: &'a AtomicU64,
+            recording_at_play: Cell<bool>,
+            epoch_at_play: Cell<u64>,
+        }
+        impl AudioStreamControl for OrderStream<'_> {
+            fn start_io(&self) -> Result<(), String> {
+                self.recording_at_play
+                    .set(self.recording.load(Ordering::SeqCst));
+                self.epoch_at_play.set(self.epoch.load(Ordering::SeqCst));
+                Ok(())
+            }
+            fn stop_io(&self) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let recording = AtomicBool::new(false);
+        let failed = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let stream = OrderStream {
+            recording: &recording,
+            epoch: &epoch,
+            recording_at_play: Cell::new(true), // sentinel: must be overwritten
+            epoch_at_play: Cell::new(u64::MAX),
+        };
+        resume_retained(&stream, &recording, &failed, &epoch).unwrap();
+        assert!(
+            !stream.recording_at_play.get(),
+            "recording must not be claimed until play has returned"
+        );
+        assert_eq!(
+            stream.epoch_at_play.get(),
+            1,
+            "epoch must be bumped before play so the callback resets in time"
+        );
+        assert!(recording.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_resumed_utterance_drops_the_previous_carry_instead_of_interpolating_it() {
+        let (mut producer, mut consumer) = HeapRb::<f32>::new(64).split();
+        let recording = AtomicBool::new(false);
+        let epoch = AtomicU64::new(0);
+        let mut state = ResampleState::new(1, SAMPLE_RATE, 0);
+
+        // First utterance ends loud, leaving `last == 0.9`.
+        recording.store(true, Ordering::SeqCst);
+        push_resampled(&[0.5, 0.9], 1, 1.0, &mut state, &epoch, &mut producer, &recording);
+
+        // Park, then resume the same retained stream.
+        recording.store(false, Ordering::SeqCst);
+        epoch.fetch_add(1, Ordering::SeqCst);
+        recording.store(true, Ordering::SeqCst);
+        push_resampled(&[0.1, 0.1], 1, 1.0, &mut state, &epoch, &mut producer, &recording);
+
+        let mut out = vec![0.0f32; consumer.occupied_len()];
+        consumer.pop_slice(&mut out);
+        // The very first callback's first sample uses the initial carry (0.0).
+        assert_eq!(&out[..2], &[0.0, 0.5], "first utterance");
+        // The new utterance resets the carry to 0.0; without the reset this
+        // sample would be the previous utterance's 0.9 — a click at the seam.
+        assert_eq!(out[2], 0.0, "stale carry leaked into the resumed utterance");
+        assert_eq!(out[3], 0.1);
+    }
+
+    #[test]
+    fn a_new_utterance_clears_an_undecided_probe_but_keeps_a_chosen_channel() {
+        // Undecided 8-channel picker: reset must drop the partial probe energy.
+        let rate = 48_000u32;
+        let channels = 8usize;
+        let mut picker = ChannelPicker::new(channels, rate);
+        let probe = picker.probe_frames;
+        let mut partial = vec![0.0f32; channels * 10];
+        for frame in partial.chunks_exact_mut(channels) {
+            frame[3] = 0.4;
+        }
+        let _ = picker.observe(&partial);
+        picker.reset_for_new_utterance();
+        assert_eq!(
+            picker.observe(&vec![0.0001f32; channels * probe]),
+            Downmix::Mean,
+            "partial probe energy must not survive into the new utterance"
+        );
+
+        // Decided picker: the chosen channel is kept (a device change rebuilds).
+        let mut decided = ChannelPicker::new(channels, rate);
+        let probe = decided.probe_frames;
+        let mut speech = vec![0.0f32; channels * probe];
+        for frame in speech.chunks_exact_mut(channels) {
+            frame[5] = 0.4;
+        }
+        assert_eq!(decided.observe(&speech), Downmix::Channel(5));
+        decided.reset_for_new_utterance();
+        assert_eq!(
+            decided.observe(&vec![0.0001f32; channels * probe]),
+            Downmix::Channel(5)
+        );
     }
 }
 

@@ -20,7 +20,7 @@
 //! on the next daemon launch — same as switching the model or hotkey.
 
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Default cleanup prompt. Lives here (not in `cleaner.rs`) so all prompt text
@@ -229,9 +229,19 @@ pub struct Prompts {
     pub transform: String,
     /// Named output-shape presets (e.g. `email`, `bullets`, `code`), keyed by
     /// lowercased name. Each value is a full cleanup-style system prompt used
-    /// in place of `cleanup` when that preset is active. Empty unless the user
-    /// defines a `formats` object in `prompts.json`.
+    /// in place of `cleanup` when that preset is active. The built-in presets
+    /// are always present; a user's `formats` object overlays them.
     pub formats: HashMap<String, String>,
+    /// Lowercased names of presets the user's `prompts.json` supplied or
+    /// overrode. Such a preset is a free-form instruction that S1-mini was not
+    /// trained to follow, so the engine routes it to an instruction model.
+    pub custom_formats: HashSet<String>,
+    /// True when `cleanup` came from an env var or `prompts.json` rather than
+    /// the built-in default. A custom cleanup prompt is a free-form instruction
+    /// that S1-mini was not trained to follow.
+    pub cleanup_is_custom: bool,
+    /// True when `transform` came from an env var or `prompts.json`.
+    pub transform_is_custom: bool,
 }
 
 /// On-disk shape of `prompts.json`. All fields optional; unknown keys (e.g. a
@@ -322,21 +332,38 @@ impl Prompts {
         // Start from the built-in presets and overlay the user's file formats:
         // a matching key overrides the default, a new key adds a preset. Blank
         // values and `_`-comment keys are dropped (they can't blank a preset).
+        // File-supplied names are remembered so the engine can tell a free-form
+        // custom preset from a built-in one.
         let mut formats = default_formats();
+        let mut custom_formats = HashSet::new();
         for (k, v) in file_formats {
             if k.starts_with('_') || v.trim().is_empty() {
                 continue;
             }
             let k = k.trim().to_lowercase();
             if !k.is_empty() {
+                custom_formats.insert(k.clone());
                 formats.insert(k, v);
             }
         }
+        let (cleanup, cleanup_is_custom) = pick_tracked(env_cleanup, file_cleanup, DEFAULT_CLEANUP);
+        let (transform, transform_is_custom) =
+            pick_tracked(env_transform, file_transform, DEFAULT_TRANSFORM);
         Self {
-            cleanup: pick(env_cleanup, file_cleanup, DEFAULT_CLEANUP),
-            transform: pick(env_transform, file_transform, DEFAULT_TRANSFORM),
+            cleanup,
+            transform,
             formats,
+            custom_formats,
+            cleanup_is_custom,
+            transform_is_custom,
         }
+    }
+
+    /// True when `format` names a preset the user supplied or overrode in
+    /// `prompts.json`. Such a preset is a free-form instruction S1-mini cannot
+    /// follow, and must not be silently replaced by a trained axis.
+    pub fn is_custom_format(&self, format: &str) -> bool {
+        self.custom_formats.contains(&format.trim().to_lowercase())
     }
 
     /// The cleanup system prompt to use for the active formatting preset. When
@@ -371,13 +398,21 @@ impl Prompts {
     }
 }
 
-/// First non-blank of `env`, then `file`, else `default`.
-fn pick(env: Option<String>, file: Option<String>, default: &str) -> String {
-    [env, file]
+/// First non-blank of `env`, then `file`, else `default`, plus whether an
+/// override (env or file) supplied the value.
+fn pick_tracked(
+    env: Option<String>,
+    file: Option<String>,
+    default: &str,
+) -> (String, bool) {
+    match [env, file]
         .into_iter()
         .flatten()
         .find(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
+    {
+        Some(value) => (value, true),
+        None => (default.to_string(), false),
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +552,35 @@ mod tests {
         );
         assert_eq!(p.cleanup, DEFAULT_CLEANUP);
         assert_eq!(p.transform, "only transform");
+    }
+
+    #[test]
+    fn custom_overrides_are_tracked_for_routing() {
+        // A built-in preset is not custom; a file-supplied one is. The engine
+        // needs this to tell a free-form instruction from a trained axis.
+        let mut formats = HashMap::new();
+        formats.insert("email".into(), "Write it as an email.".into());
+        formats.insert("legal".into(), "Make it legalese.".into());
+        let p = Prompts::resolve(
+            None,
+            Some("custom cleanup".into()),
+            None,
+            Some("custom transform".into()),
+            formats,
+        );
+        assert!(p.cleanup_is_custom);
+        assert!(p.transform_is_custom);
+        assert!(p.is_custom_format("legal"));
+        assert!(p.is_custom_format("EMAIL"), "case-insensitive");
+        // Present only because it is built in.
+        assert!(!p.is_custom_format("bullets"));
+        assert!(!p.is_custom_format("numbered"));
+
+        let d = Prompts::resolve(None, None, None, None, HashMap::new());
+        assert!(!d.cleanup_is_custom);
+        assert!(!d.transform_is_custom);
+        assert!(!d.is_custom_format("bullets"));
+        assert!(d.custom_formats.is_empty());
     }
 
     #[test]

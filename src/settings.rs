@@ -179,6 +179,27 @@ pub fn hotkey_name(keycode: i64) -> String {
 
 /// Env var that pins the cleanup model path (wins over `settings.json`).
 pub const LLM_MODEL_PATH_ENV: &str = "DICTATE_LLM_MODEL_PATH";
+/// Optional instruction-model override. Empty explicitly disables the second model.
+pub const INSTRUCTION_MODEL_PATH_ENV: &str = "DICTATE_INSTRUCTION_MODEL_PATH";
+
+/// Languages actually supported by the fixed Cohere checkpoint/tokenizer.
+pub const COHERE_LANGUAGE_CHOICES: &[(&str, &str)] = &[
+    ("en", "English (en)"), ("fr", "French (fr)"), ("de", "German (de)"),
+    ("es", "Spanish (es)"), ("it", "Italian (it)"), ("pt", "Portuguese (pt)"),
+    ("nl", "Dutch (nl)"), ("pl", "Polish (pl)"), ("el", "Greek (el)"),
+    ("ar", "Arabic (ar)"), ("ja", "Japanese (ja)"), ("zh", "Chinese (zh)"),
+    ("vi", "Vietnamese (vi)"), ("ko", "Korean (ko)"),
+];
+
+/// Resolve one optional model selection without reading process-global state.
+/// An explicit empty override/configuration means disabled, not "use default".
+pub fn resolve_instruction_model_from(
+    environment: Option<&str>, configured: Option<&str>, default: Option<&str>,
+) -> Option<String> {
+    environment.or(configured).or(default)
+        .map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned)
+}
+
 /// Env var that pins the completion sound id (wins over `settings.json`).
 pub const COMPLETION_SOUND_ENV: &str = "DICTATE_COMPLETION_SOUND";
 /// Env var that pins the start sound id (wins over `settings.json`).
@@ -219,6 +240,10 @@ pub struct Settings {
     /// here on load (see `migrate_legacy_keys`); it is never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub llm_model: Option<String>,
+    /// GGUF for rewrites, translations and custom output instructions. None
+    /// uses an available default; an empty string explicitly disables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_model: Option<String>,
     /// Legacy spelling of `llm_model`. Read-only: `load_from` folds it into
     /// `llm_model` and `save` drops it. Remove after one release.
     #[serde(default, skip_serializing)]
@@ -271,9 +296,9 @@ pub struct Settings {
     /// Override: `DICTATE_TAIL_CAPTURE_CAP_MS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail_capture_cap_ms: Option<u32>,
-    /// Warm-window (ms): how long after a recording stops the mic stays open (in
-    /// the default press-to-open mode) so a follow-up dictation reuses the live
-    /// stream instead of paying cpal's ~120 ms open cost. 0 disables it (each
+    /// Warm-window (ms): how long an idle capture resource is retained with IO
+    /// paused, so a follow-up dictation can resume without rebuilding the stream.
+    /// Explicit always-on pre-roll remains a separate mode. 0 disables reuse (each
     /// utterance opens fresh). `None` ⇒ 60000. Override: `DICTATE_WARM_WINDOW_MS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm_window_ms: Option<u32>,
@@ -567,6 +592,12 @@ impl Settings {
             .unwrap_or_else(|| default.to_string())
     }
 
+    /// Optional instruction model, independently selected from normalization.
+    pub fn resolve_instruction_model(&self, default: Option<&str>) -> Option<String> {
+        let environment = std::env::var(INSTRUCTION_MODEL_PATH_ENV).ok();
+        resolve_instruction_model_from(environment.as_deref(), self.instruction_model.as_deref(), default)
+    }
+
     /// Resolve the fixed Cohere MLX ASR configuration with the usual
     /// **env > settings > default** precedence. The engine is hard-pinned to
     /// Cohere MLX Q4; the only selectable knob is the decoder language.
@@ -584,10 +615,18 @@ impl Settings {
             })
             .unwrap_or_else(|| "en".to_string());
 
+        let normalized = cohere_language.trim().to_ascii_lowercase();
+        let language = if COHERE_LANGUAGE_CHOICES.iter().any(|(code, _)| *code == normalized) {
+            normalized
+        } else {
+            eprintln!("[warn] unsupported Cohere language; using English (choose one of the supported languages in Settings)");
+            "en".to_string()
+        };
+
         AsrConfig {
             helper_path: crate::app_paths::cohere_mlx_helper_path(),
             model_dir: crate::app_paths::cohere_mlx_default_dir(),
-            language: cohere_language,
+            language,
             max_tokens: 256,
         }
     }
@@ -1038,19 +1077,14 @@ fn parse_param_billions(name: &str) -> Option<f32> {
 /// Thresholds are grounded in the measured ~2.5× cleanup-latency gap between
 /// Gemma 1B and 4B on this machine (see examples/latency_lab).
 fn model_hint(name: &str) -> Option<String> {
-    let b = parse_param_billions(name)?;
-    Some(
-        if b < 0.8 {
-            "fastest · roughest cleanup"
-        } else if b <= 1.5 {
-            "fast · recommended"
-        } else if b < 3.0 {
-            "balanced · slower"
-        } else {
-            "most accurate · ~2.5× slower"
-        }
-        .to_string(),
-    )
+    let normalized = name.to_ascii_lowercase();
+    if normalized.contains("s1-mini") {
+        return Some("English normalization".to_string());
+    }
+    if normalized.contains("tiny-aya") {
+        return Some("NonCommercial licence · personal use only".to_string());
+    }
+    parse_param_billions(name).map(|size| format!("{size}B parameters"))
 }
 
 /// Enumerate cleanup models under `<models base>/llm/<name>/*.gguf`, where the
@@ -1058,7 +1092,16 @@ fn model_hint(name: &str) -> Option<String> {
 /// contributes its first `.gguf`. Returns paths canonicalized to absolute so a
 /// selection survives a daemon relaunch regardless of CWD.
 pub fn discover_llm_models() -> Vec<ModelChoice> {
-    discover_llm_models_in(&crate::app_paths::llm_models_dir())
+    let mut choices = discover_llm_models_in(&crate::app_paths::llm_models_dir());
+    if let Some(path) = crate::app_paths::instruction_default_path() {
+        if !choices.iter().any(|choice| choice.path == path) {
+            let label = Path::new(&path).file_stem().and_then(|name| name.to_str())
+                .unwrap_or("Instruction model").to_string();
+            choices.push(ModelChoice { hint: model_hint(&label), label, path });
+        }
+    }
+    choices.sort_by(|a, b| a.label.cmp(&b.label));
+    choices
 }
 
 fn discover_llm_models_in(root: &Path) -> Vec<ModelChoice> {
@@ -1100,6 +1143,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn instruction_model_precedence_and_explicit_disable() {
+        assert_eq!(resolve_instruction_model_from(None, None, Some("default.gguf")).as_deref(), Some("default.gguf"));
+        assert_eq!(resolve_instruction_model_from(None, Some("saved.gguf"), Some("default.gguf")).as_deref(), Some("saved.gguf"));
+        assert_eq!(resolve_instruction_model_from(Some(" env.gguf "), Some("saved.gguf"), None).as_deref(), Some("env.gguf"));
+        assert_eq!(resolve_instruction_model_from(Some(""), Some("saved.gguf"), Some("default.gguf")), None);
+        assert_eq!(resolve_instruction_model_from(None, Some("  "), Some("default.gguf")), None);
+        assert_eq!(resolve_instruction_model_from(None, None, None), None);
+    }
+
+    #[test]
+    fn instruction_model_survives_settings_round_trip() {
+        let settings: Settings = serde_json::from_str(r#"{"instruction_model":"local.gguf","llm_model":"normalize.gguf"}"#).unwrap();
+        assert_eq!(settings.instruction_model.as_deref(), Some("local.gguf"));
+        assert_eq!(serde_json::from_str::<Settings>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+        assert_eq!(serde_json::from_str::<Settings>("{}").unwrap().instruction_model, None);
+    }
+
+    #[test]
+    fn language_menu_matches_the_checkpoint_supported_set() {
+        let mut codes: Vec<_> = COHERE_LANGUAGE_CHOICES.iter().map(|(code, _)| *code).collect();
+        codes.sort_unstable();
+        assert_eq!(codes, vec!["ar", "de", "el", "en", "es", "fr", "it", "ja", "ko", "nl", "pl", "pt", "vi", "zh"]);
+    }
+
+    #[test]
     fn param_billions_parsing() {
         assert_eq!(parse_param_billions("gemma-3-1b-it"), Some(1.0));
         assert_eq!(parse_param_billions("gemma-3-4b-it"), Some(4.0));
@@ -1111,20 +1179,22 @@ mod tests {
     }
 
     #[test]
-    fn model_hints_bucket_by_size() {
+    fn model_hints_describe_capability_without_claiming_untested_accuracy() {
         assert_eq!(
             model_hint("smollm2-360m-it").as_deref(),
-            Some("fastest · roughest cleanup")
+            Some("0.36B parameters")
         );
         assert_eq!(
             model_hint("gemma-3-1b-it").as_deref(),
-            Some("fast · recommended")
+            Some("1B parameters")
         );
         assert_eq!(
             model_hint("gemma-3-4b-it").as_deref(),
-            Some("most accurate · ~2.5× slower")
+            Some("4B parameters")
         );
         assert_eq!(model_hint("mystery-model").as_deref(), None);
+        assert_eq!(model_hint("s1-mini").as_deref(), Some("English normalization"));
+        assert_eq!(model_hint("tiny-aya-global").as_deref(), Some("NonCommercial licence · personal use only"));
     }
 
     #[test]

@@ -55,6 +55,16 @@ pub struct Corrections {
 #[derive(Deserialize)]
 struct RawMap(HashMap<String, String>);
 
+/// The result of a Dictionary-pane Add/rename. `NoTarget` means the "Correct
+/// to" field was blank, which is a nudge, not an error.
+#[derive(Debug, PartialEq, Eq)]
+pub enum QuickAdd {
+    /// Written to disk. Carries the new entry count.
+    Saved(usize),
+    /// Nothing to add: no target spelling was typed.
+    NoTarget,
+}
+
 impl Corrections {
     pub fn empty() -> Self {
         Self::default()
@@ -321,6 +331,49 @@ impl Corrections {
         let path =
             Self::config_path().ok_or_else(|| eyre::eyre!("no config dir for corrections.json"))?;
         self.save_to(&path)
+    }
+
+    /// Add (or rename) one entry exactly as the Dictionary pane's Add button
+    /// does, then persist it **immediately** so the edit survives closing the
+    /// window without Apply & Restart. `editing` is the key a row click pulled
+    /// into the fields; it is dropped before the new line is added so renaming
+    /// does not leave the old spelling behind beside the new one. On a write
+    /// failure nothing is committed: both the in-memory dictionary and the file
+    /// are left untouched, and the error comes back for the pane to show.
+    pub fn add_and_save_to(
+        &mut self,
+        editing: Option<&str>,
+        heard: &str,
+        correct: &str,
+        path: &Path,
+    ) -> eyre::Result<QuickAdd> {
+        let Some(line) = quick_add_line(heard, correct) else {
+            return Ok(QuickAdd::NoTarget);
+        };
+        let mut next = self.clone();
+        if let Some(key) = editing {
+            next.remove(key);
+        }
+        let mut lines = next.to_editor_lines();
+        lines.push(line);
+        next = Self::from_editor_text(&lines.join("\n"));
+        next.save_to(path)?;
+        *self = next;
+        Ok(QuickAdd::Saved(self.len()))
+    }
+
+    /// Remove the entry keyed by `key` and persist **immediately**, so the
+    /// delete survives closing the window without Apply & Restart. Returns
+    /// whether an entry was dropped. A write failure changes nothing: the
+    /// in-memory dictionary and the file are both left as they were.
+    pub fn remove_and_save_to(&mut self, key: &str, path: &Path) -> eyre::Result<bool> {
+        let mut next = self.clone();
+        if !next.remove(key) {
+            return Ok(false);
+        }
+        next.save_to(path)?;
+        *self = next;
+        Ok(true)
     }
 
     pub fn load_from(path: &Path) -> eyre::Result<Self> {
@@ -672,6 +725,96 @@ mod tests {
         let path = scratch_file("fresh");
         Corrections::from_editor_text("Beatrix").save_to(&path).unwrap();
         assert_eq!(Corrections::load_from(&path).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn add_and_save_persists_immediately_and_keeps_existing_entries() {
+        // Regression: the Dictionary pane's Add said "Saved" but only mutated
+        // an in-memory copy, so closing the window lost the term. The Add path
+        // must write the file before it confirms anything.
+        let path = scratch_file("add-saves");
+        std::fs::write(&path, r#"{ "_comment": "keep me", "todoist": "Todoist" }"#).unwrap();
+        let mut c = Corrections::load_from(&path).unwrap();
+        let outcome = c.add_and_save_to(None, "cece", "Cici", &path).unwrap();
+        assert_eq!(outcome, QuickAdd::Saved(2));
+        // The committed file carries the new term, the old one, and the comment.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("keep me"), "{body}");
+        let on_disk = Corrections::load_from(&path).unwrap();
+        assert_eq!(on_disk.len(), 2);
+        assert_eq!(on_disk.apply("cece said hi"), "Cici said hi");
+        assert_eq!(on_disk.apply("todoist"), "Todoist");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn add_with_a_rename_drops_the_old_key_on_disk() {
+        let path = scratch_file("add-rename");
+        std::fs::write(&path, r#"{ "acmelabs": "Acme Labs" }"#).unwrap();
+        let mut c = Corrections::load_from(&path).unwrap();
+        assert_eq!(
+            c.add_and_save_to(Some("acmelabs"), "acme labbs", "Acme Labs", &path)
+                .unwrap(),
+            QuickAdd::Saved(1)
+        );
+        let on_disk = Corrections::load_from(&path).unwrap();
+        assert_eq!(
+            on_disk.entries(),
+            vec![("acme labbs".to_string(), "Acme Labs".to_string())]
+        );
+        assert_eq!(on_disk.apply("acmelabs"), "acmelabs");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn add_without_a_target_writes_nothing() {
+        let path = scratch_file("add-notarget");
+        std::fs::write(&path, r#"{ "todoist": "Todoist" }"#).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        let mut c = Corrections::load_from(&path).unwrap();
+        assert_eq!(
+            c.add_and_save_to(None, "cece", "   ", &path).unwrap(),
+            QuickAdd::NoTarget
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        assert_eq!(c.len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_refused_add_leaves_the_file_and_memory_untouched() {
+        // A file this build cannot parse is refused, not overwritten; the Add
+        // path must not pretend the edit landed.
+        let path = scratch_file("add-refused");
+        let broken = "{ \"to twist\": \"Todoist\",, }";
+        std::fs::write(&path, broken).unwrap();
+        let mut c = Corrections::from_editor_text("Todoist");
+        let err = c
+            .add_and_save_to(None, "cece", "Cici", &path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be read"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(
+            c.entries(),
+            vec![("todoist".to_string(), "Todoist".to_string())]
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_and_save_persists_immediately() {
+        let path = scratch_file("remove-saves");
+        std::fs::write(&path, r#"{ "todoist": "Todoist", "macos": "macOS" }"#).unwrap();
+        let mut c = Corrections::load_from(&path).unwrap();
+        assert!(c.remove_and_save_to("todoist", &path).unwrap());
+        let on_disk = Corrections::load_from(&path).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk.apply("todoist went away"), "todoist went away");
+        assert_eq!(on_disk.apply("macos"), "macOS");
+        // Removing a key that is not there is a no-op, not an error.
+        assert!(!c.remove_and_save_to("nothing", &path).unwrap());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

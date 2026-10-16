@@ -77,6 +77,12 @@ pub enum UiState {
     /// "show it". Before it, the press went into a channel nobody was reading
     /// and the user saw nothing at all.
     Unavailable = 16,
+    /// A transform (rewrite-the-selection) request failed before any write.
+    /// Nothing was inserted and the selection still stands, unlike the generic
+    /// `Error` ("Couldn't transcribe"). The pill says the rewrite failed and
+    /// that the selection is unchanged. Terminal like a kept result: never
+    /// cancellable, and it stays until it expires or a key press dismisses it.
+    RewriteFailed = 17,
 }
 
 impl UiState {
@@ -111,6 +117,7 @@ impl UiState {
                 | Self::PasteFailedCopied
                 | Self::LimitReached
                 | Self::LimitReachedCopied
+                | Self::RewriteFailed
         )
     }
 
@@ -133,6 +140,7 @@ impl UiState {
             14 => UiState::LimitReachedCopied,
             15 => UiState::NothingToCopy,
             16 => UiState::Unavailable,
+            17 => UiState::RewriteFailed,
             _ => UiState::Idle,
         }
     }
@@ -585,10 +593,26 @@ mod tests {
 
     #[test]
     fn every_state_round_trips_through_its_byte() {
-        for v in 0..=16u8 {
+        for v in 0..=17u8 {
             assert_eq!(UiState::from_u8(v) as u8, v);
         }
         assert_eq!(UiState::from_u8(200), UiState::Idle);
+    }
+
+    /// A rewrite failure is a terminal, non-cancellable result: the selection
+    /// was left untouched, so nothing is in flight and Escape must pass
+    /// through. It persists like a kept result rather than flashing a generic
+    /// transcription error.
+    #[test]
+    fn rewrite_failed_is_a_persistent_terminal_result_never_cancellable() {
+        assert_eq!(
+            UiState::from_u8(UiState::RewriteFailed as u8),
+            UiState::RewriteFailed
+        );
+        assert!(UiState::RewriteFailed.is_kept_result());
+        assert!(!UiState::RewriteFailed.is_active());
+        assert!(!UiState::RewriteFailed.is_processing());
+        assert!(!UiState::RewriteFailed.is_cancellable());
     }
 
     #[test]
@@ -600,6 +624,7 @@ mod tests {
             UiState::PasteFailedCopied,
             UiState::LimitReached,
             UiState::LimitReachedCopied,
+            UiState::RewriteFailed,
         ] {
             assert!(s.is_kept_result());
             assert!(!s.is_active());

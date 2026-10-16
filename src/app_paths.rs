@@ -195,6 +195,21 @@ pub fn llm_default_path() -> String {
         .into_owned()
 }
 
+/// Optional instruction-model slot. Installing a model here (or a symlink to
+/// verified shared weights) enables instruction work without changing cleanup.
+/// Missing is a valid state: plain dictation remains usable.
+pub fn instruction_default_path() -> Option<String> {
+    let mut candidates = vec![models_base_dir().join("llm/instruction-default.gguf")];
+    // A model downloaded after installing a self-contained app belongs in the
+    // writable sidecar, never inside the signed app bundle.
+    if let Some(support) = app_support_dir() {
+        candidates.push(support.join("models/llm/instruction-default.gguf"));
+    }
+    candidates.into_iter().find(|path| path.is_file()).map(|path| {
+        std::fs::canonicalize(&path).unwrap_or(path).to_string_lossy().into_owned()
+    })
+}
+
 /// Directory the menu's model picker scans for cleanup models (`<base>/llm`).
 pub fn llm_models_dir() -> PathBuf {
     models_base_dir().join("llm")
