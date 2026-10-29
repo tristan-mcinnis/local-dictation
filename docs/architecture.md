@@ -708,6 +708,37 @@ Each release pipeline records a privacy-safe timing snapshot, printed as one `[l
 The numbers measure this app's own release-to-write work (when the insertion request returned),
 not when another application's pixels became visible.
 
+### The slow tail (measured 2026-10-29, n=624)
+
+`release_ms` p50 624, p90 1209, p99 3811. `asr_ms` p50 233, p90 581, p99 3212.
+`cleanup_ms` p50 0, p99 437. 1.4% of releases had `inserted=false`.
+
+The tail is ASR time, not cleanup. Cleanup ran on only 18 of 624 releases
+(the deterministic path skips the LLM, see `worker.rs` "LLM skipped"), and none of
+the slowest 12 (the top 2%) ran it. Those 12 average 3953 ms release and
+3463 ms ASR, against 648 ms and 291 ms for the other 612. No release took the
+whole-buffer fallback (`streaming fallback` never appears), so the cost is in the
+streamed path (`stream_process_asr` in `src/daemon/worker.rs`).
+
+Two groups sit in the top 12:
+
+- Stalled single inference (4 of 12). Holds of 2.8 to 5.4 s, one `helper inference`
+  line of 4.8 to 5.9 s, against a typical 230 ms. Audio length cannot explain
+  it. This looks like a cold or stalled MLX helper call. The cause inside the
+  helper is not yet proven.
+- Long holds (8 of 12). Holds of 32 to 204 s. The last helper inference is
+  normal (250 to 590 ms) but `asr_ms` is 2.0 to 3.8 s, so 1.5 to 3.3 s is spent
+  in the flush around it (`checkpoint_capture_with` drain, recovery-audio append,
+  final VAD segment, backup copy). Not isolated further.
+
+Hold length matters but is not the cause: correlation of hold with `asr_ms` is
+0.61. Mean `release_ms` is about 610 ms for holds under 10 s and 1298 ms for
+holds over 20 s (82 of 624).
+
+Reproduce: `scripts/latency-report.sh` prints n and p50/p90/p99. For the pairing
+with hold time, pair each `[latency]` line with the preceding
+`⏹ stopped · held` line in `$HOME/Library/Logs/Local Dictation/daemon.log`.
+
 A first daemon run needs Microphone + Accessibility granted in System Settings. Neither is fatal
 any more: the menu bar comes up, the Setup window says which is missing, and the event tap
 installs itself when the grant lands (see "First run, permissions and health"). macOS ties
