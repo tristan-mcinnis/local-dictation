@@ -1,6 +1,6 @@
 - Dictation History no longer freezes the app. The panel opens at once, loads rows as you scroll, and reads the history store off the main thread. When the store is busy, it says so instead of hanging.
 - Turning Accessibility off while the app runs is now shown in the menu bar. Turning it back on asks you to relaunch, because the hotkey needs a fresh start.
-- Retry last recording: a cancelled dictation keeps its audio in memory, so you can transcribe it again from the menu.
+- Spoken instructions can use a separate optional instruction model, while cleanup stays on its own small model. Quick controls, progress feedback and clearer failure messages in the pill and menu.
 - The microphone pauses between dictations and resumes in about 15 ms, so the next dictation starts fast without keeping capture running.
 - Dictionary edits in Settings are saved at once, and a failed save is shown in the window instead of only in the log.
 - Clearer log lines when text is held instead of typed: each one names the target app and the reason, never the text.
