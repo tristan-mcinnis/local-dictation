@@ -299,13 +299,14 @@ without it.
 ### Performance
 
 Measured on an Apple M5 after warm-up with `testdata/dictation_sample.wav`
-(8.35 seconds of speech):
+(7.53 seconds of synthetic speech), three runs on 2026-10-29
+while other builds were running, so expect the low end on an idle machine:
 
 | Stage | Hot latency |
 | --- | ---: |
-| Cohere Transcribe Q4 through MLX | about 196–220 ms |
-| S1-mini attempt on the fixture | about 6–70 ms |
-| Combined inference fixture | about 207–270 ms |
+| Cohere Transcribe Q4 through MLX | about 169–362 ms |
+| S1-mini cleanup on the fixture | about 188–253 ms |
+| Combined inference fixture | about 422–550 ms |
 
 Native Accessibility insertion takes about 5 ms. Electron apps add about 185 ms
 of clipboard paste settle time. Run
