@@ -1645,7 +1645,7 @@ pub(super) fn worker_loop(
                         } else {
                             crate::last_dictation::KeptCause::NoEditableField
                         };
-                        eprintln!("  ◌    not inserted ({cause:?}) — transcript kept");
+                        eprintln!("  ◌    not inserted ({cause:?}) — transcript kept app={}", crate::injector::app_label_for_pid(target_pid));
                         keep_and_show(cur_gen, &final_text, cause);
                     }
                     crate::injector::FinalizeResult::Cancelled => {
@@ -1655,7 +1655,7 @@ pub(super) fn worker_loop(
                         ui_channel::set_state(UiState::Idle);
                     }
                     crate::injector::FinalizeResult::Failed => {
-                        eprintln!("  ✗    inject failed — transcript kept");
+                        eprintln!("  ✗    inject failed — transcript kept app={}", crate::injector::app_label_for_pid(target_pid));
                         // The words exist; only the write failed. Keep them
                         // reachable (they used to be dropped, so "Copy last
                         // dictation" returned the PREVIOUS text) and say what
@@ -1755,7 +1755,7 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
             RecoveryStatus::Completed
         },
         Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-            eprintln!("  ◌    transform refused — target app not frontmost at paste (text kept)");
+            eprintln!("  ◌    transform refused — target app not frontmost at paste (text kept) app={}", crate::injector::app_label_for_pid(expected));
             keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
@@ -2063,6 +2063,7 @@ pub(super) fn handle_spoken_command(
     crate::history::append_recovery_stage(generation, StageKind::Transform, result, &cmd.label);
     ui_channel::publish_preview(generation, result);
     let authorize = || authorize_paste(generation);
+    let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
     let inject_result = match captured_target {
         Some(target) => AccessibilityInjector::inject_with_target_cancellable(target, result, &authorize),
         None => AccessibilityInjector::inject_text_cancellable(result, &authorize),
@@ -2075,7 +2076,7 @@ pub(super) fn handle_spoken_command(
             RecoveryStatus::Completed
         }
         Ok(crate::injector::InjectOutcome::NoEditableField) => {
-            eprintln!("  ◌    no text field selected — result kept");
+            eprintln!("  ◌    no text field selected — result kept app={}", crate::injector::app_label_for_pid(target_pid));
             keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
@@ -2087,12 +2088,12 @@ pub(super) fn handle_spoken_command(
         Ok(crate::injector::InjectOutcome::RefusedForeground) => {
             // Fail-closed: the expected app was not frontmost at the global
             // Cmd+V, so nothing was written. Keep it recoverable.
-            eprintln!("  ◌    target not frontmost at paste — result kept");
+            eprintln!("  ◌    target not frontmost at paste — result kept app={}", crate::injector::app_label_for_pid(target_pid));
             keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Err(e) => {
-            eprintln!("  ✗    inject failed: {e:?} — result kept");
+            eprintln!("  ✗    inject failed: {e:?} — result kept app={}", crate::injector::app_label_for_pid(target_pid));
             keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
             RecoveryStatus::Failed
         }
