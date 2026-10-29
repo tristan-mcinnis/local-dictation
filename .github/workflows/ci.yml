@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (featureless, no models or native deps)
+        run: cargo test
+      - name: Scrub
+        run: sh tests/scrub.sh
+      - name: Build all targets with warnings denied
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --all-targets
