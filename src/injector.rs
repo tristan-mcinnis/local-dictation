@@ -570,15 +570,31 @@ pub fn hold_log_line(reason: &str, app: &str) -> String {
     format!("[inject] {reason} app={app}")
 }
 
-/// [`app_label`] for a PID, looked up only on hold/fallback paths.
-#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+/// [`app_label`] for a PID, looked up only on hold/fallback paths. May spawn
+/// `ps`, so never call it before a paste; use [`app_label_for_pid_cheap`]
+/// there. Without the `ax-inject` feature it is always `unknown`.
 pub fn app_label_for_pid(pid: Option<i32>) -> String {
-    let Some(pid) = pid else { return app_label(None, None) };
-    let bundle = bundle_id_for_pid(pid);
-    if bundle.is_some() {
-        return app_label(bundle.as_deref(), None);
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    if let Some(pid) = pid {
+        let bundle = bundle_id_for_pid(pid);
+        if bundle.is_some() {
+            return app_label(bundle.as_deref(), None);
+        }
+        return app_label(None, process_command_path(pid).as_deref());
     }
-    app_label(None, process_command_path(pid).as_deref())
+    let _ = pid;
+    app_label(None, None)
+}
+
+/// Bundle-id-only label (one `NSRunningApplication` read, no `ps`), for log
+/// lines written just before a clipboard paste.
+pub fn app_label_for_pid_cheap(pid: Option<i32>) -> String {
+    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+    if let Some(pid) = pid {
+        return app_label(bundle_id_for_pid(pid).as_deref(), None);
+    }
+    let _ = pid;
+    app_label(None, None)
 }
 
 /// Pure app-name check for AX-blind native chat apps (WeChat). Split out of
@@ -1261,7 +1277,7 @@ mod imp {
                     "{}",
                     super::hold_log_line(
                         &format!("no focused AX element (AXError {err}); paste-safe app → clipboard paste"),
-                        &super::app_label_for_pid(expected_pid),
+                        &super::app_label_for_pid_cheap(expected_pid),
                     )
                 );
                 let tail = super::recall_tail();
@@ -1480,7 +1496,7 @@ mod imp {
             );
         }
         if sel_err == kAXErrorSuccess {
-            let r = confirm_or_fallback(focused, pid, &role_key, before, padded, prof, expected_pid);
+            let r = confirm_or_fallback(focused, pid, &role_key, before, padded, expected_pid);
             if prof {
                 eprintln!("[inject-prof] TOTAL: {:?}", t_total.elapsed());
             }
@@ -1496,7 +1512,7 @@ mod imp {
             "{}",
             super::hold_log_line(
                 &format!("AX caret write refused (selected={sel_err}); using clipboard paste"),
-                &super::app_label_for_pid(pid.or(expected_pid)),
+                &super::app_label_for_pid_cheap(pid.or(expected_pid)),
             )
         );
         match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
@@ -1541,7 +1557,6 @@ mod imp {
         role_key: &str,
         before: Option<FieldSnapshot>,
         padded: &str,
-        prof: bool,
         expected_pid: Option<i32>,
     ) -> eyre::Result<InjectOutcome> {
         let (pid, before) = match (pid, before) {
@@ -1559,11 +1574,13 @@ mod imp {
             return Ok(InjectOutcome::Injected);
         }
 
-        if prof {
-            eprintln!(
-                "[inject-prof] AX write reported success but value didn't change (pid {pid}); marking clipboard-only + falling back to Cmd+V"
-            );
-        }
+        eprintln!(
+            "{}",
+            super::hold_log_line(
+                "AX write reported success but value didn't change; marking clipboard-only, falling back to Cmd+V (clipboard paste)",
+                &super::app_label_for_pid_cheap(Some(pid)),
+            )
+        );
         super::mark_clipboard_only(pid);
         match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
             Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
@@ -2222,13 +2239,35 @@ mod tests {
     }
 
     #[test]
-    fn hold_log_line_carries_only_reason_and_app() {
-        // The formatter takes no transcript text; a secret in neither input
-        // cannot appear in the output.
-        let l = hold_log_line("not frontmost at Cmd+V", &app_label(Some("com.x.App"), None));
-        assert!(!l.contains("secret transcript"));
-        assert_eq!(l, "[inject] not frontmost at Cmd+V app=com.x.App");
+    fn every_hold_and_fallback_log_line_names_the_app() {
+        const MARKERS: [&str; 5] =
+            ["holding", "text kept", "transcript kept", "result kept", "clipboard paste"];
+        let files = [
+            ("injector.rs", include_str!("injector.rs")),
+            ("daemon/listen.rs", include_str!("daemon/listen.rs")),
+            ("daemon/worker.rs", include_str!("daemon/worker.rs")),
+        ];
+        let mut bad = Vec::new();
+        for (name, src) in files {
+            // Production code only: stop at the test module.
+            let prod = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+            let lines: Vec<&str> = prod.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") || !line.contains('"') || line.contains("[limit]") || !MARKERS.iter().any(|m| line.contains(m)) {
+                    continue;
+                }
+                // Statement window: this line and the next 6 (multi-line eprintln!/format!).
+                let from = n.saturating_sub(3);
+                let win = lines[from..(n + 7).min(lines.len())].join("\n");
+                if !(win.contains("hold_log_line") || win.contains("app=")) {
+                    bad.push(format!("{name}:{}", n + 1));
+                }
+            }
+        }
+        assert!(bad.is_empty(), "hold/fallback log lines without an app: {bad:?}");
     }
+
 
     fn app(pid: i32, bundle: &str) -> TargetApp {
         TargetApp { pid, bundle_id: Some(bundle.to_string()) }

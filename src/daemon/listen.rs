@@ -279,6 +279,7 @@ pub(super) fn inject_refined_authorized(
         }
         DictationOutcome::Inject { text, action } => {
             let target = FocusTarget::capture().ok();
+            let target_pid = target.as_ref().and_then(|t| t.inner_pid());
             let res = match target {
                 Some(t) => AccessibilityInjector::inject_with_target_cancellable(t, &text, authorize),
                 None => AccessibilityInjector::inject_text_cancellable(&text, authorize),
@@ -294,7 +295,7 @@ pub(super) fn inject_refined_authorized(
                     }
                 }
                 Ok(crate::injector::InjectOutcome::NoEditableField) => {
-                    eprintln!("  ◌    no text field selected — text kept");
+                    eprintln!("  ◌    no text field selected — text kept app={}", crate::injector::app_label_for_pid(target_pid));
                     keep_unscoped(&text, crate::last_dictation::KeptCause::NoEditableField);
                 }
                 Ok(crate::injector::InjectOutcome::Cancelled) => {
@@ -306,12 +307,12 @@ pub(super) fn inject_refined_authorized(
                 Ok(crate::injector::InjectOutcome::RefusedForeground) => {
                     // Fail-closed: the expected app was not frontmost at the
                     // global Cmd+V, so nothing was written. Hold it recoverable.
-                    eprintln!("  ◌    target not frontmost at paste — text kept");
+                    eprintln!("  ◌    target not frontmost at paste — text kept app={}", crate::injector::app_label_for_pid(target_pid));
                     keep_unscoped(&text, crate::last_dictation::KeptCause::NoEditableField);
                 }
                 Err(e) => {
                     // Regression: a failed write here used to drop the text.
-                    eprintln!("  ✗    inject failed: {e:?} — text kept");
+                    eprintln!("  ✗    inject failed: {e:?} — text kept app={}", crate::injector::app_label_for_pid(target_pid));
                     keep_unscoped(&text, crate::last_dictation::KeptCause::PasteFailed);
                 }
             }
