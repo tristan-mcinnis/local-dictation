@@ -511,9 +511,7 @@ pub(crate) fn show_history_detail(id: i64) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
-    let ui = DETAIL_UI.get_or_init(|| build_history_detail(mtm));
-    stop_audio();
-    *ui.requested.borrow_mut() = None;
+    DETAIL_UI.get_or_init(|| build_history_detail(mtm));
     let generation = DETAIL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {
         let read = crate::history::entry_detail_ui(id);
@@ -532,14 +530,27 @@ fn finish_show_detail(
     if generation != DETAIL_GEN.load(Ordering::SeqCst) {
         return;
     }
+    if matches!(read, UiRead::Ok(_)) {
+        stop_audio();
+        *ui.requested.borrow_mut() = None;
+    }
     match read {
         UiRead::Ok(Some(record)) => populate_detail(ui, record),
         UiRead::Ok(None) => clear_deleted_detail(ui),
-        UiRead::Busy => status(ui, DETAIL_BUSY),
-        UiRead::Failed(_) => status(
-            ui,
-            "Could not load this dictation. Close History and try again.",
-        ),
+        // Never show the previous record under a new click: leave the window
+        // as it was (hidden, or showing the record it already shows) and say
+        // why in its status line.
+        UiRead::Busy => {
+            status(ui, DETAIL_BUSY);
+            super::history::history_footer_note(DETAIL_BUSY);
+            return;
+        }
+        UiRead::Failed(_) => {
+            let message = "Could not load this dictation. Close History and try again.";
+            status(ui, message);
+            super::history::history_footer_note(message);
+            return;
+        }
     }
     ui.window.makeKeyAndOrderFront(None);
     ui.window.makeFirstResponder(Some(&*ui.layers));

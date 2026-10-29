@@ -655,13 +655,20 @@ define_class!(
                 return;
             };
             // History is a store, not a pending setting: the delete lands now.
-            if !crate::history::delete(id) {
-                set_history_status(ui, "That dictation was already gone.");
-                refresh_history_list(ui);
-                return;
-            }
-            refresh_history_list(ui);
-            set_history_status(ui, &format!("Deleted “{}”.", history_preview(&text)));
+            // It runs off the main thread, since it waits on the write lock.
+            set_history_status(ui, "Deleting…");
+            std::thread::spawn(move || {
+                let deleted = crate::history::delete(id);
+                menubar::run_on_main(move || {
+                    let Some(ui) = SETTINGS_UI.get() else { return };
+                    refresh_history_list(ui);
+                    if deleted {
+                        set_history_status(ui, &format!("Deleted “{}”.", history_preview(&text)));
+                    } else {
+                        set_history_status(ui, "That dictation was already gone.");
+                    }
+                });
+            });
         }
 
         #[unsafe(method(clearHistory:))]
@@ -669,14 +676,20 @@ define_class!(
             let Some(ui) = SETTINGS_UI.get() else {
                 return;
             };
-            let n = crate::history::clear();
-            refresh_history_list(ui);
-            if n == 0 {
-                set_history_status(ui, "There was nothing to delete.");
-            } else {
-                let plural = if n == 1 { "dictation" } else { "dictations" };
-                set_history_status(ui, &format!("Deleted {n} {plural}."));
-            }
+            set_history_status(ui, "Deleting…");
+            std::thread::spawn(move || {
+                let n = crate::history::clear();
+                menubar::run_on_main(move || {
+                    let Some(ui) = SETTINGS_UI.get() else { return };
+                    refresh_history_list(ui);
+                    if n == 0 {
+                        set_history_status(ui, "There was nothing to delete.");
+                    } else {
+                        let plural = if n == 1 { "dictation" } else { "dictations" };
+                        set_history_status(ui, &format!("Deleted {n} {plural}."));
+                    }
+                });
+            });
         }
 
         #[unsafe(method(applyAndRestart:))]
@@ -1723,12 +1736,12 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         &controller,
         sel!(clearHistory:),
     );
-    let history_count = if render_fixture {
-        0
+    let history_line = if render_fixture {
+        history_count_line(0)
     } else {
-        crate::history::count()
+        history_count_text()
     };
-    let history_status = hint_line(mtm, &mut card, &history_count_line(history_count));
+    let history_status = hint_line(mtm, &mut card, &history_line);
     let usage = if render_fixture {
         recovery_usage_summary(0, 0, 0)
     } else {
@@ -1767,7 +1780,10 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     let (initial_history, initial_history_total) = if render_fixture {
         (Vec::new(), 0)
     } else {
-        history_query("")
+        match history_query("") {
+            crate::history::UiRead::Ok(found) => found,
+            _ => (Vec::new(), 0),
+        }
     };
     let initial_history_list = fill_history_body(
         mtm,
@@ -3104,12 +3120,8 @@ fn history_search_row(
 /// drawing below stays free of IO and a render proof can hand it sample rows
 /// instead. The total is counted in SQL rather than taken from the fetch, so
 /// the note under a long store reports the real number.
-fn history_query(filter: &str) -> (Vec<crate::history::Entry>, usize) {
-    let filter = filter.trim();
-    (
-        crate::history::search(filter, HISTORY_FETCH),
-        crate::history::match_count(filter),
-    )
+fn history_query(filter: &str) -> crate::history::UiRead<(Vec<crate::history::Entry>, usize)> {
+    crate::history::query_ui(filter.trim(), HISTORY_FETCH)
 }
 
 /// Draw `matched` as a day-grouped list into `body`, then size `body` to what
@@ -3347,7 +3359,17 @@ fn refresh_history_list(ui: &SettingsUi) {
     };
     let filter = ui.history_search.stringValue().to_string();
     refresh_recovery_usage(ui);
-    let (matched, total) = history_query(&filter);
+    let (matched, total) = match history_query(&filter) {
+        crate::history::UiRead::Ok(found) => found,
+        // A writer holds the store: keep the list on screen and say so
+        // instead of waiting on it or showing an empty pane.
+        crate::history::UiRead::Busy => {
+            ui.history_status
+                .setStringValue(&NSString::from_str(HISTORY_BUSY));
+            return;
+        }
+        crate::history::UiRead::Failed(_) => (Vec::new(), 0),
+    };
     let list = fill_history_body(
         mtm,
         &ui.history_body,
@@ -3474,17 +3496,29 @@ fn clear_history_flash(ui: &SettingsUi) {
 /// Set the status line under the retention row, then re-state the stored count
 /// so the pane never leaves a stale total behind an action.
 fn set_history_status(ui: &SettingsUi, message: &str) {
-    let line = format!("{message} {}", history_count_line(crate::history::count()));
+    let line = format!("{message} {}", history_count_text());
     ui.history_status.setStringValue(&NSString::from_str(&line));
     refresh_recovery_usage(ui);
 }
 
+const HISTORY_BUSY: &str = "History is busy, try again.";
+
+/// The stored-count line, read without waiting on a writer.
+fn history_count_text() -> String {
+    match crate::history::count_ui() {
+        crate::history::UiRead::Ok(n) => history_count_line(n),
+        crate::history::UiRead::Busy => HISTORY_BUSY.to_string(),
+        crate::history::UiRead::Failed(_) => history_count_line(0),
+    }
+}
+
 fn recovery_usage_line() -> String {
-    match crate::history::recovery_usage() {
-        Ok(usage) => {
+    match crate::history::recovery_usage_ui() {
+        crate::history::UiRead::Ok(usage) => {
             recovery_usage_summary(usage.audio_count, usage.audio_bytes, usage.record_count)
         }
-        Err(_) => "Audio storage totals are unavailable.".to_string(),
+        crate::history::UiRead::Busy => "Audio storage totals are busy.".to_string(),
+        crate::history::UiRead::Failed(_) => "Audio storage totals are unavailable.".to_string(),
     }
 }
 

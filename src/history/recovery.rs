@@ -281,6 +281,28 @@ pub fn recovery_usage() -> Result<RecoveryUsage> {
     })
 }
 
+/// [`recovery_usage`] for a window: read-only, 150 ms wait.
+pub fn recovery_usage_ui() -> super::UiRead<RecoveryUsage> {
+    super::ui_result((|| {
+        let Some(path) = db_path() else {
+            return Ok(RecoveryUsage { audio_count: 0, audio_bytes: 0, record_count: 0 });
+        };
+        let Some(conn) = super::open_ui_at(&path)? else {
+            return Ok(RecoveryUsage { audio_count: 0, audio_bytes: 0, record_count: 0 });
+        };
+        let (count, bytes, records) = conn.query_row(
+            "SELECT COALESCE(SUM(audio_bytes>0),0),COALESCE(SUM(audio_bytes),0),COUNT(*) FROM dictations",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        )?;
+        Ok(RecoveryUsage {
+            audio_count: usize::try_from(count)?,
+            audio_bytes: u64::try_from(bytes)?,
+            record_count: usize::try_from(records)?,
+        })
+    })())
+}
+
 pub fn recovery_audio_path(id: i64) -> Result<Option<PathBuf>> {
     audio_path_at(
         &db_path().ok_or_else(|| eyre!("history path unavailable"))?,

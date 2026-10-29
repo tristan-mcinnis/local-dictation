@@ -375,6 +375,13 @@ fn set_footer(ui: &HistoryUi, text: &str) {
     );
 }
 
+/// Say something in the History panel's footer (a failed click-through, say).
+pub(super) fn history_footer_note(text: &str) {
+    if let Some(ui) = HISTORY_UI.get() {
+        set_footer(ui, text);
+    }
+}
+
 /// Open the panel at once and read the history on a background thread. The
 /// read waits only briefly for a writer; the main thread, which also carries
 /// the hotkey event tap, never waits on SQLite.

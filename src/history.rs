@@ -457,6 +457,70 @@ fn try_match_count_at(path: &Path, needle: &str) -> eyre::Result<usize> {
     Ok(n.max(0) as usize)
 }
 
+/// The newest `limit` dictations matching `query` and how many match in all,
+/// for a window: one read-only connection, 150 ms wait, "busy" kept apart from
+/// "failed". A blank query matches everything.
+pub fn query_ui(query: &str, limit: usize) -> UiRead<(Vec<Entry>, usize)> {
+    match db_path() {
+        Some(path) => query_ui_at(&path, query, limit),
+        None => UiRead::Ok((Vec::new(), 0)),
+    }
+}
+
+pub fn query_ui_at(path: &Path, query: &str, limit: usize) -> UiRead<(Vec<Entry>, usize)> {
+    ui_result((|| {
+        let Some(conn) = open_ui_at(path)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let needle = query.trim();
+        let pattern = format!("%{}%", like_escape(needle));
+        let filter = if needle.is_empty() {
+            "1=1".to_string()
+        } else {
+            r"(text LIKE ?1 ESCAPE '\' OR EXISTS(SELECT 1 FROM dictation_stages WHERE dictation_id=dictations.id AND text LIKE ?1 ESCAPE '\'))".to_string()
+        };
+        let total: i64 = {
+            let sql = format!("SELECT COUNT(*) FROM dictations WHERE {filter}");
+            if needle.is_empty() {
+                conn.query_row(&sql, [], |row| row.get(0))?
+            } else {
+                conn.query_row(&sql, rusqlite::params![pattern], |row| row.get(0))?
+            }
+        };
+        let sql = format!(
+            "SELECT id, text, created_at FROM dictations WHERE {filter}
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            if needle.is_empty() { "?1" } else { "?2" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map = |row: &rusqlite::Row| {
+            Ok(Entry { id: row.get(0)?, text: row.get(1)?, created_at: row.get(2)? })
+        };
+        let rows: Vec<Entry> = if needle.is_empty() {
+            stmt.query_map(rusqlite::params![limit as i64], map)?.collect::<Result<_, _>>()?
+        } else {
+            stmt.query_map(rusqlite::params![pattern, limit as i64], map)?.collect::<Result<_, _>>()?
+        };
+        Ok((rows, total.max(0) as usize))
+    })())
+}
+
+/// [`count`] for a window.
+pub fn count_ui() -> UiRead<usize> {
+    match db_path() {
+        Some(path) => count_ui_at(&path),
+        None => UiRead::Ok(0),
+    }
+}
+
+pub fn count_ui_at(path: &Path) -> UiRead<usize> {
+    ui_result((|| {
+        let Some(conn) = open_ui_at(path)? else { return Ok(0) };
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM dictations", [], |row| row.get(0))?;
+        Ok(n.max(0) as usize)
+    })())
+}
+
 /// Delete one dictation by id. Returns whether a row actually went away, so a
 /// caller can tell a stale click from a real delete.
 pub fn delete(id: i64) -> bool {
@@ -809,6 +873,43 @@ mod tests {
         assert!(took < std::time::Duration::from_millis(300), "UI read blocked {took:?}");
         assert!(matches!(got, UiRead::Busy), "a busy store is not an unreadable one");
         assert_eq!(unreadable_reason_at(&db), None, "busy is not a fault");
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// Every read the Settings pane makes must give up fast behind a writer,
+    /// and must still answer correctly when nobody holds the lock.
+    #[test]
+    fn settings_reads_are_bounded_behind_a_writer_and_correct_without_one() {
+        let db = test_db("settings-reads");
+        {
+            let mut conn = open_at(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..30_i64 {
+                tx.execute(
+                    "INSERT INTO dictations (text, created_at) VALUES (?1, ?2)",
+                    (format!("invented {i} {}", if i % 3 == 0 { "alpha" } else { "beta" }), 1_000 + i),
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        match query_ui_at(&db, "alpha", 5) {
+            UiRead::Ok((rows, total)) => {
+                assert_eq!((rows.len(), total), (5, 10));
+                assert!(rows[0].created_at > rows[1].created_at, "newest first");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(query_ui_at(&db, "", 1000), UiRead::Ok((r, 30)) if r.len() == 30));
+        assert!(matches!(count_ui_at(&db), UiRead::Ok(30)));
+
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let t = std::time::Instant::now();
+        let (q, c) = (query_ui_at(&db, "alpha", 5), count_ui_at(&db));
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(600), "two reads took {took:?}");
+        assert!(matches!(q, UiRead::Busy) && matches!(c, UiRead::Busy));
         writer.execute_batch("ROLLBACK").unwrap();
     }
 }
