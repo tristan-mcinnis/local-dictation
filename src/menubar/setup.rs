@@ -151,7 +151,19 @@ pub(crate) const RELAUNCH: &str = "Relaunch";
 /// reported before it has propagated). The grant is on, so "Open Settings"
 /// would send the user to a switch that is already correct; the hotkey is dead
 /// until the tap is created again, and the tap can only be created at startup.
-pub(crate) fn accessibility_state(trusted: bool, install_failed: bool) -> RowState {
+///
+/// `revoked` is the grant turned off while running: the tap is dead, so turning
+/// it back on is not enough. The grant is read first, so an off switch never
+/// reads as "Allowed".
+pub(crate) fn accessibility_state(trusted: bool, install_failed: bool, revoked: bool) -> RowState {
+    if !trusted && (revoked || install_failed) {
+        let why = if revoked { "Turned off while running" } else { "Off, and the hotkey did not start" };
+        return RowState {
+            satisfied: false,
+            detail: format!("{why}. Turn it on, then relaunch."),
+            action: Some("Open Settings".to_string()),
+        };
+    }
     if trusted && install_failed {
         return RowState {
             satisfied: false,
@@ -250,6 +262,7 @@ pub(crate) fn current_states() -> Vec<RowState> {
         accessibility_state(
             permissions::accessibility_trusted(),
             permissions::accessibility_install_failed(),
+            permissions::accessibility_revoked(),
         ),
         models_state(&statuses, phase.as_ref()),
     ]
@@ -724,12 +737,33 @@ mod tests {
 
     #[test]
     fn the_accessibility_row_promises_no_restart() {
-        let off = accessibility_state(false, false);
+        let off = accessibility_state(false, false, false);
         assert!(!off.satisfied);
         assert_eq!(off.action.as_deref(), Some("Open Settings"));
         assert!(off.detail.contains("no restart"), "{}", off.detail);
-        let on = accessibility_state(true, false);
+        let on = accessibility_state(true, false, false);
         assert!(on.satisfied && on.action.is_none());
+    }
+
+    /// A revoke leaves the tap dead, so the row must not promise "no restart".
+    #[test]
+    fn a_revoked_grant_says_to_turn_it_on_then_relaunch() {
+        let row = accessibility_state(false, false, true);
+        assert!(!row.satisfied);
+        assert!(row.detail.to_lowercase().contains("turned off while running"), "{}", row.detail);
+        assert!(row.detail.contains("relaunch"), "{}", row.detail);
+        assert!(!row.detail.contains("no restart"));
+        assert_eq!(row.action.as_deref(), Some("Open Settings"));
+    }
+
+    /// Regression: grant off after a failed install read "Allowed, but the
+    /// hotkey did not start" while the switch was off.
+    #[test]
+    fn a_grant_that_is_off_never_reads_as_allowed() {
+        let row = accessibility_state(false, true, false);
+        assert!(!row.satisfied);
+        assert!(!row.detail.contains("Allowed"), "{}", row.detail);
+        assert_eq!(row.action.as_deref(), Some("Open Settings"));
     }
 
     /// Regression: a granted permission whose tap install failed used to read
@@ -737,7 +771,7 @@ mod tests {
     /// hotkey was dead and nothing on screen could revive it.
     #[test]
     fn a_granted_permission_whose_tap_failed_offers_a_relaunch() {
-        let stuck = accessibility_state(true, true);
+        let stuck = accessibility_state(true, true, false);
         assert!(!stuck.satisfied);
         assert_eq!(stuck.action.as_deref(), Some(RELAUNCH));
         assert!(stuck.detail.contains("Relaunch"), "{}", stuck.detail);
@@ -836,7 +870,7 @@ mod tests {
     fn the_window_opens_by_itself_only_when_something_is_missing() {
         let ready = vec![
             microphone_state(Grant::Granted),
-            accessibility_state(true, false),
+            accessibility_state(true, false, false),
             models_state(&[present(model_fetch::ASR, true)], None),
         ];
         assert!(
@@ -847,7 +881,7 @@ mod tests {
 
         let one_off = vec![
             microphone_state(Grant::Granted),
-            accessibility_state(false, false),
+            accessibility_state(false, false, false),
             models_state(&[present(model_fetch::ASR, true)], None),
         ];
         assert!(should_open_on_launch(&one_off));
@@ -855,7 +889,7 @@ mod tests {
 
         let fresh = vec![
             microphone_state(Grant::Undecided),
-            accessibility_state(false, false),
+            accessibility_state(false, false, false),
             models_state(&[absent(model_fetch::ASR, true)], None),
         ];
         assert_eq!(headline(&fresh), "3 things left.");

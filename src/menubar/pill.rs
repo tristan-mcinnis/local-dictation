@@ -1339,6 +1339,7 @@ mod health_signature_tests {
         let mut seen = vec![0u8];
         for fault in [
             Fault::AccessibilityMissing,
+            Fault::AccessibilityRelaunch,
             Fault::MicrophoneBlocked,
             Fault::ModelsMissing,
             Fault::EngineFailed,

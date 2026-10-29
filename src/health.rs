@@ -26,22 +26,25 @@ use std::sync::Mutex;
 pub enum Fault {
     /// Accessibility is not granted, so no event tap and no hotkey.
     AccessibilityMissing = 0,
+    /// Accessibility was turned off while running and is back on, but the event
+    /// tap made at boot may not recover: only a relaunch restores the hotkey.
+    AccessibilityRelaunch = 1,
     /// Microphone access is denied, restricted, or not yet decided.
-    MicrophoneBlocked = 1,
+    MicrophoneBlocked = 2,
     /// A model file the engine needs is not on disk.
-    ModelsMissing = 2,
+    ModelsMissing = 3,
     /// The worker could not start, or it stopped (error or panic).
-    EngineFailed = 3,
+    EngineFailed = 4,
     /// The speech helper died and could not be restarted.
-    HelperFailed = 4,
+    HelperFailed = 5,
     /// The microphone stream failed mid-session; it is rebuilt on next press.
-    AudioLost = 5,
+    AudioLost = 6,
     /// The cleanup model could not load. Dictation still works: the raw
     /// transcript is used, so this is a degradation, not a blocker.
-    CleanupUnavailable = 6,
+    CleanupUnavailable = 7,
     /// Models are still loading. Lowest priority: any real fault replaces it
     /// in [`current`], and it clears itself when the worker is ready.
-    Booting = 7,
+    Booting = 8,
 }
 
 impl Fault {
@@ -50,6 +53,7 @@ impl Fault {
     pub fn headline(self) -> &'static str {
         match self {
             Fault::AccessibilityMissing => "Accessibility is off",
+            Fault::AccessibilityRelaunch => "Relaunch to restore the hotkey",
             Fault::MicrophoneBlocked => "Microphone access is off",
             Fault::ModelsMissing => "Speech model is missing",
             Fault::EngineFailed => "Dictation engine stopped",
@@ -64,6 +68,7 @@ impl Fault {
     pub fn next_step(self) -> &'static str {
         match self {
             Fault::AccessibilityMissing => "Open Setup & permissions to turn it on.",
+            Fault::AccessibilityRelaunch => "Accessibility is back on; relaunch Local Dictation.",
             Fault::MicrophoneBlocked => "Open Setup & permissions to turn it on.",
             Fault::ModelsMissing => "Open Setup & permissions to get the model.",
             Fault::EngineFailed => "Open the log, then relaunch from the menu.",
@@ -224,6 +229,7 @@ mod tests {
         let _serial = test_lock();
         for fault in [
             Fault::AccessibilityMissing,
+            Fault::AccessibilityRelaunch,
             Fault::MicrophoneBlocked,
             Fault::ModelsMissing,
             Fault::EngineFailed,
@@ -298,6 +304,7 @@ mod tests {
         assert!(!Fault::CleanupUnavailable.blocks_dictation());
         for fault in [
             Fault::AccessibilityMissing,
+            Fault::AccessibilityRelaunch,
             Fault::MicrophoneBlocked,
             Fault::ModelsMissing,
             Fault::EngineFailed,
@@ -312,6 +319,7 @@ mod tests {
     fn every_fault_says_what_is_wrong_and_what_to_do_next() {
         for fault in [
             Fault::AccessibilityMissing,
+            Fault::AccessibilityRelaunch,
             Fault::MicrophoneBlocked,
             Fault::ModelsMissing,
             Fault::EngineFailed,
