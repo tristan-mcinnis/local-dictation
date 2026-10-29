@@ -753,14 +753,27 @@ fn verify_history_scale(mtm: MainThreadMarker, ui: &HistoryUi) -> eyre::Result<(
     let search = t.elapsed();
     let search_views = ui.doc.subviews().len();
 
+    // A query that keeps only part of the list (about one entry in 17).
+    let t = Instant::now();
+    let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+    let part = filter_entries(all, "item 3");
+    rebuild_history_list(mtm, ui, &part);
+    let partial = t.elapsed();
+    let partial_views = ui.doc.subviews().len();
+    if part.is_empty() || part.len() >= 200 {
+        eyre::bail!("history partial query kept {} of 1000 -> fix the fixture", part.len());
+    }
+
     println!(
-        "[render-ui] history-scale entries=1000 open={:.1}ms search={:.1}ms views_open={open_views} views_search={search_views}",
+        "[render-ui] history-scale entries=1000 open={:.1}ms search={:.1}ms partial={:.1}ms ({} kept) views_open={open_views} views_search={search_views} views_partial={partial_views}",
         open.as_secs_f64() * 1e3,
         search.as_secs_f64() * 1e3,
+        partial.as_secs_f64() * 1e3,
+        part.len(),
     );
-    if open_views > MAX_HISTORY_VIEWS || search_views > MAX_HISTORY_VIEWS {
+    if open_views > MAX_HISTORY_VIEWS || search_views > MAX_HISTORY_VIEWS || partial_views > MAX_HISTORY_VIEWS {
         eyre::bail!(
-            "history panel built {open_views}/{search_views} views for 1000 entries (limit {MAX_HISTORY_VIEWS}) -> build rows lazily"
+            "history panel built {open_views}/{search_views} views for 1000 entries (limit {MAX_HISTORY_VIEWS}, partial {partial_views}) -> build rows lazily"
         );
     }
     // Paging must reach every entry with one header per day and no gap.
@@ -775,17 +788,17 @@ fn verify_history_scale(mtm: MainThreadMarker, ui: &HistoryUi) -> eyre::Result<(
         eyre::bail!("history paging built {paged} list views, one pass builds {full} -> fix the page seam");
     }
     rebuild_history_list(mtm, ui, &entries);
-    if open.as_millis() > 250 || search.as_millis() > 150 {
+    if open.as_millis() > 60 || search.as_millis() > 50 || partial.as_millis() > 50 {
         eyre::bail!(
-            "history panel too slow at 1000 entries: open {open:?}, search {search:?} -> keep list builds bounded"
+            "history panel too slow at 1000 entries: open {open:?}, search {search:?}, partial {partial:?} -> keep list builds bounded"
         );
     }
     Ok(())
 }
 
-/// Views the first page of rows may add to the list: a page of entries at 6
-/// views each, plus day labels, with headroom.
-const MAX_HISTORY_VIEWS: usize = 600;
+/// Views the first page of rows may add to the list: a page of 50 entries plus
+/// day labels, with headroom (rows are one list view each).
+const MAX_HISTORY_VIEWS: usize = 160;
 
 /// One second of silent PCM, created only in the requested render output.
 /// The proof never opens a window, plays audio, or reads private history.

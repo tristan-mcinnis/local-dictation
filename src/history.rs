@@ -119,6 +119,49 @@ fn open_at(path: &Path) -> eyre::Result<Connection> {
     Ok(conn)
 }
 
+/// How long a UI read waits for a writer before it reports "busy". A
+/// dictation that is finishing holds the write lock for a moment; the History
+/// panel must not wait out the 2 s write timeout behind it.
+const UI_BUSY_MS: u64 = 150;
+
+/// The result of a read made for a window. Never blocks for long.
+#[derive(Debug)]
+pub enum UiRead<T> {
+    Ok(T),
+    /// A writer held the lock past the short UI timeout. Nothing is wrong
+    /// with the store; the caller should keep what it shows and say so.
+    Busy,
+    Failed(String),
+}
+
+fn is_busy(e: &eyre::Report) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn ui_result<T>(r: eyre::Result<T>) -> UiRead<T> {
+    match r {
+        Ok(v) => UiRead::Ok(v),
+        Err(e) if is_busy(&e) => UiRead::Busy,
+        Err(e) => UiRead::Failed(e.to_string()),
+    }
+}
+
+/// A read-only connection for windows: no chmod, no schema create, no
+/// migration, and a short busy timeout. `None` when the file does not exist
+/// yet (nothing dictated). On-disk format and journal mode are untouched.
+fn open_ui_at(path: &Path) -> eyre::Result<Option<Connection>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_millis(UI_BUSY_MS))?;
+    Ok(Some(conn))
+}
+
 /// Open the default history DB (see [`db_path`]).
 fn open() -> eyre::Result<Connection> {
     let path = db_path().ok_or_else(|| eyre::eyre!("cannot resolve history path ($HOME unset)"))?;
@@ -238,6 +281,31 @@ pub fn recent(limit: usize) -> Vec<Entry> {
     }
 }
 
+/// [`recent`] for a window: bounded wait, and "busy" is told apart from
+/// "unreadable". Call it off the main thread anyway.
+pub fn recent_ui(limit: usize) -> UiRead<Vec<Entry>> {
+    match db_path() {
+        Some(path) => recent_ui_at(&path, limit),
+        None => UiRead::Ok(Vec::new()),
+    }
+}
+
+pub fn recent_ui_at(path: &Path, limit: usize) -> UiRead<Vec<Entry>> {
+    ui_result((|| {
+        let Some(conn) = open_ui_at(path)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT id, text, created_at FROM dictations
+             ORDER BY created_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(Entry { id: row.get(0)?, text: row.get(1)?, created_at: row.get(2)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })())
+}
+
 /// Why the history store cannot be read, or `None` when it is readable (which
 /// includes "it does not exist yet" — nothing has been dictated).
 ///
@@ -258,14 +326,17 @@ pub fn unreadable_reason_at(path: &Path) -> Option<String> {
         return None;
     }
     // Opening is lazy in SQLite, so a corrupt file only fails on a real
-    // query. One cheap count is the honest check.
-    let probe = open_at(path).and_then(|conn| {
-        conn.query_row("SELECT count(*) FROM dictations", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(Into::into)
-    });
-    probe.err().map(|e| e.to_string())
+    // query. One cheap count is the honest check. A busy store is a writer at
+    // work, not a fault.
+    let probe = (|| -> eyre::Result<()> {
+        let Some(conn) = open_ui_at(path)? else { return Ok(()) };
+        conn.query_row("SELECT count(*) FROM dictations", [], |row| row.get::<_, i64>(0))?;
+        Ok(())
+    })();
+    match probe {
+        Err(e) if !is_busy(&e) => Some(e.to_string()),
+        _ => None,
+    }
 }
 
 /// The empty-list line for a history surface. `searching` is true when a query
@@ -717,5 +788,27 @@ mod tests {
         eprintln!("[history-bench] recent(1000) = {took:?}");
         assert_eq!(rows.len(), 1000);
         assert!(took < std::time::Duration::from_millis(250), "recent(1000) took {took:?}");
+    }
+
+    /// Hold the write lock the way a finishing dictation does, then read the
+    /// way the History panel reads. The read must give up within a fraction of
+    /// a second so the panel can say "busy" instead of freezing.
+    #[test]
+    fn ui_read_returns_fast_while_a_writer_holds_the_lock() {
+        let db = test_db("ui-read-busy");
+        {
+            let conn = open_at(&db).unwrap();
+            conn.execute("INSERT INTO dictations (text, created_at) VALUES ('x', 1)", []).unwrap();
+        }
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let t = std::time::Instant::now();
+        let got = recent_ui_at(&db, 1000);
+        let took = t.elapsed();
+        eprintln!("[history-bench] read under writer lock = {took:?}");
+        assert!(took < std::time::Duration::from_millis(300), "UI read blocked {took:?}");
+        assert!(matches!(got, UiRead::Busy), "a busy store is not an unreadable one");
+        assert_eq!(unreadable_reason_at(&db), None, "busy is not a fault");
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 }

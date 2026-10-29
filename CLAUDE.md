@@ -23,6 +23,7 @@ cargo build --features full --release          # the real build
 cargo test                                     # no models, no native deps
 cargo test --features full                     # adds cleaner/injector/menubar/history suites
 native/cohere-mlx/test.sh                      # Swift bridge protocol tests
+cargo run --release --features full -- render-ui /tmp/ui   # offscreen UI proofs + History panel scale check
 ./scripts/build-app.sh --install               # bundle + /Applications + login item
 ./scripts/reload-daemon.sh                     # relaunch to pick up config edits
 ```

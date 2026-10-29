@@ -7,12 +7,17 @@ use crate::history::{RecoveryRecord, RecoveryStatus, StageKind};
 use objc2_app_kit::NSPopUpButton;
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 const DETAIL_W: f64 = LAYOUT_PANEL_WIDTH;
 const DETAIL_H: f64 = house_theme::LAYOUT_CHAT_HEIGHT;
 static DETAIL_UI: OnceLock<HistoryDetailUi> = OnceLock::new();
 static POLL_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// A refresh read is in flight; the next tick skips instead of stacking.
+static POLL_READING: AtomicBool = AtomicBool::new(false);
+/// Bumped on every open; a read for an older open is dropped.
+static DETAIL_GEN: AtomicU64 = AtomicU64::new(0);
+const DETAIL_BUSY: &str = "History is busy, try again.";
 
 define_class!(
     #[unsafe(super(NSWindow))]
@@ -500,6 +505,8 @@ fn status(ui: &HistoryDetailUi, message: &str) {
     ui.status.setStringValue(&NSString::from_str(message));
 }
 
+/// Open the detail window. The read runs on a background thread with a short
+/// wait, so a writer finishing a dictation cannot freeze the main thread.
 pub(crate) fn show_history_detail(id: i64) {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
@@ -507,16 +514,32 @@ pub(crate) fn show_history_detail(id: i64) {
     let ui = DETAIL_UI.get_or_init(|| build_history_detail(mtm));
     stop_audio();
     *ui.requested.borrow_mut() = None;
-    match crate::history::entry_detail(id) {
-        Ok(Some(record)) => populate_detail(ui, record),
-        Ok(None) => clear_deleted_detail(ui),
-        Err(_) => {
-            status(
-                ui,
-                "Could not load this dictation. Close History and try again.",
-            );
-            return;
-        }
+    let generation = DETAIL_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        let read = crate::history::entry_detail_ui(id);
+        run_on_main(move || finish_show_detail(generation, read));
+    });
+}
+
+fn finish_show_detail(
+    generation: u64,
+    read: crate::history::UiRead<Option<RecoveryRecord>>,
+) {
+    use crate::history::UiRead;
+    let (Some(mtm), Some(ui)) = (MainThreadMarker::new(), DETAIL_UI.get()) else {
+        return;
+    };
+    if generation != DETAIL_GEN.load(Ordering::SeqCst) {
+        return;
+    }
+    match read {
+        UiRead::Ok(Some(record)) => populate_detail(ui, record),
+        UiRead::Ok(None) => clear_deleted_detail(ui),
+        UiRead::Busy => status(ui, DETAIL_BUSY),
+        UiRead::Failed(_) => status(
+            ui,
+            "Could not load this dictation. Close History and try again.",
+        ),
     }
     ui.window.makeKeyAndOrderFront(None);
     ui.window.makeFirstResponder(Some(&*ui.layers));
@@ -622,9 +645,22 @@ fn audio_for_action(
         })
 }
 
-fn validated_audio_path(ui: &HistoryDetailUi) -> Result<PathBuf, String> {
+/// Look up the saved audio for the shown record off the main thread (the
+/// lookup opens the store and may sweep expired audio, which writes), then run
+/// `then` on the main thread with the answer.
+fn with_validated_audio(
+    ui: &HistoryDetailUi,
+    then: impl FnOnce(&HistoryDetailUi, Result<PathBuf, String>) + Send + 'static,
+) {
     let id = ui.record.borrow().as_ref().map(|r| r.entry.id);
-    audio_for_action(id, crate::history::recovery_audio_path)
+    std::thread::spawn(move || {
+        let found = audio_for_action(id, crate::history::recovery_audio_path);
+        run_on_main(move || {
+            if let Some(ui) = DETAIL_UI.get() {
+                then(ui, found);
+            }
+        });
+    });
 }
 
 fn play_file(ui: &HistoryDetailUi, path: &Path) {
@@ -673,7 +709,7 @@ fn perform_action(action: DetailAction) {
                 }
             });
         }
-        DetailAction::Play | DetailAction::Reveal => match validated_audio_path(ui) {
+        DetailAction::Play | DetailAction::Reveal => with_validated_audio(ui, move |ui, found| match found {
             Ok(path) if action == DetailAction::Play => play_file(ui, &path),
             Ok(path) => match std::process::Command::new("/usr/bin/open")
                 .arg("-R")
@@ -687,50 +723,14 @@ fn perform_action(action: DetailAction) {
                 stop_audio();
                 status(ui, &message);
             }
-        },
-        DetailAction::Recover => {
-            if let Err(message) = validated_audio_path(ui) {
+        }),
+        DetailAction::Recover => with_validated_audio(ui, |ui, found| {
+            if let Err(message) = found {
                 status(ui, &message);
                 return;
             }
-            let command = {
-                let record = ui.record.borrow();
-                let Some(record) = record.as_ref() else {
-                    return;
-                };
-                match recovery_command(record, ui.requested.borrow().is_some()) {
-                    Ok(command) => command,
-                    Err(message) => {
-                        status(ui, message);
-                        return;
-                    }
-                }
-            };
-            let crate::ipc::Command::Recover(id) = command else {
-                return;
-            };
-            stop_audio();
-            match crate::ipc::send(command) {
-                Ok(reply) if reply.starts_with("ok ") => {
-                    *ui.requested.borrow_mut() = Some(id);
-                    ui.recover.set_enabled(false);
-                    status(
-                        ui,
-                        "Recovery requested · The result will be copied to the clipboard.",
-                    );
-                }
-                Ok(reply) => status(
-                    ui,
-                    reply
-                        .strip_prefix("err ")
-                        .unwrap_or("Recovery could not start. Try again."),
-                ),
-                Err(_) => status(
-                    ui,
-                    "Local Dictation is not running. Launch it, then try Recover again.",
-                ),
-            }
-        }
+            start_recovery(ui);
+        }),
         DetailAction::Raw | DetailAction::Cleaned | DetailAction::Previous | DetailAction::Next => {
             let record = ui.record.borrow();
             let Some(record) = record.as_ref() else {
@@ -762,6 +762,46 @@ fn perform_action(action: DetailAction) {
     }
 }
 
+fn start_recovery(ui: &HistoryDetailUi) {
+    let command = {
+        let record = ui.record.borrow();
+        let Some(record) = record.as_ref() else {
+            return;
+        };
+        match recovery_command(record, ui.requested.borrow().is_some()) {
+            Ok(command) => command,
+            Err(message) => {
+                status(ui, message);
+                return;
+            }
+        }
+    };
+    let crate::ipc::Command::Recover(id) = command else {
+        return;
+    };
+    stop_audio();
+    match crate::ipc::send(command) {
+        Ok(reply) if reply.starts_with("ok ") => {
+            *ui.requested.borrow_mut() = Some(id);
+            ui.recover.set_enabled(false);
+            status(
+                ui,
+                "Recovery requested · The result will be copied to the clipboard.",
+            );
+        }
+        Ok(reply) => status(
+            ui,
+            reply
+                .strip_prefix("err ")
+                .unwrap_or("Recovery could not start. Try again."),
+        ),
+        Err(_) => status(
+            ui,
+            "Local Dictation is not running. Launch it, then try Recover again.",
+        ),
+    }
+}
+
 fn poll_detail() {
     let Some(ui) = DETAIL_UI.get().filter(|ui| ui.window.isVisible()) else {
         return;
@@ -777,8 +817,29 @@ fn poll_detail() {
     let Some(id) = ui.record.borrow().as_ref().map(|r| r.entry.id) else {
         return;
     };
-    match crate::history::entry_detail(id) {
-        Ok(Some(record)) => {
+    if POLL_READING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let read = crate::history::entry_detail_ui(id);
+        run_on_main(move || {
+            POLL_READING.store(false, Ordering::SeqCst);
+            apply_poll(id, read);
+        });
+    });
+}
+
+fn apply_poll(id: i64, read: crate::history::UiRead<Option<RecoveryRecord>>) {
+    use crate::history::UiRead;
+    let Some(ui) = DETAIL_UI.get().filter(|ui| ui.window.isVisible()) else {
+        return;
+    };
+    // The user may have opened another record while this read was in flight.
+    if ui.record.borrow().as_ref().map(|r| r.entry.id) != Some(id) {
+        return;
+    }
+    match read {
+        UiRead::Ok(Some(record)) => {
             let changed = *ui.fingerprint.borrow() != fingerprint(&record);
             if changed {
                 if record.audio.is_none() {
@@ -810,8 +871,10 @@ fn poll_detail() {
                 }
             }
         }
-        Ok(None) => clear_deleted_detail(ui),
-        Err(_) => status(
+        UiRead::Ok(None) => clear_deleted_detail(ui),
+        // A busy store is a writer at work; the next tick tries again.
+        UiRead::Busy => {}
+        UiRead::Failed(_) => status(
             ui,
             "Could not refresh this dictation. Stored audio and text have not been changed.",
         ),

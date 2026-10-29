@@ -225,6 +225,13 @@ pub(super) fn audio_path_at(path: &Path, id: i64) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let conn = open_at(path)?;
+    audio_path_on(&conn, path, id, true)
+}
+
+/// Find the saved audio for `id`. With `sweep`, expired audio is deleted and
+/// its row updated; without it (a window's read-only connection) expired audio
+/// is simply reported as absent and left for a writer to sweep.
+fn audio_path_on(conn: &Connection, path: &Path, id: i64, sweep: bool) -> Result<Option<PathBuf>> {
     let row: Option<(Option<i64>, String)> = conn
         .query_row(
             "SELECT audio_expires_at,recovery_status FROM dictations WHERE id=?1 AND is_recovery=1",
@@ -239,8 +246,10 @@ pub(super) fn audio_path_at(path: &Path, id: i64) -> Result<Option<PathBuf>> {
         && status != "recording"
         && status != "recovering"
     {
-        remove_audio_at(path, id)?;
-        conn.execute("UPDATE dictations SET audio_bytes=0,audio_error='Audio expired under retention setting' WHERE id=?1", [id])?;
+        if sweep {
+            remove_audio_at(path, id)?;
+            conn.execute("UPDATE dictations SET audio_bytes=0,audio_error='Audio expired under retention setting' WHERE id=?1", [id])?;
+        }
         return Ok(None);
     }
     let audio = audio_filename(path, id)?;
@@ -286,6 +295,22 @@ pub fn entry_detail(id: i64) -> Result<Option<RecoveryRecord>> {
 }
 fn detail_at(path: &Path, id: i64) -> Result<Option<RecoveryRecord>> {
     let conn = open_at(path)?;
+    detail_on(&conn, path, id, true)
+}
+
+/// [`entry_detail`] for a window: read-only, short busy timeout, never writes.
+/// Call it off the main thread.
+pub fn entry_detail_ui(id: i64) -> super::UiRead<Option<RecoveryRecord>> {
+    super::ui_result((|| {
+        let path = db_path().ok_or_else(|| eyre!("history path unavailable"))?;
+        match super::open_ui_at(&path)? {
+            Some(conn) => detail_on(&conn, &path, id, false),
+            None => Ok(None),
+        }
+    })())
+}
+
+fn detail_on(conn: &Connection, path: &Path, id: i64, sweep: bool) -> Result<Option<RecoveryRecord>> {
     let row = conn
         .query_row(
             "SELECT text,created_at,recovery_status,audio_sample_rate,audio_expires_at,
@@ -323,7 +348,7 @@ fn detail_at(path: &Path, id: i64) -> Result<Option<RecoveryRecord>> {
             created_at,
         });
     }
-    let audio = audio_path_at(path, id)?
+    let audio = (if id <= 0 { Ok(None) } else { audio_path_on(conn, path, id, sweep) })?
         .map(|audio| -> Result<AudioRecord> {
             let bytes = std::fs::metadata(&audio)?.len();
             Ok(AudioRecord {
