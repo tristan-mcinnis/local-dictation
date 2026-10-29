@@ -11,6 +11,8 @@
 //! the launcher contract, so a panel with no title bar is never stranded.
 
 use super::*;
+use objc2_app_kit::NSViewBoundsDidChangeNotification;
+use objc2_foundation::{NSNotification, NSNotificationCenter};
 use std::sync::atomic::AtomicUsize;
 
 static HISTORY_VISIBLE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
@@ -275,6 +277,25 @@ fn build_history_with_hotkey(mtm: MainThreadMarker, keycode: i64) -> HistoryUi {
         ]
     };
     scroll.setDocumentView(Some(&*doc));
+    // Rows are built a page at a time; scrolling near the end builds the next.
+    {
+        let clip = scroll.contentView();
+        clip.setPostsBoundsChangedNotifications(true);
+        let block = block2::RcBlock::new(|_note: std::ptr::NonNull<NSNotification>| {
+            load_more_if_near_end();
+        });
+        let center = NSNotificationCenter::defaultCenter();
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSViewBoundsDidChangeNotification),
+                Some(&*clip),
+                None,
+                &block,
+            )
+        };
+        // The history window lives for the whole process.
+        std::mem::forget(token);
+    }
     glass.addSubview(&scroll);
 
     // ── Footer well ────────────────────────────────────────────────────
@@ -331,41 +352,60 @@ const SEARCH_GLYPH: f64 = 18.0;
 /// The editable band inside the 58 px search row.
 const SEARCH_FIELD_H: f64 = 24.0;
 
-/// Re-query the history DB, rebuild the list, and bring the window forward.
+/// Shown in place of the list while the first read is in flight, when the
+/// busy store has no cached list to fall back on, or when the store failed.
+static HISTORY_EMPTY_NOTE: Mutex<Option<String>> = Mutex::new(None);
+/// Bumped on every open; a read that finishes for an older open is dropped.
+static HISTORY_LOAD_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+const HISTORY_BUSY_NOTE: &str = "History is busy, try again.";
+
+fn set_empty_note(note: Option<String>) {
+    if let Ok(mut n) = HISTORY_EMPTY_NOTE.lock() {
+        *n = note;
+    }
+}
+
+fn set_footer(ui: &HistoryUi, text: &str) {
+    ui.footer_status.setStringValue(&NSString::from_str(text));
+    slate::place_left(
+        &ui.footer_status,
+        SPACE_MD + slate::DOT + PILL_GAP,
+        CONTROL_FOOTER / 2.0,
+    );
+}
+
+/// Say something in the History panel's footer (a failed click-through, say).
+pub(super) fn history_footer_note(text: &str) {
+    if let Some(ui) = HISTORY_UI.get() {
+        set_footer(ui, text);
+    }
+}
+
+/// Open the panel at once and read the history on a background thread. The
+/// read waits only briefly for a writer; the main thread, which also carries
+/// the hotkey event tap, never waits on SQLite.
 pub(super) fn show_history_window() {
     let Some(mtm) = MainThreadMarker::new() else {
         return;
     };
     let ui = history_ui(mtm);
-    let entries = crate::history::recent(1000);
 
-    // Cache the full (unfiltered) entry list so the search field can filter it
-    // without re-querying the DB, then show everything.
-    if let Ok(mut all) = HISTORY_ALL.lock() {
-        *all = entries.clone();
+    // Show what the last open cached right away (search cleared), or a
+    // loading line when there is nothing cached yet.
+    let cached = HISTORY_ALL.lock().map(|g| !g.is_empty()).unwrap_or(false);
+    if cached {
+        set_empty_note(None);
+        apply_history_filter("");
+    } else {
+        set_empty_note(Some("Loading…".to_string()));
+        HISTORY_SELECTED.store(0, Ordering::SeqCst);
+        rebuild_history_list(mtm, ui, &[]);
     }
-    // Stash the full texts, newest first, so a clicked row (carrying its index
-    // as its tag) can copy the untruncated text.
-    if let Ok(mut store) = HISTORY_ENTRIES.lock() {
-        *store = entries.iter().map(|e| e.text.clone()).collect();
-    }
-    *HISTORY_VISIBLE.lock().unwrap() = entries.clone();
-    HISTORY_SELECTED.store(0, Ordering::SeqCst);
-    rebuild_history_list(mtm, ui, &entries);
-
-    // Reset the footer status and clear any prior search query for the fresh open.
-    {
-        ui.footer_status
-            .setStringValue(&NSString::from_str(FOOTER_READY));
-        slate::place_left(
-            &ui.footer_status,
-            SPACE_MD + slate::DOT + PILL_GAP,
-            CONTROL_FOOTER / 2.0,
-        );
-        ui.search.setStringValue(&NSString::from_str(""));
-        ui.window.makeKeyAndOrderFront(None);
-        ui.window.makeFirstResponder(Some(&*ui.search));
-    }
+    set_footer(ui, FOOTER_READY);
+    ui.search.setStringValue(&NSString::from_str(""));
+    ui.window.makeKeyAndOrderFront(None);
+    ui.window.makeFirstResponder(Some(&*ui.search));
     // We're an Accessory app (no Dock icon); without an explicit activate the
     // new window opens behind the frontmost app.
     let app = NSApplication::sharedApplication(mtm);
@@ -373,6 +413,58 @@ pub(super) fn show_history_window() {
     {
         app.activateIgnoringOtherApps(true)
     };
+
+    let generation = HISTORY_LOAD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    std::thread::spawn(move || {
+        let read = crate::history::recent_ui(1000);
+        // Only an empty answer needs the (second) probe for "why".
+        let reason = match &read {
+            crate::history::UiRead::Ok(v) if v.is_empty() => crate::history::unreadable_reason(),
+            _ => None,
+        };
+        run_on_main(move || finish_history_load(generation, read, reason));
+    });
+}
+
+/// Main-thread half of an open: apply the read, or keep the previous list.
+fn finish_history_load(
+    generation: u64,
+    read: crate::history::UiRead<Vec<Entry>>,
+    reason: Option<String>,
+) {
+    use crate::history::UiRead;
+    let (Some(mtm), Some(ui)) = (MainThreadMarker::new(), HISTORY_UI.get()) else {
+        return;
+    };
+    if generation != HISTORY_LOAD_GEN.load(Ordering::SeqCst) {
+        return;
+    }
+    let cached = HISTORY_ALL.lock().map(|g| !g.is_empty()).unwrap_or(false);
+    match read {
+        UiRead::Ok(entries) => {
+            set_empty_note(reason.map(|r| crate::history::empty_state_text(Some(&r), false)));
+            if let Ok(mut all) = HISTORY_ALL.lock() {
+                *all = entries;
+            }
+            // Honour a query typed while the read was in flight.
+            let query = ui.search.stringValue().to_string();
+            apply_history_filter(&query);
+        }
+        UiRead::Busy => {
+            set_footer(ui, HISTORY_BUSY_NOTE);
+            if !cached {
+                set_empty_note(Some(HISTORY_BUSY_NOTE.to_string()));
+                rebuild_history_list(mtm, ui, &[]);
+            }
+        }
+        UiRead::Failed(why) => {
+            set_footer(ui, "History could not be read.");
+            if !cached {
+                set_empty_note(Some(crate::history::empty_state_text(Some(&why), false)));
+                rebuild_history_list(mtm, ui, &[]);
+            }
+        }
+    }
 }
 
 /// Filter the cached history by a case-insensitive substring query and rebuild
@@ -386,14 +478,9 @@ pub(super) fn apply_history_filter(query: &str) {
     let Some(ui) = HISTORY_UI.get() else {
         return;
     };
-    let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
-    let needle = query.trim().to_lowercase();
-    let filtered: Vec<Entry> = if needle.is_empty() {
-        all
-    } else {
-        all.into_iter()
-            .filter(|e| e.text.to_lowercase().contains(&needle))
-            .collect()
+    let filtered = {
+        let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+        filter_entries(all, query)
     };
 
     if let Ok(mut store) = HISTORY_ENTRIES.lock() {
@@ -402,6 +489,18 @@ pub(super) fn apply_history_filter(query: &str) {
     *HISTORY_VISIBLE.lock().unwrap() = filtered.clone();
     HISTORY_SELECTED.store(0, Ordering::SeqCst);
     rebuild_history_list(mtm, ui, &filtered);
+}
+
+/// The entries whose text contains `query`, case-insensitively. A blank query
+/// keeps everything.
+pub(super) fn filter_entries(all: Vec<Entry>, query: &str) -> Vec<Entry> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return all;
+    }
+    all.into_iter()
+        .filter(|e| e.text.to_lowercase().contains(&needle))
+        .collect()
 }
 
 pub(super) fn open_history_entry_at(tag: isize) {
@@ -422,6 +521,7 @@ pub(super) fn move_history_selection(delta: isize) {
     if count == 0 { return; }
     let next = (HISTORY_SELECTED.load(Ordering::SeqCst) as isize + delta).clamp(0, count as isize - 1) as usize;
     HISTORY_SELECTED.store(next, Ordering::SeqCst);
+    ensure_row_built(next);
     if let Some(ui) = HISTORY_UI.get() { select_row(ui, next as isize); }
 }
 
@@ -487,14 +587,26 @@ pub(crate) enum HistoryRow {
 /// Group entries by local calendar day (newest first) into a flat row list.
 /// `NSDateFormatter` renders dates/times in the user's locale + timezone.
 pub(crate) fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
+    history_rows_range(entries, 0, entries.len(), None)
+}
+
+/// Rows for `entries[from..to]` only, with `index` still counting from the
+/// start of `entries`. `last_day` is the day label of the row before `from`,
+/// so a page that continues a day does not repeat its header.
+fn history_rows_range(
+    entries: &[Entry],
+    from: usize,
+    to: usize,
+    mut last_day: Option<String>,
+) -> Vec<HistoryRow> {
     let day_fmt = NSDateFormatter::new();
     day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
     let time_fmt = NSDateFormatter::new();
     time_fmt.setDateFormat(Some(&NSString::from_str("HH:mm")));
 
     let mut rows = Vec::new();
-    let mut last_day: Option<String> = None;
-    for (i, e) in entries.iter().enumerate() {
+    let to = to.min(entries.len());
+    for (i, e) in entries.iter().enumerate().take(to).skip(from) {
         let date = NSDate::dateWithTimeIntervalSince1970(e.created_at as f64);
         let day = day_fmt.stringFromDate(&date).to_string().to_uppercase();
         let time = time_fmt.stringFromDate(&date).to_string();
@@ -513,11 +625,81 @@ pub(crate) fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
     rows
 }
 
+/// Entries built into rows per page. The list is a window onto the history,
+/// not a copy of it: a thousand eager rows is six thousand views and a
+/// multi-hundred-millisecond stall on the main run loop, which also carries
+/// the hotkey event tap.
+const HISTORY_PAGE: usize = 50;
+/// Load the next page when the visible edge is within this many points of the
+/// last built row.
+const LOAD_AHEAD: f64 = 240.0;
+
+/// Where the built part of the list ends, so the next page continues it.
+struct ListCursor {
+    /// Y of the next row in the flipped document view.
+    y: f64,
+    /// Index of the next entry to build.
+    next: usize,
+}
+
+static LIST_CURSOR: Mutex<ListCursor> = Mutex::new(ListCursor { y: 0.0, next: 0 });
+
+/// The entries to build next: from `next` up to `upto` (exclusive), clamped to
+/// the list length. `None` when there is nothing left to build. Pure.
+fn page_range(next: usize, len: usize, upto: usize) -> Option<std::ops::Range<usize>> {
+    let end = upto.min(len);
+    (next < end).then_some(next..end)
+}
+
+/// Rows for one page. The day label before the page comes from the entry
+/// just ahead of it, so a page that continues a day does not repeat the
+/// header and a page that starts a new day gets one. Pure apart from date
+/// formatting.
+fn rows_for_page(entries: &[Entry], page: std::ops::Range<usize>) -> Vec<HistoryRow> {
+    let carry = page
+        .start
+        .checked_sub(1)
+        .and_then(|i| entries.get(i))
+        .map(|e| history_day_label(e.created_at));
+    history_rows_range(entries, page.start, page.end, carry)
+}
+
+/// Whether the visible edge is close enough to the end of the built rows to
+/// build another page. Pure.
+fn needs_more(visible_bottom: f64, built_to: f64, next: usize, len: usize) -> bool {
+    next < len && visible_bottom + LOAD_AHEAD >= built_to
+}
+
+/// Build more rows when the user has scrolled near the end of the built part.
+pub(super) fn load_more_if_near_end() {
+    let (Some(mtm), Some(ui)) = (MainThreadMarker::new(), HISTORY_UI.get()) else {
+        return;
+    };
+    let visible = ui.scroll.documentVisibleRect();
+    let (built_to, next) = LIST_CURSOR.lock().map(|c| (c.y, c.next)).unwrap_or((0.0, 0));
+    // Check under the lock and return before touching anything when there is
+    // nothing to build: a scroll event fires on every pixel.
+    let Ok(entries) = HISTORY_VISIBLE.lock() else { return };
+    if needs_more(visible.origin.y + visible.size.height, built_to, next, entries.len()) {
+        append_history_rows(mtm, ui, &entries, next + HISTORY_PAGE);
+    }
+}
+
+/// Make sure the row for entry `index` exists, so keyboard selection can walk
+/// past the built part.
+fn ensure_row_built(index: usize) {
+    let (Some(mtm), Some(ui)) = (MainThreadMarker::new(), HISTORY_UI.get()) else {
+        return;
+    };
+    if LIST_CURSOR.lock().map(|c| index < c.next).unwrap_or(true) {
+        return;
+    }
+    let Ok(entries) = HISTORY_VISIBLE.lock() else { return };
+    append_history_rows(mtm, ui, &entries, index + 1);
+}
+
 /// Tear down and rebuild the day-grouped list.
 pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]) {
-    /// Section label band: the `section` type plus the mockup's 6 px above and
-    /// below it.
-    const SECTION_H: f64 = 24.0;
 
     let doc = &ui.doc;
     let content = ui.scroll.contentSize();
@@ -529,15 +711,16 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
     doc.setSubviews(&empty);
 
     if entries.is_empty() {
-        // Three situations, not two: history is empty, the search matched
-        // nothing, or the store could not be opened at all. The third used to
-        // read as the first, which told a user with a corrupt or unreachable
-        // database that they had never dictated anything.
+        // Four situations: still loading, the store was busy, the store could
+        // not be opened, or simply nothing (yet, or no match). The load result
+        // sets the note; this never touches the database, so a rebuild on the
+        // main thread cannot wait on a writer.
         let has_history = HISTORY_ALL.lock().map(|g| !g.is_empty()).unwrap_or(false);
-        let msg = crate::history::empty_state_text(
-            crate::history::unreadable_reason().as_deref(),
-            has_history,
-        );
+        let msg = HISTORY_EMPTY_NOTE
+            .lock()
+            .ok()
+            .and_then(|n| n.clone())
+            .unwrap_or_else(|| crate::history::empty_state_text(None, has_history));
         let label = slate::label(
             mtm,
             &msg,
@@ -554,14 +737,42 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
             NSPoint::new(0.0, 0.0),
             NSSize::new(width, content.height.max(CONTROL_ROW)),
         ));
+        if let Ok(mut c) = LIST_CURSOR.lock() {
+            *c = ListCursor { y: 0.0, next: 0 };
+        }
         return;
     }
 
+    if let Ok(mut c) = LIST_CURSOR.lock() {
+        *c = ListCursor { y: SPACE_XS, next: 0 };
+    }
+    append_history_rows(mtm, ui, entries, HISTORY_PAGE);
+    // Flipped view: (0,0) is the top, so this shows the newest entries.
+    ui.doc.scrollPoint(NSPoint::new(0.0, 0.0));
+}
+
+/// Build rows for `entries` from the cursor up to (not including) `upto`, and
+/// grow the document view to fit.
+pub(super) fn append_history_rows(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry], upto: usize) {
+    /// Section label band: the `section` type plus the mockup's 6 px above and
+    /// below it.
+    const SECTION_H: f64 = 24.0;
+
+    let doc = &ui.doc;
+    let content = ui.scroll.contentSize();
+    let width = content.width.max(LAYOUT_PANEL_WIDTH / 2.0);
+    let row_w = width - 2.0 * LIST_PAD;
+    let (mut y, from) = match LIST_CURSOR.lock() {
+        Ok(c) => (c.y, c.next),
+        Err(_) => return,
+    };
+    let Some(page) = page_range(from, entries.len(), upto) else {
+        return;
+    };
+    let upto = page.end;
     // The shared action target whose copyHistoryEntry: handles row clicks.
     let actions = GLOBALS.get().map(|g| &g._actions);
-
-    let mut y = SPACE_XS;
-    for row in history_rows(entries) {
+    for row in rows_for_page(entries, page) {
         match row {
             HistoryRow::Day(day) => {
                 let label = slate::section_label(mtm, &day);
@@ -671,15 +882,106 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
         }
     }
 
+    if let Ok(mut c) = LIST_CURSOR.lock() {
+        *c = ListCursor { y, next: upto };
+    }
     let total = y + SPACE_XS;
     doc.setFrame(NSRect::new(
         NSPoint::new(0.0, 0.0),
         NSSize::new(width, total.max(content.height)),
     ));
-    // Flipped view: (0,0) is the top, so this shows the newest entries.
-    doc.scrollPoint(NSPoint::new(0.0, 0.0));
+}
+
+/// The upper-case day header text for a timestamp, as `history_rows_range`
+/// writes it.
+fn history_day_label(created_at: i64) -> String {
+    let day_fmt = NSDateFormatter::new();
+    day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
+    let date = NSDate::dateWithTimeIntervalSince1970(created_at as f64);
+    day_fmt.stringFromDate(&date).to_string().to_uppercase()
 }
 
 /// Width of the right-aligned time column, so times line up whatever the
 /// locale renders.
 const TIME_W: f64 = 52.0;
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    /// `n` invented entries, 20 minutes apart, newest first: several days.
+    fn entries(n: usize) -> Vec<Entry> {
+        (0..n)
+            .map(|i| Entry {
+                id: i as i64 + 1,
+                text: format!("invented dictation {i}"),
+                created_at: 1_772_000_000 - i as i64 * 1_200,
+            })
+            .collect()
+    }
+
+    /// Build every page the way the panel does and join the rows.
+    fn paged(entries: &[Entry]) -> Vec<HistoryRow> {
+        let mut next = 0;
+        let mut out = Vec::new();
+        while let Some(page) = page_range(next, entries.len(), next + HISTORY_PAGE) {
+            next = page.end;
+            out.extend(rows_for_page(entries, page));
+        }
+        out
+    }
+
+    #[test]
+    fn page_range_clamps_and_ends() {
+        assert_eq!(page_range(0, 1000, 50), Some(0..50));
+        assert_eq!(page_range(50, 1000, 100), Some(50..100));
+        assert_eq!(page_range(990, 1000, 1040), Some(990..1000));
+        assert_eq!(page_range(1000, 1000, 1050), None);
+        assert_eq!(page_range(0, 0, 50), None);
+        assert_eq!(page_range(5, 10, 3), None);
+    }
+
+    /// Paging must produce exactly the rows one pass produces: no repeated
+    /// day header at a seam, none missing where a new day starts.
+    #[test]
+    fn pages_join_into_the_same_rows_as_one_pass() {
+        for n in [1, 49, 50, 51, 100, 237, 1000] {
+            let all = entries(n);
+            assert_eq!(
+                format!("{:?}", paged(&all)),
+                format!("{:?}", history_rows(&all)),
+                "seam mismatch at n={n}"
+            );
+        }
+    }
+
+    /// A filtered subset is a new list: paging indexes into it, not the full one.
+    #[test]
+    fn paging_a_filtered_subset_indexes_the_subset() {
+        let all = entries(400);
+        let subset: Vec<Entry> = all.into_iter().filter(|e| e.id % 7 == 0).collect();
+        let rows = paged(&subset);
+        assert_eq!(format!("{rows:?}"), format!("{:?}", history_rows(&subset)));
+        let last = rows.iter().rev().find_map(|r| match r {
+            HistoryRow::Item { index, .. } => Some(*index),
+            _ => None,
+        });
+        assert_eq!(last, Some(subset.len() - 1), "last built index is len-1");
+    }
+
+    #[test]
+    fn the_last_page_builds_up_to_len_minus_one() {
+        let all = entries(123);
+        let rows = paged(&all);
+        let items = rows.iter().filter(|r| matches!(r, HistoryRow::Item { .. })).count();
+        assert_eq!(items, 123);
+        assert!(page_range(123, all.len(), 123 + HISTORY_PAGE).is_none());
+    }
+
+    #[test]
+    fn near_the_end_loads_more_only_while_entries_remain() {
+        assert!(needs_more(900.0, 1000.0, 50, 1000));
+        assert!(!needs_more(100.0, 1000.0, 50, 1000), "far from the end");
+        assert!(!needs_more(990.0, 1000.0, 1000, 1000), "nothing left");
+    }
+}

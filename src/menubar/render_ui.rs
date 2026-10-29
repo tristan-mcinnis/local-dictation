@@ -46,6 +46,8 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
     let sample_entries = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
     crate::settings_window::seed_history_for_render(&settings, &sample_entries);
     crate::settings_window::verify_history_render_fixture(&settings, sample_entries.len())?;
+    verify_history_scale(mtm, &history)?;
+    seed_sample_history(mtm, &history);
     dictionary
         .text_view
         .setString(&NSString::from_str(SAMPLE_DICTIONARY));
@@ -708,6 +710,95 @@ fn seed_sample_history(mtm: MainThreadMarker, ui: &HistoryUi) {
     }
     rebuild_history_list(mtm, ui, &entries);
 }
+
+/// 1000 invented dictations, newest first, spread over ~14 days.
+fn synthetic_history(n: usize) -> Vec<Entry> {
+    let now = 1_772_000_000_i64;
+    (0..n)
+        .map(|i| Entry {
+            id: i as i64 + 1,
+            text: format!(
+                "Invented dictation number {i}: please move the review to next week and \
+                 keep the agenda short, then ask about the budget for item {}",
+                i % 17
+            ),
+            created_at: now - (i as i64) * 1_200,
+        })
+        .collect()
+}
+
+/// Time the launcher panel at 1000 entries: an open (cache fill plus first
+/// list build) and one search keystroke. Prints the numbers and fails when the
+/// panel builds an unbounded number of views or blows a generous ceiling, so a
+/// return to the eager 1000-row build cannot ship. Uses invented text only.
+fn verify_history_scale(mtm: MainThreadMarker, ui: &HistoryUi) -> eyre::Result<()> {
+    use std::time::Instant;
+    let entries = synthetic_history(1000);
+
+    let t = Instant::now();
+    if let Ok(mut store) = HISTORY_ENTRIES.lock() {
+        *store = entries.iter().map(|e| e.text.clone()).collect();
+    }
+    if let Ok(mut all) = HISTORY_ALL.lock() {
+        *all = entries.clone();
+    }
+    rebuild_history_list(mtm, ui, &entries);
+    let open = t.elapsed();
+    let open_views = ui.doc.subviews().len();
+
+    let t = Instant::now();
+    let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+    let filtered = filter_entries(all, "i");
+    rebuild_history_list(mtm, ui, &filtered);
+    let search = t.elapsed();
+    let search_views = ui.doc.subviews().len();
+
+    // A query that keeps only part of the list (about one entry in 17).
+    let t = Instant::now();
+    let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+    let part = filter_entries(all, "item 3");
+    rebuild_history_list(mtm, ui, &part);
+    let partial = t.elapsed();
+    let partial_views = ui.doc.subviews().len();
+    if part.is_empty() || part.len() >= 200 {
+        eyre::bail!("history partial query kept {} of 1000 -> fix the fixture", part.len());
+    }
+
+    println!(
+        "[render-ui] history-scale entries=1000 open={:.1}ms search={:.1}ms partial={:.1}ms ({} kept) views_open={open_views} views_search={search_views} views_partial={partial_views}",
+        open.as_secs_f64() * 1e3,
+        search.as_secs_f64() * 1e3,
+        partial.as_secs_f64() * 1e3,
+        part.len(),
+    );
+    if open_views > MAX_HISTORY_VIEWS || search_views > MAX_HISTORY_VIEWS || partial_views > MAX_HISTORY_VIEWS {
+        eyre::bail!(
+            "history panel built {open_views}/{search_views} views for 1000 entries (limit {MAX_HISTORY_VIEWS}, partial {partial_views}) -> build rows lazily"
+        );
+    }
+    // Paging must reach every entry with one header per day and no gap.
+    rebuild_history_list(mtm, ui, &entries);
+    // Two pages first, to cross a page seam, then the rest.
+    append_history_rows(mtm, ui, &entries, 100);
+    append_history_rows(mtm, ui, &entries, 101);
+    append_history_rows(mtm, ui, &entries, usize::MAX);
+    let full = history_rows(&entries).len();
+    let paged = ui.doc.subviews().len();
+    if paged != full {
+        eyre::bail!("history paging built {paged} list views, one pass builds {full} -> fix the page seam");
+    }
+    rebuild_history_list(mtm, ui, &entries);
+    if open.as_millis() > 60 || search.as_millis() > 50 || partial.as_millis() > 50 {
+        eyre::bail!(
+            "history panel too slow at 1000 entries: open {open:?}, search {search:?}, partial {partial:?} -> keep list builds bounded"
+        );
+    }
+    Ok(())
+}
+
+/// Views the first page of rows may add to the list: a page of 50 entries plus
+/// day labels, with headroom (rows are one list view each).
+const MAX_HISTORY_VIEWS: usize = 160;
 
 /// One second of silent PCM, created only in the requested render output.
 /// The proof never opens a window, plays audio, or reads private history.

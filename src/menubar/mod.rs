@@ -1740,7 +1740,7 @@ fn run_osascript_picker(script: &str, label: &str) -> Option<PathBuf> {
 /// Run `work` once on the main run loop. Safe from any thread: it adds a
 /// one-shot timer, which Core Foundation allows from any thread, in the
 /// common modes so it also fires while a menu or modal is open.
-pub(super) fn run_on_main(work: impl FnOnce() + Send + 'static) {
+pub(crate) fn run_on_main(work: impl FnOnce() + Send + 'static) {
     type Work = Box<dyn FnOnce() + Send>;
     unsafe extern "C-unwind" fn fire(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
         // SAFETY: `info` is the `Box<Work>` leaked below, and a one-shot

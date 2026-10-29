@@ -119,6 +119,49 @@ fn open_at(path: &Path) -> eyre::Result<Connection> {
     Ok(conn)
 }
 
+/// How long a UI read waits for a writer before it reports "busy". A
+/// dictation that is finishing holds the write lock for a moment; the History
+/// panel must not wait out the 2 s write timeout behind it.
+const UI_BUSY_MS: u64 = 150;
+
+/// The result of a read made for a window. Never blocks for long.
+#[derive(Debug)]
+pub enum UiRead<T> {
+    Ok(T),
+    /// A writer held the lock past the short UI timeout. Nothing is wrong
+    /// with the store; the caller should keep what it shows and say so.
+    Busy,
+    Failed(String),
+}
+
+fn is_busy(e: &eyre::Report) -> bool {
+    matches!(
+        e.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(f.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+fn ui_result<T>(r: eyre::Result<T>) -> UiRead<T> {
+    match r {
+        Ok(v) => UiRead::Ok(v),
+        Err(e) if is_busy(&e) => UiRead::Busy,
+        Err(e) => UiRead::Failed(e.to_string()),
+    }
+}
+
+/// A read-only connection for windows: no chmod, no schema create, no
+/// migration, and a short busy timeout. `None` when the file does not exist
+/// yet (nothing dictated). On-disk format and journal mode are untouched.
+fn open_ui_at(path: &Path) -> eyre::Result<Option<Connection>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(std::time::Duration::from_millis(UI_BUSY_MS))?;
+    Ok(Some(conn))
+}
+
 /// Open the default history DB (see [`db_path`]).
 fn open() -> eyre::Result<Connection> {
     let path = db_path().ok_or_else(|| eyre::eyre!("cannot resolve history path ($HOME unset)"))?;
@@ -238,6 +281,31 @@ pub fn recent(limit: usize) -> Vec<Entry> {
     }
 }
 
+/// [`recent`] for a window: bounded wait, and "busy" is told apart from
+/// "unreadable". Call it off the main thread anyway.
+pub fn recent_ui(limit: usize) -> UiRead<Vec<Entry>> {
+    match db_path() {
+        Some(path) => recent_ui_at(&path, limit),
+        None => UiRead::Ok(Vec::new()),
+    }
+}
+
+pub fn recent_ui_at(path: &Path, limit: usize) -> UiRead<Vec<Entry>> {
+    ui_result((|| {
+        let Some(conn) = open_ui_at(path)? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            "SELECT id, text, created_at FROM dictations
+             ORDER BY created_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok(Entry { id: row.get(0)?, text: row.get(1)?, created_at: row.get(2)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    })())
+}
+
 /// Why the history store cannot be read, or `None` when it is readable (which
 /// includes "it does not exist yet" — nothing has been dictated).
 ///
@@ -258,14 +326,17 @@ pub fn unreadable_reason_at(path: &Path) -> Option<String> {
         return None;
     }
     // Opening is lazy in SQLite, so a corrupt file only fails on a real
-    // query. One cheap count is the honest check.
-    let probe = open_at(path).and_then(|conn| {
-        conn.query_row("SELECT count(*) FROM dictations", [], |row| {
-            row.get::<_, i64>(0)
-        })
-        .map_err(Into::into)
-    });
-    probe.err().map(|e| e.to_string())
+    // query. One cheap count is the honest check. A busy store is a writer at
+    // work, not a fault.
+    let probe = (|| -> eyre::Result<()> {
+        let Some(conn) = open_ui_at(path)? else { return Ok(()) };
+        conn.query_row("SELECT count(*) FROM dictations", [], |row| row.get::<_, i64>(0))?;
+        Ok(())
+    })();
+    match probe {
+        Err(e) if !is_busy(&e) => Some(e.to_string()),
+        _ => None,
+    }
 }
 
 /// The empty-list line for a history surface. `searching` is true when a query
@@ -386,19 +457,107 @@ fn try_match_count_at(path: &Path, needle: &str) -> eyre::Result<usize> {
     Ok(n.max(0) as usize)
 }
 
-/// Delete one dictation by id. Returns whether a row actually went away, so a
-/// caller can tell a stale click from a real delete.
-pub fn delete(id: i64) -> bool {
-    let Some(path) = db_path() else {
-        return false;
-    };
-    match delete_at(&path, id) {
-        Ok(n) => n > 0,
+/// The newest `limit` dictations matching `query` and how many match in all,
+/// for a window: one read-only connection, 150 ms wait, "busy" kept apart from
+/// "failed". A blank query matches everything.
+pub fn query_ui(query: &str, limit: usize) -> UiRead<(Vec<Entry>, usize)> {
+    match db_path() {
+        Some(path) => query_ui_at(&path, query, limit),
+        None => UiRead::Ok((Vec::new(), 0)),
+    }
+}
+
+pub fn query_ui_at(path: &Path, query: &str, limit: usize) -> UiRead<(Vec<Entry>, usize)> {
+    ui_result((|| {
+        let Some(conn) = open_ui_at(path)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let needle = query.trim();
+        let pattern = format!("%{}%", like_escape(needle));
+        let filter = if needle.is_empty() {
+            "1=1".to_string()
+        } else {
+            r"(text LIKE ?1 ESCAPE '\' OR EXISTS(SELECT 1 FROM dictation_stages WHERE dictation_id=dictations.id AND text LIKE ?1 ESCAPE '\'))".to_string()
+        };
+        let total: i64 = {
+            let sql = format!("SELECT COUNT(*) FROM dictations WHERE {filter}");
+            if needle.is_empty() {
+                conn.query_row(&sql, [], |row| row.get(0))?
+            } else {
+                conn.query_row(&sql, rusqlite::params![pattern], |row| row.get(0))?
+            }
+        };
+        let sql = format!(
+            "SELECT id, text, created_at FROM dictations WHERE {filter}
+             ORDER BY created_at DESC, id DESC LIMIT {}",
+            if needle.is_empty() { "?1" } else { "?2" }
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let map = |row: &rusqlite::Row| {
+            Ok(Entry { id: row.get(0)?, text: row.get(1)?, created_at: row.get(2)? })
+        };
+        let rows: Vec<Entry> = if needle.is_empty() {
+            stmt.query_map(rusqlite::params![limit as i64], map)?.collect::<Result<_, _>>()?
+        } else {
+            stmt.query_map(rusqlite::params![pattern, limit as i64], map)?.collect::<Result<_, _>>()?
+        };
+        Ok((rows, total.max(0) as usize))
+    })())
+}
+
+/// [`count`] for a window.
+pub fn count_ui() -> UiRead<usize> {
+    match db_path() {
+        Some(path) => count_ui_at(&path),
+        None => UiRead::Ok(0),
+    }
+}
+
+pub fn count_ui_at(path: &Path) -> UiRead<usize> {
+    ui_result((|| {
+        let Some(conn) = open_ui_at(path)? else { return Ok(0) };
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM dictations", [], |row| row.get(0))?;
+        Ok(n.max(0) as usize)
+    })())
+}
+
+/// What a delete did. A stale click ("Gone") is not an error.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DeleteOutcome {
+    Deleted,
+    Gone,
+    Failed,
+}
+
+/// What a clear did. `Cleared(0)` is an empty store, not a failure.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ClearOutcome {
+    Cleared(usize),
+    Failed,
+}
+
+/// Delete one dictation by id, telling a stale click from a real failure.
+pub fn delete_outcome(id: i64) -> DeleteOutcome {
+    match db_path() {
+        Some(path) => delete_outcome_at(&path, id),
+        None => DeleteOutcome::Failed,
+    }
+}
+
+fn delete_outcome_at(path: &Path, id: i64) -> DeleteOutcome {
+    match delete_at(path, id) {
+        Ok(0) => DeleteOutcome::Gone,
+        Ok(_) => DeleteOutcome::Deleted,
         Err(e) => {
             eprintln!("[history] delete failed: {e}");
-            false
+            DeleteOutcome::Failed
         }
     }
+}
+
+/// Delete one dictation by id. Returns whether a row actually went away.
+pub fn delete(id: i64) -> bool {
+    delete_outcome(id) == DeleteOutcome::Deleted
 }
 
 fn delete_at(path: &Path, id: i64) -> eyre::Result<usize> {
@@ -410,18 +569,29 @@ fn delete_at(path: &Path, id: i64) -> eyre::Result<usize> {
     )?)
 }
 
-/// Delete every dictation. Returns how many rows went away; logs and reports
-/// `0` on error rather than propagating — this is called from a UI click.
-pub fn clear() -> usize {
-    let Some(path) = db_path() else {
-        return 0;
-    };
-    match clear_at(&path) {
-        Ok(n) => n,
+/// Delete every dictation, telling an empty store from a failure.
+pub fn clear_outcome() -> ClearOutcome {
+    match db_path() {
+        Some(path) => clear_outcome_at(&path),
+        None => ClearOutcome::Failed,
+    }
+}
+
+fn clear_outcome_at(path: &Path) -> ClearOutcome {
+    match clear_at(path) {
+        Ok(n) => ClearOutcome::Cleared(n),
         Err(e) => {
             eprintln!("[history] clear failed: {e}");
-            0
+            ClearOutcome::Failed
         }
+    }
+}
+
+/// Delete every dictation. Returns how many rows went away (`0` on error).
+pub fn clear() -> usize {
+    match clear_outcome() {
+        ClearOutcome::Cleared(n) => n,
+        ClearOutcome::Failed => 0,
     }
 }
 
@@ -692,5 +862,107 @@ mod tests {
         let rows = try_recent_at(&db, 5).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "hello");
+    }
+
+    /// The panel reads 1000 rows on open. Reading them from SQLite must stay
+    /// cheap; the freeze lives in building views, not here. Invented text only.
+    #[test]
+    fn recent_1000_is_fast() {
+        let db = test_db("recent-1000");
+        {
+            let mut conn = open_at(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..1000_i64 {
+                tx.execute(
+                    "INSERT INTO dictations (text, created_at) VALUES (?1, ?2)",
+                    (format!("Invented dictation {i}: move the review and keep the agenda short"), 1_772_000_000 - i * 1_200),
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let t = std::time::Instant::now();
+        let rows = try_recent_at(&db, 1000).unwrap();
+        let took = t.elapsed();
+        eprintln!("[history-bench] recent(1000) = {took:?}");
+        assert_eq!(rows.len(), 1000);
+        assert!(took < std::time::Duration::from_millis(250), "recent(1000) took {took:?}");
+    }
+
+    /// Hold the write lock the way a finishing dictation does, then read the
+    /// way the History panel reads. The read must give up within a fraction of
+    /// a second so the panel can say "busy" instead of freezing.
+    #[test]
+    fn ui_read_returns_fast_while_a_writer_holds_the_lock() {
+        let db = test_db("ui-read-busy");
+        {
+            let conn = open_at(&db).unwrap();
+            conn.execute("INSERT INTO dictations (text, created_at) VALUES ('x', 1)", []).unwrap();
+        }
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let t = std::time::Instant::now();
+        let got = recent_ui_at(&db, 1000);
+        let took = t.elapsed();
+        eprintln!("[history-bench] read under writer lock = {took:?}");
+        assert!(took < std::time::Duration::from_millis(300), "UI read blocked {took:?}");
+        assert!(matches!(got, UiRead::Busy), "a busy store is not an unreadable one");
+        assert_eq!(unreadable_reason_at(&db), None, "busy is not a fault");
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// Every read the Settings pane makes must give up fast behind a writer,
+    /// and must still answer correctly when nobody holds the lock.
+    #[test]
+    fn settings_reads_are_bounded_behind_a_writer_and_correct_without_one() {
+        let db = test_db("settings-reads");
+        {
+            let mut conn = open_at(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..30_i64 {
+                tx.execute(
+                    "INSERT INTO dictations (text, created_at) VALUES (?1, ?2)",
+                    (format!("invented {i} {}", if i % 3 == 0 { "alpha" } else { "beta" }), 1_000 + i),
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        match query_ui_at(&db, "alpha", 5) {
+            UiRead::Ok((rows, total)) => {
+                assert_eq!((rows.len(), total), (5, 10));
+                assert!(rows[0].created_at > rows[1].created_at, "newest first");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(query_ui_at(&db, "", 1000), UiRead::Ok((r, 30)) if r.len() == 30));
+        assert!(matches!(count_ui_at(&db), UiRead::Ok(30)));
+
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let t = std::time::Instant::now();
+        let (q, c) = (query_ui_at(&db, "alpha", 5), count_ui_at(&db));
+        let took = t.elapsed();
+        assert!(took < std::time::Duration::from_millis(600), "two reads took {took:?}");
+        assert!(matches!(q, UiRead::Busy) && matches!(c, UiRead::Busy));
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A failure is not "already gone" and not "nothing to delete".
+    #[test]
+    fn delete_and_clear_tell_failure_from_gone() {
+        let db = test_db("delete-outcome");
+        insert_at(&db, "one", 1).unwrap();
+        insert_at(&db, "two", 2).unwrap();
+        let id = try_recent_at(&db, 1).unwrap()[0].id;
+        assert_eq!(delete_outcome_at(&db, id), DeleteOutcome::Deleted);
+        assert_eq!(delete_outcome_at(&db, id), DeleteOutcome::Gone);
+        // A path that cannot be opened as a database is a failure.
+        let bad = db.parent().unwrap().join("not-a-db");
+        std::fs::create_dir_all(&bad).unwrap();
+        assert_eq!(delete_outcome_at(&bad, 1), DeleteOutcome::Failed);
+        assert_eq!(clear_outcome_at(&bad), ClearOutcome::Failed);
+        assert_eq!(clear_outcome_at(&db), ClearOutcome::Cleared(1));
+        assert_eq!(clear_outcome_at(&db), ClearOutcome::Cleared(0));
     }
 }
