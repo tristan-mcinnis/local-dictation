@@ -693,4 +693,29 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "hello");
     }
+
+    /// The panel reads 1000 rows on open. Reading them from SQLite must stay
+    /// cheap; the freeze lives in building views, not here. Invented text only.
+    #[test]
+    fn recent_1000_is_fast() {
+        let db = test_db("recent-1000");
+        {
+            let mut conn = open_at(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            for i in 0..1000_i64 {
+                tx.execute(
+                    "INSERT INTO dictations (text, created_at) VALUES (?1, ?2)",
+                    (format!("Invented dictation {i}: move the review and keep the agenda short"), 1_772_000_000 - i * 1_200),
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let t = std::time::Instant::now();
+        let rows = try_recent_at(&db, 1000).unwrap();
+        let took = t.elapsed();
+        eprintln!("[history-bench] recent(1000) = {took:?}");
+        assert_eq!(rows.len(), 1000);
+        assert!(took < std::time::Duration::from_millis(250), "recent(1000) took {took:?}");
+    }
 }

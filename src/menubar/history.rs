@@ -11,6 +11,8 @@
 //! the launcher contract, so a panel with no title bar is never stranded.
 
 use super::*;
+use objc2_app_kit::NSViewBoundsDidChangeNotification;
+use objc2_foundation::{NSNotification, NSNotificationCenter};
 use std::sync::atomic::AtomicUsize;
 
 static HISTORY_VISIBLE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
@@ -275,6 +277,25 @@ fn build_history_with_hotkey(mtm: MainThreadMarker, keycode: i64) -> HistoryUi {
         ]
     };
     scroll.setDocumentView(Some(&*doc));
+    // Rows are built a page at a time; scrolling near the end builds the next.
+    {
+        let clip = scroll.contentView();
+        clip.setPostsBoundsChangedNotifications(true);
+        let block = block2::RcBlock::new(|_note: std::ptr::NonNull<NSNotification>| {
+            load_more_if_near_end();
+        });
+        let center = NSNotificationCenter::defaultCenter();
+        let token = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSViewBoundsDidChangeNotification),
+                Some(&*clip),
+                None,
+                &block,
+            )
+        };
+        // The history window lives for the whole process.
+        std::mem::forget(token);
+    }
     glass.addSubview(&scroll);
 
     // ── Footer well ────────────────────────────────────────────────────
@@ -386,14 +407,9 @@ pub(super) fn apply_history_filter(query: &str) {
     let Some(ui) = HISTORY_UI.get() else {
         return;
     };
-    let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
-    let needle = query.trim().to_lowercase();
-    let filtered: Vec<Entry> = if needle.is_empty() {
-        all
-    } else {
-        all.into_iter()
-            .filter(|e| e.text.to_lowercase().contains(&needle))
-            .collect()
+    let filtered = {
+        let all = HISTORY_ALL.lock().map(|g| g.clone()).unwrap_or_default();
+        filter_entries(all, query)
     };
 
     if let Ok(mut store) = HISTORY_ENTRIES.lock() {
@@ -402,6 +418,18 @@ pub(super) fn apply_history_filter(query: &str) {
     *HISTORY_VISIBLE.lock().unwrap() = filtered.clone();
     HISTORY_SELECTED.store(0, Ordering::SeqCst);
     rebuild_history_list(mtm, ui, &filtered);
+}
+
+/// The entries whose text contains `query`, case-insensitively. A blank query
+/// keeps everything.
+pub(super) fn filter_entries(all: Vec<Entry>, query: &str) -> Vec<Entry> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return all;
+    }
+    all.into_iter()
+        .filter(|e| e.text.to_lowercase().contains(&needle))
+        .collect()
 }
 
 pub(super) fn open_history_entry_at(tag: isize) {
@@ -422,6 +450,7 @@ pub(super) fn move_history_selection(delta: isize) {
     if count == 0 { return; }
     let next = (HISTORY_SELECTED.load(Ordering::SeqCst) as isize + delta).clamp(0, count as isize - 1) as usize;
     HISTORY_SELECTED.store(next, Ordering::SeqCst);
+    ensure_row_built(next);
     if let Some(ui) = HISTORY_UI.get() { select_row(ui, next as isize); }
 }
 
@@ -487,14 +516,26 @@ pub(crate) enum HistoryRow {
 /// Group entries by local calendar day (newest first) into a flat row list.
 /// `NSDateFormatter` renders dates/times in the user's locale + timezone.
 pub(crate) fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
+    history_rows_range(entries, 0, entries.len(), None)
+}
+
+/// Rows for `entries[from..to]` only, with `index` still counting from the
+/// start of `entries`. `last_day` is the day label of the row before `from`,
+/// so a page that continues a day does not repeat its header.
+fn history_rows_range(
+    entries: &[Entry],
+    from: usize,
+    to: usize,
+    mut last_day: Option<String>,
+) -> Vec<HistoryRow> {
     let day_fmt = NSDateFormatter::new();
     day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
     let time_fmt = NSDateFormatter::new();
     time_fmt.setDateFormat(Some(&NSString::from_str("HH:mm")));
 
     let mut rows = Vec::new();
-    let mut last_day: Option<String> = None;
-    for (i, e) in entries.iter().enumerate() {
+    let to = to.min(entries.len());
+    for (i, e) in entries.iter().enumerate().take(to).skip(from) {
         let date = NSDate::dateWithTimeIntervalSince1970(e.created_at as f64);
         let day = day_fmt.stringFromDate(&date).to_string().to_uppercase();
         let time = time_fmt.stringFromDate(&date).to_string();
@@ -513,11 +554,55 @@ pub(crate) fn history_rows(entries: &[Entry]) -> Vec<HistoryRow> {
     rows
 }
 
+/// Entries built into rows per page. The list is a window onto the history,
+/// not a copy of it: a thousand eager rows is six thousand views and a
+/// multi-hundred-millisecond stall on the main run loop, which also carries
+/// the hotkey event tap.
+const HISTORY_PAGE: usize = 50;
+/// Load the next page when the visible edge is within this many points of the
+/// last built row.
+const LOAD_AHEAD: f64 = 240.0;
+
+/// Where the built part of the list ends, so the next page continues it.
+struct ListCursor {
+    /// Y of the next row in the flipped document view.
+    y: f64,
+    /// Index of the next entry to build.
+    next: usize,
+    /// Day label of the last built entry.
+    last_day: Option<String>,
+}
+
+static LIST_CURSOR: Mutex<ListCursor> = Mutex::new(ListCursor { y: 0.0, next: 0, last_day: None });
+
+/// Build more rows when the user has scrolled near the end of the built part.
+pub(super) fn load_more_if_near_end() {
+    let (Some(mtm), Some(ui)) = (MainThreadMarker::new(), HISTORY_UI.get()) else {
+        return;
+    };
+    let visible = ui.scroll.documentVisibleRect();
+    let (built_to, next) = LIST_CURSOR.lock().map(|c| (c.y, c.next)).unwrap_or((0.0, 0));
+    if visible.origin.y + visible.size.height + LOAD_AHEAD >= built_to {
+        let entries = HISTORY_VISIBLE.lock().map(|e| e.clone()).unwrap_or_default();
+        append_history_rows(mtm, ui, &entries, next + HISTORY_PAGE);
+    }
+}
+
+/// Make sure the row for entry `index` exists, so keyboard selection can walk
+/// past the built part.
+fn ensure_row_built(index: usize) {
+    let (Some(mtm), Some(ui)) = (MainThreadMarker::new(), HISTORY_UI.get()) else {
+        return;
+    };
+    if LIST_CURSOR.lock().map(|c| index < c.next).unwrap_or(true) {
+        return;
+    }
+    let entries = HISTORY_VISIBLE.lock().map(|e| e.clone()).unwrap_or_default();
+    append_history_rows(mtm, ui, &entries, index + 1);
+}
+
 /// Tear down and rebuild the day-grouped list.
 pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry]) {
-    /// Section label band: the `section` type plus the mockup's 6 px above and
-    /// below it.
-    const SECTION_H: f64 = 24.0;
 
     let doc = &ui.doc;
     let content = ui.scroll.contentSize();
@@ -554,14 +639,43 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
             NSPoint::new(0.0, 0.0),
             NSSize::new(width, content.height.max(CONTROL_ROW)),
         ));
+        if let Ok(mut c) = LIST_CURSOR.lock() {
+            *c = ListCursor { y: 0.0, next: 0, last_day: None };
+        }
         return;
     }
 
+    if let Ok(mut c) = LIST_CURSOR.lock() {
+        *c = ListCursor { y: SPACE_XS, next: 0, last_day: None };
+    }
+    append_history_rows(mtm, ui, entries, HISTORY_PAGE);
+    // Flipped view: (0,0) is the top, so this shows the newest entries.
+    ui.doc.scrollPoint(NSPoint::new(0.0, 0.0));
+}
+
+/// Build rows for `entries` from the cursor up to (not including) `upto`, and
+/// grow the document view to fit.
+pub(super) fn append_history_rows(mtm: MainThreadMarker, ui: &HistoryUi, entries: &[Entry], upto: usize) {
+    /// Section label band: the `section` type plus the mockup's 6 px above and
+    /// below it.
+    const SECTION_H: f64 = 24.0;
+
+    let doc = &ui.doc;
+    let content = ui.scroll.contentSize();
+    let width = content.width.max(LAYOUT_PANEL_WIDTH / 2.0);
+    let row_w = width - 2.0 * LIST_PAD;
+    let (mut y, from, last_day) = match LIST_CURSOR.lock() {
+        Ok(c) => (c.y, c.next, c.last_day.clone()),
+        Err(_) => return,
+    };
+    let upto = upto.min(entries.len());
+    if from >= upto {
+        return;
+    }
     // The shared action target whose copyHistoryEntry: handles row clicks.
     let actions = GLOBALS.get().map(|g| &g._actions);
-
-    let mut y = SPACE_XS;
-    for row in history_rows(entries) {
+    let new_last_day = history_day_label(entries[upto - 1].created_at);
+    for row in history_rows_range(entries, from, upto, last_day) {
         match row {
             HistoryRow::Day(day) => {
                 let label = slate::section_label(mtm, &day);
@@ -671,13 +785,23 @@ pub(super) fn rebuild_history_list(mtm: MainThreadMarker, ui: &HistoryUi, entrie
         }
     }
 
+    if let Ok(mut c) = LIST_CURSOR.lock() {
+        *c = ListCursor { y, next: upto, last_day: Some(new_last_day) };
+    }
     let total = y + SPACE_XS;
     doc.setFrame(NSRect::new(
         NSPoint::new(0.0, 0.0),
         NSSize::new(width, total.max(content.height)),
     ));
-    // Flipped view: (0,0) is the top, so this shows the newest entries.
-    doc.scrollPoint(NSPoint::new(0.0, 0.0));
+}
+
+/// The upper-case day header text for a timestamp, as `history_rows_range`
+/// writes it.
+fn history_day_label(created_at: i64) -> String {
+    let day_fmt = NSDateFormatter::new();
+    day_fmt.setDateFormat(Some(&NSString::from_str("MMMM d, yyyy")));
+    let date = NSDate::dateWithTimeIntervalSince1970(created_at as f64);
+    day_fmt.stringFromDate(&date).to_string().to_uppercase()
 }
 
 /// Width of the right-aligned time column, so times line up whatever the
