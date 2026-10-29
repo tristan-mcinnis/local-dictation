@@ -752,12 +752,12 @@ fallback` line since the previous `[latency]` line:
 grep -a -E '^⏹ stopped|streaming fallback|^\[latency\]' \
     "$HOME/Library/Logs/Local Dictation/daemon.log" | awk '
   /^⏹ stopped/ { h=$NF; sub(/s$/,"",h); held=h+0; next }
-  /streaming fallback/ { fb++; next }
+  /streaming fallback/ { if (seen) fb++; next }
   /^\[latency\]/ {
     match($0,/release_ms=[0-9]+/); r=substr($0,RSTART+11,RLENGTH-11)
     match($0,/asr_ms=[0-9]+/);     a=substr($0,RSTART+7,RLENGTH-7)
     match($0,/cleanup_ms=[0-9]+/); c=substr($0,RSTART+11,RLENGTH-11)
-    print r, a, c, held, fb+0; fb=0 }' | sort -rn | head -12
+    print r, a, c, held, fb+0; fb=0; seen=1 }' | sort -rn | head -12
 ```
 
 Columns: release_ms, asr_ms, cleanup_ms, hold seconds, fallback count.
