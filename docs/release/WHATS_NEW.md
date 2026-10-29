@@ -1,7 +1,7 @@
-- First download build on GitHub Releases. Before this, you had to build it from source.
-- First-run Setup window. A missing permission or model never stops the app from starting. The menu bar and the Setup window say what is missing and what to do next.
-- Models are checked. The speech model comes from a public pinned 4-bit conversion, and every file is checked against a SHA-256. Setup can fetch the cleanup model for you.
-- Recovery history keeps the audio and the text versions of every capture on your Mac.
-- Dictation works in more apps: Slack, Electron apps and Helium now expose their text fields.
-- Selectable start and completion sounds.
-- Licences and third-party notices ship inside the app, and a scrub gate keeps private content out of the repository.
+- Dictation History no longer freezes the app. The panel opens at once, loads rows as you scroll, and reads the history store off the main thread. When the store is busy, it says so instead of hanging.
+- Turning Accessibility off while the app runs is now shown in the menu bar. Turning it back on asks you to relaunch, because the hotkey needs a fresh start.
+- Retry last recording: a cancelled dictation keeps its audio in memory, so you can transcribe it again from the menu.
+- The microphone pauses between dictations and resumes in about 15 ms, so the next dictation starts fast without keeping capture running.
+- Dictionary edits in Settings are saved at once, and a failed save is shown in the window instead of only in the log.
+- Clearer log lines when text is held instead of typed: each one names the target app and the reason, never the text.
+- New `scripts/latency-report.sh` prints p50, p90 and p99 timings from your own log.
