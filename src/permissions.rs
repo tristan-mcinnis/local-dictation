@@ -162,11 +162,17 @@ pub fn run_when_accessibility_granted(task: impl FnOnce() -> Result<(), String> 
 /// Poll the grant and run any pending task. Called about once a second from
 /// the menu-bar timer, on the main thread. Cheap: one non-prompting syscall.
 pub fn poll_pending_accessibility() {
+    poll_pending_with(accessibility_trusted());
+}
+
+/// [`poll_pending_accessibility`] with the trust reading passed in.
+fn poll_pending_with(trusted: bool) {
     let waiting = PENDING.with(|slot| slot.borrow().is_some());
     if !waiting {
+        poll_with(trusted);
         return;
     }
-    if !accessibility_trusted() {
+    if !trusted {
         return;
     }
     let Some(task) = PENDING.with(|slot| slot.borrow_mut().take()) else {
@@ -179,6 +185,7 @@ pub fn poll_pending_accessibility() {
 fn finish_accessibility_task(task: PendingTask) {
     match task() {
         Ok(()) => {
+            SEEN.with(|s| s.set(Seen::Trusted));
             INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
             crate::health::clear(crate::health::Fault::AccessibilityMissing)
         }
@@ -186,6 +193,7 @@ fn finish_accessibility_task(task: PendingTask) {
             // The task is spent either way (it owns the tap's callback), so a
             // failure here cannot be retried in place. Record it so the Setup
             // window offers the one thing that does work: a relaunch.
+            SEEN.with(|s| s.set(Seen::Idle));
             INSTALL_FAILED.store(accessibility_trusted(), std::sync::atomic::Ordering::SeqCst);
             crate::health::raise(crate::health::Fault::AccessibilityMissing, why)
         }
@@ -209,6 +217,78 @@ static INSTALL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// and the hotkey is dead, which without this is a silent dead end.
 pub fn accessibility_install_failed() -> bool {
     INSTALL_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// ─── Revocation while running ───────────────────────────────────────────
+
+/// What the poll has seen of the grant since the event tap was installed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seen {
+    /// No tap installed yet (or the install failed): the pending path owns it.
+    Idle,
+    /// The tap is installed and the grant is on.
+    Trusted,
+    /// The grant went off while running; the tap is dead.
+    Revoked,
+    /// The grant came back after a revoke. The tap made at boot may not
+    /// recover, so the user is told to relaunch.
+    Regranted,
+}
+
+/// What one poll tick must do about a [`Seen`] transition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Watch {
+    Nothing,
+    Revoke,
+    Relaunch,
+}
+
+/// Pure decision: previous state and current trust in, next state and action out.
+fn revoke_step(seen: Seen, trusted: bool) -> (Seen, Watch) {
+    match (seen, trusted) {
+        (Seen::Trusted | Seen::Regranted, false) => (Seen::Revoked, Watch::Revoke),
+        (Seen::Revoked, true) => (Seen::Regranted, Watch::Relaunch),
+        (seen, _) => (seen, Watch::Nothing),
+    }
+}
+
+thread_local! {
+    static SEEN: std::cell::Cell<Seen> = const { std::cell::Cell::new(Seen::Idle) };
+}
+
+/// Was Accessibility turned off while running (and not yet turned back on)?
+/// The Setup window uses it to say a relaunch is needed, not just a switch.
+pub fn accessibility_revoked() -> bool {
+    SEEN.with(|s| s.get()) == Seen::Revoked
+}
+
+/// Apply one tick of [`revoke_step`] when no task is pending. Logs once per
+/// transition, not per tick. Known limit: a revoke and regrant inside one
+/// second (between two ticks) is not seen.
+fn poll_with(trusted: bool) {
+    let (next, action) = revoke_step(SEEN.with(|s| s.get()), trusted);
+    SEEN.with(|s| s.set(next));
+    match action {
+        Watch::Nothing => {}
+        Watch::Revoke => {
+            eprintln!("[perm] Accessibility turned off while running — the hotkey is dead");
+            INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::health::clear(crate::health::Fault::AccessibilityRelaunch);
+            crate::health::raise(
+                crate::health::Fault::AccessibilityMissing,
+                "turned off while running — turn it back on, then relaunch",
+            );
+        }
+        Watch::Relaunch => {
+            eprintln!("[perm] Accessibility turned back on — a relaunch restores the hotkey");
+            INSTALL_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::health::clear(crate::health::Fault::AccessibilityMissing);
+            crate::health::raise(
+                crate::health::Fault::AccessibilityRelaunch,
+                "turned back on — relaunch to restore the hotkey",
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
@@ -397,6 +477,91 @@ mod tests {
             PENDING.with(|slot| *slot.borrow_mut() = None);
             crate::health::clear(crate::health::Fault::AccessibilityMissing);
         }
+    }
+
+    #[test]
+    fn revoke_step_covers_every_transition() {
+        use Seen::*;
+        use Watch::*;
+        // Never granted yet, or the install failed: the pending path owns it.
+        assert_eq!(revoke_step(Idle, true), (Idle, Nothing));
+        assert_eq!(revoke_step(Idle, false), (Idle, Nothing));
+        // Still trusted: silent.
+        assert_eq!(revoke_step(Trusted, true), (Trusted, Nothing));
+        // Turned off while running: one fault.
+        assert_eq!(revoke_step(Trusted, false), (Revoked, Revoke));
+        assert_eq!(revoke_step(Revoked, false), (Revoked, Nothing));
+        // Turned back on: the old tap may be dead, so ask for a relaunch once.
+        assert_eq!(revoke_step(Revoked, true), (Regranted, Relaunch));
+        assert_eq!(revoke_step(Regranted, true), (Regranted, Nothing));
+        // Off again after a regrant.
+        assert_eq!(revoke_step(Regranted, false), (Revoked, Revoke));
+    }
+
+    /// Restores the process-wide watcher state even when an assert fails, so
+    /// one failing test cannot poison the others.
+    struct WatchGuard {
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+    impl WatchGuard {
+        fn new(seen: Seen) -> Self {
+            let _serial = crate::health::test_lock();
+            SEEN.with(|s| s.set(seen));
+            WatchGuard { _serial }
+        }
+    }
+    impl Drop for WatchGuard {
+        fn drop(&mut self) {
+            SEEN.with(|s| s.set(Seen::Idle));
+            INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+            PENDING.with(|slot| *slot.borrow_mut() = None);
+            crate::health::clear(crate::health::Fault::AccessibilityMissing);
+            crate::health::clear(crate::health::Fault::AccessibilityRelaunch);
+        }
+    }
+
+    #[test]
+    fn a_revoke_raises_a_fault_and_a_regrant_offers_a_relaunch() {
+        use crate::health::Fault::{AccessibilityMissing as Missing, AccessibilityRelaunch as Relaunch};
+        let _guard = WatchGuard::new(Seen::Trusted);
+        poll_with(true);
+        assert!(!crate::health::is_raised(Missing), "still trusted: no fault");
+        poll_with(false);
+        let problem = crate::health::current().expect("a revoke is a fault");
+        assert_eq!(problem.fault, Missing);
+        assert!(problem.detail.contains("turned off while running"), "{}", problem.detail);
+        assert!(accessibility_revoked());
+        assert!(!accessibility_install_failed());
+        poll_with(true);
+        assert!(accessibility_install_failed(), "Setup must offer the relaunch");
+        assert!(!accessibility_revoked());
+        assert!(!crate::health::is_raised(Missing), "the pill must not say it is off");
+        let problem = crate::health::current().expect("a regrant still needs a relaunch");
+        assert_eq!(problem.fault, Relaunch);
+        // Off again: back to the off fault, the relaunch fault gone.
+        poll_with(false);
+        assert!(crate::health::is_raised(Missing));
+        assert!(!crate::health::is_raised(Relaunch));
+    }
+
+    /// The poll must reach the watcher, and a finished install must arm it.
+    /// Removing either call leaves a dead hotkey that nothing reports.
+    #[test]
+    fn the_poll_and_a_finished_install_arm_the_watcher() {
+        let _guard = WatchGuard::new(Seen::Idle);
+        finish_accessibility_task(Box::new(|| Ok(())));
+        assert_eq!(SEEN.with(|s| s.get()), Seen::Trusted);
+        assert!(!accessibility_task_pending());
+        poll_pending_with(false);
+        assert_eq!(SEEN.with(|s| s.get()), Seen::Revoked, "an idle poll must watch");
+        assert!(crate::health::is_raised(crate::health::Fault::AccessibilityMissing));
+    }
+
+    #[test]
+    fn a_failed_install_leaves_the_watcher_idle() {
+        let _guard = WatchGuard::new(Seen::Trusted);
+        finish_accessibility_task(Box::new(|| Err("tap refused".to_string())));
+        assert_eq!(SEEN.with(|s| s.get()), Seen::Idle);
     }
 
     #[test]
