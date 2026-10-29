@@ -521,19 +521,43 @@ pub fn count_ui_at(path: &Path) -> UiRead<usize> {
     })())
 }
 
-/// Delete one dictation by id. Returns whether a row actually went away, so a
-/// caller can tell a stale click from a real delete.
-pub fn delete(id: i64) -> bool {
-    let Some(path) = db_path() else {
-        return false;
-    };
-    match delete_at(&path, id) {
-        Ok(n) => n > 0,
+/// What a delete did. A stale click ("Gone") is not an error.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DeleteOutcome {
+    Deleted,
+    Gone,
+    Failed,
+}
+
+/// What a clear did. `Cleared(0)` is an empty store, not a failure.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ClearOutcome {
+    Cleared(usize),
+    Failed,
+}
+
+/// Delete one dictation by id, telling a stale click from a real failure.
+pub fn delete_outcome(id: i64) -> DeleteOutcome {
+    match db_path() {
+        Some(path) => delete_outcome_at(&path, id),
+        None => DeleteOutcome::Failed,
+    }
+}
+
+fn delete_outcome_at(path: &Path, id: i64) -> DeleteOutcome {
+    match delete_at(path, id) {
+        Ok(0) => DeleteOutcome::Gone,
+        Ok(_) => DeleteOutcome::Deleted,
         Err(e) => {
             eprintln!("[history] delete failed: {e}");
-            false
+            DeleteOutcome::Failed
         }
     }
+}
+
+/// Delete one dictation by id. Returns whether a row actually went away.
+pub fn delete(id: i64) -> bool {
+    delete_outcome(id) == DeleteOutcome::Deleted
 }
 
 fn delete_at(path: &Path, id: i64) -> eyre::Result<usize> {
@@ -545,18 +569,29 @@ fn delete_at(path: &Path, id: i64) -> eyre::Result<usize> {
     )?)
 }
 
-/// Delete every dictation. Returns how many rows went away; logs and reports
-/// `0` on error rather than propagating — this is called from a UI click.
-pub fn clear() -> usize {
-    let Some(path) = db_path() else {
-        return 0;
-    };
-    match clear_at(&path) {
-        Ok(n) => n,
+/// Delete every dictation, telling an empty store from a failure.
+pub fn clear_outcome() -> ClearOutcome {
+    match db_path() {
+        Some(path) => clear_outcome_at(&path),
+        None => ClearOutcome::Failed,
+    }
+}
+
+fn clear_outcome_at(path: &Path) -> ClearOutcome {
+    match clear_at(path) {
+        Ok(n) => ClearOutcome::Cleared(n),
         Err(e) => {
             eprintln!("[history] clear failed: {e}");
-            0
+            ClearOutcome::Failed
         }
+    }
+}
+
+/// Delete every dictation. Returns how many rows went away (`0` on error).
+pub fn clear() -> usize {
+    match clear_outcome() {
+        ClearOutcome::Cleared(n) => n,
+        ClearOutcome::Failed => 0,
     }
 }
 
@@ -911,5 +946,23 @@ mod tests {
         assert!(took < std::time::Duration::from_millis(600), "two reads took {took:?}");
         assert!(matches!(q, UiRead::Busy) && matches!(c, UiRead::Busy));
         writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    /// A failure is not "already gone" and not "nothing to delete".
+    #[test]
+    fn delete_and_clear_tell_failure_from_gone() {
+        let db = test_db("delete-outcome");
+        insert_at(&db, "one", 1).unwrap();
+        insert_at(&db, "two", 2).unwrap();
+        let id = try_recent_at(&db, 1).unwrap()[0].id;
+        assert_eq!(delete_outcome_at(&db, id), DeleteOutcome::Deleted);
+        assert_eq!(delete_outcome_at(&db, id), DeleteOutcome::Gone);
+        // A path that cannot be opened as a database is a failure.
+        let bad = db.parent().unwrap().join("not-a-db");
+        std::fs::create_dir_all(&bad).unwrap();
+        assert_eq!(delete_outcome_at(&bad, 1), DeleteOutcome::Failed);
+        assert_eq!(clear_outcome_at(&bad), ClearOutcome::Failed);
+        assert_eq!(clear_outcome_at(&db), ClearOutcome::Cleared(1));
+        assert_eq!(clear_outcome_at(&db), ClearOutcome::Cleared(0));
     }
 }

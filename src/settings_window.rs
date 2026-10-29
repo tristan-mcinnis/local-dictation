@@ -658,14 +658,17 @@ define_class!(
             // It runs off the main thread, since it waits on the write lock.
             set_history_status(ui, "Deleting…");
             std::thread::spawn(move || {
-                let deleted = crate::history::delete(id);
+                let outcome = crate::history::delete_outcome(id);
                 menubar::run_on_main(move || {
                     let Some(ui) = SETTINGS_UI.get() else { return };
                     refresh_history_list(ui);
-                    if deleted {
-                        set_history_status(ui, &format!("Deleted “{}”.", history_preview(&text)));
-                    } else {
-                        set_history_status(ui, "That dictation was already gone.");
+                    use crate::history::DeleteOutcome;
+                    match outcome {
+                        DeleteOutcome::Deleted => {
+                            set_history_status(ui, &format!("Deleted “{}”.", history_preview(&text)))
+                        }
+                        DeleteOutcome::Gone => set_history_status(ui, "That dictation was already gone."),
+                        DeleteOutcome::Failed => set_history_status(ui, HISTORY_DELETE_FAILED),
                     }
                 });
             });
@@ -678,15 +681,18 @@ define_class!(
             };
             set_history_status(ui, "Deleting…");
             std::thread::spawn(move || {
-                let n = crate::history::clear();
+                let outcome = crate::history::clear_outcome();
                 menubar::run_on_main(move || {
                     let Some(ui) = SETTINGS_UI.get() else { return };
                     refresh_history_list(ui);
-                    if n == 0 {
-                        set_history_status(ui, "There was nothing to delete.");
-                    } else {
-                        let plural = if n == 1 { "dictation" } else { "dictations" };
-                        set_history_status(ui, &format!("Deleted {n} {plural}."));
+                    use crate::history::ClearOutcome;
+                    match outcome {
+                        ClearOutcome::Cleared(0) => set_history_status(ui, "There was nothing to delete."),
+                        ClearOutcome::Cleared(n) => {
+                            let plural = if n == 1 { "dictation" } else { "dictations" };
+                            set_history_status(ui, &format!("Deleted {n} {plural}."));
+                        }
+                        ClearOutcome::Failed => set_history_status(ui, HISTORY_DELETE_FAILED),
                     }
                 });
             });
@@ -903,6 +909,7 @@ pub fn seed_history_for_render(ui: &SettingsUi, entries: &[crate::history::Entry
         entries,
         entries.len(),
         "",
+        None,
     );
     adopt_history_list(ui, list);
     size_list_card(
@@ -1777,12 +1784,20 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     );
     card.view.addSubview(&history_body);
     let history_card = card.view.clone();
+    let mut initial_failure: Option<String> = None;
     let (initial_history, initial_history_total) = if render_fixture {
         (Vec::new(), 0)
     } else {
         match history_query("") {
             crate::history::UiRead::Ok(found) => found,
-            _ => (Vec::new(), 0),
+            crate::history::UiRead::Busy => {
+                initial_failure = Some(HISTORY_BUSY.to_string());
+                (Vec::new(), 0)
+            }
+            crate::history::UiRead::Failed(why) => {
+                initial_failure = Some(why);
+                (Vec::new(), 0)
+            }
         }
     };
     let initial_history_list = fill_history_body(
@@ -1792,6 +1807,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         &initial_history,
         initial_history_total,
         "",
+        initial_failure.as_deref(),
     );
     size_list_card(
         &history_pane_view,
@@ -3136,6 +3152,7 @@ fn fill_history_body(
     matched: &[crate::history::Entry],
     total: usize,
     filter: &str,
+    read_failure: Option<&str>,
 ) -> HistoryList {
     for view in body.subviews().iter() {
         view.removeFromSuperview();
@@ -3169,7 +3186,14 @@ fn fill_history_body(
         }
     }
 
-    let note = if matched.is_empty() {
+    let note = if let Some(why) = read_failure {
+        // The read itself failed: say so, whatever the query was.
+        if why == HISTORY_BUSY {
+            why.to_string()
+        } else {
+            crate::history::empty_state_text(Some(why), false)
+        }
+    } else if matched.is_empty() {
         if needle.is_empty() {
             crate::history::empty_state_text(
                 crate::history::unreadable_reason().as_deref(),
@@ -3359,6 +3383,7 @@ fn refresh_history_list(ui: &SettingsUi) {
     };
     let filter = ui.history_search.stringValue().to_string();
     refresh_recovery_usage(ui);
+    let mut failure: Option<String> = None;
     let (matched, total) = match history_query(&filter) {
         crate::history::UiRead::Ok(found) => found,
         // A writer holds the store: keep the list on screen and say so
@@ -3368,7 +3393,10 @@ fn refresh_history_list(ui: &SettingsUi) {
                 .setStringValue(&NSString::from_str(HISTORY_BUSY));
             return;
         }
-        crate::history::UiRead::Failed(_) => (Vec::new(), 0),
+        crate::history::UiRead::Failed(why) => {
+            failure = Some(why);
+            (Vec::new(), 0)
+        }
     };
     let list = fill_history_body(
         mtm,
@@ -3377,6 +3405,7 @@ fn refresh_history_list(ui: &SettingsUi) {
         &matched,
         total,
         &filter,
+        failure.as_deref(),
     );
     adopt_history_list(ui, list);
     size_list_card(
@@ -3502,6 +3531,7 @@ fn set_history_status(ui: &SettingsUi, message: &str) {
 }
 
 const HISTORY_BUSY: &str = "History is busy, try again.";
+const HISTORY_DELETE_FAILED: &str = "Could not delete, try again.";
 
 /// The stored-count line, read without waiting on a writer.
 fn history_count_text() -> String {
