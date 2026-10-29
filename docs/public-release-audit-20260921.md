@@ -1,12 +1,14 @@
 # Public-release readiness audit — 2026-09-21
 
-> **Status 2026-10-03.** The tracked-file items below are fixed at HEAD:
+> **Status 2026-10-29.** The repository is public, published on 2026-10-03
+> from a fresh, rewritten history; the older history stays in a separate
+> private archive repository. The tracked-file items below are fixed at HEAD:
 > `.memory/` is untracked and gitignored, `prompts-lab/cleanup_stream.json` is
 > deleted, personal names and paths are neutralised, `tests/scrub.sh` guards the
 > tree, and `scripts/download-models.sh` fetches a public Cohere 4-bit MLX
-> conversion. Still open: the same material remains in Git history (publish
-> from a fresh history or run `git filter-repo`), the test voice needs recorded
-> consent, and there is no Developer ID certificate yet.
+> conversion. The verdict below ("NOT PUBLIC-READY") is the 2026-09-21
+> finding and is kept as a record. Releases ship as a free DMG without a
+> Developer ID by decision (see `docs/release/first-open.md`).
 
 An evidence-backed audit of Local Dictation for public, direct-distribution
 release: secrets, licences, personal and machine-specific data, dependencies,
