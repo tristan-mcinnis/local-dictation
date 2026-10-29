@@ -14,7 +14,8 @@
 
 ## Measured fixture latency
 
-Machine: Apple M5. Fixture: `testdata/dictation_sample.wav`, 8.35 seconds.
+Machine: Apple M5. Fixture: the earlier human-voice `testdata/dictation_sample.wav`, 8.35 seconds
+(replaced by a synthetic clip on 2026-10-29).
 
 | Stage | Warm latency |
 |---|---:|

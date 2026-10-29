@@ -37,7 +37,7 @@ press-to-text path short and measurable.
 ## Features
 
 1. **Fast speech-to-text.** A persistent native MLX helper runs Cohere
-   Transcribe Q4. The 8.35-second test clip transcribes in about 200 ms hot.
+   Transcribe Q4. The 7.5-second synthetic test clip transcribes in roughly 170-360 ms hot.
 2. **Private and offline.** No account, no telemetry, no network while you
    dictate.
 3. **Lands at your cursor, in any app.** Native Cocoa apps get the text through
@@ -300,7 +300,9 @@ without it.
 
 Measured on an Apple M5 after warm-up with `testdata/dictation_sample.wav`
 (7.53 seconds of synthetic speech), three runs on 2026-10-29
-while other builds were running, so expect the low end on an idle machine:
+while other builds were running, so the timings are noisy. The cleanup row now
+times a real cleanup decode, so it is not comparable with the earlier 6-70 ms
+figure:
 
 | Stage | Hot latency |
 | --- | ---: |

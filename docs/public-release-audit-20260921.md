@@ -99,7 +99,7 @@ rendered — is a privacy breach.
   (a colleague's and the author's names), `src/audio.rs`, `src/cues.rs`,
   `src/corrections.rs`, and `docs/cleanup-behaviour-20260909.md` (a client
   project name). `src/history.rs` used a client brand in test fixtures.
-- `testdata/dictation_sample.wav` is 8.35 s of a real human voice (its transcript
+- `testdata/dictation_sample.wav` was 8.35 s of a real human voice (its transcript
   was quoted in `docs/superwhisper-comparison-2026-08-25.md`). Publishing it needs
   the speaker's consent, or it should be replaced with a synthetic sample.
   RESOLVED 2026-10-29: replaced by a synthetic voice (`testdata/README.md`) and the
@@ -205,8 +205,9 @@ threads, file paths, faces or voices. Safe to publish.
 3. Purge the `resources/sounds/reference/superwhisper-*.m4a` objects from
    history (for example with `git filter-repo`), or publish from a fresh
    history.
-4. Scrub the absolute paths and personal names listed in Section 3, and (done
-   2026-10-29: `testdata/dictation_sample.wav` replaced synthetically; history still holds the old file).
+4. Scrub the absolute paths and personal names listed in Section 3. The
+   `testdata/dictation_sample.wav` part is done (2026-10-29, replaced with a
+   synthetic voice); the old recording is still in Git history.
 5. Resolve the Cohere model distribution question.
 6. Complete the credential and publication human gates in
    `docs/release/direct-distribution.md`.
