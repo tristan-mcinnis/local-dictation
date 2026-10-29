@@ -1,12 +1,13 @@
 # Superwhisper comparison — 2026-08-25
 
-Fixture: `testdata/dictation_sample.wav`, mono 16 kHz, 8.35 seconds.
+Note: these numbers were measured on an earlier human-voice fixture that was replaced by a synthetic one on 2026-10-29. Fixture length and transcript below refer to the earlier recording.
+
+Fixture: earlier `testdata/dictation_sample.wav`, mono 16 kHz, 8.35 seconds.
 Machine: Apple M5. Both applications used Cohere Transcribe Q4 and S1-mini.
 
 Both applications produced the identical raw transcript:
 
-> So, yeah, we should build the Rust loop and then like compile it on Mac OS,
-> right? Um, the Parakeet ONNX runtime is the core dependency.
+(transcript of the earlier fixture removed)
 
 ## Results
 
@@ -23,18 +24,10 @@ Dictation timings came from the native helper response and cleanup benchmark.
 
 ## Cleaned text
 
-Superwhisper:
+(transcript of the earlier fixture removed)
 
-> So, yeah, we should build the Rust loop and then compile it on Mac OS, right?
-> The Parakeet ONNX runtime is the core dependency.
-
-Local Dictation:
-
-> Yeah, we should build the Rust loop and then like compile it on Mac OS, right?
-> The Parakeet ONNX runtime is the core dependency.
-
-Both preserve the meaning and remove `Um`; Superwhisper removes `like`, while
-Local Dictation removes the opening `So`.
+Both preserved the meaning and removed the filler words; they differed in which
+other fillers they dropped.
 
 ## Interpretation
 
