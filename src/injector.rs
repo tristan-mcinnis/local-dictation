@@ -547,6 +547,40 @@ pub fn process_command_path(pid: i32) -> Option<String> {
         .and_then(|o| String::from_utf8(o.stdout).ok())
 }
 
+/// Name for the app a hold or clipboard-fallback log line is about: the bundle
+/// id, else the executable file name (from `ps -o comm=`), else `unknown`.
+/// Pure so the choice is unit-testable; never takes text, titles or values.
+pub fn app_label(bundle_id: Option<&str>, command_path: Option<&str>) -> String {
+    let clean = |s: &str| s.trim().to_string();
+    if let Some(b) = bundle_id.map(clean).filter(|b| !b.is_empty()) {
+        return b;
+    }
+    command_path
+        .map(clean)
+        .and_then(|c| c.rsplit('/').next().map(str::to_string))
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The one format for an injector hold or clipboard-fallback log line:
+/// `[inject] <reason> app=<name>`. `reason` is a fixed phrase plus an AX error
+/// or role key, never transcript text, a window title or a field value.
+pub fn hold_log_line(reason: &str, app: &str) -> String {
+    let app = if app.trim().is_empty() { "unknown" } else { app.trim() };
+    format!("[inject] {reason} app={app}")
+}
+
+/// [`app_label`] for a PID, looked up only on hold/fallback paths.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub fn app_label_for_pid(pid: Option<i32>) -> String {
+    let Some(pid) = pid else { return app_label(None, None) };
+    let bundle = bundle_id_for_pid(pid);
+    if bundle.is_some() {
+        return app_label(bundle.as_deref(), None);
+    }
+    app_label(None, process_command_path(pid).as_deref())
+}
+
 /// Pure app-name check for AX-blind native chat apps (WeChat). Split out of
 /// `classify_pid` so the name matching is unit-testable without shelling to
 /// `ps`. Case-insensitive. Matches only WeChat's main app process
@@ -1055,7 +1089,7 @@ mod imp {
         // cancellation gate (passed through to `inject_through`).
         match plan_live_inject(frontmost_pid()) {
             LiveInjectPlan::Hold => {
-                eprintln!("[inject] no frontmost app at write time — holding (no live field)");
+                eprintln!("{}", super::hold_log_line("no frontmost app at write time — holding (no live field)", "unknown"));
                 return Ok(InjectOutcome::NoEditableField);
             }
             LiveInjectPlan::ResolveApp { pid } => unsafe {
@@ -1224,7 +1258,11 @@ mod imp {
                 .unwrap_or(false);
             if front_paste_safe {
                 eprintln!(
-                    "[inject] no focused AX element (AXError {err}); paste-safe app → clipboard paste"
+                    "{}",
+                    super::hold_log_line(
+                        &format!("no focused AX element (AXError {err}); paste-safe app → clipboard paste"),
+                        &super::app_label_for_pid(expected_pid),
+                    )
                 );
                 let tail = super::recall_tail();
                 let padded = smart_pad(text, tail, tail, None);
@@ -1241,7 +1279,11 @@ mod imp {
                     }
                     Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
                         eprintln!(
-                            "[inject] target {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                            "{}",
+                            super::hold_log_line(
+                                &format!("target {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
+                                &super::app_label_for_pid(expected_pid),
+                            )
                         );
                         return Ok(InjectOutcome::RefusedForeground);
                     }
@@ -1249,7 +1291,11 @@ mod imp {
                 }
             }
             eprintln!(
-                "[inject] no focused AX element (AXError {err}); not a known text-input app → holding (never paste blindly)"
+                "{}",
+                super::hold_log_line(
+                    &format!("no focused AX element (AXError {err}); not a known text-input app → holding (never paste blindly)"),
+                    &super::app_label_for_pid(expected_pid),
+                )
             );
             return Ok(InjectOutcome::NoEditableField);
         }
@@ -1342,13 +1388,17 @@ mod imp {
             // Name the focused role/subrole (never its value), so a hold in a
             // browser can be told apart from a focus miss without a live
             // INJECT_DIAG repro. An empty key means no element or no role.
+            let role = if focused.is_null() {
+                "none".to_string()
+            } else {
+                verification_role_key(focused)
+            };
             eprintln!(
-                "[inject] no editable field focused (role {}) — holding transcript (never paste blindly)",
-                if focused.is_null() {
-                    "none".to_string()
-                } else {
-                    verification_role_key(focused)
-                }
+                "{}",
+                super::hold_log_line(
+                    &format!("no editable field focused (role {role}) — holding transcript (never paste blindly)"),
+                    &super::app_label_for_pid(pid.or(expected_pid)),
+                )
             );
             return Ok(InjectOutcome::NoEditableField);
         }
@@ -1357,7 +1407,11 @@ mod imp {
         // intended foreground app at the actual write boundary.
         if !clipboard_target_is_frontmost(expected_pid, super::frontmost_pid()) {
             eprintln!(
-                "[inject] expected app {expected_pid:?} not frontmost at write — holding (not written)"
+                "{}",
+                super::hold_log_line(
+                    &format!("expected app {expected_pid:?} not frontmost at write — holding (not written)"),
+                    &super::app_label_for_pid(expected_pid),
+                )
             );
             return Ok(InjectOutcome::RefusedForeground);
         }
@@ -1390,7 +1444,11 @@ mod imp {
                 }
                 Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
                     eprintln!(
-                        "[inject] expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                        "{}",
+                        super::hold_log_line(
+                            &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
+                            &super::app_label_for_pid(expected_pid),
+                        )
                     );
                     return Ok(InjectOutcome::RefusedForeground);
                 }
@@ -1435,7 +1493,11 @@ mod imp {
         // is no kAXValue rung: setting the value replaces the WHOLE field with
         // the utterance and destroys what the user already wrote there.
         eprintln!(
-            "[inject] AX caret write refused (selected={sel_err}); using clipboard paste"
+            "{}",
+            super::hold_log_line(
+                &format!("AX caret write refused (selected={sel_err}); using clipboard paste"),
+                &super::app_label_for_pid(pid.or(expected_pid)),
+            )
         );
         match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
             Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
@@ -1444,7 +1506,11 @@ mod imp {
             }
             Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
                 eprintln!(
-                    "[inject] expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                    "{}",
+                    super::hold_log_line(
+                        &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
+                        &super::app_label_for_pid(expected_pid),
+                    )
                 );
                 Ok(InjectOutcome::RefusedForeground)
             }
@@ -1506,7 +1572,11 @@ mod imp {
             }
             Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
                 eprintln!(
-                    "[inject] expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"
+                    "{}",
+                    super::hold_log_line(
+                        &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
+                        &super::app_label_for_pid(expected_pid),
+                    )
                 );
                 Ok(InjectOutcome::RefusedForeground)
             }
@@ -2128,6 +2198,38 @@ impl AccessibilityInjector {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hold_log_line_names_the_app() {
+        let l = hold_log_line("no focused AX element (AXError -25212); holding", "com.apple.Safari");
+        assert!(l.starts_with("[inject] "));
+        assert!(l.ends_with("app=com.apple.Safari"));
+        assert!(l.contains("AXError -25212"));
+    }
+
+    #[test]
+    fn hold_log_line_handles_missing_app() {
+        assert!(hold_log_line("holding", "").contains("app=unknown"));
+        assert!(hold_log_line("holding", "  ").ends_with("app=unknown"));
+    }
+
+    #[test]
+    fn app_label_prefers_bundle_then_exe_then_unknown() {
+        assert_eq!(app_label(Some("com.x.App"), Some("/A/B/App")), "com.x.App");
+        assert_eq!(app_label(None, Some("/Applications/Foo.app/Contents/MacOS/Foo\n")), "Foo");
+        assert_eq!(app_label(Some(" "), Some("/a/b/Bar")), "Bar");
+        assert_eq!(app_label(None, None), "unknown");
+        assert_eq!(app_label(None, Some("")), "unknown");
+    }
+
+    #[test]
+    fn hold_log_line_carries_only_reason_and_app() {
+        // The formatter takes no transcript text; a secret in neither input
+        // cannot appear in the output.
+        let l = hold_log_line("not frontmost at Cmd+V", &app_label(Some("com.x.App"), None));
+        assert!(!l.contains("secret transcript"));
+        assert_eq!(l, "[inject] not frontmost at Cmd+V app=com.x.App");
+    }
+
     fn app(pid: i32, bundle: &str) -> TargetApp {
         TargetApp { pid, bundle_id: Some(bundle.to_string()) }
     }
