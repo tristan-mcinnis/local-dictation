@@ -710,34 +710,57 @@ not when another application's pixels became visible.
 
 ### The slow tail (measured 2026-10-29, n=624)
 
-`release_ms` p50 624, p90 1209, p99 3811. `asr_ms` p50 233, p90 581, p99 3212.
-`cleanup_ms` p50 0, p99 437. 1.4% of releases had `inserted=false`.
+`scripts/latency-report.sh` on the log of 2026-10-29 (n=624): `release_ms` p50 624,
+p90 1209, p99 3811. `asr_ms` p50 233, p90 581, p99 3212. `cleanup_ms` p50 0,
+p99 437. 1.4% of releases had `inserted=false`.
 
-The tail is ASR time, not cleanup. Cleanup ran on only 18 of 624 releases
-(the deterministic path skips the LLM, see `worker.rs` "LLM skipped"), and none of
-the slowest 12 (the top 2%) ran it. Those 12 average 3953 ms release and
-3463 ms ASR, against 648 ms and 291 ms for the other 612. No release took the
-whole-buffer fallback (`streaming fallback` never appears), so the cost is in the
-streamed path (`stream_process_asr` in `src/daemon/worker.rs`).
+The figures below are a one-off analysis of that log on 2026-10-29. The script
+reproduces only the percentiles above. The pairing snippet at the end reproduces
+the per-release numbers.
 
-Two groups sit in the top 12:
+The tail is ASR time, not cleanup. Cleanup ran on only 18 of 624 releases (the
+deterministic path skips the LLM, see `worker.rs` "LLM skipped"), and none of the
+slowest 12 (the top 2%) ran it. Those 12 average 3953 ms release and 3463 ms ASR,
+against 648 ms and 291 ms for the other 612.
 
-- Stalled single inference (4 of 12). Holds of 2.8 to 5.4 s, one `helper inference`
-  line of 4.8 to 5.9 s, against a typical 230 ms. Audio length cannot explain
-  it. This looks like a cold or stalled MLX helper call. The cause inside the
-  helper is not yet proven.
-- Long holds (8 of 12). Holds of 32 to 204 s. The last helper inference is
-  normal (250 to 590 ms) but `asr_ms` is 2.0 to 3.8 s, so 1.5 to 3.3 s is spent
-  in the flush around it (`checkpoint_capture_with` drain, recovery-audio append,
-  final VAD segment, backup copy). Not isolated further.
+The whole-buffer `streaming fallback` line (`src/daemon/worker.rs`) appeared in
+24 of the 624 releases (26 lines in the window; 2 had no `[latency]` line). Those
+24 average 888 ms release against 704 ms for the rest, so the fallback is not the
+main tail driver. 2 of the top 12 took it (4815 ms and 4454 ms).
 
-Hold length matters but is not the cause: correlation of hold with `asr_ms` is
-0.61. Mean `release_ms` is about 610 ms for holds under 10 s and 1298 ms for
+The top 12 fall into three groups:
+
+- 3 stalled single inferences, no fallback (6186, 6109, 5301 ms). Holds of 2.8 to
+  4.1 s, one `helper inference` line of 5.0 to 5.9 s against a typical 230 ms.
+  Audio length cannot explain it. This looks like a cold or stalled MLX helper
+  call. The cause inside the helper is not proven.
+- 2 whole-buffer fallbacks (4815 and 4454 ms). A fallback re-transcribes the
+  whole buffer in one call, so ASR time follows buffer length.
+- 7 long holds (32 to 204 s) without fallback. The last helper inference is
+  normal (250 to 590 ms) but `asr_ms` is 2.0 to 3.8 s. The extra time is likely in
+  the flush around it; sub-steps not measured.
+
+Hold length matters but is not the whole cause: correlation of hold with `asr_ms`
+is 0.61. Mean `release_ms` is about 610 ms for holds under 10 s and 1298 ms for
 holds over 20 s (82 of 624).
 
-Reproduce: `scripts/latency-report.sh` prints n and p50/p90/p99. For the pairing
-with hold time, pair each `[latency]` line with the preceding
-`⏹ stopped · held` line in `$HOME/Library/Logs/Local Dictation/daemon.log`.
+Reproduce the pairing (numbers only, prints no log text). It pairs each
+`[latency]` line with the `⏹ stopped · held` line before it and any `streaming
+fallback` line since the previous `[latency]` line:
+
+```bash
+grep -a -E '^⏹ stopped|streaming fallback|^\[latency\]' \
+    "$HOME/Library/Logs/Local Dictation/daemon.log" | awk '
+  /^⏹ stopped/ { h=$NF; sub(/s$/,"",h); held=h+0; next }
+  /streaming fallback/ { fb++; next }
+  /^\[latency\]/ {
+    match($0,/release_ms=[0-9]+/); r=substr($0,RSTART+11,RLENGTH-11)
+    match($0,/asr_ms=[0-9]+/);     a=substr($0,RSTART+7,RLENGTH-7)
+    match($0,/cleanup_ms=[0-9]+/); c=substr($0,RSTART+11,RLENGTH-11)
+    print r, a, c, held, fb+0; fb=0 }' | sort -rn | head -12
+```
+
+Columns: release_ms, asr_ms, cleanup_ms, hold seconds, fallback count.
 
 A first daemon run needs Microphone + Accessibility granted in System Settings. Neither is fatal
 any more: the menu bar comes up, the Setup window says which is missing, and the event tap

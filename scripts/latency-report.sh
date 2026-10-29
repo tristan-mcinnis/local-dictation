@@ -17,7 +17,10 @@ for key in release_ms asr_ms cleanup_ms; do
     | awk -v key="$key" '
         { v[NR] = $1 }
         function at(p,  k) { k = int((p * NR + 99) / 100); if (k < 1) k = 1; return v[k] }
-        END { printf "%s p50=%s p90=%s p99=%s\n", key, at(50), at(90), at(99) }'
+        END {
+          if (NR == 0) { printf "%s n=0\n", key; exit }
+          printf "%s n=%d p50=%s p90=%s p99=%s\n", key, NR, at(50), at(90), at(99)
+        }'
 done
 
 printf '%s\n' "$lines" | awk '
