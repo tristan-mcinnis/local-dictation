@@ -164,6 +164,7 @@ pub fn run_when_accessibility_granted(task: impl FnOnce() -> Result<(), String> 
 pub fn poll_pending_accessibility() {
     let waiting = PENDING.with(|slot| slot.borrow().is_some());
     if !waiting {
+        watch_accessibility(accessibility_trusted());
         return;
     }
     if !accessibility_trusted() {
@@ -179,6 +180,7 @@ pub fn poll_pending_accessibility() {
 fn finish_accessibility_task(task: PendingTask) {
     match task() {
         Ok(()) => {
+            SEEN.with(|s| s.set(Seen::Trusted));
             INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
             crate::health::clear(crate::health::Fault::AccessibilityMissing)
         }
@@ -186,6 +188,7 @@ fn finish_accessibility_task(task: PendingTask) {
             // The task is spent either way (it owns the tap's callback), so a
             // failure here cannot be retried in place. Record it so the Setup
             // window offers the one thing that does work: a relaunch.
+            SEEN.with(|s| s.set(Seen::Idle));
             INSTALL_FAILED.store(accessibility_trusted(), std::sync::atomic::Ordering::SeqCst);
             crate::health::raise(crate::health::Fault::AccessibilityMissing, why)
         }
@@ -209,6 +212,68 @@ static INSTALL_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// and the hotkey is dead, which without this is a silent dead end.
 pub fn accessibility_install_failed() -> bool {
     INSTALL_FAILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+// ─── Revocation while running ───────────────────────────────────────────
+
+/// What the poll has seen of the grant since the event tap was installed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Seen {
+    /// No tap installed yet (or the install failed): the pending path owns it.
+    Idle,
+    /// The tap is installed and the grant is on.
+    Trusted,
+    /// The grant went off while running; the tap is dead.
+    Revoked,
+    /// The grant came back after a revoke. The tap made at boot may not
+    /// recover, so the user is told to relaunch.
+    Regranted,
+}
+
+/// What one poll tick must do about a [`Seen`] transition.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Watch {
+    Nothing,
+    Revoke,
+    Relaunch,
+}
+
+/// Pure decision: previous state and current trust in, next state and action out.
+fn revoke_step(seen: Seen, trusted: bool) -> (Seen, Watch) {
+    match (seen, trusted) {
+        (Seen::Trusted | Seen::Regranted, false) => (Seen::Revoked, Watch::Revoke),
+        (Seen::Revoked, true) => (Seen::Regranted, Watch::Relaunch),
+        (seen, _) => (seen, Watch::Nothing),
+    }
+}
+
+thread_local! {
+    static SEEN: std::cell::Cell<Seen> = const { std::cell::Cell::new(Seen::Idle) };
+}
+
+/// Apply one tick of [`revoke_step`]. Logs once per transition, not per tick.
+fn watch_accessibility(trusted: bool) {
+    let (next, action) = revoke_step(SEEN.with(|s| s.get()), trusted);
+    SEEN.with(|s| s.set(next));
+    match action {
+        Watch::Nothing => {}
+        Watch::Revoke => {
+            eprintln!("[perm] Accessibility turned off while running — the hotkey is dead");
+            INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+            crate::health::raise(
+                crate::health::Fault::AccessibilityMissing,
+                "turned off while running — turn it back on, then relaunch",
+            );
+        }
+        Watch::Relaunch => {
+            eprintln!("[perm] Accessibility turned back on — a relaunch restores the hotkey");
+            INSTALL_FAILED.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::health::raise(
+                crate::health::Fault::AccessibilityMissing,
+                "turned back on — relaunch to restore the hotkey",
+            );
+        }
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
@@ -397,6 +462,45 @@ mod tests {
             PENDING.with(|slot| *slot.borrow_mut() = None);
             crate::health::clear(crate::health::Fault::AccessibilityMissing);
         }
+    }
+
+    #[test]
+    fn revoke_step_covers_every_transition() {
+        use Seen::*;
+        use Watch::*;
+        // Never granted yet, or the install failed: the pending path owns it.
+        assert_eq!(revoke_step(Idle, true), (Idle, Nothing));
+        assert_eq!(revoke_step(Idle, false), (Idle, Nothing));
+        // Still trusted: silent.
+        assert_eq!(revoke_step(Trusted, true), (Trusted, Nothing));
+        // Turned off while running: one fault.
+        assert_eq!(revoke_step(Trusted, false), (Revoked, Revoke));
+        assert_eq!(revoke_step(Revoked, false), (Revoked, Nothing));
+        // Turned back on: the old tap may be dead, so ask for a relaunch once.
+        assert_eq!(revoke_step(Revoked, true), (Regranted, Relaunch));
+        assert_eq!(revoke_step(Regranted, true), (Regranted, Nothing));
+        // Off again after a regrant.
+        assert_eq!(revoke_step(Regranted, false), (Revoked, Revoke));
+    }
+
+    #[test]
+    fn a_revoke_raises_a_fault_and_a_regrant_offers_a_relaunch() {
+        let _serial = crate::health::test_lock();
+        use crate::health::Fault::AccessibilityMissing as Missing;
+        SEEN.with(|s| s.set(Seen::Trusted));
+        watch_accessibility(true);
+        assert!(!crate::health::is_raised(Missing), "still trusted: no fault");
+        watch_accessibility(false);
+        let problem = crate::health::current().expect("a revoke is a fault");
+        assert_eq!(problem.fault, Missing);
+        assert!(problem.detail.contains("turned off while running"), "{}", problem.detail);
+        assert!(!accessibility_install_failed());
+        watch_accessibility(true);
+        assert!(accessibility_install_failed(), "Setup must offer the relaunch");
+        assert!(crate::health::is_raised(Missing), "never silently cleared");
+        INSTALL_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
+        SEEN.with(|s| s.set(Seen::Idle));
+        crate::health::clear(Missing);
     }
 
     #[test]
