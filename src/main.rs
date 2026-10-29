@@ -550,7 +550,7 @@ fn llm_model_path() -> String {
     Settings::load().resolve_llm_model(&fast_dictate_backend::app_paths::llm_default_path())
 }
 
-#[cfg(feature = "cleaner")]
+#[cfg(all(feature = "cleaner", feature = "cohere-mlx"))]
 fn initialize_text_engine(path: &str) -> eyre::Result<fast_dictate_backend::cleaner::TextCleanupEngine> {
     let default = fast_dictate_backend::app_paths::instruction_default_path();
     let instruction = fast_dictate_backend::settings::Settings::load().resolve_instruction_model(default.as_deref());

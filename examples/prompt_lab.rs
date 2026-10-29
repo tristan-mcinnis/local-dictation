@@ -21,10 +21,14 @@
 //! qualitative ("does this read right?") cheap to eyeball and the quantitative
 //! ("did the proper noun survive?") automatic.
 
+#[cfg(feature = "cleaner")]
 use std::collections::BTreeMap;
+#[cfg(feature = "cleaner")]
 use std::fmt::Write as _;
+#[cfg(feature = "cleaner")]
 use std::path::PathBuf;
 
+#[cfg(feature = "cleaner")]
 use serde::Deserialize;
 
 #[cfg(not(feature = "cleaner"))]
@@ -35,6 +39,7 @@ fn main() {
 
 // ---- corpus / lab spec (prompts-lab/lab.json) ------------------------------
 
+#[cfg(feature = "cleaner")]
 #[derive(Debug, Deserialize)]
 struct Lab {
     /// Reps per case. Default 2.
@@ -57,6 +62,7 @@ struct Lab {
     format_cases: Vec<FormatCase>,
 }
 
+#[cfg(feature = "cleaner")]
 #[derive(Debug, Deserialize, Clone)]
 struct Checks {
     /// Output must contain each (case-insensitive substring).
@@ -89,6 +95,7 @@ struct Checks {
     max_len_ratio: Option<f32>,
 }
 
+#[cfg(feature = "cleaner")]
 #[derive(Debug, Deserialize)]
 struct CleanupCase {
     id: String,
@@ -102,6 +109,7 @@ struct CleanupCase {
     checks: Option<Checks>,
 }
 
+#[cfg(feature = "cleaner")]
 #[derive(Debug, Deserialize)]
 struct TransformCase {
     id: String,
@@ -115,6 +123,7 @@ struct TransformCase {
     checks: Option<Checks>,
 }
 
+#[cfg(feature = "cleaner")]
 #[derive(Debug, Deserialize)]
 struct FormatCase {
     id: String,
@@ -131,6 +140,7 @@ struct FormatCase {
 // "the text", which are legitimate sentence openers in transform outputs.
 // "okay"/"ok" stay: for cleanup they catch a real failure (leading filler
 // "okay so ..." that should have been stripped).
+#[cfg(feature = "cleaner")]
 const PREAMBLE_TELLS: &[&str] = &[
     "here's",
     "here is",
@@ -146,10 +156,12 @@ const PREAMBLE_TELLS: &[&str] = &[
     "the cleaned version",
 ];
 
+#[cfg(feature = "cleaner")]
 fn line_count(s: &str) -> usize {
     s.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
+#[cfg(feature = "cleaner")]
 /// Returns (failures). Empty vec == all checks passed.
 fn evaluate(out: &str, input: &str, c: &Checks) -> Vec<String> {
     let mut fail = Vec::new();
@@ -395,6 +407,7 @@ async fn main() -> eyre::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cleaner")]
 /// Append a case to the markdown + jsonl. Returns whether ALL reps passed.
 #[allow(clippy::too_many_arguments)]
 fn report_case(
@@ -448,10 +461,12 @@ fn report_case(
     all_pass
 }
 
+#[cfg(feature = "cleaner")]
 fn one_line(s: &str) -> String {
     s.replace('\n', " ⏎ ")
 }
 
+#[cfg(feature = "cleaner")]
 /// Cheap timestamp without pulling a date crate: seconds since epoch.
 fn chrono_stamp() -> String {
     let secs = std::time::SystemTime::now()
