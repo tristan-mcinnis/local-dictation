@@ -6,7 +6,7 @@ contract. It records what was implemented, what the automated suite proves, and
 without a real Accessibility session, and the user was asleep, so no live speech
 acceptance was claimed).
 
-Status: **implementation + automated verification done; Escape-cancel live-confirmed by user; the new cancel-retains-audio + Retry feature is code-complete and unit-tested, pending a live retry check.**
+Status (2026-10-29): **implementation and automated verification done. Escape-cancel (section 4, checks 1 and 2) is live-confirmed by the user. Checks 3 to 11, Retry last recording, and the retained-element rescue for apps that report AXError -25212 still need a live run on the installed build.**
 
 ---
 
