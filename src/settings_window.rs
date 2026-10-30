@@ -46,8 +46,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::menubar::house_theme::{
     CONTROL_CHIP, CONTROL_FOOTER, CONTROL_RAILROW, CONTROL_ROW, CONTROL_TILE, HAIRLINE,
     LAYOUT_SETTINGS_HEIGHT, LAYOUT_SETTINGS_RAIL, LAYOUT_SETTINGS_WIDTH, RADIUS_LG, RADIUS_MD,
-    RADIUS_SM, RADIUS_TILE, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXS,
-    TYPE_BODY_SMALL, TYPE_CAPTION, TYPE_LABEL, TYPE_META, TYPE_TITLE, WEIGHT_MEDIUM,
+    RADIUS_SM, RADIUS_TILE, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL, SPACE_XXS,
+    SPACE_XXXL, TYPE_BODY_SMALL, TYPE_CAPTION, TYPE_LABEL, TYPE_META, TYPE_TITLE, WEIGHT_MEDIUM,
     WEIGHT_REGULAR, WEIGHT_SEMIBOLD,
 };
 
@@ -70,18 +70,32 @@ const WIN_H: f64 = LAYOUT_SETTINGS_HEIGHT;
 const RAIL_W: f64 = LAYOUT_SETTINGS_RAIL;
 /// Room for the traffic lights on a full-size-content window.
 const TITLEBAR_H: f64 = 28.0;
-/// The pane's heading band: `title` over a `meta` subtitle.
-const HEADER_H: f64 = 60.0;
+/// The pane title's frame height, and the `meta` subtitle's under it.
+const PANE_TITLE_H: f64 = TYPE_TITLE + SPACE_XS;
+const PANE_SUBTITLE_H: f64 = TYPE_META + SPACE_XXS;
+/// Clear band between the subtitle and the scroll view's top edge, so content
+/// scrolled up clips before it reaches the subtitle.
+const HEADER_CLIP: f64 = SPACE_XS;
+/// The pane's heading band below the titlebar: the title sits `xxxl` below the
+/// window top (the pane's top padding; the titlebar lies inside it), the
+/// subtitle `xs` below the title frame, then the clip band.
+const HEADER_H: f64 =
+    SPACE_XXXL - TITLEBAR_H + PANE_TITLE_H + SPACE_XS + PANE_SUBTITLE_H + HEADER_CLIP;
 const PANE_X: f64 = RAIL_W;
 const PANE_W: f64 = WIN_W - RAIL_W;
-/// Gutter between the pane edge and a card.
-const PANE_PAD: f64 = 22.0;
+/// Gutter between the pane edge and a card: the pane's side padding.
+const PANE_PAD: f64 = SPACE_XXL;
 const CARD_W: f64 = PANE_W - 2.0 * PANE_PAD;
 /// Horizontal padding inside a card, and the 4 px band above/below its rows.
 const CARD_PAD_X: f64 = 14.0;
 const CARD_PAD_Y: f64 = 4.0;
-/// The uppercase section label band at the top of a card.
-const CARD_LABEL_H: f64 = 28.0;
+/// The section label's header row at the top of a card: `sm` above the label,
+/// `xs` below it, then the divider. Measured from the card's top edge.
+const CARD_LABEL_TOP: f64 = SPACE_SM;
+const CARD_LABEL_BELOW: f64 = SPACE_XS;
+/// Header (pane heading) to the first card in a pane is `xl`, group to group;
+/// the header band already holds `HEADER_CLIP` of it.
+const FIRST_CARD_Y: f64 = SPACE_XL - HEADER_CLIP;
 /// Widest a popup chip may grow before its title truncates.
 const POPUP_MAX_W: f64 = 220.0;
 /// The shelf toggle's two glyphs: the standard macOS sidebar pair, so the
@@ -1143,8 +1157,8 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         theme::text_primary(),
     );
     pane_title.setFrame(NSRect::new(
-        NSPoint::new(PANE_X + PANE_PAD, header_y + HEADER_H / 2.0 - 2.0),
-        NSSize::new(PANE_W - 2.0 * PANE_PAD, TYPE_TITLE + SPACE_XS),
+        NSPoint::new(PANE_X + PANE_PAD, WIN_H - SPACE_XXXL - PANE_TITLE_H),
+        NSSize::new(PANE_W - 2.0 * PANE_PAD, PANE_TITLE_H),
     ));
     panel.addSubview(&pane_title);
     let pane_subtitle = slate::label(
@@ -1155,8 +1169,8 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
         theme::text_secondary(),
     );
     pane_subtitle.setFrame(NSRect::new(
-        NSPoint::new(PANE_X + PANE_PAD, header_y + SPACE_XS),
-        NSSize::new(PANE_W - 2.0 * PANE_PAD, TYPE_META + SPACE_XXS),
+        NSPoint::new(PANE_X + PANE_PAD, header_y + HEADER_CLIP),
+        NSSize::new(PANE_W - 2.0 * PANE_PAD, PANE_SUBTITLE_H),
     ));
     panel.addSubview(&pane_subtitle);
 
@@ -1243,7 +1257,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 0 — Dictation ═════════════════════════════════════════════
     let dictation = new_pane();
-    let mut y = SPACE_MD;
+    let mut y = FIRST_CARD_Y;
 
     let mut card = card_begin(mtm, &dictation, y, "Input");
 
@@ -1546,7 +1560,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 1 — Dictionary ════════════════════════════════════════════
     let dictionary = new_pane();
-    let mut card = card_begin(mtm, &dictionary, SPACE_MD, "Add a term");
+    let mut card = card_begin(mtm, &dictionary, FIRST_CARD_Y, "Add a term");
     let dictionary_heard_field = text_row(mtm, &mut card, "What dictation hears", "");
     dictionary_heard_field.setPlaceholderString(Some(&NSString::from_str("e.g. acmelabs")));
     let dictionary_correct_field = text_row(mtm, &mut card, "Correct to", "");
@@ -1623,7 +1637,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
     // lives here too, beside the rows it governs, rather than three panes away
     // among the input settings.
     let history_pane_view = new_pane();
-    let mut card = card_begin(mtm, &history_pane_view, SPACE_MD, "Keeping");
+    let mut card = card_begin(mtm, &history_pane_view, FIRST_CARD_Y, "Keeping");
 
     let retention_locked = std::env::var_os("DICTATE_HISTORY_RETENTION").is_some();
     let retention_popup = popup_row(mtm, &mut card, "Keep text for");
@@ -1819,7 +1833,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 2 — Translate ═════════════════════════════════════════════
     let translate = new_pane();
-    let mut card = card_begin(mtm, &translate, SPACE_MD, "Targets");
+    let mut card = card_begin(mtm, &translate, FIRST_CARD_Y, "Targets");
     let loaded_targets = if render_fixture {
         vec!["Spanish".to_string(), "Chinese".to_string()]
     } else {
@@ -1866,7 +1880,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 3 — Output ════════════════════════════════════════════════
     let output = new_pane();
-    let mut card = card_begin(mtm, &output, SPACE_MD, "Format");
+    let mut card = card_begin(mtm, &output, FIRST_CARD_Y, "Format");
     let format_popup = popup_row(mtm, &mut card, "Output format");
     let format_names = if render_fixture {
         let mut names: Vec<String> = crate::prompts::default_formats().into_keys().collect();
@@ -1916,7 +1930,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 4 — Speech engine ═════════════════════════════════════════
     let speech = new_pane();
-    let mut card = card_begin(mtm, &speech, SPACE_MD, "Engine");
+    let mut card = card_begin(mtm, &speech, FIRST_CARD_Y, "Engine");
     let resolved_asr = loaded.resolve_asr();
     hint_line(
         mtm,
@@ -2022,7 +2036,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 5 — Experimental ══════════════════════════════════════════
     let experimental = new_pane();
-    let mut card = card_begin(mtm, &experimental, SPACE_MD, "Experimental");
+    let mut card = card_begin(mtm, &experimental, FIRST_CARD_Y, "Experimental");
     let listen_switch = toggle_row(
         mtm,
         &mut card,
@@ -2055,7 +2069,7 @@ fn build_settings_window(mtm: MainThreadMarker, render_fixture: bool) -> Setting
 
     // ═══ Pane 6 — About ═════════════════════════════════════════════════
     let about = new_pane();
-    let mut card = card_begin(mtm, &about, SPACE_MD, "Files & logs");
+    let mut card = card_begin(mtm, &about, FIRST_CARD_Y, "Files & logs");
     for (title, action) in [
         ("Cleanup prompts", sel!(editPrompts:)),
         ("Corrections folder", sel!(openCorrections:)),
@@ -2264,12 +2278,17 @@ struct Card {
     y: f64,
     /// Where the card sits in its pane.
     origin_y: f64,
+    /// The last thing added is a helper line, not a row: the card's bottom
+    /// inset then matches the header's `sm` text inset.
+    last_is_helper: bool,
+    /// Anything has been added under the header.
+    has_rows: bool,
 }
 
 fn card_begin(mtm: MainThreadMarker, pane: &SettingsFlippedView, y: f64, label_text: &str) -> Card {
     let view = slate::SlateView::flipped(
         mtm,
-        NSRect::new(NSPoint::new(PANE_PAD, y), NSSize::new(CARD_W, CARD_LABEL_H)),
+        NSRect::new(NSPoint::new(PANE_PAD, y), NSSize::new(CARD_W, 0.0)),
         slate::Paint::Card,
         RADIUS_LG,
     );
@@ -2277,15 +2296,19 @@ fn card_begin(mtm: MainThreadMarker, pane: &SettingsFlippedView, y: f64, label_t
     l.sizeToFit();
     let lh = l.frame().size.height;
     l.setFrame(NSRect::new(
-        NSPoint::new(CARD_PAD_X, (CARD_PAD_Y + (CARD_LABEL_H - lh) / 2.0).round()),
+        NSPoint::new(CARD_PAD_X, CARD_LABEL_TOP),
         NSSize::new(CARD_W - 2.0 * CARD_PAD_X, lh),
     ));
     view.addSubview(&l);
     pane.addSubview(&view);
+    let header_h = CARD_LABEL_TOP + lh + CARD_LABEL_BELOW;
+    view.setFrameSize(NSSize::new(CARD_W, header_h));
     Card {
         view,
-        y: CARD_PAD_Y + CARD_LABEL_H,
+        y: header_h,
         origin_y: y,
+        last_is_helper: false,
+        has_rows: false,
     }
 }
 
@@ -2293,6 +2316,11 @@ fn card_begin(mtm: MainThreadMarker, pane: &SettingsFlippedView, y: f64, label_t
 /// Returns the row's origin y inside the card.
 fn card_row(card: &mut Card, height: f64) -> f64 {
     let mtm = MainThreadMarker::new().expect("card_row on the main thread");
+    // A helper line's text ends `xs` above the next divider, as the header's
+    // label does.
+    if card.last_is_helper {
+        card.y += SPACE_XS;
+    }
     let line = slate::SlateView::new(
         mtm,
         NSRect::new(
@@ -2305,20 +2333,27 @@ fn card_row(card: &mut Card, height: f64) -> f64 {
     card.view.addSubview(&line);
     let y = card.y + HAIRLINE;
     card.y = y + height;
+    card.last_is_helper = false;
+    card.has_rows = true;
     y
 }
 
 /// Size the card to its rows and return the pane's next free y.
 fn card_end(card: &Card) -> f64 {
-    let h = card.y + CARD_PAD_Y;
+    let bottom = if card.last_is_helper {
+        SPACE_SM
+    } else {
+        CARD_PAD_Y
+    };
+    let h = card.y + bottom;
     card.view.setFrameSize(NSSize::new(CARD_W, h));
-    card.origin_y + h + SPACE_SM
+    card.origin_y + h + SPACE_XL
 }
 
 /// Size the pane's document view to the cards it holds, so the scroll view
 /// knows how far it can travel.
 fn finish_pane(pane: &SettingsFlippedView, last: &Card) {
-    let h = last.origin_y + last.view.frame().size.height + SPACE_LG;
+    let h = last.origin_y + last.view.frame().size.height + SPACE_XXXL;
     let current = pane.frame().size.height;
     pane.setFrameSize(NSSize::new(PANE_W, h.max(current)));
 }
@@ -2934,12 +2969,12 @@ fn list_note(mtm: MainThreadMarker, body: &slate::SlateView, y: f64, text: &str)
     l.setFrame(NSRect::new(
         NSPoint::new(
             CARD_PAD_X,
-            (y + (HINT_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round(),
+            (y + (LIST_NOTE_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round(),
         ),
         NSSize::new(CARD_W - 2.0 * CARD_PAD_X, TYPE_CAPTION + SPACE_XXS),
     ));
     body.addSubview(&l);
-    y + HINT_H
+    y + LIST_NOTE_H
 }
 
 /// A label sized to its text but never wider than `max_w` (it truncates), left
@@ -2976,7 +3011,7 @@ fn size_list_card(
 ) {
     let card_h = body_y + body_h + CARD_PAD_Y;
     card.setFrameSize(NSSize::new(CARD_W, card_h));
-    let pane_h = (card_y + card_h + SPACE_LG).max(PANE_VIEWPORT_H);
+    let pane_h = (card_y + card_h + SPACE_XXXL).max(PANE_VIEWPORT_H);
     pane.setFrameSize(NSSize::new(PANE_W, pane_h));
 }
 
@@ -3599,9 +3634,17 @@ fn history_entry_at(ui: &SettingsUi, tag: isize) -> Option<(i64, String)> {
 }
 
 /// A full-width `caption` line inside a card: hints, env-var locks, and the
-/// About facts.
+/// About facts. A helper sits `xxs` under the row (or helper) above it, with no
+/// divider: it belongs to that control. Straight under the card header it is
+/// a row of its own and keeps the header's divider.
 fn hint_line(mtm: MainThreadMarker, card: &mut Card, text: &str) -> Retained<NSTextField> {
-    let y = card_row(card, HINT_H);
+    let y = if card.has_rows {
+        card.y + SPACE_XXS
+    } else {
+        card_row(card, 0.0) + SPACE_XS
+    };
+    card.y = y + HINT_H;
+    card.last_is_helper = true;
     let l = slate::label(
         mtm,
         text,
@@ -3610,17 +3653,17 @@ fn hint_line(mtm: MainThreadMarker, card: &mut Card, text: &str) -> Retained<NST
         theme::text_tertiary(),
     );
     l.setFrame(NSRect::new(
-        NSPoint::new(
-            CARD_PAD_X,
-            (y + (HINT_H - TYPE_CAPTION - SPACE_XXS) / 2.0).round(),
-        ),
-        NSSize::new(CARD_W - 2.0 * CARD_PAD_X, TYPE_CAPTION + SPACE_XXS),
+        NSPoint::new(CARD_PAD_X, y),
+        NSSize::new(CARD_W - 2.0 * CARD_PAD_X, HINT_H),
     ));
     card.view.addSubview(&l);
     l
 }
 
-const HINT_H: f64 = 22.0;
+/// A helper line's frame: one `caption` line.
+const HINT_H: f64 = TYPE_CAPTION + SPACE_XXS;
+/// The count / empty-state line under a list's rows (its own component band).
+const LIST_NOTE_H: f64 = 22.0;
 
 /// "(locked by DICTATE_…)" footnote.
 fn env_hint(mtm: MainThreadMarker, card: &mut Card, varname: &str) {
