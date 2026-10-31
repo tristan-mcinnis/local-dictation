@@ -579,9 +579,9 @@ impl TextCleanupEngine {
         // so the lab measures what the daemon would actually inject.
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
         let deterministic = crate::text_polish::fix_speech_mechanics(raw);
-        if cleanup_ran_away(raw, &cleaned) {
-            Ok(deterministic)
-        } else if cleaned.trim() == raw && deterministic != raw {
+        // Same fallback as production: a runaway, or a model that echoed the
+        // raw text when the deterministic pass would change it.
+        if cleanup_ran_away(raw, &cleaned) || (cleaned.trim() == raw && deterministic != raw) {
             Ok(deterministic)
         } else {
             Ok(cleaned)
@@ -616,9 +616,9 @@ impl TextCleanupEngine {
             .await?;
         let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
         let deterministic = crate::text_polish::fix_speech_mechanics(raw);
-        if cleanup_ran_away(raw, &cleaned) {
-            Ok(deterministic)
-        } else if cleaned.trim() == raw && deterministic != raw {
+        // Same fallback as production: a runaway, or a model that echoed the
+        // raw text when the deterministic pass would change it.
+        if cleanup_ran_away(raw, &cleaned) || (cleaned.trim() == raw && deterministic != raw) {
             Ok(deterministic)
         } else {
             Ok(cleaned)
