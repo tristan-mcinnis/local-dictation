@@ -461,10 +461,7 @@ impl Corrections {
         let mut tokens: Vec<&str> = Vec::new();
         let mut consumed: Vec<usize> = Vec::new(); // segs spanned when the phrase ends at this word
         let mut j = start;
-        loop {
-            let Some(Seg::Word { lower, .. }) = segs.get(j) else {
-                break;
-            };
+        while let Some(Seg::Word { lower, .. }) = segs.get(j) {
             tokens.push(lower.as_str());
             consumed.push(j + 1 - start);
             if tokens.len() >= self.max_phrase_tokens {

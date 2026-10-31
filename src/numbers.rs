@@ -303,7 +303,8 @@ fn parse_cardinal(words: &[&str]) -> Option<u64> {
             group += t;
             had_any = true;
             last_was_value = true;
-        } else if let Some(s) = scale(w) {
+        } else {
+            let s = scale(w)?;
             if !had_any {
                 return None; // scale with nothing before it ("hundred")
             }
@@ -319,8 +320,6 @@ fn parse_cardinal(words: &[&str]) -> Option<u64> {
                 group = 0;
             }
             last_was_value = true;
-        } else {
-            return None;
         }
         i += 1;
     }

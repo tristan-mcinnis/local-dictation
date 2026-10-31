@@ -429,8 +429,10 @@ fn read_audio_at(path: &Path, id: i64) -> Result<Option<(Vec<f32>, u32)>> {
     file.read_to_end(&mut bytes)?;
     Ok(Some((
         bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect(),
         rate,
     )))

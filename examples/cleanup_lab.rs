@@ -123,7 +123,7 @@ async fn main() -> eyre::Result<()> {
         println!("\n=== content loss (non-filler words the LLM deleted) ===");
         println!("  utterances that lost a content word : {drop_events} of {llm_ran}");
         println!("  content words lost in total         : {dropped_words}");
-        worst.sort_by(|a, b| b.0.cmp(&a.0));
+        worst.sort_by_key(|w| std::cmp::Reverse(w.0));
         for (n, raw, cleaned, lost) in worst.iter().take(5) {
             println!("\n  -{n}: {lost:?}");
             println!("   B: {}", &raw[..raw.len().min(4000)]);
