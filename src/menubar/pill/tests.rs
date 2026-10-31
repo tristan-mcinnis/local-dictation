@@ -9,7 +9,7 @@ fn only_idle_slows_the_poll() {
         let state = UiState::from_u8(v);
         assert_eq!(poll_interval(state), POLL_ACTIVE_SECONDS, "{state:?}");
     }
-    assert!(POLL_IDLE_SECONDS >= SLOW_CHECK_SECONDS - POLL_ACTIVE_SECONDS / 2.0);
+    const _: () = assert!(POLL_IDLE_SECONDS >= SLOW_CHECK_SECONDS - POLL_ACTIVE_SECONDS / 2.0);
 }
 
 #[test]
@@ -53,8 +53,8 @@ fn recovery_failure_is_visible_without_exposing_the_transcript_or_blocking_work(
 fn compact_dimensions_and_preview_preserve_the_contract() {
     assert_eq!(pill_height(PillSize::Compact), 32.0);
     assert_eq!(pill_height(PillSize::Standard), 36.0);
-    assert!(PILL_W <= 100.0);
-    assert!(CANCEL_HIT >= 24.0);
+    const _: () = assert!(PILL_W <= 100.0);
+    const _: () = assert!(CANCEL_HIT >= 24.0);
     let text = "这是最新的中文。".repeat(30);
     let preview = preview_excerpt(&text);
     assert!(preview.starts_with('…') && preview.ends_with("这是最新的中文。"));

@@ -291,7 +291,7 @@ fn whisper_threshold_is_strictly_lower_than_normal() {
     }
     // Hushed room: whisper's lower absolute floor kicks in.
     assert_eq!(speech_threshold_with_mode(0.0, true), WHISPER_ABS_FLOOR);
-    assert!(WHISPER_ABS_FLOOR < TAIL_ABS_FLOOR);
+    const _: () = assert!(WHISPER_ABS_FLOOR < TAIL_ABS_FLOOR);
 }
 
 #[test]
