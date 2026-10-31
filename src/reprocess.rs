@@ -17,6 +17,14 @@ pub enum Version {
     Cleaned,
 }
 
+/// What one cleanup pass produced: the text to copy, and whether it is the
+/// model's own output (recorded as a Cleaned version) or deterministic text.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Cleanup {
+    pub text: String,
+    pub from_model: bool,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Copied(String),
@@ -33,7 +41,7 @@ pub fn to_clipboard(
     generation: u64,
     audio: &[f32],
     transcribe: impl FnOnce(&[f32]) -> eyre::Result<String>,
-    cleanup: Option<&mut dyn FnMut(&str) -> eyre::Result<String>>,
+    cleanup: Option<&mut dyn FnMut(&str) -> Cleanup>,
     mut phase: impl FnMut(Phase),
     mut version: impl FnMut(Version, &str),
     mut copy: impl FnMut(&str) -> eyre::Result<()>,
@@ -62,24 +70,14 @@ pub fn to_clipboard(
     let cleaned = match cleanup {
         Some(clean) => {
             phase(Phase::Cleaning);
-            match clean(&raw) {
-                Ok(text) => {
-                    version(Version::Cleaned, &text);
-                    text
-                }
-                Err(error) => {
-                    if !gate.allows_progress(generation) {
-                        return Outcome::Cancelled;
-                    }
-                    // Recovery is the safety net: a cleanup failure must not
-                    // cost the user the words. Degrade exactly as live
-                    // dictation does, to the deterministic pass over the raw
-                    // transcript. No Cleaned version is recorded, because the
-                    // model produced none.
-                    eprintln!("[recovery] cleanup failed ({error}); copying the raw transcript");
-                    crate::text_polish::fix_speech_mechanics(&raw)
-                }
+            let cleaned = clean(&raw);
+            // Only the model's own words are a Cleaned version. The
+            // deterministic fallback the live path also degrades to is not
+            // one, because the model produced none.
+            if cleaned.from_model {
+                version(Version::Cleaned, &cleaned.text);
             }
+            cleaned.text
         }
         None => raw,
     };
@@ -145,7 +143,7 @@ mod tests {
         let mut phases = Vec::new();
         let mut cleanup = |_: &str| {
             gate.request_cancel();
-            Ok("Cleaned sentence.".into())
+            Cleanup { text: "Cleaned sentence.".into(), from_model: true }
         };
         let result = to_clipboard(
             &gate,
@@ -173,7 +171,7 @@ mod tests {
         let gate = CancelGate::new();
         let gen = gate.begin();
         let mut versions = Vec::new();
-        let mut cleanup = |_: &str| -> eyre::Result<String> { panic!("no cleanup after cancel") };
+        let mut cleanup = |_: &str| -> Cleanup { panic!("no cleanup after cancel") };
         let result = to_clipboard(
             &gate,
             gen,
@@ -216,15 +214,15 @@ mod tests {
     }
 
     #[test]
-    fn failed_cleanup_copies_the_raw_transcript() {
+    fn a_fallback_cleanup_copies_without_inventing_a_cleaned_version() {
         // Regression: a cleanup error used to fail the whole recovery, and the
-        // transcript was never copied.
+        // transcript was never copied. The policy now hands back the
+        // deterministic text instead; it is copied, and not a Cleaned version.
         let gate = CancelGate::new();
         let gen = gate.begin();
         let versions = RefCell::new(Vec::new());
         let mut copies = Vec::new();
-        let mut cleanup =
-            |_: &str| -> eyre::Result<String> { Err(eyre::eyre!("decode prompt failed")) };
+        let mut cleanup = |raw: &str| Cleanup { text: raw.to_string(), from_model: false };
         let result = to_clipboard(
             &gate,
             gen,
@@ -251,8 +249,7 @@ mod tests {
     fn failed_asr_never_runs_cleanup_or_copy() {
         let gate = CancelGate::new();
         let gen = gate.begin();
-        let mut cleanup =
-            |_: &str| -> eyre::Result<String> { panic!("no cleanup after ASR failure") };
+        let mut cleanup = |_: &str| -> Cleanup { panic!("no cleanup after ASR failure") };
         let result = to_clipboard(
             &gate,
             gen,

@@ -13,10 +13,12 @@
 //! flags system-wide. The first run surfaces the TCC prompt via the
 //! injector's `ensure_trusted_or_prompt`.
 
+mod cleanup;
 mod deliver;
 mod ptt;
 mod worker;
 mod listen;
+use cleanup::*;
 use deliver::*;
 use ptt::*;
 use worker::*;

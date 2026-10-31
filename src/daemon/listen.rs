@@ -74,6 +74,18 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
 
     let corrections = Corrections::load_default().unwrap_or_else(|_| Corrections::empty());
     let refiner = Refiner::new(corrections);
+    #[cfg(feature = "cleaner")]
+    let format_active = cleaner.as_ref().is_some_and(|c| c.format_active());
+    #[cfg(not(feature = "cleaner"))]
+    let format_active = false;
+    let pipeline = Pipeline {
+        #[cfg(feature = "cleaner")]
+        cleaner: cleaner.as_ref(),
+        #[cfg(feature = "cleaner")]
+        rt: &rt,
+        refiner: &refiner,
+        format_active,
+    };
 
     // Continuous capture: hold the recording flag true so every callback pushes
     // into the ring (no pre-roll needed — we're always listening).
@@ -140,10 +152,9 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
                 continue;
             }
 
-            #[cfg(feature = "cleaner")]
-            listen_dictate(&rt, &refiner, &body, cleaner.as_ref());
-            #[cfg(not(feature = "cleaner"))]
-            listen_dictate(&refiner, &body);
+            let generation = ui_channel::begin_utterance(UiState::Transcribing, false);
+            let _utterance = ui_channel::UtteranceScope(generation);
+            dictate_transcript(&pipeline, &body, generation);
         }
 
         // Keep memory bounded over a long listening session.
@@ -154,44 +165,14 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
     }
 }
 
-/// Clean (if a cleaner is present), refine, and inject one wake-word-triggered
-/// dictation body into the focused field, honouring trailing voice commands
-/// ("press enter", "scratch that", …) just like push-to-talk.
-#[cfg(feature = "cleaner")]
-pub(super) fn listen_dictate(
-    rt: &tokio::runtime::Runtime,
-    refiner: &Refiner,
-    body: &str,
-    cleaner: Option<&TextCleanupEngine>,
-) {
-    let cleaned = match cleaner {
-        Some(c) => rt
-            .block_on(c.process_transcript(body))
-            .unwrap_or_else(|_| body.to_string()),
-        None => body.to_string(),
-    };
-    inject_refined(refiner, &cleaned);
-}
-
-#[cfg(not(feature = "cleaner"))]
-pub(super) fn listen_dictate(refiner: &Refiner, body: &str) {
-    inject_refined(refiner, body);
-}
-
-#[cfg(feature = "cleaner")]
+/// Re-run the pipeline on the retained "last recording" audio (control-socket
+/// "retry" / menu-bar item). From the transcript on, retry is the live path.
 pub(super) fn retry_last(
-    rt: &tokio::runtime::Runtime,
+    pipeline: &Pipeline,
     worker: &mut LocalInferenceWorker,
-    cleaner: Option<&TextCleanupEngine>,
-    refiner: &Refiner,
     audio: &[f32],
     retry_gen: u64,
 ) {
-    if audio.is_empty() {
-        eprintln!("  ↻    retry: nothing to retry yet");
-        cues::play_error();
-        return;
-    }
     let transcript = match worker.transcribe_pcm(audio) {
         Ok(t) => t,
         Err(e) => {
@@ -204,104 +185,51 @@ pub(super) fn retry_last(
         eprintln!("  ↻    retry: empty transcript");
         return;
     }
-    ui_channel::publish_preview(retry_gen, &transcript);
-    if !crate::cancel::CANCEL.allows_progress(retry_gen) { return; }
-    let cleaned = match cleaner {
-        Some(c) => {
-            if !ui_channel::set_phase(retry_gen, UiState::Cleaning) { return; }
-            rt.block_on(c.process_transcript_with_vocab(&transcript, &[]))
-                .unwrap_or_else(|_| transcript.clone())
-        },
-        None => transcript,
-    };
-    // Same cancel gate + focus guard as a live utterance: claim the write
-    // commit at the last moment, immediately before the first side effect.
-    ui_channel::publish_preview(retry_gen, &cleaned);
-    let authorize = || authorize_paste(retry_gen);
-    inject_refined_authorized(refiner, &cleaned, &authorize);
+    dictate_transcript(pipeline, &transcript, retry_gen);
 }
 
-/// Non-cleaner build: retry re-transcribes and injects the raw transcript
-/// (no cleanup engine).
-#[cfg(not(feature = "cleaner"))]
-pub(super) fn retry_last(
-    worker: &mut LocalInferenceWorker,
-    refiner: &Refiner,
-    audio: &[f32],
-    retry_gen: u64,
-) {
-    if audio.is_empty() {
-        eprintln!("  ↻    retry: nothing to retry yet");
-        cues::play_error();
+/// Clean, refine and deliver a transcript that did not come from a live
+/// release: a retry of the retained audio, or a wake-word segment. The target
+/// evidence is the field under the caret now, and from there the path is the
+/// live one: the same cleanup policy (corrections, the short and clean
+/// shortcut, the dropped-content guard, the terminal skip, tone and screen
+/// vocabulary), the same refiner, the same cancel gate and write authorizer.
+pub(super) fn dictate_transcript(pipeline: &Pipeline, transcript: &str, generation: u64) {
+    ui_channel::publish_preview(generation, transcript);
+    if !crate::cancel::CANCEL.allows_progress(generation) {
         return;
     }
-    let transcript = match worker.transcribe_pcm(audio) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("  ↻    retry transcribe failed: {e:?}");
-            cues::play_error();
-            return;
-        }
+    let app = crate::injector::frontmost_target_app();
+    let focus = FocusTarget::capture().ok();
+    let target_pid = app.as_ref().map(|a| a.pid);
+    let target = CleanupTarget::of(app.as_ref(), focus.as_ref());
+    let Ok(cleaned) = clean(transcript, pipeline, &target, generation) else {
+        return;
     };
-    ui_channel::publish_preview(retry_gen, &transcript);
-    let authorize = || authorize_paste(retry_gen);
-    inject_refined_authorized(refiner, &transcript, &authorize);
-}
-
-/// Shared tail of `listen_dictate`: run the refiner's terminal classification
-/// and act on it (inject text + trailing key, run a bare command, or discard).
-pub(super) fn inject_refined(refiner: &Refiner, text: &str) {
-    inject_refined_authorized(refiner, text, &|| true);
-}
-
-/// Retry and listen mode have no recovery record of their own: keep the text
-/// (last dictation + clipboard) and show the kept-result pill unscoped.
-fn keep_unscoped(text: &str, cause: crate::last_dictation::KeptCause) {
-    let state = crate::recovery::keep_transcript(text, cause);
-    ui_channel::show_transient(state, ui_channel::KEPT_PILL);
-}
-
-/// Cancellable form of [`inject_refined`]: `authorize` is polled once by the
-/// injector immediately before the first write/clipboard side effect, so retry
-/// obeys the same Escape + focus/no-blind-paste guard as a live utterance.
-pub(super) fn inject_refined_authorized(
-    refiner: &Refiner,
-    text: &str,
-    authorize: &dyn Fn() -> bool,
-) {
-    use crate::refiner::DictationOutcome;
-    match refiner.refine(text).outcome() {
+    ui_channel::publish_preview(generation, &cleaned.text);
+    match pipeline.refiner.refine(&cleaned.text).outcome() {
         DictationOutcome::Discard => eprintln!("  ⌫    scratch that · discarded"),
         DictationOutcome::Skip => eprintln!("  skip · empty after cleanup"),
         DictationOutcome::BareAction(action) => {
-            if authorize() { execute_trailing_action(&action); }
+            if authorize_paste(generation) {
+                execute_trailing_action(&action);
+            }
             eprintln!("  ↵    bare command");
         }
         DictationOutcome::Inject { text, action } => {
-            let target = FocusTarget::capture().ok();
-            let target_pid = target.as_ref().and_then(|t| t.inner_pid());
-            let res = AccessibilityInjector::inject(
-                InjectRequest { target, authorize: Some(authorize), ..Default::default() },
-                &text,
-            );
-            match crate::injector::delivery_of(res, target_pid) {
-                Delivery::Delivered => {
-                    eprintln!("  ✓    {}", crate::daemon_log::text(&text));
-                    ui_channel::set_last_dictation(&text);
-                    crate::history::record(&text);
-                    if !matches!(action, TrailingAction::None) {
-                        std::thread::sleep(Duration::from_millis(40));
-                        execute_trailing_action(&action);
-                    }
-                }
-                // A failed write used to drop the text; it is kept either way.
-                Delivery::Held(cause) => keep_unscoped(&text, cause),
-                Delivery::Cancelled => {
-                    // A cancel landed during retry: suppress the write. The
-                    // retained audio is kept (not cleared) for another retry.
-                    eprintln!("  ⌫    cancelled · discarded");
-                    cues::play_cancel();
-                }
+            if deliver(generation, None, focus, target_pid, &text) != Delivery::Delivered {
+                return;
+            }
+            eprintln!("  ✓    {}", crate::daemon_log::text(&text));
+            ui_channel::set_last_dictation(&text);
+            crate::history::record(&text);
+            if !matches!(action, TrailingAction::None) {
+                // Clipboard insertion returns after queuing Cmd+V. Keep
+                // Enter/Tab behind its consume/restore window so a slow app
+                // cannot submit the previous field text.
+                crate::clipboard_paste::wait_for_pending_transaction();
+                std::thread::sleep(Duration::from_millis(40));
+                execute_trailing_action(&action);
             }
         }
     }

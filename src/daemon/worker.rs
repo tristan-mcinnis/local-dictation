@@ -238,11 +238,21 @@ pub(super) fn worker_loop(
     // When an output-format preset (numbered/bullets/email/…) is active, every
     // dictation must go through the LLM to be reshaped — so the short-utterance
     // deterministic shortcut is disabled. Default cleanup has no such need.
-    #[cfg(feature = "cleaner")]
     // Asked of the engine, which validated the name against prompts.json: an
     // unknown or deleted preset name must not force every utterance through
     // the model with the default prompt.
+    #[cfg(feature = "cleaner")]
     let format_active = cleaner.as_ref().is_some_and(|c| c.format_active());
+    #[cfg(not(feature = "cleaner"))]
+    let format_active = false;
+    let pipeline = Pipeline {
+        #[cfg(feature = "cleaner")]
+        cleaner: cleaner.as_ref(),
+        #[cfg(feature = "cleaner")]
+        rt: &rt,
+        refiner: &refiner,
+        format_active,
+    };
     // Per-utterance streaming accumulators (only used when `streaming_asr`). These
     // are the whole incremental-ASR state, independent of the cleaner feature:
     // transcribe_pcm + SegmentStream + corrections need no LLM.
@@ -423,16 +433,21 @@ pub(super) fn worker_loop(
                     eprintln!("[recovery] unsupported saved sample rate {rate}");
                     continue;
                 }
-                #[cfg(feature = "cleaner")]
-                let mut cleanup = |text: &str| {
-                    rt.block_on(cleaner.as_ref().unwrap().process_transcript_with_vocab(text, &[]))
+                let mut cleanup = |text: &str| match clean(text, &pipeline, &CleanupTarget::NONE, generation) {
+                    Ok(cleaned) => crate::reprocess::Cleanup {
+                        text: cleaned.text,
+                        from_model: cleaned.source == CleanupSource::Model,
+                    },
+                    // Cancelled while cleaning: reprocess sees the cancel next
+                    // and never copies, so any faithful text will do here.
+                    Err(Superseded) => crate::reprocess::Cleanup {
+                        text: crate::text_polish::fix_speech_mechanics(text),
+                        from_model: false,
+                    },
                 };
-                #[cfg(feature = "cleaner")]
-                let cleanup_fn = if cleaner.is_some() {
-                    Some(&mut cleanup as &mut dyn FnMut(&str) -> eyre::Result<String>)
-                } else { None };
-                #[cfg(not(feature = "cleaner"))]
-                let cleanup_fn = None;
+                let cleanup_fn = pipeline
+                    .has_cleaner()
+                    .then_some(&mut cleanup as &mut dyn FnMut(&str) -> crate::reprocess::Cleanup);
                 let outcome = crate::reprocess::to_clipboard(
                     &crate::cancel::CANCEL, generation, &audio,
                     |audio| worker.transcribe_pcm(audio), cleanup_fn,
@@ -496,10 +511,7 @@ pub(super) fn worker_loop(
                 }
                 let retry_gen = ui_channel::begin_utterance(UiState::Transcribing, streaming_asr);
                 let _utterance = ui_channel::UtteranceScope(retry_gen);
-                #[cfg(feature = "cleaner")]
-                retry_last(&rt, &mut worker, cleaner.as_ref(), &refiner, &last_audio, retry_gen);
-                #[cfg(not(feature = "cleaner"))]
-                retry_last(&mut worker, &refiner, &last_audio, retry_gen);
+                retry_last(&pipeline, &mut worker, &last_audio, retry_gen);
                 ui_channel::finish_utterance(retry_gen);
             }
             DaemonEvent::CancelRecording => {
@@ -1331,141 +1343,24 @@ pub(super) fn worker_loop(
                     }
                 }
 
-                // Terminals draw their own text grid and almost always receive
-                // shell commands, not prose — Gemma cleanup corrupts more than
-                // it helps there, so inject the raw transcript instead. Every
-                // other app keeps the normal formal-cleanup path.
-                #[cfg(feature = "cleaner")]
-                let is_terminal = target_pid
-                    .map(crate::injector::is_terminal_pid)
-                    .unwrap_or(false);
-
                 // Keep the raw ASR text so the summary block can compare it to
                 // the cleaned output — the only way to tell, after the fact,
                 // whether a short result came from ASR or from the cleanup model
                 // dropping content. Cheap: dictations are short strings.
-                let raw_transcript = transcript.clone();
-
-                // Screen-context vocabulary: proper nouns harvested (during the
-                // parallel focus capture, so off the critical path) from the
-                // focused field + window title. Fed to cleanup so Gemma spells
-                // on-screen names the way they appear instead of as similar-
-                // sounding common words. Empty in AX-blind apps.
-                #[cfg(feature = "cleaner")]
-                let screen_vocab: Vec<String> = captured_target
-                    .as_ref()
-                    .map(|t| t.screen_terms(SCREEN_VOCAB_CAP))
-                    .unwrap_or_default();
-
-                // Per-app tone: a short style hint for cleanup, derived from the
-                // frontmost app (chat vs email vs code …). Feeds the same
-                // whole-utterance cleanup prompt as the vocabulary block.
-                #[cfg(feature = "cleaner")]
-                let tone: Option<&'static str> = {
-                    let bundle = target_app.as_ref().and_then(|a| a.bundle_id.as_deref());
-                    let name = target_pid.map(app_name).unwrap_or_default();
-                    let t = crate::app_tones::tone_for(&name, bundle);
-                    if let Some(t) = t {
-                        eprintln!("  ♪    tone: {t}");
-                    }
-                    t
+                let raw_transcript = transcript;
+                let cleanup_target = CleanupTarget::of(target_app.as_ref(), captured_target.as_ref());
+                let cleaned = match clean(&raw_transcript, &pipeline, &cleanup_target, cur_gen) {
+                    Ok(cleaned) => cleaned,
+                    Err(Superseded) => continue 'evloop,
                 };
-
-                let mut t_cleanup_ms = 0_u128;
-                let final_text = {
-                    #[cfg(feature = "cleaner")]
-                    {
-                        match cleaner {
-                            Some(ref c) if !is_terminal => {
-                                if !screen_vocab.is_empty() {
-                                    eprintln!("  ⌕    screen vocab: {}", crate::daemon_log::terms(&screen_vocab));
-                                }
-                                // Fix known proper nouns in the *raw* transcript
-                                // before cleanup, so the small model sees the
-                                // intended spelling (e.g. "to twist" → "Todoist")
-                                // instead of mangling a garbled one out of reach
-                                // of the post-cleanup pass. refine() corrects
-                                // again afterwards (idempotent for these fixes).
-                                let pre_corrected = refiner.apply_corrections(&transcript);
-                                if pre_corrected != transcript {
-                                    eprintln!("  ✎    pre-cleanup corrections applied");
-                                }
-                                // Deterministic cleanup (filler/casing/numbers on
-                                // top of already-corrected, already-punctuated
-                                // Cohere text). Used both as the short-utterance
-                                // shortcut and as the safe fallback when the LLM
-                                // over-deletes — it can never drop a clause.
-                                let deterministic =
-                                    crate::text_polish::fix_speech_mechanics(&pre_corrected);
-                                let word_count = pre_corrected.split_whitespace().count();
-
-                                // Below 3 words there is nothing for the LLM to
-                                // clean, tone, or format — even an active preset
-                                // gains nothing reshaping "Yes." — so tiny
-                                // utterances always take the deterministic path.
-                                if word_count < 3
-                                    || (!format_active
-                                        && !crate::text_polish::needs_llm_cleanup(&pre_corrected))
-                                {
-                                    // (1) Clean dictation skips the generative LLM
-                                    // entirely. Measured: ~87% of utterances pass
-                                    // through it unchanged, and some pick up unwanted
-                                    // substitutions ("open pencil" → "open source").
-                                    // The deterministic pass can't drop or swap a word,
-                                    // and it's faster. The LLM runs only on real mess
-                                    // (contractions, stutters, dense filler, run-ons).
-                                    eprintln!(
-                                        "  ⚡    clean ({word_count} words) · deterministic cleanup, LLM skipped"
-                                    );
-                                    deterministic
-                                } else {
-                                    if !ui_channel::set_phase(cur_gen, UiState::Cleaning) { continue 'evloop; }
-                                    let t_clean = Instant::now();
-                                    match rt.block_on(c.process_transcript_with_vocab_tone(
-                                        &pre_corrected,
-                                        &screen_vocab,
-                                        tone,
-                                    )) {
-                                        Ok(cleaned) => {
-                                            t_cleanup_ms = ms(t_clean.elapsed());
-                                            // (2) Diff-guard: if the generative
-                                            // cleanup rewrote away real content
-                                            // (dropped a whole clause), keep the
-                                            // faithful deterministic result instead.
-                                            if crate::text_polish::cleanup_dropped_content(
-                                                &pre_corrected,
-                                                &cleaned,
-                                            ) {
-                                                eprintln!(
-                                                    "  ⚠    cleanup dropped content — using faithful deterministic text instead"
-                                                );
-                                                recovery.error = Some("Model cleanup rejected because it dropped content; deterministic text used".into());
-                                                deterministic
-                                            } else {
-                                                crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Cleaned, &cleaned, "Accepted model cleanup");
-                                                cleaned
-                                            }
-                                        }
-                                        Err(err) => {
-                                            eprintln!("[warn] cleanup failed, using raw: {err:?}");
-                                            recovery.error = Some(format!("Cleanup failed; deterministic text used: {err}"));
-                                            deterministic
-                                        }
-                                    }
-                                }
-                            }
-                            Some(_) => {
-                                eprintln!("  ⌁    terminal · raw transcript (cleanup skipped)");
-                                transcript
-                            }
-                            None => transcript,
-                        }
-                    }
-                    #[cfg(not(feature = "cleaner"))]
-                    {
-                        transcript
-                    }
-                };
+                let t_cleanup_ms = cleaned.llm_ms;
+                if cleaned.error.is_some() {
+                    recovery.error = cleaned.error;
+                }
+                if cleaned.source == CleanupSource::Model {
+                    crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Cleaned, &cleaned.text, "Accepted model cleanup");
+                }
+                let final_text = cleaned.text;
 
                 // Corrections dictionary + trailing voice-command parsing, in
                 // the canonical order (corrections first). Same transform the

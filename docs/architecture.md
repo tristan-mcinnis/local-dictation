@@ -464,6 +464,10 @@ context is capped at `MAX_CTX = 8192`.
 - A **diff-guard** (`text_polish::cleanup_dropped_content`): if the model rewrote away real content
   (dropped a clause), the faithful deterministic result wins.
 
+The gate, the pre-cleanup corrections pass, the terminal skip and the diff-guard are one policy,
+`src/daemon/cleanup.rs`, and every path runs it: push-to-talk, Retry on the retained audio, listen
+mode and saved-audio recovery. Retry on the same audio therefore gives the live result.
+
 ### The model-aware cleanup contract
 
 `src/llm_contract.rs` is the one place that turns *what the user asked for* (an output format, an
