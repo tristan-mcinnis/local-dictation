@@ -232,6 +232,15 @@ if [ "$BUNDLE_MODELS" -eq 1 ]; then
   # -L: models/ entries are symlinks into ~/Models; copy the bytes, not the link.
   cp -RL "$REPO_ROOT/models/$COHERE_REL" "$RES_DIR/models/$COHERE_REL"
   cp -RL "$REPO_ROOT/models/$LLM_REL"   "$RES_DIR/models/$LLM_REL"
+  # Apache-2.0 4(d): redistributed weights carry their LICENSE and NOTICE.
+  for rel in "$COHERE_REL" "$LLM_REL"; do
+    for kind in LICENSE NOTICE; do
+      if ! ls "$RES_DIR/models/$rel/$kind"* >/dev/null 2>&1; then
+        echo "error: models/$rel has no $kind file; run scripts/download-models.sh" >&2
+        exit 1
+      fi
+    done
+  done
   echo "  bundled: $(du -sh "$RES_DIR/models" | cut -f1)"
 elif [ "$SLIM" -eq 1 ]; then
   # Ship NO models and NO dev symlink. On a clean machine the Setup window can
