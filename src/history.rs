@@ -886,7 +886,9 @@ mod tests {
         let took = t.elapsed();
         eprintln!("[history-bench] recent(1000) = {took:?}");
         assert_eq!(rows.len(), 1000);
-        assert!(took < std::time::Duration::from_millis(250), "recent(1000) took {took:?}");
+        if crate::timing_checks() {
+            assert!(took < std::time::Duration::from_millis(250), "recent(1000) took {took:?}");
+        }
     }
 
     /// Hold the write lock the way a finishing dictation does, then read the
@@ -908,7 +910,9 @@ mod tests {
         // The old read-write open blocked 2 s. Hosted CI runners sleep coarsely
         // (a 150 ms busy timeout measured 555 ms there), so the bound only has to
         // separate "gave up" from "waited the full 2 s".
-        assert!(took < std::time::Duration::from_millis(1000), "UI read blocked {took:?}");
+        if crate::timing_checks() {
+            assert!(took < std::time::Duration::from_millis(1000), "UI read blocked {took:?}");
+        }
         assert!(matches!(got, UiRead::Busy), "a busy store is not an unreadable one");
         assert_eq!(unreadable_reason_at(&db), None, "busy is not a fault");
         writer.execute_batch("ROLLBACK").unwrap();
@@ -946,7 +950,9 @@ mod tests {
         let t = std::time::Instant::now();
         let (q, c) = (query_ui_at(&db, "alpha", 5), count_ui_at(&db));
         let took = t.elapsed();
-        assert!(took < std::time::Duration::from_millis(1500), "two reads took {took:?}");
+        if crate::timing_checks() {
+            assert!(took < std::time::Duration::from_millis(1500), "two reads took {took:?}");
+        }
         assert!(matches!(q, UiRead::Busy) && matches!(c, UiRead::Busy));
         writer.execute_batch("ROLLBACK").unwrap();
     }

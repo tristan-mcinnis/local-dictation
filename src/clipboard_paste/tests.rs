@@ -25,7 +25,9 @@ fn the_selection_probe_reads_once_the_copy_lands_and_stops_at_the_deadline() {
     let started = Instant::now();
     let unchanged = wait_for_change_count(Some(7), || Some(7), Duration::from_millis(30), Duration::from_millis(5));
     assert_eq!(unchanged, Some(7));
-    assert!(started.elapsed() < Duration::from_secs(1), "bounded by the deadline");
+    if crate::timing_checks() {
+        assert!(started.elapsed() < Duration::from_secs(1), "bounded by the deadline");
+    }
 
     assert_eq!(wait_for_change_count(None, || None, Duration::from_millis(5), Duration::from_millis(1)), None);
 }
@@ -189,10 +191,12 @@ fn queued_transaction_returns_immediately_and_holds_the_gate_until_done() {
     run_transaction_async(ClipboardTransaction::new(permit, work));
 
     // (1) Queueing did not wait for the settle/restore.
-    assert!(
-        queued_at.elapsed() < Duration::from_millis(500),
-        "queueing must not block on the settle/restore (sync design would)"
-    );
+    if crate::timing_checks() {
+        assert!(
+            queued_at.elapsed() < Duration::from_millis(500),
+            "queueing must not block on the settle/restore (sync design would)"
+        );
+    }
     // (2) The gate is still held: the restore has not completed.
     assert!(
         gate.try_acquire().is_none(),

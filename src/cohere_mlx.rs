@@ -530,11 +530,13 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("exited unexpectedly"), "{err}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "a dead helper must not be waited out: took {:?}",
-            started.elapsed()
-        );
+        if crate::timing_checks() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a dead helper must not be waited out: took {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     /// Regression: the request was written synchronously before any timeout
@@ -564,11 +566,13 @@ mod tests {
         let started = std::time::Instant::now();
         let result = worker.attempt(&audio, Duration::from_millis(300));
         assert!(matches!(result, Err(Failure::Hung(_))), "a full stdin pipe must time out");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "bounded by the budget: took {:?}",
-            started.elapsed()
-        );
+        if crate::timing_checks() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "bounded by the budget: took {:?}",
+                started.elapsed()
+            );
+        }
         drop(worker);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -22,6 +22,7 @@ cargo build --features full --release          # the real build
 ./target/release/fast-dictate-backend daemon   # run the daemon
 cargo test                                     # no models, no native deps
 cargo test --features full                     # adds cleaner/injector/menubar/history suites
+LOCAL_DICTATION_TIMING=1 cargo test           # also checks wall-clock bounds (off by default)
 native/cohere-mlx/test.sh                      # Swift bridge protocol tests
 cargo run --release --features full -- render-ui /tmp/ui   # offscreen UI proofs + History panel scale check
 ./scripts/build-app.sh --install               # bundle + /Applications + login item

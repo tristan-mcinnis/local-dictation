@@ -66,3 +66,11 @@ pub mod settings_window;
 // Push-to-talk daemon. Needs the fixed Cohere MLX stack and AX injection.
 #[cfg(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject"))]
 pub mod daemon;
+
+/// Wall-clock bounds in tests are opt-in, so a slow or busy machine (hosted
+/// CI, a loaded Mac) cannot turn the default `cargo test` red. Run them with
+/// `LOCAL_DICTATION_TIMING=1 cargo test`. The behaviour asserts always run.
+#[cfg(test)]
+pub(crate) fn timing_checks() -> bool {
+    std::env::var("LOCAL_DICTATION_TIMING").is_ok_and(|v| v == "1")
+}

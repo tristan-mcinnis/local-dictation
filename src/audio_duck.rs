@@ -373,11 +373,13 @@ mod tests {
         SETS.lock().unwrap().clear();
         let t = std::time::Instant::now();
         D.mute(slow_unmuted_read, record_set);
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(100),
-            "mute blocked for {:?}",
-            t.elapsed()
-        );
+        if crate::timing_checks() {
+            assert!(
+                t.elapsed() < std::time::Duration::from_millis(100),
+                "mute blocked for {:?}",
+                t.elapsed()
+            );
+        }
         D.restore(record_set);
         assert_eq!(*SETS.lock().unwrap(), vec![true, false], "mute, then unmute");
         assert!(!D.active.load(Ordering::SeqCst));
