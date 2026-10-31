@@ -12,7 +12,8 @@
 //! dictation. What is still lost is listed on [`is_restorable_type`] and
 //! [`SNAPSHOT_BUDGET_BYTES`]: lazily promised file data (the promising app is
 //! the only one that can produce it) and anything past the snapshot byte
-//! budget. We also guard the restore with the pasteboard's `changeCount` so a
+//! budget. When that is the whole clipboard, the write is refused instead
+//! ([`snapshot_or_refuse`]) and the caller keeps the text. We also guard the restore with the pasteboard's `changeCount` so a
 //! user copying something during the paste-settle window isn't clobbered (see
 //! [`paste_via_clipboard`]).
 //!
@@ -356,16 +357,33 @@ fn fits_budget(used: usize, len: usize, budget: usize) -> bool {
 /// Objective-C objects) so it can cross to the detached restore thread.
 type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
 
-/// Copy every restorable flavour of every pasteboard item into plain bytes.
-/// An empty result means "nothing we can put back" (empty clipboard, or only
-/// promised/oversized content).
-fn snapshot_pasteboard() -> ClipboardSnapshot {
+/// Snapshot the clipboard before one of our writes, or refuse the write when
+/// the user's clipboard holds something (a promised file, an image past the
+/// budget) of which nothing could be put back: writing would destroy it.
+fn snapshot_or_refuse() -> eyre::Result<ClipboardSnapshot> {
+    let (snapshot, item_count) = snapshot_pasteboard();
+    eyre::ensure!(
+        !would_lose_clipboard(item_count, &snapshot),
+        "the clipboard holds content that cannot be restored; not overwriting it"
+    );
+    Ok(snapshot)
+}
+
+/// True when the clipboard had items but none of them is restorable. Pure.
+fn would_lose_clipboard(item_count: usize, snapshot: &ClipboardSnapshot) -> bool {
+    item_count > 0 && snapshot.is_empty()
+}
+
+/// Copy every restorable flavour of every pasteboard item into plain bytes,
+/// with the number of items on the pasteboard. An empty snapshot with a
+/// non-zero count means the clipboard holds only promised or oversized content.
+fn snapshot_pasteboard() -> (ClipboardSnapshot, usize) {
     use objc2_app_kit::NSPasteboard;
 
     let pb = NSPasteboard::generalPasteboard();
     let mut snapshot: ClipboardSnapshot = Vec::new();
     let Some(items) = pb.pasteboardItems() else {
-        return snapshot;
+        return (snapshot, 0);
     };
     let mut used = 0usize;
     for item in items.iter() {
@@ -393,7 +411,7 @@ fn snapshot_pasteboard() -> ClipboardSnapshot {
             snapshot.push(flavours);
         }
     }
-    snapshot
+    (snapshot, items.count())
 }
 
 /// Put a snapshot back on the general pasteboard, all items and flavours in
@@ -485,7 +503,7 @@ pub fn paste_via_clipboard(text: &str, expected_pid: Option<i32>) -> eyre::Resul
         return Ok(PasteOutcome::RefusedForeground);
     }
 
-    let saved = snapshot_pasteboard();
+    let saved = snapshot_or_refuse()?;
 
     write_preserving_snapshot(text, &saved)?;
 
@@ -516,9 +534,10 @@ pub fn paste_via_clipboard(text: &str, expected_pid: Option<i32>) -> eyre::Resul
         if settle_ms > 0 {
             std::thread::sleep(Duration::from_millis(settle_ms));
         }
-        // If the clipboard was empty before, leave our injected text on it
-        // (better than wiping it — gives the user a manual paste fallback). The
-        // settle above still ran, so the gate stayed held for the consume window.
+        // An empty snapshot here means the clipboard was empty before (an
+        // unrestorable one was refused above): leave our injected text on it
+        // as a manual paste fallback. The settle above still ran, so the gate
+        // stayed held for the consume window.
         if !saved.is_empty() {
             let restored_at = Instant::now();
             restore_clipboard_inner(saved, our_count);
@@ -550,9 +569,35 @@ fn restore_snapshot_if_owned(orig: &ClipboardSnapshot, our_count: Option<isize>)
     }
 }
 
-/// Time the OS needs to consume a synthesized Cmd+C and populate the
-/// pasteboard with the selection before we read it back.
-const COPY_SETTLE_MS: u64 = 140;
+/// How long the target app gets to service the synthesized Cmd+C. We poll
+/// `changeCount` and read as soon as it moves; a count that never moves within
+/// this window means nothing was selected.
+const COPY_WAIT_MAX: Duration = Duration::from_millis(400);
+const COPY_POLL: Duration = Duration::from_millis(10);
+
+/// Poll `read` until it reports a count other than `start`, or `max` passes.
+/// Returns the last count seen. Pure over its inputs: unit-tested with a fake
+/// counter.
+fn wait_for_change_count(
+    start: Option<isize>,
+    mut read: impl FnMut() -> Option<isize>,
+    max: Duration,
+    poll: Duration,
+) -> Option<isize> {
+    if start.is_none() {
+        // Nothing to compare against: give the copy the whole window.
+        std::thread::sleep(max);
+        return read();
+    }
+    let deadline = Instant::now() + max;
+    loop {
+        let now = read();
+        if now != start || Instant::now() >= deadline {
+            return now;
+        }
+        std::thread::sleep(poll);
+    }
+}
 
 /// Grab the focused app's current selection via a Cmd+C round-trip, returning
 /// `None` when nothing is selected. Used by transform mode to read the text the
@@ -569,21 +614,24 @@ pub fn copy_selection_via_clipboard() -> eyre::Result<Option<String>> {
     // between our set and the Cmd+C that reads it.
     let _permit = clipboard_gate().acquire();
     let mut cb = Clipboard::new().map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
-    let saved = snapshot_pasteboard();
+    let saved = snapshot_or_refuse()?;
 
     // The probe is one of our own writes too: mark it transient so clipboard
     // managers don't record the sentinel (or the selection Cmd+C pulls in).
     write_preserving_snapshot(SENTINEL, &saved)?;
     let our_count = pasteboard_change_count();
     rollback_on_error(synthesize_cmd_c, || restore_snapshot_if_owned(&saved, our_count))?;
-    std::thread::sleep(Duration::from_millis(COPY_SETTLE_MS));
+    let copied_count = wait_for_change_count(our_count, pasteboard_change_count, COPY_WAIT_MAX, COPY_POLL);
 
     let after = cb.get_text().unwrap_or_default();
 
-    // Restore the user's clipboard regardless of outcome. An empty snapshot
-    // means there was nothing restorable there: clear rather than leave the
-    // sentinel (or the copied selection) behind.
-    if saved.is_empty() {
+    // Put the user's clipboard back, unless something wrote to it after the
+    // copy we read (a slow app's late Cmd+C, or the user): restoring then would
+    // replace what is there now. An empty snapshot means the clipboard was
+    // empty: clear rather than leave the sentinel or the selection behind.
+    if user_copied_during_settle(copied_count, pasteboard_change_count()) {
+        eprintln!("[clipboard] clipboard changed after the selection probe; leaving it as-is");
+    } else if saved.is_empty() {
         let _ = write_text_transient("");
     } else {
         restore_pasteboard(&saved);
@@ -693,6 +741,44 @@ pub fn synthesize_undo() -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clipboard_with_nothing_restorable_is_never_overwritten() {
+        let restorable: ClipboardSnapshot = vec![vec![("public.utf8-plain-text".into(), b"hi".to_vec())]];
+        assert!(!would_lose_clipboard(0, &Vec::new()), "an empty clipboard may take our text");
+        assert!(would_lose_clipboard(1, &Vec::new()), "a lone promised or oversized item would be lost");
+        assert!(!would_lose_clipboard(1, &restorable));
+        assert!(!would_lose_clipboard(2, &restorable), "partial loss is logged per flavour, not refused");
+    }
+
+    #[test]
+    fn the_selection_probe_reads_once_the_copy_lands_and_stops_at_the_deadline() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let landed = wait_for_change_count(
+            Some(7),
+            || { reads.set(reads.get() + 1); Some(if reads.get() >= 3 { 8 } else { 7 }) },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        );
+        assert_eq!(landed, Some(8), "returns the count the copy produced");
+        assert_eq!(reads.get(), 3, "stops polling as soon as it moves");
+
+        let started = Instant::now();
+        let unchanged = wait_for_change_count(Some(7), || Some(7), Duration::from_millis(30), Duration::from_millis(5));
+        assert_eq!(unchanged, Some(7));
+        assert!(started.elapsed() < Duration::from_secs(1), "bounded by the deadline");
+
+        assert_eq!(wait_for_change_count(None, || None, Duration::from_millis(5), Duration::from_millis(1)), None);
+    }
+
+    #[test]
+    fn a_late_write_after_the_probe_read_blocks_the_restore() {
+        // The copy landed at 8. A slow app's second write (9) arrives before
+        // the restore: the restore must stand down rather than replace it.
+        assert!(user_copied_during_settle(Some(8), Some(9)));
+        assert!(!user_copied_during_settle(Some(8), Some(8)));
+    }
 
     #[test]
     fn failed_pre_delivery_steps_restore_once_and_success_never_rolls_back() {
