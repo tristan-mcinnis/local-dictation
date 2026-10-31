@@ -198,7 +198,11 @@ fn hid_modifier_flags() -> u64 {
     unsafe { CGEventSourceFlagsState(CGEventSourceStateID::HIDSystemState as i32) }
 }
 
-/// Configuration for the daemon. Built from CLI args / env vars in main.rs.
+/// Everything the daemon reads from settings, resolved once at boot from one
+/// `Settings` load (env > settings.json > default) and passed down. Relaunch
+/// to apply. The one per-utterance read is the Translate-to target, which
+/// `spoken_command` loads only for an utterance that opens with "translate",
+/// so the menu's choice applies without a relaunch.
 pub struct DaemonConfig {
     /// Resolved fixed Cohere MLX ASR configuration.
     pub asr: crate::transcriber::AsrConfig,
@@ -208,31 +212,78 @@ pub struct DaemonConfig {
     pub instruction_model_path: Option<String>,
     /// If true, inject the raw ASR transcript without model cleanup.
     pub no_cleanup: bool,
-    /// Hotkey keycode to watch on FlagsChanged.
-    pub hotkey_keycode: i64,
+    /// The push-to-talk key or chord the event tap watches.
+    pub hotkey: crate::hotkeys::Hotkey,
+    /// The "Copy last dictation" chord, `None` when off.
+    pub copy_last_hotkey: Option<crate::hotkeys::Hotkey>,
+    /// Double-tap the hotkey to latch hands-free.
+    pub double_tap_latch: bool,
+    pub capture: CaptureConfig,
+    pub result: ResultPrefs,
+    /// The listen-mode wake word.
+    pub wake_word: String,
+}
+
+/// How the microphone is run around a press.
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureConfig {
+    /// Always-on mic lookback; 0 is the open-on-press path.
+    pub preroll_ms: u32,
+    /// Lower speech thresholds for quiet dictation.
+    pub whisper_mode: bool,
+    /// Keep the mic open briefly after release so the last word is not clipped.
+    pub tail_capture: bool,
+    pub tail_capture_cap_ms: u32,
+    /// Keep a stopped mic parked this long for a cheap reuse; 0 opens fresh.
+    pub warm_window_ms: u32,
+    /// Transcribe VAD-closed sentences during the hold for a live preview.
+    pub streaming_asr: bool,
+    /// Stop a recording at this length; 0 is no limit.
+    pub max_recording_minutes: u32,
+}
+
+/// What the user sees and gets when a dictation settles.
+#[derive(Clone, Copy, Debug)]
+pub struct ResultPrefs {
+    /// Flash the "Landed" pill after each dictation.
+    pub show_result: bool,
+    /// Put a kept transcript on the clipboard.
+    pub copy_on_paste_failure: bool,
 }
 
 impl DaemonConfig {
-    pub fn from_env(
-        asr: crate::transcriber::AsrConfig,
-        #[cfg(feature = "cleaner")] llm_model_path: String,
-        no_cleanup: bool,
-    ) -> Self {
-        // Through `Hotkey::from_settings` so an unusable configured key (a
+    pub fn from_settings(settings: &crate::settings::Settings, no_cleanup: bool) -> Self {
+        // Through `Hotkey::from_loaded` so an unusable configured key (a
         // plain typing key with no modifier) falls back the same way here as
-        // in the event tap.
-        let hotkey_keycode = crate::hotkeys::Hotkey::from_settings().keycode;
+        // in the Settings window.
+        let hotkey = crate::hotkeys::Hotkey::from_loaded(settings);
         Self {
-            asr,
+            asr: settings.resolve_asr(),
             #[cfg(feature = "cleaner")]
-            llm_model_path,
+            llm_model_path: settings.resolve_llm_model(&crate::app_paths::llm_default_path()),
             #[cfg(feature = "cleaner")]
             instruction_model_path: {
                 let default = crate::app_paths::instruction_default_path();
-                crate::settings::Settings::load().resolve_instruction_model(default.as_deref())
+                settings.resolve_instruction_model(default.as_deref())
             },
             no_cleanup,
-            hotkey_keycode,
+            hotkey,
+            copy_last_hotkey: crate::hotkeys::copy_last_from_loaded(settings),
+            double_tap_latch: settings.resolve_double_tap_latch(),
+            capture: CaptureConfig {
+                preroll_ms: settings.resolve_preroll_ms(),
+                whisper_mode: settings.resolve_whisper_mode(),
+                tail_capture: settings.resolve_tail_capture(),
+                tail_capture_cap_ms: settings.resolve_tail_capture_cap_ms(),
+                warm_window_ms: settings.resolve_warm_window_ms(),
+                streaming_asr: settings.resolve_streaming_asr(),
+                max_recording_minutes: settings.resolve_max_recording_minutes(),
+            },
+            result: ResultPrefs {
+                show_result: settings.resolve_show_result(),
+                copy_on_paste_failure: settings.resolve_copy_on_paste_failure(),
+            },
+            wake_word: settings.resolve_wake_word(),
         }
     }
 }
@@ -346,6 +397,11 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
 
     let (tx, rx) = mpsc::channel::<DaemonEvent>();
 
+    // The tap's settings, before the config moves to the worker thread.
+    let hotkey = config.hotkey;
+    let double_tap_latch = config.double_tap_latch;
+    let copy_last = config.copy_last_hotkey;
+
     // Only the event tap needs Accessibility, so the models load straight
     // away whatever the grant says. "Starting up…" is a visible state until
     // the worker reports ready.
@@ -374,7 +430,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // The CGEventTap callback runs on the main CFRunLoop thread. Keep it
     // FAST — just send to the worker.
     let tx_for_callback = tx.clone();
-    let hotkey = crate::hotkeys::Hotkey::from_settings();
     let hotkey_keycode = hotkey.keycode;
     let modifier_only = hotkey.is_modifier_only();
     // A modifier-only hotkey (Right Option etc.) is detected via FlagsChanged
@@ -407,7 +462,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
 
     // Double-tap-to-latch: the callback records press/release timing to
     // recognise a hotkey double-tap (the no-Spacebar route into hands-free).
-    let double_tap_latch = crate::settings::Settings::load().resolve_double_tap_latch();
     let detector_cb = Arc::new(Mutex::new(DoubleTapDetector::default()));
 
     // Drive the latch state machine once, forwarding any Start/Stop decision to
@@ -452,7 +506,6 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
     // The second global hotkey: "Copy last dictation". The callback only sends
     // on this channel; the clipboard write and the pill happen on a small
     // dedicated thread, never behind the worker (which blocks during ASR).
-    let copy_last = crate::hotkeys::copy_last_from_settings();
     match copy_last {
         Some(h) => eprintln!("[boot] copy-last  hotkey {}", h.display()),
         None => eprintln!("[boot] copy-last  hotkey off"),

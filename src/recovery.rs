@@ -73,11 +73,11 @@ pub fn copy_last_dictation(source: &str) -> crate::last_dictation::CopyLastOutco
 }
 
 /// Keep a finished transcript that did not reach the app: last dictation,
-/// clipboard (when the setting allows), error cue. Returns the pill state for
-/// the caller to show under its own generation rules.
+/// clipboard when `auto_copy` (the copy-on-paste-failure setting) allows,
+/// error cue. Returns the pill state for the caller to show under its own
+/// generation rules.
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-pub fn keep_transcript(text: &str, cause: crate::last_dictation::KeptCause) -> crate::ui_channel::UiState {
-    let auto_copy = crate::settings::Settings::load().resolve_copy_on_paste_failure();
+pub fn keep_transcript(text: &str, cause: crate::last_dictation::KeptCause, auto_copy: bool) -> crate::ui_channel::UiState {
     let state = crate::last_dictation::keep(text, cause, auto_copy, |t| {
         crate::clipboard_paste::copy_only(t).map_err(|e| e.to_string())
     });
@@ -162,6 +162,8 @@ pub fn paste_last_dictation(
         return;
     }
 
+    // A menu click, not the hot path: read the clipboard setting here.
+    let auto_copy = crate::settings::Settings::load().resolve_copy_on_paste_failure();
     // All slow work off the AppKit loop. The busy guard moves into the
     // worker thread and is held for the duration of the recovery work.
     std::thread::spawn(move || {
@@ -179,7 +181,7 @@ pub fn paste_last_dictation(
             eprintln!(
                 "[recovery] could not restore app pid {target} to frontmost — refusing to paste"
             );
-            let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField);
+            let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField, auto_copy);
             ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             return;
         }
@@ -207,7 +209,7 @@ pub fn paste_last_dictation(
             // Never paste blindly: a missing field, a target that left the
             // front, or a failed write all keep the text.
             Delivery::Held(cause) => {
-                let state = keep_transcript(&text, cause);
+                let state = keep_transcript(&text, cause, auto_copy);
                 ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             }
             Delivery::Cancelled => {

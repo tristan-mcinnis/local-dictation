@@ -441,8 +441,13 @@ pub fn copy_last_field(text: &str, ptt: &Hotkey) -> (String, Option<String>) {
 /// The chord the running app should watch, from settings. A bad configured
 /// value turns the hotkey off (with a log line) rather than guessing another.
 pub fn copy_last_from_settings() -> Option<Hotkey> {
-    let configured = crate::settings::Settings::load().resolve_copy_last_hotkey();
-    match copy_last_hotkey(configured.as_deref(), &Hotkey::from_settings()) {
+    copy_last_from_loaded(&crate::settings::Settings::load())
+}
+
+/// As [`copy_last_from_settings`], for settings already in hand.
+pub fn copy_last_from_loaded(settings: &crate::settings::Settings) -> Option<Hotkey> {
+    let configured = settings.resolve_copy_last_hotkey();
+    match copy_last_hotkey(configured.as_deref(), &Hotkey::from_loaded(settings)) {
         Ok(hotkey) => hotkey,
         Err(why) => {
             eprintln!("[hotkey] copy-last hotkey ignored ({why}); it is off");

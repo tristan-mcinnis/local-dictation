@@ -149,10 +149,24 @@ const KNOWN_LANGUAGES: &[&str] = &[
 /// delegates to [`parse_spoken_command_ex`]. Existing callers
 /// ([`crate::daemon`]) keep using this unchanged.
 pub fn parse_spoken_command(text: &str) -> Option<SpokenCommand> {
+    // The settings file is read only for an utterance that opens with the
+    // command word, so the menu's Translate-to choice applies without a
+    // relaunch and ordinary dictation never touches the disk here.
+    if !opens_with_command(text) {
+        return None;
+    }
     let settings = crate::settings::Settings::load();
     let targets = settings.resolve_translation_targets();
     let active_target = settings.resolve_active_translation_target(&targets);
     parse_spoken_command_with(text, active_target.as_deref(), &targets)
+}
+
+/// Every lead-in starts with "translate", so this one word decides whether
+/// the rest of the parse (and the settings read behind it) runs at all.
+pub fn opens_with_command(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case("translate"))
 }
 
 /// Parse a transcript for a leading spoken command given an already-resolved
@@ -317,6 +331,9 @@ mod tests {
     #[test]
     fn plain_dictation_is_not_a_command() {
         assert!(parse_spoken_command("the quick brown fox").is_none());
+        assert!(!opens_with_command("the quick brown fox"));
+        assert!(!opens_with_command("  Translated already"));
+        assert!(opens_with_command("  Translate to French bonjour"));
         assert!(parse_spoken_command("let me translate this for you later").is_none());
         assert!(parse_spoken_command("").is_none());
         assert!(parse_spoken_command("   ").is_none());

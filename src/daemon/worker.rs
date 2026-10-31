@@ -135,11 +135,10 @@ pub(super) fn worker_loop(
     // key press are retained, so the first words are never clipped and there's
     // no stream-open latency on press. `None` ⇒ the proven open-on-press path
     // (default). Created on the worker thread because the cpal Stream is !Send.
-    let preroll_ms = crate::settings::Settings::load().resolve_preroll_ms();
+    let preroll_ms = config.capture.preroll_ms;
     // Whisper mode lowers the speech threshold so quiet dictation is captured.
-    // Read once at boot (like every other setting); threaded into the VAD + the
-    // tail-capture engage threshold below.
-    let whisper_mode = crate::settings::Settings::load().resolve_whisper_mode();
+    // Threaded into the VAD + the tail-capture engage threshold below.
+    let whisper_mode = config.capture.whisper_mode;
     if whisper_mode {
         eprintln!("[boot] whisper     mode ON (lower speech threshold)");
     }
@@ -191,12 +190,12 @@ pub(super) fn worker_loop(
     // loop (draining new audio into the streaming path) so the last word of an
     // utterance isn't clipped. Open-on-press only — always-on pre-roll already
     // keeps rolling past the release, so the two don't compose.
-    let tail_capture = crate::settings::Settings::load().resolve_tail_capture();
-    let tail_capture_cap_ms = crate::settings::Settings::load().resolve_tail_capture_cap_ms();
+    let tail_capture = config.capture.tail_capture;
+    let tail_capture_cap_ms = config.capture.tail_capture_cap_ms;
     // Warm window: after a press-to-open recording stops, keep the input stream
     // open this long so a back-to-back dictation reuses it (skipping cpal's
     // ~120 ms open cost instead of paying it again). 0 = open fresh each time.
-    let warm_window_ms = crate::settings::Settings::load().resolve_warm_window_ms();
+    let warm_window_ms = config.capture.warm_window_ms;
     // True while a press-to-open engine is parked (idle but open) awaiting a
     // cheap reuse within the warm window. Distinct from `engine.is_some()`
     // (which also covers an actively-recording engine) so the event loop can
@@ -231,7 +230,7 @@ pub(super) fn worker_loop(
     // runs at release (accuracy). Streaming ASR and always-on pre-roll are
     // mutually exclusive for now (they drain the capture ring differently);
     // pre-roll wins and streaming falls back to the proven whole-buffer path.
-    let streaming_asr = crate::settings::Settings::load().resolve_streaming_asr();
+    let streaming_asr = config.capture.streaming_asr;
     if streaming_asr {
         eprintln!("[boot] streaming   asr ENABLED (VAD-segmented transcribe during hold)");
     }
@@ -252,6 +251,7 @@ pub(super) fn worker_loop(
         rt: &rt,
         refiner: &refiner,
         format_active,
+        result: config.result,
     };
     // Per-utterance streaming accumulators (only used when `streaming_asr`). These
     // are the whole incremental-ASR state, independent of the cleaner feature:
@@ -279,7 +279,7 @@ pub(super) fn worker_loop(
     let mut pending_saved_recoveries = std::collections::VecDeque::<i64>::new();
     // Recording limit (minutes, 0 = none) and whether the in-flight stop came
     // from it rather than from a key.
-    let max_recording_minutes = crate::settings::Settings::load().resolve_max_recording_minutes();
+    let max_recording_minutes = config.capture.max_recording_minutes;
     if max_recording_minutes > 0 {
         eprintln!("[boot] recording  limit {max_recording_minutes} min");
     }
@@ -1253,15 +1253,7 @@ pub(super) fn worker_loop(
                 // AX-blind apps (Electron, terminals).
                 #[cfg(feature = "cleaner")]
                 if transform {
-                    match cleaner {
-                        Some(ref c) => recovery.status = handle_transform(&rt, c, &transcript, cur_gen),
-                        None => {
-                            eprintln!(
-                                "  ✗    transform needs the cleanup engine (running with --no-cleanup)"
-                            );
-                            cues::play_error();
-                        }
-                    }
+                    recovery.status = handle_transform(&pipeline, &transcript, cur_gen);
                     eprintln!();
                     // Leave a kept-result pill on screen; only a still-working
                     // state is reset.
@@ -1323,9 +1315,9 @@ pub(super) fn worker_loop(
                 // dictation when nothing matches, or when running --no-cleanup.
                 #[cfg(feature = "cleaner")]
                 if let Some(cmd) = crate::spoken_command::parse_spoken_command(&transcript).filter(|_| !limit_stopped) {
-                    match cleaner {
-                        Some(ref c) => {
-                            recovery.status = handle_spoken_command(&rt, c, cmd, captured_target, cur_gen);
+                    match pipeline.cleaner {
+                        Some(_) => {
+                            recovery.status = handle_spoken_command(&pipeline, cmd, captured_target, cur_gen);
                             eprintln!();
                             // Leave a result pill ("Couldn’t paste") on screen;
                             // only a still-working state is reset.
@@ -1416,6 +1408,7 @@ pub(super) fn worker_loop(
                 let used_fresh_capture = captured_target.is_none();
                 let t_inject = Instant::now();
                 let delivery = deliver(
+                    pipeline.result,
                     cur_gen,
                     // A limit stop is held by decision: known "do not write".
                     limit_stopped.then_some(crate::last_dictation::KeptCause::LimitReached),
@@ -1496,7 +1489,7 @@ pub(super) fn worker_loop(
                         // The write was just verified against the frontmost app;
                         // the pill's Undo is only valid while that app stays in front.
                         ui_channel::set_last_inject_pid(crate::injector::frontmost_pid());
-                        show_result_pill();
+                        show_result_pill(pipeline.result);
                         // Persist to the browsable dictation history (best-effort;
                         // never blocks or fails the hot path).
                         crate::history::append_recovery_stage(cur_gen, crate::history::StageKind::Output, &final_text, "Inserted");
@@ -1538,8 +1531,13 @@ pub(super) fn worker_loop(
 /// the selection. Read + replace both go through the clipboard so it works in
 /// AX-blind apps. All failures are logged + cue'd; never fatal.
 #[cfg(feature = "cleaner")]
-pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextCleanupEngine, instruction: &str, generation: u64) -> crate::history::RecoveryStatus {
+pub(super) fn handle_transform(pipeline: &Pipeline, instruction: &str, generation: u64) -> crate::history::RecoveryStatus {
     use crate::history::{RecoveryStatus, StageKind};
+    let Some(cleaner) = pipeline.cleaner else {
+        eprintln!("  ✗    transform needs the cleanup engine (running with --no-cleanup)");
+        cues::play_error();
+        return RecoveryStatus::Failed;
+    };
     if !crate::cancel::CANCEL.allows_progress(generation) { return RecoveryStatus::Cancelled; }
     if let Some(problem) = cleaner.instruction_problem() {
         eprintln!("[rewrite] unavailable: {problem}; selection unchanged");
@@ -1571,7 +1569,7 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
 
     if !ui_channel::set_phase(generation, UiState::Cleaning) { return RecoveryStatus::Cancelled; }
     let t = Instant::now();
-    let result = match rt.block_on(cleaner.transform(instruction, &selection)) {
+    let result = match pipeline.rt.block_on(cleaner.transform(instruction, &selection)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("  ✗    transform failed: {e:?}");
@@ -1605,12 +1603,12 @@ pub(super) fn handle_transform(rt: &tokio::runtime::Runtime, cleaner: &TextClean
         },
         Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
             eprintln!("  ◌    transform refused — target app not frontmost at paste (text kept) app={}", crate::injector::app_label_for_pid(expected));
-            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
+            keep_and_show(pipeline.result, generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
-            keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
+            keep_and_show(pipeline.result, generation, result, crate::last_dictation::KeptCause::PasteFailed);
             RecoveryStatus::Failed
         }
     }
@@ -1882,8 +1880,7 @@ pub(super) fn begin_open_capture(
 /// + trailing-command parse are English-prose transforms that don't apply.
 #[cfg(feature = "cleaner")]
 pub(super) fn handle_spoken_command(
-    rt: &tokio::runtime::Runtime,
-    cleaner: &TextCleanupEngine,
+    pipeline: &Pipeline,
     cmd: crate::spoken_command::SpokenCommand,
     captured_target: Option<FocusTarget>,
     generation: u64,
@@ -1892,7 +1889,10 @@ pub(super) fn handle_spoken_command(
     if !ui_channel::set_phase(generation, UiState::Cleaning) { return RecoveryStatus::Cancelled; }
     eprintln!("  ⌘    {} · {} chars", cmd.label, cmd.body.chars().count());
     let t = Instant::now();
-    let result = match rt.block_on(cleaner.transform(&cmd.instruction, &cmd.body)) {
+    let Some(cleaner) = pipeline.cleaner else {
+        return RecoveryStatus::Failed;
+    };
+    let result = match pipeline.rt.block_on(cleaner.transform(&cmd.instruction, &cmd.body)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("  ✗    command failed: {e:?}");
@@ -1912,7 +1912,7 @@ pub(super) fn handle_spoken_command(
     crate::history::append_recovery_stage(generation, StageKind::Transform, result, &cmd.label);
     ui_channel::publish_preview(generation, result);
     let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
-    let delivery = deliver(generation, None, captured_target, target_pid, result);
+    let delivery = deliver(pipeline.result, generation, None, captured_target, target_pid, result);
     if delivery == Delivery::Delivered {
         eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
         ui_channel::set_last_dictation(result);

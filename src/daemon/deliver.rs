@@ -17,6 +17,7 @@ use crate::last_dictation::KeptCause;
 /// immediately before the first side effect, and a cancel that landed on a
 /// path that never claimed it (an empty write, a hold) still wins here.
 pub(super) fn deliver(
+    prefs: ResultPrefs,
     generation: u64,
     hold: Option<KeptCause>,
     target: Option<FocusTarget>,
@@ -41,7 +42,7 @@ pub(super) fn deliver(
     crate::audio_duck::restore();
     match delivery {
         Delivery::Delivered => {}
-        Delivery::Held(cause) => keep_and_show(generation, text, cause),
+        Delivery::Held(cause) => keep_and_show(prefs, generation, text, cause),
         Delivery::Cancelled => {
             eprintln!("  ⌫    cancelled · discarded");
             cues::play_cancel();
@@ -65,8 +66,8 @@ pub(super) fn recovery_status(delivery: Delivery) -> crate::history::RecoverySta
 /// put it on the clipboard (setting permitting), note it in History, play the
 /// error cue and show the kept-result pill for this generation: about four
 /// seconds, or until the next key press, with the History button on it.
-pub(super) fn keep_and_show(generation: u64, text: &str, cause: KeptCause) {
-    let state = crate::recovery::keep_transcript(text, cause);
+pub(super) fn keep_and_show(prefs: ResultPrefs, generation: u64, text: &str, cause: KeptCause) {
+    let state = crate::recovery::keep_transcript(text, cause, prefs.copy_on_paste_failure);
     let copied = matches!(
         state,
         UiState::HeldCopied | UiState::PasteFailedCopied | UiState::LimitReachedCopied
@@ -82,8 +83,8 @@ pub(super) fn keep_and_show(generation: u64, text: &str, cause: KeptCause) {
 
 /// Flash the "Landed · N words" pill, or go straight to Idle when the result
 /// pill is off (default). The text landing at the cursor is the real feedback.
-pub(super) fn show_result_pill() {
-    if crate::settings::Settings::load().resolve_show_result() {
+pub(super) fn show_result_pill(prefs: ResultPrefs) {
+    if prefs.show_result {
         ui_channel::show_transient(
             UiState::Success,
             Duration::from_millis(crate::settings::RESULT_PILL_MS),

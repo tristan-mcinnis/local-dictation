@@ -27,8 +27,7 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
         ));
     }
 
-    let settings = crate::settings::Settings::load();
-    let wake_word = settings.resolve_wake_word();
+    let wake_word = &config.wake_word;
 
     let t_load = Instant::now();
     let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
@@ -85,6 +84,7 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
         rt: &rt,
         refiner: &refiner,
         format_active,
+        result: config.result,
     };
 
     // Continuous capture: hold the recording flag true so every callback pushes
@@ -217,7 +217,7 @@ pub(super) fn dictate_transcript(pipeline: &Pipeline, transcript: &str, generati
             eprintln!("  ↵    bare command");
         }
         DictationOutcome::Inject { text, action } => {
-            if deliver(generation, None, focus, target_pid, &text) != Delivery::Delivered {
+            if deliver(pipeline.result, generation, None, focus, target_pid, &text) != Delivery::Delivered {
                 return;
             }
             eprintln!("  ✓    {}", crate::daemon_log::text(&text));

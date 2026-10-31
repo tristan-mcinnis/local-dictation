@@ -14,6 +14,7 @@ pub(super) struct Pipeline<'a> {
     /// utterance of three words or more goes through the model to be
     /// reshaped, so the clean-dictation shortcut is off.
     pub format_active: bool,
+    pub result: ResultPrefs,
 }
 
 impl Pipeline<'_> {

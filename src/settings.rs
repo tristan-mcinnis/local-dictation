@@ -123,15 +123,19 @@ impl LivePreviewControl {
     }
 }
 
+/// One rule for every on/off env override: `1`/`true`/`on`/`yes` and
+/// `0`/`false`/`off`/`no`, any case, trimmed. Anything else is not a value and
+/// falls through to the saved setting, as a bad number does.
+fn parse_flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn resolve_enabled_flag(saved: Option<bool>, override_value: Option<&str>, default: bool) -> bool {
-    override_value
-        .map(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            )
-        })
-        .unwrap_or(saved.unwrap_or(default))
+    override_value.and_then(parse_flag).or(saved).unwrap_or(default)
 }
 
 fn resolve_audio_retention_value(
@@ -643,11 +647,7 @@ impl Settings {
             );
             return false;
         }
-        if let Ok(v) = std::env::var("DICTATE_STREAMING_ASR") {
-            let v = v.trim().to_ascii_lowercase();
-            return !matches!(v.as_str(), "0" | "false" | "off" | "no");
-        }
-        self.streaming_asr.unwrap_or(true)
+        resolve_enabled_flag(self.streaming_asr, std::env::var("DICTATE_STREAMING_ASR").ok().as_deref(), true)
     }
 
     pub fn live_preview_control(&self) -> LivePreviewControl {
@@ -729,11 +729,7 @@ impl Settings {
         if self.resolve_preroll_ms() > 0 {
             return false;
         }
-        if let Ok(v) = std::env::var("DICTATE_TAIL_CAPTURE") {
-            let v = v.trim().to_ascii_lowercase();
-            return !matches!(v.as_str(), "0" | "false" | "off" | "no");
-        }
-        self.tail_capture.unwrap_or(true)
+        resolve_enabled_flag(self.tail_capture, std::env::var("DICTATE_TAIL_CAPTURE").ok().as_deref(), true)
     }
 
     /// Resolve the tail-capture grace cap in ms: `DICTATE_TAIL_CAPTURE_CAP_MS` env
@@ -766,11 +762,7 @@ impl Settings {
     /// the daemon additionally requires `resolve_preroll_ms() > 0` to actually
     /// engage it (listen mode needs the always-on stream).
     pub fn resolve_listen_mode(&self) -> bool {
-        if let Ok(v) = std::env::var("DICTATE_LISTEN_MODE") {
-            let v = v.trim().to_ascii_lowercase();
-            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
-        }
-        self.listen_mode.unwrap_or(false)
+        resolve_enabled_flag(self.listen_mode, std::env::var("DICTATE_LISTEN_MODE").ok().as_deref(), false)
     }
 
     /// Resolve the wake word: `DICTATE_WAKE_WORD` env > settings > default.
@@ -903,20 +895,12 @@ impl Settings {
 
     /// Resolve whisper mode: `DICTATE_WHISPER_MODE` env > settings > false.
     pub fn resolve_whisper_mode(&self) -> bool {
-        if let Ok(v) = std::env::var("DICTATE_WHISPER_MODE") {
-            let v = v.trim().to_ascii_lowercase();
-            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
-        }
-        self.whisper_mode.unwrap_or(false)
+        resolve_enabled_flag(self.whisper_mode, std::env::var("DICTATE_WHISPER_MODE").ok().as_deref(), false)
     }
 
     /// Resolve the result pill: `DICTATE_SHOW_RESULT` env > settings > off.
     pub fn resolve_show_result(&self) -> bool {
-        if let Ok(v) = std::env::var("DICTATE_SHOW_RESULT") {
-            let v = v.trim().to_ascii_lowercase();
-            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
-        }
-        self.show_result.unwrap_or(false)
+        resolve_enabled_flag(self.show_result, std::env::var("DICTATE_SHOW_RESULT").ok().as_deref(), false)
     }
 
     /// Resolve the completion sound: `DICTATE_COMPLETION_SOUND` env > settings
@@ -944,11 +928,7 @@ impl Settings {
     /// Resolve copy-on-failure: `DICTATE_COPY_ON_PASTE_FAILURE` env >
     /// settings > on.
     pub fn resolve_copy_on_paste_failure(&self) -> bool {
-        if let Ok(v) = std::env::var("DICTATE_COPY_ON_PASTE_FAILURE") {
-            let v = v.trim().to_ascii_lowercase();
-            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
-        }
-        self.copy_on_paste_failure.unwrap_or(true)
+        resolve_enabled_flag(self.copy_on_paste_failure, std::env::var("DICTATE_COPY_ON_PASTE_FAILURE").ok().as_deref(), true)
     }
 
     /// The configured "Copy last dictation" chord string:
@@ -978,11 +958,7 @@ impl Settings {
     /// Resolve double-tap-to-latch (hands-free from a hotkey double-tap):
     /// `DICTATE_DOUBLE_TAP_LATCH` env > settings > enabled.
     pub fn resolve_double_tap_latch(&self) -> bool {
-        if let Ok(v) = std::env::var("DICTATE_DOUBLE_TAP_LATCH") {
-            let v = v.trim().to_ascii_lowercase();
-            return matches!(v.as_str(), "1" | "true" | "on" | "yes");
-        }
-        self.double_tap_latch.unwrap_or(true)
+        resolve_enabled_flag(self.double_tap_latch, std::env::var("DICTATE_DOUBLE_TAP_LATCH").ok().as_deref(), true)
     }
 
     /// Resolve the active formatting preset: `DICTATE_FORMAT` env > settings >
@@ -1840,6 +1816,20 @@ mod tests {
         assert!(resolve_enabled_flag(None, None, true));
         assert!(!resolve_enabled_flag(Some(true), Some("off"), true));
         assert!(resolve_enabled_flag(Some(false), Some("1"), true));
+    }
+
+    #[test]
+    fn a_bad_flag_value_falls_through_like_a_bad_number() {
+        // DICTATE_TAIL_CAPTURE=garbage used to mean on and
+        // DICTATE_WHISPER_MODE=garbage used to mean off. Now neither is a value.
+        for garbage in ["garbage", "", "  ", "2", "yes please"] {
+            assert!(resolve_enabled_flag(Some(false), Some(garbage), true) == false, "{garbage:?}");
+            assert!(resolve_enabled_flag(None, Some(garbage), true), "{garbage:?}");
+            assert!(!resolve_enabled_flag(None, Some(garbage), false), "{garbage:?}");
+        }
+        for (value, expected) in [(" ON ", true), ("No", false), ("TRUE", true), ("0", false)] {
+            assert_eq!(resolve_enabled_flag(Some(!expected), Some(value), !expected), expected, "{value:?}");
+        }
     }
 
     #[test]

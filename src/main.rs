@@ -642,16 +642,10 @@ fn redirect_stdio_to_log_if_bundled() {
 async fn run_listen(no_cleanup: bool) -> eyre::Result<()> {
     use fast_dictate_backend::daemon::{run_listen, DaemonConfig};
     fast_dictate_backend::model_fetch::ensure_models_on_first_run();
+    let settings = fast_dictate_backend::settings::Settings::load();
     #[cfg(feature = "cleaner")]
-    let no_cleanup =
-        !fast_dictate_backend::settings::Settings::load().resolve_cleanup_enabled(no_cleanup);
-    let config = DaemonConfig::from_env(
-        asr_config(),
-        #[cfg(feature = "cleaner")]
-        llm_model_path(),
-        no_cleanup,
-    );
-    run_listen(config)
+    let no_cleanup = !settings.resolve_cleanup_enabled(no_cleanup);
+    run_listen(DaemonConfig::from_settings(&settings, no_cleanup))
 }
 
 #[cfg(not(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject")))]
@@ -675,16 +669,10 @@ async fn run_daemon(no_cleanup: bool) -> eyre::Result<()> {
     // MainThreadMarker::new() will return None.
     // The menu-bar cleanup toggle lives in settings.json; a CLI --no-cleanup
     // is a hard override that always wins.
+    let settings = fast_dictate_backend::settings::Settings::load();
     #[cfg(feature = "cleaner")]
-    let no_cleanup =
-        !fast_dictate_backend::settings::Settings::load().resolve_cleanup_enabled(no_cleanup);
-    let config = DaemonConfig::from_env(
-        asr_config(),
-        #[cfg(feature = "cleaner")]
-        llm_model_path(),
-        no_cleanup,
-    );
-    run(config)
+    let no_cleanup = !settings.resolve_cleanup_enabled(no_cleanup);
+    run(DaemonConfig::from_settings(&settings, no_cleanup))
 }
 
 #[cfg(not(all(target_os = "macos", feature = "cohere-mlx", feature = "ax-inject")))]

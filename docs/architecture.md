@@ -641,8 +641,14 @@ Save, and the Settings pane refuses Add and says why. `_`-prefixed comment keys 
 `corrections.json` survive a save. A blank `corrections.json` is an empty dictionary, not a
 corrupt one. CSV import strips a UTF-8 BOM.
 
-Precedence is always **env var > JSON file > built-in default**. The active env knobs on the fixed
-stack:
+Precedence is always **env var > JSON file > built-in default**. The daemon resolves every setting
+it uses once, in `daemon::DaemonConfig::from_settings`, from one load of `settings.json` at boot,
+and passes the result down; nothing on the dictation path reads the file. Three settings apply
+without a relaunch: appearance (the Settings popup applies it), the Translate-to target
+(`spoken_command` reads it only for an utterance that opens with "translate") and history retention
+(read per record). On/off env values take one rule: `1`/`true`/`on`/`yes` or `0`/`false`/`off`/`no`,
+any case; anything else is ignored and the saved setting applies, as with a bad number. The active
+env knobs on the fixed stack:
 
 | Var | Effect |
 | --- | --- |
