@@ -330,7 +330,7 @@ if [ "$INSTALL" -eq 1 ]; then
   # first or `open` below would only bring the old daemon forward.
   if pgrep -U "$(id -u)" -f "$DAEMON_RE" >/dev/null; then
     echo "• stopping the running ${APP_NAME}…"
-    pkill -U "$(id -u)" -TERM -f "$DAEMON_RE" || true
+    pkill -TERM -U "$(id -u)" -f "$DAEMON_RE" || true
     for _ in $(seq 50); do pgrep -U "$(id -u)" -f "$DAEMON_RE" >/dev/null || break; sleep 0.1; done
     if pgrep -U "$(id -u)" -f "$DAEMON_RE" >/dev/null; then
       echo "✗ ${APP_NAME} did not quit; quit it from the menu bar and re-run." >&2
