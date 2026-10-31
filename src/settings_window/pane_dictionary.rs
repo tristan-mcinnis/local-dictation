@@ -194,24 +194,22 @@ pub(super) fn dictionary_row(
     let avail = (text_right - x0).max(0.0);
     if key.eq_ignore_ascii_case(value) {
         // An identity entry: the spelling is kept, nothing is replaced.
-        let word = clamped_label(
-            mtm,
-            value,
-            TYPE_LABEL,
-            WEIGHT_MEDIUM,
-            theme::text_primary(),
+        let word = clamp_label(
+            slate::label(mtm, value, TYPE_LABEL, WEIGHT_MEDIUM, theme::text_primary()),
             x0,
             mid,
             avail,
         );
         let used = word.frame().size.width;
         row.addSubview(&word);
-        let note = clamped_label(
-            mtm,
-            "kept as spelled",
-            TYPE_META,
-            WEIGHT_REGULAR,
-            theme::text_tertiary(),
+        let note = clamp_label(
+            slate::label(
+                mtm,
+                "kept as spelled",
+                TYPE_META,
+                WEIGHT_REGULAR,
+                theme::text_tertiary(),
+            ),
             x0 + used + SPACE_XS,
             mid,
             (avail - used - SPACE_XS).max(0.0),
@@ -219,23 +217,15 @@ pub(super) fn dictionary_row(
         row.addSubview(&note);
     } else {
         let heard_w = (avail * TERM_HEARD_FRACTION).round();
-        let heard = clamped_label(
-            mtm,
-            key,
-            TYPE_LABEL,
-            WEIGHT_REGULAR,
-            theme::text_secondary(),
+        let heard = clamp_label(
+            slate::label(mtm, key, TYPE_LABEL, WEIGHT_REGULAR, theme::text_secondary()),
             x0,
             mid,
             heard_w,
         );
         row.addSubview(&heard);
-        let arrow = clamped_label(
-            mtm,
-            "→",
-            TYPE_META,
-            WEIGHT_REGULAR,
-            theme::text_tertiary(),
+        let arrow = clamp_label(
+            slate::label(mtm, "→", TYPE_META, WEIGHT_REGULAR, theme::text_tertiary()),
             x0 + heard_w + SPACE_XS,
             mid,
             avail,
@@ -243,12 +233,8 @@ pub(super) fn dictionary_row(
         let arrow_w = arrow.frame().size.width;
         row.addSubview(&arrow);
         let value_x = x0 + heard_w + SPACE_XS + arrow_w + SPACE_XS;
-        let replacement = clamped_label(
-            mtm,
-            value,
-            TYPE_LABEL,
-            WEIGHT_MEDIUM,
-            theme::text_primary(),
+        let replacement = clamp_label(
+            slate::label(mtm, value, TYPE_LABEL, WEIGHT_MEDIUM, theme::text_primary()),
             value_x,
             mid,
             (text_right - value_x).max(0.0),

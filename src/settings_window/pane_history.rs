@@ -305,12 +305,8 @@ pub(super) fn history_row(
 
     let text_x = x0 + HISTORY_TIME_W + SPACE_XS;
     let text_right = trash.frame().origin.x - SPACE_SM;
-    let said = clamped_label(
-        mtm,
-        text,
-        TYPE_BODY_SMALL,
-        WEIGHT_REGULAR,
-        theme::text_primary(),
+    let said = clamp_label(
+        slate::label(mtm, text, TYPE_BODY_SMALL, WEIGHT_REGULAR, theme::text_primary()),
         text_x,
         mid,
         (text_right - text_x).max(0.0),

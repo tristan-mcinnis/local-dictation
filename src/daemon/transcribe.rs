@@ -91,9 +91,7 @@ impl WorkerState {
                 &mut self.stream,
                 &mut ring.consumer,
                 &mut self.noise_floor,
-                true,
-                whisper,
-                generation,
+                StreamPass { final_flush: true, whisper, generation },
             );
             let segs_cached = self.stream.segs.len();
             // Boundary-repairing join: a pause before the last word makes the
@@ -149,6 +147,16 @@ impl WorkerState {
 }
 
 
+/// The per-call switches for [`stream_process_asr`].
+pub(super) struct StreamPass {
+    /// The key is up: flush the open segment too.
+    pub(super) final_flush: bool,
+    /// Whisper mode: use the lower speech threshold.
+    pub(super) whisper: bool,
+    /// The utterance this pass belongs to.
+    pub(super) generation: u64,
+}
+
 /// One incremental ASR step: pull available audio into the segment stream, then
 /// transcribe each completed segment (NO cleanup — whole-utterance cleanup stays
 /// at release) and cache the corrected text in `segs_acc`. Every drained sample
@@ -170,10 +178,9 @@ pub(super) fn stream_process_asr(
     stream: &mut Streaming,
     consumer: &mut crate::audio::HeapAudioConsumer,
     noise_floor: &mut crate::audio::NoiseFloorEstimator,
-    final_flush: bool,
-    whisper: bool,
-    generation: u64,
+    pass: StreamPass,
 ) -> u128 {
+    let StreamPass { final_flush, whisper, generation } = pass;
     let Streaming { segmenter, segs: segs_acc, raw_segs: raw_segs_acc, audio: audio_backup, poisoned } = stream;
     let Some(st) = segmenter.as_mut() else {
         return 0;

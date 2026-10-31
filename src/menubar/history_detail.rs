@@ -141,6 +141,14 @@ pub(super) struct HistoryDetailUi {
 unsafe impl Send for HistoryDetailUi {}
 unsafe impl Sync for HistoryDetailUi {}
 
+/// What a detail button does: its title, the action it sends, and the
+/// shortcut its tooltip names.
+struct DetailCommand {
+    title: &'static str,
+    action: objc2::runtime::Sel,
+    shortcut: &'static str,
+}
+
 fn button(
     mtm: MainThreadMarker,
     parent: &NSView,
@@ -148,10 +156,9 @@ fn button(
     x: f64,
     y: f64,
     width: f64,
-    title: &str,
-    action: objc2::runtime::Sel,
-    shortcut: &str,
+    command: DetailCommand,
 ) -> DetailButton {
+    let DetailCommand { title, action, shortcut } = command;
     let ground = slate::SlateView::new(
         mtm,
         NSRect::new(NSPoint::new(x, y), NSSize::new(width, CONTROL_CHIP)),
@@ -225,9 +232,11 @@ pub(super) fn build_history_detail(mtm: MainThreadMarker) -> HistoryDetailUi {
         SPACE_LG,
         control_y,
         CONTROL_INPUT * 2.0,
-        "Play audio",
-        sel!(playHistoryAudio:),
-        "⌘P",
+        DetailCommand {
+            title: "Play audio",
+            action: sel!(playHistoryAudio:),
+            shortcut: "⌘P",
+        },
     );
     let reveal = button(
         mtm,
@@ -236,9 +245,11 @@ pub(super) fn build_history_detail(mtm: MainThreadMarker) -> HistoryDetailUi {
         SPACE_LG + CONTROL_INPUT * 2.0 + SPACE_SM,
         control_y,
         CONTROL_INPUT * 2.0,
-        "Show in Finder",
-        sel!(revealHistoryAudio:),
-        "⌘O",
+        DetailCommand {
+            title: "Show in Finder",
+            action: sel!(revealHistoryAudio:),
+            shortcut: "⌘O",
+        },
     );
     let layer_y = control_y - CONTROL_ROW - SPACE_LG;
     let layers: Retained<NSPopUpButton> = unsafe {
@@ -257,9 +268,11 @@ pub(super) fn build_history_detail(mtm: MainThreadMarker) -> HistoryDetailUi {
         DETAIL_W - SPACE_LG - CONTROL_INPUT * 2.5,
         layer_y + (CONTROL_ROW - CONTROL_CHIP) / 2.0,
         CONTROL_INPUT * 2.5,
-        "Copy layer",
-        sel!(copyHistoryLayer:),
-        "⇧⌘C",
+        DetailCommand {
+            title: "Copy layer",
+            action: sel!(copyHistoryLayer:),
+            shortcut: "⇧⌘C",
+        },
     );
     let text_y = CONTROL_FOOTER * 2.0 + SPACE_SM;
     let scroll_frame = NSRect::new(
@@ -310,9 +323,11 @@ pub(super) fn build_history_detail(mtm: MainThreadMarker) -> HistoryDetailUi {
         SPACE_LG,
         SPACE_SM,
         CONTROL_INPUT * 4.0,
-        "Recover to Clipboard",
-        sel!(recoverHistoryAudio:),
-        "⌘R",
+        DetailCommand {
+            title: "Recover to Clipboard",
+            action: sel!(recoverHistoryAudio:),
+            shortcut: "⌘R",
+        },
     );
     let destination = slate::label(
         mtm,

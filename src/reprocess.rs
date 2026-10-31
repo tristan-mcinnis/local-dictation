@@ -36,6 +36,9 @@ pub enum Outcome {
 /// Keep every model result before checking cancellation, but claim the gate
 /// immediately before the clipboard write. Cancelled recovery never erases the
 /// saved recording or earlier versions. No action interpretation exists here.
+// Each argument after `audio` is an effect the tests swap out on its own; a
+// struct of five generic closures would add a type and no meaning.
+#[allow(clippy::too_many_arguments)]
 pub fn to_clipboard(
     gate: &CancelGate,
     generation: u64,

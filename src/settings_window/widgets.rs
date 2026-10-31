@@ -431,19 +431,14 @@ pub(super) fn list_note(mtm: MainThreadMarker, body: &slate::SlateView, y: f64, 
     y + LIST_NOTE_H
 }
 
-/// A label sized to its text but never wider than `max_w` (it truncates), left
+/// Size a label to its text but never wider than `max_w` (it truncates), left
 /// edge at `x`, centred on `mid_y` inside a flipped parent.
-pub(super) fn clamped_label(
-    mtm: MainThreadMarker,
-    text: &str,
-    size: f64,
-    weight: f64,
-    color: objc2::rc::Retained<objc2_app_kit::NSColor>,
+pub(super) fn clamp_label(
+    l: Retained<NSTextField>,
     x: f64,
     mid_y: f64,
     max_w: f64,
 ) -> Retained<NSTextField> {
-    let l = slate::label(mtm, text, size, weight, color);
     l.sizeToFit();
     let f = l.frame();
     l.setFrame(NSRect::new(

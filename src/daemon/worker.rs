@@ -200,9 +200,7 @@ impl WorkerState {
                     &mut self.stream,
                     &mut ring.consumer,
                     &mut self.noise_floor,
-                    false,
-                    whisper,
-                    rec.generation,
+                    StreamPass { final_flush: false, whisper, generation: rec.generation },
                 );
             }
         } else if let (Some(ring), Some(rec)) = (self.ring.as_mut(), self.recording.as_ref()) {
