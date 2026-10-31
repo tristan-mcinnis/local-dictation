@@ -73,14 +73,17 @@ over a dead hotkey.
   (`home_dir`, `config_dir`, `config_file`, `cache_dir`, `app_support_dir`,
   `models_base_dir`, `daemon_log_path`). Never re-join `$HOME` elsewhere.
 - Precedence is always env var > JSON file > built-in default, resolved in
-  `settings.rs` `resolve_*` methods. Read config once at boot; relaunch to
+  `settings/` `resolve_*` methods. Read config once at boot; relaunch to
   apply.
 - Constants: default hotkey is `hotkeys::DEFAULT_KEYCODE`; keycode names come
   from `hotkeys::modifier_keycode_name`. No scattered `0x3D`.
 - Process lookups by PID go through `injector::process_command_path`.
-- `daemon/` and `menubar/` are module directories (`mod.rs` + one file per
-  concern). Child files start with `use super::*;` and expose cross-file items
-  as `pub(super)`; only `mod.rs` re-exports the crate-public API.
+- `audio/`, `cleaner/`, `daemon/`, `injector/`, `menubar/`, `settings/`,
+  `settings_window/` and `text_polish/` are module directories (`mod.rs` + one
+  file per concern). Child files start with `use super::*;` and expose
+  cross-file items as `pub(super)`; only `mod.rs` re-exports the crate-public
+  API. A file module that only sheds its tests keeps them beside it
+  (`corrections.rs` + `corrections/tests.rs`). No source file over 1,000 lines.
 - Logging is `eprintln!` with a `[tag]` prefix to the daemon log
   (`~/Library/Logs/Local Dictation/daemon.log`, `0600`, rotated at 5 MB by
   `src/daemon_log.rs`). No logging crate. User text never goes in a log line

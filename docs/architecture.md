@@ -10,7 +10,7 @@ resident for the daemon's lifetime. The Rust side (`src/cohere_mlx.rs::CohereMlx
 it over **newline-delimited JSON on stdin/stdout**:
 
 - Request: `{"op":"transcribe","request_id":"1","sample_rate":16000,"channels":1,"language":"en","max_tokens":256,"audio_f32_base64":"<base64 little-endian f32 PCM>"}`.
-  Rust owns resampling/downmixing to mono 16 kHz (see `audio.rs`); the helper expects mono,
+  Rust owns resampling/downmixing to mono 16 kHz (see `audio/`); the helper expects mono,
   finite, little-endian f32 PCM at exactly 16,000 Hz.
 - The decoder `language` is one of the 14 codes the fixed checkpoint supports
   (`settings::COHERE_LANGUAGE_CHOICES`: `en`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `pl`, `el`, `ar`,
@@ -217,7 +217,7 @@ and the menu bar.
   a launch that is not ready, never on one that is, and is always reachable from the menu as
   "Setup & permissions…". Render proofs `setup-fresh` / `setup-ready` in both appearances, from
   invented rows that never read the user's permissions or model directory.
-- **Audio resilience** (`src/audio.rs`). cpal's error callback sets a flag and raises `AudioLost`,
+- **Audio resilience** (`src/audio/`). cpal's error callback sets a flag and raises `AudioLost`,
   so a parked warm stream that died is rebuilt on the next press rather than resumed into
   silence; `AudioCaptureEngine::should_rebuild` also throws away a stream the Mac slept through,
   detected as the **gap between the wall clock and the monotonic clock** (`audio::slept_for`),
@@ -280,13 +280,13 @@ the real app. **Only three features exist** (plus `full`):
   (`src/cohere_mlx.rs`). This IS the ASR; `bench`/`dictate`/`daemon`/`listen` require it
   (`daemon`/`listen` also need `ax-inject`). Without it, `initialize` returns a "not compiled"
   error.
-- **`cleaner`** (`llama-cpp-2` with Metal, `encoding_rs`) — S1-mini cleanup via `src/cleaner.rs`,
+- **`cleaner`** (`llama-cpp-2` with Metal, `encoding_rs`) — S1-mini cleanup via `src/cleaner/`,
   plus the optional instruction model (`src/llm_contract.rs` decides the contract and the routing).
   The `transform` subcommand and Shift+PTT transform mode also live here.
 - **`ax-inject`** (`accessibility-sys`, `core-foundation`, `core-graphics`, `arboard`, `objc2*`) —
   real macOS Accessibility text injection, clipboard fallback, menu-bar status item, floating
-  wave pill, settings window. Gates `injector.rs`, `clipboard_paste.rs`, `menubar/`,
-  `settings_window.rs`, and the daemon.
+  wave pill, settings window. Gates `injector/`, `clipboard_paste.rs`, `menubar/`,
+  `settings_window/`, and the daemon.
 - **`full`** = `cohere-mlx` + `cleaner` + `ax-inject` — the one-user production stack. It is always
   what the shipped app builds with (`BUILD_FEATURES=${BUILD_FEATURES:-full}` in `build-app.sh`).
   Use it for any real build or when running the feature-gated tests.
@@ -337,16 +337,16 @@ paints `panel_tint` at full alpha instead; everything else draws exactly as it d
 drains audio and runs the pipeline:
 
 ```
-audio.rs (cpal capture, SPSC ring, downmix→16 kHz mono)        — with optional PreRoll/AlwaysOnCapture,
+audio/ (cpal capture, SPSC ring, downmix→16 kHz mono)        — with optional PreRoll/AlwaysOnCapture,
   release tail-capture grace, and warm-window mic reuse        (see below)
   → transcriber.rs / cohere_mlx.rs (spawn bridge, NDJSON transcribe, normalize_for_asr → raw text)
-  → cleaner.rs (S1-mini; skipped when the deterministic gate says the speech is clean
+  → cleaner/ (S1-mini; skipped when the deterministic gate says the speech is clean
     and no format preset is active — clear dictation goes straight through)
-  → text_polish.rs (polish, fix_speech_mechanics, flatten or preserve line breaks)
+  → text_polish/ (polish, fix_speech_mechanics, flatten or preserve line breaks)
   → refiner.rs (deterministic corrections dict + trailing voice-command parse) — shared by daemon & CLI;
     corrections run on raw terminal/no-cleanup text and again after model cleanup
   → smart_pad.rs (spacing/capitalization from caret context)
-  → injector.rs (AX direct, or clipboard paste for Electron) + trailing-action keystroke
+  → injector/ (AX direct, or clipboard paste for Electron) + trailing-action keystroke
 ```
 
 **Keycodes** are the real macOS virtual keycodes (`kVK_*`), which are not alphabetical; the one
@@ -396,7 +396,7 @@ Escape *while idle* passes through untouched (normal Escape use); only an in-fli
 
 **Cancellation and retry:** accepted cancellation immediately clears the pill and flips the active generation's capture flag, so queued inference cannot admit more audio or write later. The complete captured buffer is retained for the legacy **Retry and paste last recording** action. Durable recovery is separate: completed/cancelled/failed captures use the archive described below, and **Recover to Clipboard** never invokes voice actions, target replacement, or injection.
 
-**No-blind-paste focus gate** (`src/injector.rs`): before any write, the injector classifies the focused surface from *positive, focus-level evidence* — never an app name — into `FocusEditability`:
+**No-blind-paste focus gate** (`src/injector/`): before any write, the injector classifies the focused surface from *positive, focus-level evidence* — never an app name — into `FocusEditability`:
   * `Editable` — hard AX evidence: a text-entry role (`AXTextField`/`AXTextArea`/`AXComboBox`, or the `AXSearchField`/`AXFullScreenSearchField`/`AXTextArea` subroles) **and** a writable `AXValue`/`AXSelectedText`. Native apps write via the AX ladder: `kAXSelectedText` at the caret, then clipboard paste if that is refused. There is no `kAXValue` rung, because setting the value replaces the whole field with the utterance. The first successful write to each (pid, role/subrole) is verified by comparing the field's value and selection before and after (`injector::ax_write_landed`), not by searching for the utterance, so a repeated phrase cannot pass falsely and normalised text is not pasted twice.
   * `PasteSafe` — the *narrow, justified* fallback: a genuine terminal emulator **or WeChat** whose focused element discloses no clearly non-input role, including an `AXTextArea`/text-entry role with non-settable AX attributes. Terminal grids such as Ghostty, and WeChat's custom message box, accept keyboard + Cmd+V paste but are AX-blind, so writes go through clipboard paste. WeChat's message box never exposes a focused UI element at all (`AXFocusedUIElement` returns `kAXErrorNoValue` -25212 even with the caret visible), so the paste-safe app-type fallback also covers the no-focused-element path. The terminal exception does not distinguish shell prompts from pagers or terminal applications; choose the intended terminal input before dictating. **There is no editor/compose blanket** — a Slack pane, a Notion/Obsidian page, an Outlook window, a Cursor/VS Code editor *window*, or a browser body is only pasted into when its **focused element** reports an editable role, never by app name.
   * `NotEditable` — a positively non-input role (`AXButton`/`AXWindow`/`AXWebArea`/`AXCanvas`/`AXStaticText`/menu/checkbox/radio) denies injection **even for an allowlisted terminal or WeChat**. A password field (subrole `AXSecureTextField`) is denied the same way in every app, and its value is never read for caret context or screen vocabulary. A read-only text-entry field in a **non-paste-safe** app is also denied, as is unknown/absent non-paste-safe focus. The daemon **never** pastes here. It holds the transcript recoverable (menu "Copy last dictation") and surfaces a distinct `UiState::NoEditableField` (pill: "No text field selected").
@@ -442,7 +442,7 @@ budget instead of the model's own end is an error, never pasted. `run_job` keeps
 token bookkeeping in step with the KV cache at every step (truncate after the wipe, set once the
 prompt is decoded), so a failed job cannot leave the next one reusing a prefix the cache lost.
 
-`cleaner.rs` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
+`cleaner/` runs the cleanup LLM on a **dedicated worker thread that owns one persistent
 `LlamaContext`** for the daemon's lifetime (a context borrows its model, so it can't live in a
 struct; each model slot owns its own context, so the cleanup and instruction models keep
 independent KV caches). The worker tracks the resident token sequence and **reuses the shared KV-cache prefix**
@@ -588,10 +588,10 @@ hot-swapping.
 ## Config & precedence
 
 User config lives in `~/.config/local-dictation/` — the directory is resolved in **one** place
-(`app_paths::config_dir` / `config_file`), so every consumer (`settings.rs`, `prompts.rs`,
+(`app_paths::config_dir` / `config_file`), so every consumer (`settings/`, `prompts.rs`,
 `corrections.rs`, `history.rs`, `dictionary.rs`, the menu bar) shares the same location rather than
 re-joining the path:
-- `settings.json` (`settings.rs`) — written by the menu bar. Keys: `llm_model`, `instruction_model`, `hotkey_keycode`,
+- `settings.json` (`settings/`) — written by the menu bar. Keys: `llm_model`, `instruction_model`, `hotkey_keycode`,
   `hotkey_modifiers`, `cleanup_enabled`, `active_format`, `streaming_asr`, `preroll_ms`,
   `listen_mode`, `wake_word`, `tail_capture`, `tail_capture_cap_ms`, `warm_window_ms`,
   `translation_targets`, `active_translation_target`, `history_retention`, `whisper_mode`,
