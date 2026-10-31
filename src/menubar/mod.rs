@@ -652,6 +652,9 @@ define_class!(
                     MODEL_RELEASE_TIMEOUT.as_millis()
                 );
             }
+            // The worker's Shutdown arm does not unmute; a quit mid-capture
+            // would otherwise leave the Mac muted after we are gone.
+            crate::audio_duck::restore();
             // Only now. "Apply and restart" has already spawned the
             // replacement and it is sitting on the single-instance lock: the
             // moment it gets the lock it loads the whole model stack, so
