@@ -31,6 +31,18 @@ fn the_selection_probe_reads_once_the_copy_lands_and_stops_at_the_deadline() {
 }
 
 #[test]
+fn the_probe_restores_after_a_double_write_of_the_same_selection() {
+    // Regression: an app that writes one copy twice moved the count after
+    // the read, and the user's clipboard was left holding the selection.
+    assert!(probe_may_restore(Some(8), Some(9), "selected", || "selected".into()));
+    assert!(
+        !probe_may_restore(Some(8), Some(9), "selected", || "the user's new copy".into()),
+        "a different write after the read is the user's: leave it"
+    );
+    assert!(probe_may_restore(Some(8), Some(8), "selected", || panic!("no read when the count held")));
+}
+
+#[test]
 fn a_late_write_after_the_probe_read_blocks_the_restore() {
     // The copy landed at 8. A slow app's second write (9) arrives before
     // the restore: the restore must stand down rather than replace it.

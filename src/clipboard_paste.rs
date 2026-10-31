@@ -575,8 +575,10 @@ fn restore_snapshot_if_owned(orig: &ClipboardSnapshot, our_count: Option<isize>)
 }
 
 /// How long the target app gets to service the synthesized Cmd+C. We poll
-/// `changeCount` and read as soon as it moves; a count that never moves within
-/// this window means nothing was selected.
+/// `changeCount` and read as soon as it moves, so a real selection returns at
+/// the first write. Only "nothing selected" waits the whole window, and that
+/// path is already a failure; a shorter window would misread a slow app's copy
+/// (an Electron renderer under load) as no selection.
 const COPY_WAIT_MAX: Duration = Duration::from_millis(400);
 const COPY_POLL: Duration = Duration::from_millis(10);
 
@@ -602,6 +604,19 @@ fn wait_for_change_count(
         }
         std::thread::sleep(poll);
     }
+}
+
+/// Whether the selection probe may put the user's clipboard back. Yes when
+/// nothing wrote after the copy we read, or when what is there now is the text
+/// we read (an app that writes one copy twice). `current_text` is read only
+/// when the count moved. Pure over its inputs: unit-tested.
+fn probe_may_restore(
+    copied_count: Option<isize>,
+    now_count: Option<isize>,
+    probed: &str,
+    current_text: impl FnOnce() -> String,
+) -> bool {
+    !user_copied_during_settle(copied_count, now_count) || current_text() == probed
 }
 
 /// Grab the focused app's current selection via a Cmd+C round-trip, returning
@@ -632,11 +647,14 @@ pub fn copy_selection_via_clipboard() -> eyre::Result<Option<String>> {
 
     let after = cb.get_text().unwrap_or_default();
 
-    // Put the user's clipboard back, unless something wrote to it after the
-    // copy we read (a slow app's late Cmd+C, or the user): restoring then would
-    // replace what is there now. An empty snapshot means the clipboard was
-    // empty: clear rather than leave the sentinel or the selection behind.
-    if user_copied_during_settle(copied_count, pasteboard_change_count()) {
+    // Put the user's clipboard back, unless something else was written after
+    // the copy we read (the user copied, or a late copy changed the text):
+    // restoring then would replace what is there now. An app that writes the
+    // same selection twice still gets restored. An empty snapshot means the
+    // clipboard was empty: clear rather than leave the sentinel or the
+    // selection behind.
+    let current_text = || cb.get_text().unwrap_or_default();
+    if !probe_may_restore(copied_count, pasteboard_change_count(), &after, current_text) {
         eprintln!("[clipboard] clipboard changed after the selection probe; leaving it as-is");
     } else if saved.is_empty() {
         let _ = write_text_transient("");
