@@ -369,3 +369,38 @@ fn triple_tap_latches_then_stops() {
     ]);
     assert_eq!(end, ST_IDLE);
 }
+
+#[test]
+fn every_landed_text_gets_its_feedback_from_one_place() {
+    // Regression: retry, listen and spoken commands each copied the settle
+    // stage and dropped the success cue, the result pill and the Undo target,
+    // so the pill's Undo pointed at the previous dictation's app.
+    const LANDED_EFFECTS: [&str; 5] = [
+        "cues::play_success",
+        "set_last_inject_pid",
+        "show_result_pill(",
+        "StageKind::Output, text, note",
+        "DictationOutcome::Inject",
+    ];
+    let files = [
+        ("capture.rs", include_str!("capture.rs")),
+        ("listen.rs", include_str!("listen.rs")),
+        ("recover.rs", include_str!("recover.rs")),
+        ("release.rs", include_str!("release.rs")),
+        ("tail.rs", include_str!("tail.rs")),
+        ("transcribe.rs", include_str!("transcribe.rs")),
+        ("transform.rs", include_str!("transform.rs")),
+        ("worker.rs", include_str!("worker.rs")),
+    ];
+    let mut bad = Vec::new();
+    for (name, src) in files {
+        for effect in LANDED_EFFECTS {
+            if src.contains(effect) {
+                bad.push(format!("{name}: {effect} -> call deliver::settle, write_and_land or land"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "landed-text effects outside deliver.rs: {bad:?}");
+    let deliver = include_str!("deliver.rs");
+    assert!(LANDED_EFFECTS.iter().all(|e| deliver.contains(e)));
+}

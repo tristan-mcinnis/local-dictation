@@ -74,12 +74,10 @@ pub(super) fn handle_transform(pipeline: &Pipeline, instruction: &str, generatio
     if !authorize_paste(generation) { return RecoveryStatus::Cancelled; }
     match crate::clipboard_paste::paste_via_clipboard(result, expected) {
         Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
-            eprintln!("  ✓    transformed in {} ms", ms(t.elapsed()));
+            eprintln!("  ✎    transformed in {} ms", ms(t.elapsed()));
             // A rewrite is a finished transcript too: "Copy last dictation"
             // must return it, not the dictation before it.
-            ui_channel::set_last_dictation(result);
-            ui_channel::set_last_inject_pid(expected);
-            crate::history::append_recovery_stage(generation, StageKind::Output, result, "Selection replaced");
+            land(pipeline.result, generation, result, "Selection replaced", TrailingAction::None);
             RecoveryStatus::Completed
         },
         Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
@@ -142,11 +140,6 @@ pub(super) fn handle_spoken_command(
     crate::history::append_recovery_stage(generation, StageKind::Transform, result, &cmd.label);
     ui_channel::publish_preview(generation, result);
     let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
-    let delivery = deliver(pipeline.result, generation, None, captured_target, target_pid, result);
-    if delivery == Delivery::Delivered {
-        eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
-        ui_channel::set_last_dictation(result);
-        crate::history::append_recovery_stage(generation, StageKind::Output, result, "Inserted");
-    }
-    recovery_status(delivery)
+    let to = Destination { prefs: pipeline.result, generation, hold: None, target: captured_target, target_pid };
+    write_and_land(to, result, TrailingAction::None, |_| eprintln!("  ⌘    done in {} ms", ms(t.elapsed())))
 }

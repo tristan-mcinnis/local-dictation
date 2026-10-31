@@ -149,57 +149,40 @@ impl WorkerState {
             crate::history::append_recovery_stage(generation, crate::history::StageKind::Cleaned, &cleaned.text, "Accepted model cleanup");
         }
         ui_channel::publish_preview(generation, &cleaned.text);
-        let Some((final_text, action)) = self.refine(&cleaned.text, generation, &mut recovery) else {
-            return Flow::Now;
-        };
-
-        // The critical reject gate, evaluated at write time through the
-        // injector's write-authorizer:
-        //   1. cancel: `commit()` is the linearizable point that flips this
-        //      utterance from cancellable to committing. It is claimed by the
-        //      injector at the LAST moment, after the focus/context/padding
-        //      re-resolve and immediately before the first write/clipboard
-        //      side effect, so a cancel that lands during a slow (up to 1.5s)
-        //      AX lookup is still honored. A refusal maps to
-        //      `Delivery::Cancelled`.
-        //   2. focus: the injector re-resolves the CURRENT focused element and
-        //      gates on its role/writability, so a stale key-press target or a
-        //      same-app focus change never writes blindly. `finalize_utterance`
-        //      is the tested seam; the sink is the actual AX/clipboard call.
+        // The write gate (cancel commit and fresh focus check) is claimed by
+        // the injector's write authorizer immediately before the first side
+        // effect; see `deliver`.
         let used_fresh_capture = target.captured.is_none();
-        let t_inject = Instant::now();
-        let delivery = deliver(
-            self.text.result,
+        let to = Destination {
+            prefs: self.text.result,
             generation,
             // A limit stop is held by decision: known "do not write".
-            limit_stopped.then_some(crate::last_dictation::KeptCause::LimitReached),
-            target.captured,
-            target.pid,
-            &final_text,
-        );
-        let t_inject_ms = ms(t_inject.elapsed());
-        recovery.status = recovery_status(delivery);
-        crate::latency::record(crate::latency::Snapshot {
-            release_ms: ms(t_release.elapsed()) as u64,
-            tail_ms: t_tail_ms as u64,
-            capture_stop_ms: t_capture_stop_ms as u64,
-            asr_ms: ms(t_transcribe) as u64,
-            cleanup_ms: t_cleanup_ms as u64,
-            focus_ms: target.focus_wait_ms as u64,
-            insertion_ms: t_inject_ms as u64,
-            inserted: delivery == Delivery::Delivered,
+            hold: limit_stopped.then_some(crate::last_dictation::KeptCause::LimitReached),
+            target: target.captured,
+            target_pid: target.pid,
+        };
+        recovery.status = settle(&self.text.refiner, &cleaned.text, to, |written| {
+            crate::latency::record(crate::latency::Snapshot {
+                release_ms: ms(t_release.elapsed()) as u64,
+                tail_ms: t_tail_ms as u64,
+                capture_stop_ms: t_capture_stop_ms as u64,
+                asr_ms: ms(t_transcribe) as u64,
+                cleanup_ms: t_cleanup_ms as u64,
+                focus_ms: target.focus_wait_ms as u64,
+                insertion_ms: written.write_ms as u64,
+                inserted: written.delivery == Delivery::Delivered,
+            });
+            self.log_summary(
+                self.config.capture.streaming_asr.then_some((segs_cached, final_seg_ms)),
+                &raw_transcript,
+                written.text,
+                target.pid,
+                used_fresh_capture,
+                ms(t_transcribe),
+                t_cleanup_ms,
+                written.write_ms,
+            );
         });
-        self.log_summary(
-            self.config.capture.streaming_asr.then_some((segs_cached, final_seg_ms)),
-            &raw_transcript,
-            &final_text,
-            target.pid,
-            used_fresh_capture,
-            ms(t_transcribe),
-            t_cleanup_ms,
-            t_inject_ms,
-        );
-        settle_delivery(delivery, &final_text, action, generation, self.text.result);
         eprintln!();
         // The utterance settled (injected, held, cancelled, or failed): close
         // the cancel window so the gate reads idle and an idle Escape is never
@@ -339,42 +322,6 @@ impl WorkerState {
         ResolvedTarget { captured, app, pid, focus_wait_ms }
     }
 
-    /// Corrections dictionary + trailing voice-command parsing, in the
-    /// canonical order (corrections first). Same transform the CLI
-    /// `dictate`/`bench` paths use, so behaviour matches. The branching lives
-    /// in `RefinedDictation::outcome`, unit-tested without audio; the three
-    /// non-inject arms log, return to idle and end the release with `None`,
-    /// leaving the hot path to handle only the inject case.
-    fn refine(&self, text: &str, generation: u64, recovery: &mut RecoveryFinish) -> Option<(String, TrailingAction)> {
-        match self.text.refiner.refine(text).outcome() {
-            DictationOutcome::Discard => {
-                recovery.status = crate::history::RecoveryStatus::Cancelled;
-                eprintln!("  ⌫    scratch that · discarded");
-                eprintln!();
-                ui_channel::set_state(UiState::Idle);
-                None
-            }
-            DictationOutcome::BareAction(action) => {
-                if authorize_paste(generation) {
-                    execute_trailing_action(&action);
-                    recovery.status = crate::history::RecoveryStatus::Completed;
-                }
-                eprintln!("  ↵    bare command (no body)");
-                eprintln!();
-                ui_channel::set_state(UiState::Idle);
-                None
-            }
-            DictationOutcome::Skip => {
-                recovery.status = crate::history::RecoveryStatus::Completed;
-                eprintln!("  skip · cleaned to empty");
-                eprintln!();
-                ui_channel::set_state(UiState::Idle);
-                None
-            }
-            DictationOutcome::Inject { text, action } => Some((text, action)),
-        }
-    }
-
     /// The per-utterance summary block: timings, the target app, the model,
     /// and the raw transcript whenever cleanup changed it, so ASR-vs-cleanup
     /// is always attributable after the fact.
@@ -439,37 +386,4 @@ fn settle_instruction() -> Flow {
         ui_channel::set_state(UiState::Idle);
     }
     Flow::Now
-}
-
-/// What a landed dictation leaves behind: the success cue, the last dictation
-/// for the menu, the Undo target, the result pill, the History row and the
-/// trailing key. A held text was already kept by `deliver`.
-fn settle_delivery(delivery: Delivery, final_text: &str, action: TrailingAction, generation: u64, prefs: ResultPrefs) {
-    match delivery {
-        Delivery::Delivered => {
-            eprintln!("  ✓    {}", crate::daemon_log::text(final_text));
-            cues::play_success();
-            // Remember it for the menu-bar "Copy last dictation" item. Stored
-            // BEFORE the pill shows so the word count is this dictation's,
-            // not the previous one's.
-            ui_channel::set_last_dictation(final_text);
-            // The write was just verified against the frontmost app; the
-            // pill's Undo is only valid while that app stays in front.
-            ui_channel::set_last_inject_pid(crate::injector::frontmost_pid());
-            show_result_pill(prefs);
-            // Persist to the browsable dictation history (best-effort; never
-            // blocks or fails the hot path).
-            crate::history::append_recovery_stage(generation, crate::history::StageKind::Output, final_text, "Inserted");
-            if !matches!(action, TrailingAction::None) {
-                // Clipboard insertion returns after queuing Cmd+V. Keep
-                // Enter/Tab behind its consume/restore window so a slow app
-                // cannot submit the previous field text.
-                crate::clipboard_paste::wait_for_pending_transaction();
-                std::thread::sleep(Duration::from_millis(40));
-                execute_trailing_action(&action);
-            }
-        }
-        Delivery::Held(_) => {}
-        Delivery::Cancelled => ui_channel::set_state(UiState::Idle),
-    }
 }

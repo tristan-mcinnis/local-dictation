@@ -99,7 +99,7 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
 
             let generation = ui_channel::begin_utterance(UiState::Transcribing, false);
             let _utterance = ui_channel::UtteranceScope(generation);
-            dictate_transcript(&pipeline, &body, generation);
+            dictate_transcript(&pipeline, &body, generation, "ASR, hands-free segment");
         }
 
         // Keep memory bounded over a long listening session.
@@ -130,16 +130,19 @@ pub(super) fn retry_last(
         eprintln!("  ↻    retry: empty transcript");
         return;
     }
-    dictate_transcript(pipeline, &transcript, retry_gen);
+    dictate_transcript(pipeline, &transcript, retry_gen, "ASR, retry of the last recording");
 }
 
-/// Clean, refine and deliver a transcript that did not come from a live
-/// release: a retry of the retained audio, or a wake-word segment. The target
-/// evidence is the field under the caret now, and from there the path is the
-/// live one: the same cleanup policy (corrections, the short and clean
-/// shortcut, the dropped-content guard, the terminal skip, tone and screen
-/// vocabulary), the same refiner, the same cancel gate and write authorizer.
-pub(super) fn dictate_transcript(pipeline: &Pipeline, transcript: &str, generation: u64) {
+/// Clean and settle a transcript that did not come from a live release: a
+/// retry of the retained audio, or a wake-word segment. The target evidence is
+/// the field under the caret now; from the transcript on, the path is the live
+/// one: the same cleanup policy, the same `settle` (refiner, cancel gate,
+/// write authorizer, success feedback, Undo target) and its own History row,
+/// whose first stage is the transcript with `source` as its note.
+pub(super) fn dictate_transcript(pipeline: &Pipeline, transcript: &str, generation: u64, source: &str) {
+    crate::history::begin_recovery(generation);
+    let mut recovery = RecoveryFinish::new(generation);
+    crate::history::append_recovery_stage(generation, crate::history::StageKind::Raw, transcript, source);
     ui_channel::publish_preview(generation, transcript);
     if !crate::cancel::CANCEL.allows_progress(generation) {
         return;
@@ -152,60 +155,6 @@ pub(super) fn dictate_transcript(pipeline: &Pipeline, transcript: &str, generati
         return;
     };
     ui_channel::publish_preview(generation, &cleaned.text);
-    match pipeline.refiner.refine(&cleaned.text).outcome() {
-        DictationOutcome::Discard => eprintln!("  ⌫    scratch that · discarded"),
-        DictationOutcome::Skip => eprintln!("  skip · empty after cleanup"),
-        DictationOutcome::BareAction(action) => {
-            if authorize_paste(generation) {
-                execute_trailing_action(&action);
-            }
-            eprintln!("  ↵    bare command");
-        }
-        DictationOutcome::Inject { text, action } => {
-            if deliver(pipeline.result, generation, None, focus, target_pid, &text) != Delivery::Delivered {
-                return;
-            }
-            eprintln!("  ✓    {}", crate::daemon_log::text(&text));
-            ui_channel::set_last_dictation(&text);
-            crate::history::record(&text);
-            if !matches!(action, TrailingAction::None) {
-                // Clipboard insertion returns after queuing Cmd+V. Keep
-                // Enter/Tab behind its consume/restore window so a slow app
-                // cannot submit the previous field text.
-                crate::clipboard_paste::wait_for_pending_transaction();
-                std::thread::sleep(Duration::from_millis(40));
-                execute_trailing_action(&action);
-            }
-        }
-    }
+    let to = Destination { prefs: pipeline.result, generation, hold: None, target: focus, target_pid };
+    recovery.status = settle(&pipeline.refiner, &cleaned.text, to, |_| {});
 }
-
-/// Run a trailing voice command's keystroke(s). `None`/`Cancel` are no-ops
-/// (the caller handles `Cancel` earlier). Errors are logged, never fatal.
-pub(super) fn execute_trailing_action(action: &TrailingAction) {
-    use crate::clipboard_paste::{
-        synthesize_escape, synthesize_return, synthesize_tab, synthesize_undo,
-    };
-    if matches!(action, TrailingAction::None | TrailingAction::Cancel) { return; }
-    // Shared by ordinary dictation, retries, listen mode and bare commands.
-    // No trailing key may overtake a pending clipboard consume/restore window.
-    let result = crate::clipboard_paste::after_pending_transaction(|| match action {
-        TrailingAction::None | TrailingAction::Cancel => Ok(()),
-        TrailingAction::PressEnter => synthesize_return(),
-        TrailingAction::NewParagraph => {
-            // Two Returns, with a beat between so apps that debounce key
-            // repeat still register both.
-            let first = synthesize_return();
-            std::thread::sleep(Duration::from_millis(15));
-            first.and(synthesize_return())
-        }
-        TrailingAction::PressTab => synthesize_tab(),
-        TrailingAction::PressEscape => synthesize_escape(),
-        TrailingAction::Undo => synthesize_undo(),
-    });
-    match (action, result) {
-        (_, Ok(())) => eprintln!("  ↵    {action:?} sent"),
-        (_, Err(e)) => eprintln!("  ✗    {action:?} failed: {e:?}"),
-    }
-}
-
