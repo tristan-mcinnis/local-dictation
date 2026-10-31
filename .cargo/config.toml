@@ -1,0 +1,5 @@
+[env]
+# llama.cpp's vendored cpp-httplib links OpenSSL when CMake finds one, and
+# Homebrew's OpenSSL 4 breaks its build. The app never fetches over HTTPS from
+# llama.cpp (no network while dictating), so keep OpenSSL out of the build.
+CMAKE_DISABLE_FIND_PACKAGE_OpenSSL = "TRUE"
