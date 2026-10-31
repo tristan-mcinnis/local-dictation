@@ -26,6 +26,11 @@ pub enum KeptCause {
     PasteFailed,
     /// The recording hit the maximum length and was stopped without a key.
     LimitReached,
+    /// The clipboard route was refused because the user's clipboard holds
+    /// content that could not be put back (a promised file, an image past the
+    /// snapshot budget). The text is never auto-copied either: that would
+    /// destroy the same clipboard the refusal protected.
+    ClipboardProtected,
 }
 
 /// The pill state for a transcript that was kept instead of inserted.
@@ -37,6 +42,7 @@ pub fn kept_state(cause: KeptCause, copied: bool) -> UiState {
         (KeptCause::PasteFailed, true) => UiState::PasteFailedCopied,
         (KeptCause::LimitReached, false) => UiState::LimitReached,
         (KeptCause::LimitReached, true) => UiState::LimitReachedCopied,
+        (KeptCause::ClipboardProtected, _) => UiState::ClipboardProtected,
     }
 }
 
@@ -50,6 +56,7 @@ pub fn kept_pill_text(state: UiState) -> Option<&'static str> {
         UiState::PasteFailedCopied => "Couldn’t paste · Copied, press ⌘V",
         UiState::LimitReached => "Recording limit reached · Copy from menu",
         UiState::LimitReachedCopied => "Recording limit reached · Copied, press ⌘V",
+        UiState::ClipboardProtected => "Clipboard kept, not pasted · Copy from menu",
         _ => return None,
     })
 }
@@ -63,6 +70,7 @@ pub fn kept_stage_note(cause: KeptCause, copied: bool) -> &'static str {
         (KeptCause::PasteFailed, false) => "Not inserted",
         (KeptCause::LimitReached, true) => "Not inserted (recording limit); copied to clipboard",
         (KeptCause::LimitReached, false) => "Not inserted (recording limit)",
+        (KeptCause::ClipboardProtected, _) => "Not inserted (clipboard content could not be restored)",
     }
 }
 
@@ -78,6 +86,7 @@ pub fn keep(
 ) -> UiState {
     ui_channel::set_last_dictation(text);
     let copied = auto_copy
+        && cause != KeptCause::ClipboardProtected
         && !text.trim().is_empty()
         && match copy(text) {
             Ok(()) => true,
@@ -222,6 +231,21 @@ mod tests {
             }
         }
         assert_eq!(kept_pill_text(UiState::Success), None);
+    }
+
+    #[test]
+    fn a_protected_clipboard_is_never_overwritten_by_the_auto_copy() {
+        let _g = lock();
+        // Regression: the refusal to overwrite an unrestorable clipboard fell
+        // through to copy-on-paste-failure, which overwrote it anyway.
+        let state = keep("kept words", KeptCause::ClipboardProtected, true, |_| {
+            panic!("the auto-copy must not touch a protected clipboard")
+        });
+        assert_eq!(state, UiState::ClipboardProtected);
+        assert!(state.is_kept_result());
+        assert_eq!(ui_channel::last_dictation(), "kept words");
+        assert_eq!(kept_pill_text(state), Some("Clipboard kept, not pasted · Copy from menu"));
+        assert!(!kept_stage_note(KeptCause::ClipboardProtected, true).contains("copied"));
     }
 
     #[test]

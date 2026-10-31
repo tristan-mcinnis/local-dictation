@@ -121,6 +121,7 @@ pub(super) fn pill_status(state: UiState, details: bool) -> &'static str {
         UiState::PasteFailed | UiState::PasteFailedCopied => "Couldn’t paste",
         UiState::NoEditableField | UiState::HeldCopied => "No text field selected",
         UiState::LimitReached | UiState::LimitReachedCopied => "Recording limit reached",
+        UiState::ClipboardProtected => "Clipboard kept, not pasted",
         UiState::NothingToCopy => NOTHING_TO_COPY_TEXT,
         UiState::Unavailable => "Not ready",
         UiState::Idle => "Ready",

@@ -200,6 +200,14 @@ pub fn render_ui(out_dir: &str) -> eyre::Result<Vec<PathBuf>> {
                 false,
             ),
             (
+                "pill-clipboard-protected",
+                PillLayout::Error,
+                UiState::ClipboardProtected,
+                crate::last_dictation::kept_pill_text(UiState::ClipboardProtected).unwrap(),
+                false,
+                false,
+            ),
+            (
                 "pill-nothing-to-copy",
                 PillLayout::Copied,
                 UiState::NothingToCopy,

@@ -571,6 +571,17 @@ fn injector_discovering_no_field_reports_held() {
 }
 
 #[test]
+fn a_protected_clipboard_is_held_with_its_own_cause() {
+    // Regression: the refusal used to be a generic Err, so it was held as a
+    // failed paste and the copy-on-paste-failure setting overwrote the very
+    // clipboard the refusal protected.
+    assert_eq!(
+        delivery_of(Ok(InjectOutcome::ClipboardProtected), None),
+        Delivery::Held(KeptCause::ClipboardProtected)
+    );
+}
+
+#[test]
 fn hard_write_failure_is_kept_as_a_failed_paste() {
     let result = finalize_utterance(false, None, "x", None, |_| {
         Err(eyre::eyre!("AX refused"))

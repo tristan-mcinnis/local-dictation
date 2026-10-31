@@ -366,23 +366,7 @@ unsafe fn inject_through(
             if let Some(cancelled) = claim_write_authorization(authorize) {
                 return Ok(cancelled);
             }
-            match crate::clipboard_paste::paste_via_clipboard(&padded, expected_pid) {
-                Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
-                    super::remember_tail(&padded);
-                    return Ok(InjectOutcome::Injected);
-                }
-                Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-                    eprintln!(
-                        "{}",
-                        super::hold_log_line(
-                            &format!("target {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
-                            &super::app_label_for_pid(expected_pid),
-                        )
-                    );
-                    return Ok(InjectOutcome::RefusedForeground);
-                }
-                Err(e) => return Err(e),
-            }
+            return clipboard_paste_outcome(&padded, expected_pid);
         }
         eprintln!(
             "{}",
@@ -531,23 +515,7 @@ unsafe fn write_padded(
         if prof {
             eprintln!("[inject-prof] clipboard route (editability {editability:?}, pid {pid:?})");
         }
-        match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
-            Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
-                super::remember_tail(padded);
-                return Ok(InjectOutcome::Injected);
-            }
-            Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-                eprintln!(
-                    "{}",
-                    super::hold_log_line(
-                        &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
-                        &super::app_label_for_pid(expected_pid),
-                    )
-                );
-                return Ok(InjectOutcome::RefusedForeground);
-            }
-            Err(e) => return Err(e),
-        }
+        return clipboard_paste_outcome(padded, expected_pid);
     }
 
     let payload = CFString::new(padded);
@@ -593,23 +561,7 @@ unsafe fn write_padded(
             &super::app_label_for_pid_cheap(pid.or(expected_pid)),
         )
     );
-    match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
-        Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
-            super::remember_tail(padded);
-            Ok(InjectOutcome::Injected)
-        }
-        Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-            eprintln!(
-                "{}",
-                super::hold_log_line(
-                    &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
-                    &super::app_label_for_pid(expected_pid),
-                )
-            );
-            Ok(InjectOutcome::RefusedForeground)
-        }
-        Err(e) => Err(e),
-    }
+    clipboard_paste_outcome(padded, expected_pid)
 }
 
 /// Called after an AX write returns `kAXErrorSuccess`. Some apps (Electron
@@ -660,23 +612,7 @@ unsafe fn confirm_or_fallback(
         )
     );
     super::mark_clipboard_only(pid);
-    match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid) {
-        Ok(crate::clipboard_paste::PasteOutcome::Delivered) => {
-            super::remember_tail(padded);
-            Ok(InjectOutcome::Injected)
-        }
-        Ok(crate::clipboard_paste::PasteOutcome::RefusedForeground) => {
-            eprintln!(
-                "{}",
-                super::hold_log_line(
-                    &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
-                    &super::app_label_for_pid(expected_pid),
-                )
-            );
-            Ok(InjectOutcome::RefusedForeground)
-        }
-        Err(e) => Err(e),
-    }
+    clipboard_paste_outcome(padded, expected_pid)
 }
 
 /// The field's value + selected range, for the before/after comparison in
@@ -967,5 +903,29 @@ fn capture_focus_target_for_pid_mode(
         );
         cf_release(app as CFTypeRef);
         result
+    }
+}
+
+/// Paste `padded` through the clipboard route and translate the answer. A
+/// paste whose expected app left the front, or whose clipboard could not be
+/// protected, writes nothing; both are held, never pasted blindly.
+fn clipboard_paste_outcome(padded: &str, expected_pid: Option<i32>) -> eyre::Result<InjectOutcome> {
+    use crate::clipboard_paste::PasteOutcome;
+    match crate::clipboard_paste::paste_via_clipboard(padded, expected_pid)? {
+        PasteOutcome::Delivered => {
+            super::remember_tail(padded);
+            Ok(InjectOutcome::Injected)
+        }
+        PasteOutcome::RefusedForeground => {
+            eprintln!(
+                "{}",
+                super::hold_log_line(
+                    &format!("expected app {expected_pid:?} not frontmost at Cmd+V — holding (not pasted)"),
+                    &super::app_label_for_pid(expected_pid),
+                )
+            );
+            Ok(InjectOutcome::RefusedForeground)
+        }
+        PasteOutcome::ClipboardProtected => Ok(InjectOutcome::ClipboardProtected),
     }
 }

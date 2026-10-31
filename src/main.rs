@@ -171,6 +171,9 @@ fn run_inject_test(text: Option<String>) -> eyre::Result<()> {
         fast_dictate_backend::injector::InjectOutcome::RefusedForeground => Err(eyre::eyre!(
             "target not frontmost at paste — held (nothing written)"
         )),
+        fast_dictate_backend::injector::InjectOutcome::ClipboardProtected => Err(eyre::eyre!(
+            "clipboard holds content that cannot be restored, held (nothing written)"
+        )),
     }
 }
 

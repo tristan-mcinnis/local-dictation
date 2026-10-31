@@ -13,7 +13,7 @@
 //! [`SNAPSHOT_BUDGET_BYTES`]: lazily promised file data (the promising app is
 //! the only one that can produce it) and anything past the snapshot byte
 //! budget. When that is the whole clipboard, the write is refused instead
-//! ([`snapshot_or_refuse`]) and the caller keeps the text. We also guard the restore with the pasteboard's `changeCount` so a
+//! ([`PasteOutcome::ClipboardProtected`]) and the caller keeps the text. We also guard the restore with the pasteboard's `changeCount` so a
 //! user copying something during the paste-settle window isn't clobbered (see
 //! [`paste_via_clipboard`]).
 //!
@@ -41,6 +41,11 @@ pub enum PasteOutcome {
     /// Cmd+V was NOT posted (fail-closed — it would land in the wrong app).
     /// The caller holds the transcript recoverable and never pastes blindly.
     RefusedForeground,
+    /// The user's clipboard holds only content that could not be put back (a
+    /// promised file, an image past the snapshot budget), so nothing was
+    /// written and no Cmd+V was posted. The caller keeps the text and must not
+    /// copy it either: that would destroy the same clipboard.
+    ClipboardProtected,
 }
 
 // ⌘C / ⌘V / ⌘Z are posted at the key that types the letter in the CURRENT
@@ -358,16 +363,12 @@ fn fits_budget(used: usize, len: usize, budget: usize) -> bool {
 /// Objective-C objects) so it can cross to the detached restore thread.
 type ClipboardSnapshot = Vec<Vec<(String, Vec<u8>)>>;
 
-/// Snapshot the clipboard before one of our writes, or refuse the write when
-/// the user's clipboard holds something (a promised file, an image past the
-/// budget) of which nothing could be put back: writing would destroy it.
-fn snapshot_or_refuse() -> eyre::Result<ClipboardSnapshot> {
+/// Snapshot the clipboard before one of our writes, or `None` when the user's
+/// clipboard holds something (a promised file, an image past the budget) of
+/// which nothing could be put back: writing would destroy it.
+fn restorable_snapshot() -> Option<ClipboardSnapshot> {
     let (snapshot, item_count) = snapshot_pasteboard();
-    eyre::ensure!(
-        !would_lose_clipboard(item_count, &snapshot),
-        "the clipboard holds content that cannot be restored; not overwriting it"
-    );
-    Ok(snapshot)
+    (!would_lose_clipboard(item_count, &snapshot)).then_some(snapshot)
 }
 
 /// True when the clipboard had items but none of them is restorable. Pure.
@@ -504,7 +505,10 @@ pub fn paste_via_clipboard(text: &str, expected_pid: Option<i32>) -> eyre::Resul
         return Ok(PasteOutcome::RefusedForeground);
     }
 
-    let saved = snapshot_or_refuse()?;
+    let Some(saved) = restorable_snapshot() else {
+        eprintln!("[clipboard] the clipboard holds content that cannot be restored; not overwriting it");
+        return Ok(PasteOutcome::ClipboardProtected);
+    };
 
     write_preserving_snapshot(text, &saved)?;
 
@@ -615,7 +619,9 @@ pub fn copy_selection_via_clipboard() -> eyre::Result<Option<String>> {
     // between our set and the Cmd+C that reads it.
     let _permit = clipboard_gate().acquire();
     let mut cb = Clipboard::new().map_err(|e| eyre::eyre!("Clipboard::new failed: {e}"))?;
-    let saved = snapshot_or_refuse()?;
+    let saved = restorable_snapshot().ok_or_else(|| {
+        eyre::eyre!("the clipboard holds content that cannot be restored; not overwriting it")
+    })?;
 
     // The probe is one of our own writes too: mark it transient so clipboard
     // managers don't record the sentinel (or the selection Cmd+C pulls in).

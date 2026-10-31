@@ -379,7 +379,8 @@ pub(super) fn apply_state_transition(globals: &UiGlobals, state: UiState) {
         | UiState::HeldCopied
         | UiState::PasteFailedCopied
         | UiState::LimitReached
-        | UiState::LimitReachedCopied => {
+        | UiState::LimitReachedCopied
+        | UiState::ClipboardProtected => {
             // The words exist but did not reach the app. One sentence: what
             // happened, then where the text is ("Copied, press ⌘V" when it is
             // on the clipboard). The Error layout carries the History button,

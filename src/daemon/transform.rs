@@ -87,6 +87,11 @@ pub(super) fn handle_transform(pipeline: &Pipeline, instruction: &str, generatio
             keep_and_show(pipeline.result, generation, result, crate::last_dictation::KeptCause::NoEditableField);
             RecoveryStatus::Held
         }
+        Ok(crate::clipboard_paste::PasteOutcome::ClipboardProtected) => {
+            eprintln!("  ◌    transform not pasted, the clipboard holds content that cannot be restored (text kept) app={}", crate::injector::app_label_for_pid(expected));
+            keep_and_show(pipeline.result, generation, result, crate::last_dictation::KeptCause::ClipboardProtected);
+            RecoveryStatus::Held
+        }
         Err(e) => {
             eprintln!("  ✗    transform paste failed: {e:?}");
             keep_and_show(pipeline.result, generation, result, crate::last_dictation::KeptCause::PasteFailed);

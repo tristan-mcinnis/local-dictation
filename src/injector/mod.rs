@@ -88,6 +88,11 @@ pub enum InjectOutcome {
     /// a global paste would land in the wrong app). Nothing was written. The
     /// caller should hold the transcript recoverable, like [`NoEditableField`].
     RefusedForeground,
+    /// The clipboard route was refused before any write: the user's clipboard
+    /// holds content that could not be restored afterwards. Nothing was
+    /// written and the clipboard is untouched; the caller keeps the text and
+    /// must not auto-copy it.
+    ClipboardProtected,
 }
 
 /// Claim write authorization exactly once, immediately before the first
@@ -220,6 +225,10 @@ pub fn delivery_of(result: eyre::Result<InjectOutcome>, target_pid: Option<i32>)
         Ok(InjectOutcome::RefusedForeground) => {
             eprintln!("  ◌    target not frontmost at paste, text kept app={}", app_label_for_pid(target_pid));
             Delivery::Held(KeptCause::NoEditableField)
+        }
+        Ok(InjectOutcome::ClipboardProtected) => {
+            eprintln!("  ◌    clipboard holds unrestorable content, not pasted, text kept app={}", app_label_for_pid(target_pid));
+            Delivery::Held(KeptCause::ClipboardProtected)
         }
         Err(e) => {
             eprintln!("  ✗    inject failed: {e:?}, text kept app={}", app_label_for_pid(target_pid));

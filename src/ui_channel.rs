@@ -83,6 +83,10 @@ pub enum UiState {
     /// that the selection is unchanged. Terminal like a kept result: never
     /// cancellable, and it stays until it expires or a key press dismisses it.
     RewriteFailed = 17,
+    /// The clipboard route was refused: the user's clipboard holds content we
+    /// could not put back, so it was left alone. The text is kept as the last
+    /// dictation and in History, never auto-copied.
+    ClipboardProtected = 18,
 }
 
 impl UiState {
@@ -118,6 +122,7 @@ impl UiState {
                 | Self::LimitReached
                 | Self::LimitReachedCopied
                 | Self::RewriteFailed
+                | Self::ClipboardProtected
         )
     }
 
@@ -141,6 +146,7 @@ impl UiState {
             15 => UiState::NothingToCopy,
             16 => UiState::Unavailable,
             17 => UiState::RewriteFailed,
+            18 => UiState::ClipboardProtected,
             _ => UiState::Idle,
         }
     }
@@ -593,7 +599,7 @@ mod tests {
 
     #[test]
     fn every_state_round_trips_through_its_byte() {
-        for v in 0..=17u8 {
+        for v in 0..=18u8 {
             assert_eq!(UiState::from_u8(v) as u8, v);
         }
         assert_eq!(UiState::from_u8(200), UiState::Idle);
@@ -625,6 +631,7 @@ mod tests {
             UiState::LimitReached,
             UiState::LimitReachedCopied,
             UiState::RewriteFailed,
+            UiState::ClipboardProtected,
         ] {
             assert!(s.is_kept_result());
             assert!(!s.is_active());
