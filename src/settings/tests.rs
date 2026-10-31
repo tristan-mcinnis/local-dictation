@@ -77,8 +77,10 @@ fn parse_u64_decimal_and_hex() {
 fn hotkey_modifiers_default_zero_and_from_settings() {
     if std::env::var_os("DICTATE_HOTKEY_MODIFIERS").is_none() {
         assert_eq!(Settings::default().resolve_hotkey_modifiers(), 0);
-        let mut s = Settings::default();
-        s.hotkey_modifiers = Some(1 << 20); // Command
+        let s = Settings {
+            hotkey_modifiers: Some(1 << 20), // Command
+            ..Default::default()
+        };
         assert_eq!(s.resolve_hotkey_modifiers(), 1 << 20);
     }
 }
@@ -87,12 +89,14 @@ fn hotkey_modifiers_default_zero_and_from_settings() {
 fn translation_targets_parse_trim_and_drop_blanks() {
     if std::env::var_os("DICTATE_TRANSLATION_TARGETS").is_none() {
         assert!(Settings::default().resolve_translation_targets().is_empty());
-        let mut s = Settings::default();
-        s.translation_targets = Some(vec![
-            " Spanish ".into(),
-            "".into(),
-            "Chinese".into(),
-        ]);
+        let s = Settings {
+            translation_targets: Some(vec![
+                " Spanish ".into(),
+                "".into(),
+                "Chinese".into(),
+            ]),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_translation_targets(), vec!["Spanish", "Chinese"]);
     }
 }
@@ -105,15 +109,19 @@ fn active_translation_target_falls_back_to_first() {
             Settings::default().resolve_active_translation_target(&targets),
             Some("Spanish".to_string())
         );
-        let mut s = Settings::default();
-        s.active_translation_target = Some("chinese".into());
+        let s = Settings {
+            active_translation_target: Some("chinese".into()),
+            ..Default::default()
+        };
         assert_eq!(
             s.resolve_active_translation_target(&targets),
             Some("Chinese".to_string())
         );
         // A configured target not in the list falls back to the first.
-        let mut s2 = Settings::default();
-        s2.active_translation_target = Some("Klingon".into());
+        let s2 = Settings {
+            active_translation_target: Some("Klingon".into()),
+            ..Default::default()
+        };
         assert_eq!(
             s2.resolve_active_translation_target(&targets),
             Some("Spanish".to_string())
@@ -130,8 +138,10 @@ fn active_translation_target_falls_back_to_first() {
 fn history_retention_defaults_forever_and_normalizes() {
     if std::env::var_os("DICTATE_HISTORY_RETENTION").is_none() {
         assert_eq!(Settings::default().resolve_history_retention(), "forever");
-        let mut s = Settings::default();
-        s.history_retention = Some(" 1Month ".into());
+        let s = Settings {
+            history_retention: Some(" 1Month ".into()),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_history_retention(), "1month");
     }
 }
@@ -140,8 +150,10 @@ fn history_retention_defaults_forever_and_normalizes() {
 fn whisper_mode_off_by_default() {
     if std::env::var_os("DICTATE_WHISPER_MODE").is_none() {
         assert!(!Settings::default().resolve_whisper_mode());
-        let mut s = Settings::default();
-        s.whisper_mode = Some(true);
+        let s = Settings {
+            whisper_mode: Some(true),
+            ..Default::default()
+        };
         assert!(s.resolve_whisper_mode());
     }
 }
@@ -150,8 +162,10 @@ fn whisper_mode_off_by_default() {
 fn copy_on_paste_failure_is_on_by_default() {
     if std::env::var_os("DICTATE_COPY_ON_PASTE_FAILURE").is_none() {
         assert!(Settings::default().resolve_copy_on_paste_failure());
-        let mut s = Settings::default();
-        s.copy_on_paste_failure = Some(false);
+        let s = Settings {
+            copy_on_paste_failure: Some(false),
+            ..Default::default()
+        };
         assert!(!s.resolve_copy_on_paste_failure());
     }
 }
@@ -160,8 +174,10 @@ fn copy_on_paste_failure_is_on_by_default() {
 fn copy_last_hotkey_distinguishes_unset_from_off() {
     if std::env::var_os("DICTATE_COPY_LAST_HOTKEY").is_none() {
         assert_eq!(Settings::default().resolve_copy_last_hotkey(), None);
-        let mut s = Settings::default();
-        s.copy_last_hotkey = Some("".into());
+        let mut s = Settings {
+            copy_last_hotkey: Some("".into()),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_copy_last_hotkey().as_deref(), Some(""));
         s.copy_last_hotkey = Some(" ctrl+cmd+v ".into());
         assert_eq!(s.resolve_copy_last_hotkey().as_deref(), Some("ctrl+cmd+v"));
@@ -172,8 +188,10 @@ fn copy_last_hotkey_distinguishes_unset_from_off() {
 fn max_recording_defaults_to_ten_minutes_and_zero_means_no_limit() {
     if std::env::var_os("DICTATE_MAX_RECORDING_MINUTES").is_none() {
         assert_eq!(Settings::default().resolve_max_recording_minutes(), 10);
-        let mut s = Settings::default();
-        s.max_recording_minutes = Some(0);
+        let s = Settings {
+            max_recording_minutes: Some(0),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_max_recording_minutes(), 0);
         assert!(MAX_RECORDING_CHOICES.iter().any(|(m, _)| *m == DEFAULT_MAX_RECORDING_MINUTES));
     }
@@ -213,8 +231,10 @@ fn completion_sound_defaults_and_unknown_falls_back() {
             crate::cues::DEFAULT_COMPLETION_SOUND
         );
         // A saved audition cue is honored.
-        let mut s = Settings::default();
-        s.completion_sound = Some("glass-tick".into());
+        let mut s = Settings {
+            completion_sound: Some("glass-tick".into()),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_completion_sound(), "glass-tick");
         // Unknown, blank and whitespace all fall back rather than go silent.
         s.completion_sound = Some("not-a-real-cue".into());
@@ -242,8 +262,10 @@ fn start_sound_defaults_and_unknown_falls_back() {
             crate::cues::DEFAULT_START_SOUND
         );
         // A saved audition cue is honored.
-        let mut s = Settings::default();
-        s.start_sound = Some("glass-rise".into());
+        let mut s = Settings {
+            start_sound: Some("glass-rise".into()),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_start_sound(), "glass-rise");
         // Unknown, blank and whitespace all fall back rather than go silent.
         s.start_sound = Some("not-a-real-cue".into());
@@ -274,9 +296,11 @@ fn completion_sound_round_trips_through_the_settings_file() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("settings.json");
 
-    let mut s = Settings::default();
-    s.completion_sound = Some("glass-tick".into());
-    s.start_sound = Some("glass-rise".into());
+    let s = Settings {
+        completion_sound: Some("glass-tick".into()),
+        start_sound: Some("glass-rise".into()),
+        ..Default::default()
+    };
     s.save_to(&path).unwrap();
 
     let loaded = Settings::load_from(&path);
@@ -295,16 +319,20 @@ fn completion_sound_round_trips_through_the_settings_file() {
 fn double_tap_latch_on_by_default() {
     if std::env::var_os("DICTATE_DOUBLE_TAP_LATCH").is_none() {
         assert!(Settings::default().resolve_double_tap_latch());
-        let mut s = Settings::default();
-        s.double_tap_latch = Some(false);
+        let s = Settings {
+            double_tap_latch: Some(false),
+            ..Default::default()
+        };
         assert!(!s.resolve_double_tap_latch());
     }
 }
 
 #[test]
 fn cleanup_flag_overrides_settings() {
-    let mut s = Settings::default();
-    s.cleanup_enabled = Some(true);
+    let s = Settings {
+        cleanup_enabled: Some(true),
+        ..Default::default()
+    };
     assert!(!s.resolve_cleanup_enabled(true)); // CLI --no-cleanup wins
     assert!(s.resolve_cleanup_enabled(false));
 }
@@ -322,8 +350,10 @@ fn hotkey_falls_back_to_default_when_unset() {
     if std::env::var_os("DICTATE_HOTKEY_KEYCODE").is_none() {
         let s = Settings::default();
         assert_eq!(s.resolve_hotkey(0x3d), 0x3d);
-        let mut s2 = Settings::default();
-        s2.hotkey_keycode = Some(0x36);
+        let s2 = Settings {
+            hotkey_keycode: Some(0x36),
+            ..Default::default()
+        };
         assert_eq!(s2.resolve_hotkey(0x3d), 0x36);
     }
 }
@@ -333,8 +363,10 @@ fn llm_model_falls_back_to_default_when_unset() {
     if llm_model_env().is_none() {
         let s = Settings::default();
         assert_eq!(s.resolve_llm_model("default.gguf"), "default.gguf");
-        let mut s2 = Settings::default();
-        s2.llm_model = Some("chosen.gguf".to_string());
+        let s2 = Settings {
+            llm_model: Some("chosen.gguf".to_string()),
+            ..Default::default()
+        };
         assert_eq!(s2.resolve_llm_model("default.gguf"), "chosen.gguf");
     }
 }
@@ -347,12 +379,16 @@ fn resolve_format_from_settings_when_no_env() {
         let s = Settings::default();
         assert_eq!(s.resolve_format(), None);
 
-        let mut s2 = Settings::default();
-        s2.active_format = Some("email".into());
+        let s2 = Settings {
+            active_format: Some("email".into()),
+            ..Default::default()
+        };
         assert_eq!(s2.resolve_format(), Some("email".into()));
 
-        let mut s3 = Settings::default();
-        s3.active_format = Some("   ".into()); // blank ⇒ unset
+        let s3 = Settings {
+            active_format: Some("   ".into()), // blank ⇒ unset
+            ..Default::default()
+        };
         assert_eq!(s3.resolve_format(), None);
     }
 }
@@ -361,8 +397,10 @@ fn resolve_format_from_settings_when_no_env() {
 fn preroll_resolves_off_by_default_and_from_settings() {
     if std::env::var_os("DICTATE_PREROLL_MS").is_none() {
         assert_eq!(Settings::default().resolve_preroll_ms(), 0);
-        let mut s = Settings::default();
-        s.preroll_ms = Some(400);
+        let s = Settings {
+            preroll_ms: Some(400),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_preroll_ms(), 400);
     }
 }
@@ -371,8 +409,10 @@ fn preroll_resolves_off_by_default_and_from_settings() {
 fn listen_mode_off_by_default() {
     if std::env::var_os("DICTATE_LISTEN_MODE").is_none() {
         assert!(!Settings::default().resolve_listen_mode());
-        let mut s = Settings::default();
-        s.listen_mode = Some(true);
+        let s = Settings {
+            listen_mode: Some(true),
+            ..Default::default()
+        };
         assert!(s.resolve_listen_mode());
     }
 }
@@ -381,11 +421,15 @@ fn listen_mode_off_by_default() {
 fn wake_word_falls_back_to_default_when_blank() {
     if std::env::var_os("DICTATE_WAKE_WORD").is_none() {
         assert_eq!(Settings::default().resolve_wake_word(), DEFAULT_WAKE_WORD);
-        let mut s = Settings::default();
-        s.wake_word = Some("  ".into());
+        let s = Settings {
+            wake_word: Some("  ".into()),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_wake_word(), DEFAULT_WAKE_WORD);
-        let mut s2 = Settings::default();
-        s2.wake_word = Some("jarvis".into());
+        let s2 = Settings {
+            wake_word: Some("jarvis".into()),
+            ..Default::default()
+        };
         assert_eq!(s2.resolve_wake_word(), "jarvis");
     }
 }
@@ -519,13 +563,15 @@ fn save_and_load_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
     let path = dir.join("settings.json");
 
-    let mut s = Settings::default();
-    s.hotkey_keycode = Some(0x36);
-    s.cleanup_enabled = Some(false);
-    s.active_format = Some("bullets".into());
-    s.preroll_ms = Some(400);
-    s.cohere_language = Some("de".into());
-    s.completion_sound = Some("glass-tick".into());
+    let s = Settings {
+        hotkey_keycode: Some(0x36),
+        cleanup_enabled: Some(false),
+        active_format: Some("bullets".into()),
+        preroll_ms: Some(400),
+        cohere_language: Some("de".into()),
+        completion_sound: Some("glass-tick".into()),
+        ..Default::default()
+    };
     s.save_to(&path).unwrap();
 
     let loaded = Settings::load_from(&path);
@@ -559,10 +605,12 @@ fn legacy_settings_keys_still_deserialize() {
     )
     .unwrap();
 
-    let mut expected = Settings::default();
-    // `gemma_model` is folded into `llm_model` on load.
-    expected.llm_model = Some("/tmp/legacy.gguf".into());
-    expected.cohere_language = Some("ja".into());
+    let expected = Settings {
+        // `gemma_model` is folded into `llm_model` on load.
+        llm_model: Some("/tmp/legacy.gguf".into()),
+        cohere_language: Some("ja".into()),
+        ..Default::default()
+    };
     // Legacy-only keys are dropped (not preserved as noise); live fields
     // survive. Equality against `expected` proves this.
     let loaded = Settings::load_from(&path);
@@ -617,8 +665,10 @@ fn load_corrupt_file_returns_defaults() {
 fn resolve_streaming_asr_defaults_on_and_settings_can_disable() {
     if std::env::var_os("DICTATE_STREAMING_ASR").is_none() {
         assert!(Settings::default().resolve_streaming_asr());
-        let mut s = Settings::default();
-        s.streaming_asr = Some(false);
+        let s = Settings {
+            streaming_asr: Some(false),
+            ..Default::default()
+        };
         assert!(!s.resolve_streaming_asr());
     }
 }
@@ -631,8 +681,10 @@ fn resolve_streaming_asr_disabled_by_preroll() {
     if std::env::var_os("DICTATE_STREAMING_ASR").is_none()
         && std::env::var_os("DICTATE_PREROLL_MS").is_none()
     {
-        let mut s = Settings::default();
-        s.preroll_ms = Some(400);
+        let s = Settings {
+            preroll_ms: Some(400),
+            ..Default::default()
+        };
         assert!(!s.resolve_streaming_asr());
     }
 }
@@ -654,9 +706,11 @@ fn live_preview_ui_preserves_saved_choice_while_preroll_blocks_it() {
 fn live_preview_control_matches_runtime_without_clearing_preferences() {
     for preference in [None, Some(false), Some(true)] {
         for preroll in [0, 400] {
-            let mut settings = Settings::default();
-            settings.streaming_asr = preference;
-            settings.preroll_ms = Some(preroll);
+            let settings = Settings {
+                streaming_asr: preference,
+                preroll_ms: Some(preroll),
+                ..Default::default()
+            };
             assert_eq!(
                 settings.live_preview_control().enabled,
                 settings.resolve_streaming_asr()
@@ -718,17 +772,19 @@ fn a_bad_flag_value_falls_through_like_a_bad_number() {
 fn recording_feedback_choices_survive_save_and_reload() {
     let dir = std::env::temp_dir().join(format!("fd-feedback-settings-{}", std::process::id()));
     let path = dir.join("settings.json");
-    let mut saved = Settings::default();
-    saved.streaming_asr = Some(false);
-    saved.pill_size = Some("standard".into());
-    saved.waveform_sensitivity = Some("high".into());
-    saved.show_processing_detail = Some(false);
-    saved.audio_history_enabled = Some(false);
-    saved.audio_retention = Some("1week".into());
-    saved.audio_storage_cap_mb = Some(4096);
-    saved.show_result = Some(true);
-    saved.cleanup_enabled = Some(false);
-    saved.preroll_ms = Some(400);
+    let saved = Settings {
+        streaming_asr: Some(false),
+        pill_size: Some("standard".into()),
+        waveform_sensitivity: Some("high".into()),
+        show_processing_detail: Some(false),
+        audio_history_enabled: Some(false),
+        audio_retention: Some("1week".into()),
+        audio_storage_cap_mb: Some(4096),
+        show_result: Some(true),
+        cleanup_enabled: Some(false),
+        preroll_ms: Some(400),
+        ..Default::default()
+    };
     saved.save_to(&path).unwrap();
     assert_eq!(Settings::load_from(&path), saved);
     let _ = std::fs::remove_dir_all(dir);
@@ -757,8 +813,10 @@ fn audio_recovery_defaults_to_thirty_days_without_shortening_text_history() {
 fn tail_capture_defaults_on_and_can_be_disabled() {
     if std::env::var_os("DICTATE_TAIL_CAPTURE").is_none() {
         assert!(Settings::default().resolve_tail_capture());
-        let mut s = Settings::default();
-        s.tail_capture = Some(false);
+        let s = Settings {
+            tail_capture: Some(false),
+            ..Default::default()
+        };
         assert!(!s.resolve_tail_capture());
     }
 }
@@ -769,8 +827,10 @@ fn tail_capture_disabled_by_preroll() {
     if std::env::var_os("DICTATE_TAIL_CAPTURE").is_none()
         && std::env::var_os("DICTATE_PREROLL_MS").is_none()
     {
-        let mut s = Settings::default();
-        s.preroll_ms = Some(400);
+        let s = Settings {
+            preroll_ms: Some(400),
+            ..Default::default()
+        };
         assert!(!s.resolve_tail_capture());
     }
 }
@@ -779,8 +839,10 @@ fn tail_capture_disabled_by_preroll() {
 fn tail_capture_cap_defaults_and_parses() {
     if std::env::var_os("DICTATE_TAIL_CAPTURE_CAP_MS").is_none() {
         assert_eq!(Settings::default().resolve_tail_capture_cap_ms(), 1500);
-        let mut s = Settings::default();
-        s.tail_capture_cap_ms = Some(800);
+        let s = Settings {
+            tail_capture_cap_ms: Some(800),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_tail_capture_cap_ms(), 800);
     }
 }
@@ -789,11 +851,15 @@ fn tail_capture_cap_defaults_and_parses() {
 fn warm_window_defaults_and_can_be_zeroed() {
     if std::env::var_os("DICTATE_WARM_WINDOW_MS").is_none() {
         assert_eq!(Settings::default().resolve_warm_window_ms(), 60_000);
-        let mut s = Settings::default();
-        s.warm_window_ms = Some(0);
+        let s = Settings {
+            warm_window_ms: Some(0),
+            ..Default::default()
+        };
         assert_eq!(s.resolve_warm_window_ms(), 0);
-        let mut s2 = Settings::default();
-        s2.warm_window_ms = Some(2500);
+        let s2 = Settings {
+            warm_window_ms: Some(2500),
+            ..Default::default()
+        };
         assert_eq!(s2.resolve_warm_window_ms(), 2500);
     }
 }
@@ -804,8 +870,10 @@ fn resolve_cohere_language_defaults_and_from_settings() {
         let s = Settings::default();
         assert_eq!(s.resolve_asr().language, "en");
 
-        let mut s2 = Settings::default();
-        s2.cohere_language = Some("de".into());
+        let s2 = Settings {
+            cohere_language: Some("de".into()),
+            ..Default::default()
+        };
         assert_eq!(s2.resolve_asr().language, "de");
     }
 }
