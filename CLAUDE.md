@@ -23,6 +23,7 @@ cargo build --features full --release          # the real build
 cargo test                                     # no models, no native deps
 cargo test --features full                     # adds cleaner/injector/menubar/history suites
 LOCAL_DICTATION_TIMING=1 cargo test           # also checks wall-clock bounds (off by default)
+sh scripts/pre-push-gate.sh </dev/null        # the pre-push gate: scrub, then cargo test unless the push is docs-only
 native/cohere-mlx/test.sh                      # Swift bridge protocol tests
 cargo run --release --features full -- render-ui /tmp/ui   # offscreen UI proofs + History panel scale check
 ./scripts/build-app.sh --install               # bundle + /Applications + login item
