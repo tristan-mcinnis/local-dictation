@@ -281,13 +281,13 @@ fn parse_cardinal(words: &[&str]) -> Option<u64> {
                 // a plain unit needs an empty units place: ok after a tens word
                 // ("twenty three") or a hundred ("hundred five"), not after a
                 // unit/teen ("three four" is two numbers).
-                if group % 10 != 0 {
+                if !group.is_multiple_of(10) {
                     return None;
                 }
             } else {
                 // a teen needs empty tens+units: ok alone or after a hundred
                 // ("one hundred fifteen"), not after a tens ("twenty fifteen").
-                if group % 100 != 0 {
+                if !group.is_multiple_of(100) {
                     return None;
                 }
             }
@@ -297,7 +297,7 @@ fn parse_cardinal(words: &[&str]) -> Option<u64> {
         } else if let Some(t) = tens(w) {
             // a tens word needs the sub-100 part empty: ok alone or after a
             // hundred ("one hundred twenty"), not after another tens/unit.
-            if group % 100 != 0 {
+            if !group.is_multiple_of(100) {
                 return None;
             }
             group += t;

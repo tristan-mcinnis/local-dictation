@@ -753,7 +753,7 @@ mod tests {
             let bytes = entry.bytes;
             assert!(bytes.len() > 44, "{} is not a WAV", entry.id);
             let (channels, rate, bits, data_len) = wav_info(bytes);
-            assert!(channels >= 1 && channels <= 2, "{} channels", entry.id);
+            assert!((1..=2).contains(&channels), "{} channels", entry.id);
             assert_eq!(bits, 16, "{} sample width", entry.id);
             assert_eq!(rate, 48_000, "{} sample rate", entry.id);
             let bytes_per_frame = u32::from(channels) * 2;
@@ -825,7 +825,7 @@ mod tests {
             let bytes = entry.bytes;
             assert!(bytes.len() > 44, "{} is not a WAV", entry.id);
             let (channels, rate, bits, data_len) = wav_info(bytes);
-            assert!(channels >= 1 && channels <= 2, "{} channels", entry.id);
+            assert!((1..=2).contains(&channels), "{} channels", entry.id);
             assert_eq!(bits, 16, "{} sample width", entry.id);
             assert_eq!(rate, 48_000, "{} sample rate", entry.id);
             let bytes_per_frame = u32::from(channels) * 2;

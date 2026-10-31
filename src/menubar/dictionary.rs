@@ -331,9 +331,7 @@ pub(super) fn show_dictionary_window(actions: &MenuActions) {
     // Accessory app: explicitly activate so the window comes to the front.
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    {
-        app.activateIgnoringOtherApps(true)
-    };
+    app.activateIgnoringOtherApps(true);
 }
 
 fn set_footer(ui: &DictionaryUi, text: &str) {

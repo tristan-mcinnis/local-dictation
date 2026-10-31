@@ -364,7 +364,7 @@ pub fn free_disk_bytes(path: &Path) -> Option<u64> {
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    Some(stat.f_bavail as u64 * stat.f_frsize)
 }
 
 /// Do we have room for `needed` bytes at `dest`, given `already` bytes of a

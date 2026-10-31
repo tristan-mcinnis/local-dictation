@@ -656,7 +656,7 @@ fn strip_leading_filler(s: &str) -> String {
 pub fn strip_trailing_filler(s: &str) -> String {
     let trimmed = s.trim_end();
     // Bare text with trailing terminal punctuation / spaces removed, for matching.
-    let core = trimmed.trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | ',' | ' '));
+    let core = trimmed.trim_end_matches(['.', '!', '?', ',', ' ']);
     for f in TRAILING_FILLERS {
         if core.len() < f.len() || !core[core.len() - f.len()..].eq_ignore_ascii_case(f) {
             continue;
@@ -746,7 +746,7 @@ fn drop_filler_interjections(s: &str) -> String {
             out.push(c);
         }
     }
-    out.trim_start_matches(|c: char| c == ',' || c == ' ')
+    out.trim_start_matches([',', ' '])
         .to_string()
 }
 
@@ -1171,7 +1171,7 @@ fn collapse_repeated_fragments(s: &str) -> String {
                 continue;
             }
         }
-        out.push_str(&toks[i].text());
+        out.push_str(toks[i].text());
         i += 1;
     }
     out
@@ -1236,8 +1236,8 @@ fn normalize_at(s: &str) -> String {
         // "word at domain dot tld" → "word@domain.tld" (username at start).
         // Token layout: user(i) ws(i+1) at(i+2) ws(i+3) domain(i+4) ws(i+5)
         // dot(i+6) ws(i+7) tld(i+8).
-        if tok_email_user(&toks, i).is_some() && tok_identish(&toks, i + 4).is_some() {
-            if tok_is_ws(&toks, i + 1)
+        if tok_email_user(&toks, i).is_some() && tok_identish(&toks, i + 4).is_some()
+            && tok_is_ws(&toks, i + 1)
                 && tok_is_word(&toks, i + 2, "at")
                 && tok_is_ws(&toks, i + 3)
                 && tok_is_ws(&toks, i + 5)
@@ -1256,11 +1256,10 @@ fn normalize_at(s: &str) -> String {
                     continue;
                 }
             }
-        }
         // "at sign" → "@", but only when it's the symbol phrase, not a prose
         // "look at sign" (the word before "at" must be a function word or absent).
-        if tok_is_word(&toks, i, "at") {
-            if tok_is_ws(&toks, i + 1) && tok_is_word(&toks, i + 2, "sign") {
+        if tok_is_word(&toks, i, "at")
+            && tok_is_ws(&toks, i + 1) && tok_is_word(&toks, i + 2, "sign") {
                 let preceded_by_prose = i >= 2 && tok_identish(&toks, i - 2).is_some();
                 if !preceded_by_prose {
                     out.push('@');
@@ -1268,8 +1267,7 @@ fn normalize_at(s: &str) -> String {
                     continue;
                 }
             }
-        }
-        out.push_str(&toks[i].text());
+        out.push_str(toks[i].text());
         i += 1;
     }
     out
@@ -1328,7 +1326,7 @@ fn normalize_spoken_dots(s: &str) -> String {
             i += 3;
             continue;
         }
-        out.push_str(&toks[i].text());
+        out.push_str(toks[i].text());
         i += 1;
     }
     out
@@ -1344,7 +1342,7 @@ fn normalize_spoken_joins(s: &str) -> String {
     let mut i = 0;
     while i < n {
         if tok_is_ws(&toks, i + 1) {
-            if let Some(ch) = join_style(&toks[i + 2].text()) {
+            if let Some(ch) = join_style(toks[i + 2].text()) {
                 if tok_is_ws(&toks, i + 3) {
                     // Preserve the flanking words' casing as spoken (never
                     // lowercase a content word); only the join char is added.
@@ -1358,7 +1356,7 @@ fn normalize_spoken_joins(s: &str) -> String {
                 }
             }
         }
-        out.push_str(&toks[i].text());
+        out.push_str(toks[i].text());
         i += 1;
     }
     out

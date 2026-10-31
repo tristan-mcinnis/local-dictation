@@ -556,9 +556,7 @@ pub(super) fn show_setup_window() {
     ui.window.makeKeyAndOrderFront(None);
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    {
-        app.activateIgnoringOtherApps(true)
-    };
+    app.activateIgnoringOtherApps(true);
 }
 
 /// True when this launch is not ready to dictate, so the Setup window should

@@ -986,7 +986,7 @@ fn build_status_item(
     cancel_item.setTag(TAG_CANCEL);
     menu.addItem(&cancel_item);
 
-    menu.addItem(&*NSMenuItem::separatorItem(mtm));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // Last text: copy / repaste, then retry the audio. "Copy last text" and
     // "Paste last text" reuse the already-captured transcript; "Retry last
@@ -1023,7 +1023,7 @@ fn build_status_item(
     menu.addItem(&retry_last);
     refresh_recovery_items(&menu);
 
-    menu.addItem(&*NSMenuItem::separatorItem(mtm));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // ── Settings + More + Quit ─────────────────────────────────────────
     // The top level stays minimal: the recoverable last dictation (preview,
@@ -1060,7 +1060,7 @@ fn build_status_item(
     more_parent.setSubmenu(Some(&more_submenu));
     menu.addItem(&more_parent);
 
-    menu.addItem(&*NSMenuItem::separatorItem(mtm));
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // Latency (read-only): the app's own release-to-write timing, refreshed as
     // the menu opens. Never a claim about another app's visible pixels.
@@ -1130,7 +1130,7 @@ fn build_more_submenu(
     retention_parent.setSubmenu(Some(&retention_submenu));
     submenu.addItem(&retention_parent);
 
-    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+    submenu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // ── Language / format ────────────────────────────────────────────────
     // (Retry last audio moved to the root menu, most-used first.)
@@ -1166,7 +1166,7 @@ fn build_more_submenu(
         submenu.addItem(&format_parent);
     }
 
-    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+    submenu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // ── Config ───────────────────────────────────────────────────────────
     let hotkey_parent = unsafe {
@@ -1219,7 +1219,7 @@ fn build_more_submenu(
     // Import a .csv of vocabulary entries into the personal dictionary.
     submenu.addItem(&action_item(mtm, "Import Dictionary CSV…", sel!(importCsv:), "", actions));
 
-    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+    submenu.addItem(&NSMenuItem::separatorItem(mtm));
 
     // ── Diagnostics ──────────────────────────────────────────────────────
     submenu.addItem(&action_item(mtm, "Open Log", sel!(openLog:), "l", actions));
@@ -1270,7 +1270,7 @@ fn build_format_submenu(
         });
     }
     submenu.addItem(&default_item);
-    submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+    submenu.addItem(&NSMenuItem::separatorItem(mtm));
 
     for name in names {
         let item = unsafe {
@@ -1297,7 +1297,7 @@ fn build_format_submenu(
     }
 
     if env_locked {
-        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+        submenu.addItem(&NSMenuItem::separatorItem(mtm));
         let note = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -1455,7 +1455,7 @@ fn build_hotkey_submenu(
     }
 
     if env_locked {
-        submenu.addItem(&*NSMenuItem::separatorItem(mtm));
+        submenu.addItem(&NSMenuItem::separatorItem(mtm));
         let note = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -1846,9 +1846,7 @@ fn finish_dictionary_import(path: PathBuf) {
     ui.window.makeKeyAndOrderFront(None);
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    {
-        app.activateIgnoringOtherApps(true)
-    };
+    app.activateIgnoringOtherApps(true);
 }
 
 /// Open the user's `prompts.json` (cleanup + transform system prompts) in a

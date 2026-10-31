@@ -295,7 +295,7 @@ pub(super) fn build_pill_window(
     let history = slate::click_overlay(
         mtm,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
-        &**actions,
+        actions,
         sel!(openHistory:),
         0,
     );

@@ -637,9 +637,9 @@ impl Settings {
 
     /// Resolve incremental streaming ASR: `DICTATE_STREAMING_ASR` env > settings
     /// > true (on by default). Returns false when always-on pre-roll is active,
-    /// because the two drain the capture ring differently and a later workstream
-    /// reconciles capture. Env accepts `0`/`false`/`off`/`no` (case-insensitive)
-    /// to disable.
+    /// > because the two drain the capture ring differently and a later workstream
+    /// > reconciles capture. Env accepts `0`/`false`/`off`/`no` (case-insensitive)
+    /// > to disable.
     pub fn resolve_streaming_asr(&self) -> bool {
         if self.resolve_preroll_ms() > 0 {
             eprintln!(
@@ -711,7 +711,7 @@ impl Settings {
 
     /// Resolve the pre-roll lookback in ms: `DICTATE_PREROLL_MS` env > settings
     /// > 0 (off). 0 means open-on-press (current behaviour); any positive value
-    /// enables the always-on warm stream with that much lookback.
+    /// > enables the always-on warm stream with that much lookback.
     pub fn resolve_preroll_ms(&self) -> u32 {
         if let Ok(v) = std::env::var("DICTATE_PREROLL_MS") {
             if let Ok(n) = v.trim().parse::<u32>() {
@@ -905,7 +905,7 @@ impl Settings {
 
     /// Resolve the completion sound: `DICTATE_COMPLETION_SOUND` env > settings
     /// > the default tight thud. Blank or unknown ids fall back to the default,
-    /// so a hand-edited file can never leave the app with a missing cue.
+    /// > so a hand-edited file can never leave the app with a missing cue.
     pub fn resolve_completion_sound(&self) -> String {
         let raw = std::env::var(COMPLETION_SOUND_ENV)
             .ok()
@@ -1823,7 +1823,7 @@ mod tests {
         // DICTATE_TAIL_CAPTURE=garbage used to mean on and
         // DICTATE_WHISPER_MODE=garbage used to mean off. Now neither is a value.
         for garbage in ["garbage", "", "  ", "2", "yes please"] {
-            assert!(resolve_enabled_flag(Some(false), Some(garbage), true) == false, "{garbage:?}");
+            assert!(!resolve_enabled_flag(Some(false), Some(garbage), true), "{garbage:?}");
             assert!(resolve_enabled_flag(None, Some(garbage), true), "{garbage:?}");
             assert!(!resolve_enabled_flag(None, Some(garbage), false), "{garbage:?}");
         }

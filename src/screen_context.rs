@@ -141,8 +141,8 @@ pub fn extract_terms(text: &str, cap: usize) -> Vec<String> {
 /// True when the raw token closes a sentence, so the next word's capital is
 /// grammar rather than evidence of a proper noun.
 fn ends_sentence(raw: &str) -> bool {
-    raw.trim_end_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '\u{201D}' | '\u{2019}'))
-        .ends_with(|c: char| matches!(c, '.' | '!' | '?' | ':' | '\u{2026}'))
+    raw.trim_end_matches(['"', '\'', ')', ']', '\u{201D}', '\u{2019}'])
+        .ends_with(['.', '!', '?', ':', '\u{2026}'])
 }
 
 /// Marks every token that sits in a run of three or more ALL-CAPS words

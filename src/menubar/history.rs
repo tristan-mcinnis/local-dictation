@@ -410,9 +410,7 @@ pub(super) fn show_history_window() {
     // new window opens behind the frontmost app.
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    {
-        app.activateIgnoringOtherApps(true)
-    };
+    app.activateIgnoringOtherApps(true);
 
     let generation = HISTORY_LOAD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
     std::thread::spawn(move || {

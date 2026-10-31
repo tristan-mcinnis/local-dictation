@@ -801,17 +801,17 @@ pub(crate) fn section_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTex
         let range = NSRange::new(0, attrs.length());
         attrs.addAttribute_value_range(
             NSFontAttributeName,
-            &*font(TYPE_SECTION, WEIGHT_SEMIBOLD),
+            &font(TYPE_SECTION, WEIGHT_SEMIBOLD),
             range,
         );
         attrs.addAttribute_value_range(
             NSForegroundColorAttributeName,
-            &*theme::text_tertiary(),
+            &theme::text_tertiary(),
             range,
         );
         attrs.addAttribute_value_range(
             NSKernAttributeName,
-            &*NSNumber::new_f64(TRACKING_SECTION),
+            &NSNumber::new_f64(TRACKING_SECTION),
             range,
         );
         let _: () = msg_send![&*l, setAttributedStringValue: &*attrs];

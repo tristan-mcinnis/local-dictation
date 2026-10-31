@@ -991,7 +991,7 @@ mod tests {
         // A release during a proper (>300 ms) pause: the trailing 10 frames are
         // all quiet below the (adaptive, low) threshold → skip grace.
         let mut rec2 = vec![0.004, 0.005, 0.2];
-        rec2.extend(std::iter::repeat(0.0).take(10));
+        rec2.extend(std::iter::repeat_n(0.0, 10));
         let thresh2 = speech_threshold(noise_floor(&rec2, 0.10));
         assert!(frames_quiet(&rec2, thresh2, quiet_frame_count(300, 30)));
     }
@@ -1002,8 +1002,8 @@ mod tests {
         let frame_len = 480;
         let frame_ms = 30;
         let mut samples = Vec::new();
-        samples.extend(std::iter::repeat(0.3_f32).take(10 * frame_len)); // 300 ms speech
-        samples.extend(std::iter::repeat(0.001_f32).take(20 * frame_len)); // 600 ms tail
+        samples.extend(std::iter::repeat_n(0.3_f32, 10 * frame_len)); // 300 ms speech
+        samples.extend(std::iter::repeat_n(0.001_f32, 20 * frame_len)); // 600 ms tail
         let threshold = speech_threshold(0.001); // max(0.003, 0.01) = 0.01
         let keep = trim_trailing_silence(&samples, frame_len, threshold, frame_ms);
         // Expect: 10 speech frames + ceil(120/30)=4 hangover frames = 14 frames.
@@ -1025,8 +1025,8 @@ mod tests {
         assert_eq!(transcribe_keep_len(&misfire, 480, threshold, 30), None);
         // 300 ms of speech + quiet tail → keep the speech + hangover.
         let mut real = Vec::new();
-        real.extend(std::iter::repeat(0.3_f32).take(10 * 480));
-        real.extend(std::iter::repeat(0.001_f32).take(20 * 480));
+        real.extend(std::iter::repeat_n(0.3_f32, 10 * 480));
+        real.extend(std::iter::repeat_n(0.001_f32, 20 * 480));
         let keep = transcribe_keep_len(&real, 480, speech_threshold(0.001), 30).unwrap();
         assert_eq!(keep, 14 * 480);
     }
@@ -1037,8 +1037,8 @@ mod tests {
         // must land on the same low percentile as a one-shot sort over the same
         // input, i.e. the incremental path is not just cheaper but equivalent.
         let mut est = NoiseFloorEstimator::new(TAIL_FLOOR_RING_FRAMES);
-        let room_tone = vec![0.004_f32, 0.005, 0.006, 0.004, 0.005];
-        let speech = vec![0.2_f32, 0.3, 0.15];
+        let room_tone = [0.004_f32, 0.005, 0.006, 0.004, 0.005];
+        let speech = [0.2_f32, 0.3, 0.15];
         let mut all = Vec::new();
         for r in room_tone.iter().chain(speech.iter()) {
             est.update(*r);
@@ -1081,7 +1081,7 @@ mod tests {
         // A release in a proper (≥300 ms) pause: the trailing 10 frames are all
         // quiet below the adaptive threshold → skip grace for zero added latency.
         let mut tail_quiet = vec![0.004_f32, 0.2];
-        tail_quiet.extend(std::iter::repeat(0.0).take(10));
+        tail_quiet.extend(std::iter::repeat_n(0.0, 10));
         let (thresh, engage) =
             tail_capture_engage(&tail_quiet, 1, noise_floor(&[0.004, 0.005], 0.10), 300, 30);
         assert!(

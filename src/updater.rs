@@ -22,7 +22,7 @@ use objc2::runtime::AnyClass;
 use objc2::runtime::AnyObject;
 use objc2_foundation::MainThreadMarker;
 use std::cell::RefCell;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -98,7 +98,7 @@ pub fn start() -> bool {
     }
 
     let Some(class) =
-        AnyClass::get(CStr::from_bytes_with_nul(b"SPUStandardUpdaterController\0").unwrap())
+        AnyClass::get(c"SPUStandardUpdaterController")
     else {
         eprintln!("[updater] Sparkle loaded but SPUStandardUpdaterController is absent; skipping");
         return false;

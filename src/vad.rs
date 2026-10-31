@@ -243,7 +243,7 @@ mod tests {
         }
     }
     fn silence(buf: &mut Vec<f32>, secs: f32) {
-        buf.extend(std::iter::repeat(0.0).take((secs * SR as f32) as usize));
+        buf.extend(std::iter::repeat_n(0.0, (secs * SR as f32) as usize));
     }
 
     #[test]

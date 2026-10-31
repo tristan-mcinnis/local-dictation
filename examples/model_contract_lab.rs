@@ -6,7 +6,7 @@
 fn anchor_matches(output: &str, anchor: &str) -> bool {
     if anchor.chars().all(|c| c.is_ascii_digit()) {
         // Formatting 1842 as $1,842 preserves the amount, not a loss of digits.
-        output.replace(',', "").replace('，', "").contains(anchor)
+        output.replace([',', '，'], "").contains(anchor)
     } else {
         output.to_lowercase().contains(&anchor.to_lowercase())
     }
@@ -22,7 +22,7 @@ fn main() -> eyre::Result<()> {
     let cleanup = args
         .get(1)
         .ok_or_else(|| eyre::eyre!("expected cleanup GGUF path"))?;
-    let instruction = args.get(2).map(|value| Path::new(value));
+    let instruction = args.get(2).map(Path::new);
     let boot = Instant::now();
     let engine = TextCleanupEngine::initialize_with_instruction_model(cleanup, instruction)?;
     let boot_ms = boot.elapsed().as_millis();

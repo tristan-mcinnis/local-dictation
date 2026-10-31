@@ -1039,10 +1039,7 @@ fn run_job(
     if reuse == 0 {
         ctx.clear_kv_cache();
     } else {
-        let partial_cleared = match ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None) {
-            Ok(cleared) => cleared,
-            Err(_) => false,
-        };
+        let partial_cleared = ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None).unwrap_or_default();
         let (next_reuse, full_reset) = reuse_after_clear(partial_cleared, reuse);
         reuse = next_reuse;
         if full_reset {

@@ -121,8 +121,8 @@ async fn main() -> eyre::Result<()> {
     .map(|s| s.to_string())
     .collect();
 
-    let vocab20 = vocabulary_suffix(&pool[..20].to_vec()).unwrap();
-    let vocab64 = vocabulary_suffix(&pool[..64.min(pool.len())].to_vec()).unwrap();
+    let vocab20 = vocabulary_suffix(&pool[..20]).unwrap();
+    let vocab64 = vocabulary_suffix(&pool[..64.min(pool.len())]).unwrap();
 
     let prompt_baseline = DEFAULT_CLEANUP.to_string();
     let prompt_vocab20 = format!("{DEFAULT_CLEANUP}{vocab20}");

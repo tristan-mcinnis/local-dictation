@@ -200,9 +200,7 @@ impl Hotkey {
                         return None; // more than one key word
                     }
                     key = keycode_for_name(part);
-                    if key.is_none() {
-                        return None;
-                    }
+                    key?;
                 }
             }
         }

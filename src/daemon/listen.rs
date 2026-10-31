@@ -80,7 +80,7 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
             // Decide whether this segment is dictation: either it opens with the
             // wake word, or we're still armed from a recent trigger.
             let armed = armed_until.map(|t| Instant::now() < t).unwrap_or(false);
-            let body = match crate::wake_word::detect(&raw, &wake_word) {
+            let body = match crate::wake_word::detect(&raw, wake_word) {
                 Some(m) => m.body,            // wake word heard → its body
                 None if armed => raw.clone(), // armed continuation → whole segment
                 None => {

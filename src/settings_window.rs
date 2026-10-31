@@ -606,7 +606,7 @@ define_class!(
             menubar::copy_to_clipboard(text, move |copied| {
                 let Some(ui) = SETTINGS_UI.get() else { return; };
                 set_history_status(ui, if copied { &message } else { "Could not copy this dictation." });
-                if !copied || !history_entry_at(ui, tag).is_some_and(|entry| entry.0 == id) { return; }
+                if !copied || history_entry_at(ui, tag).is_none_or(|entry| entry.0 != id) { return; }
                 flash_history_row(ui, tag as usize);
                 // Start the confirmation window after the actual write, and
                 // never highlight another entry if filtering changed meanwhile.
@@ -884,9 +884,7 @@ pub fn show_settings_window() {
     ui.window.makeKeyAndOrderFront(None);
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    {
-        app.activateIgnoringOtherApps(true)
-    };
+    app.activateIgnoringOtherApps(true);
 }
 
 const RENDER_DICTIONARY: &str = "Cohere\nMLX\nkuh here → Cohere\nem el ex → MLX";
@@ -2477,12 +2475,12 @@ unsafe fn style_menu_item(item: &NSMenuItem, title: &str) {
     let range = NSRange::new(0, attrs.length());
     attrs.addAttribute_value_range(
         NSFontAttributeName,
-        &*slate::font(TYPE_META, WEIGHT_REGULAR),
+        &slate::font(TYPE_META, WEIGHT_REGULAR),
         range,
     );
     attrs.addAttribute_value_range(
         NSForegroundColorAttributeName,
-        &*theme::text_primary(),
+        &theme::text_primary(),
         range,
     );
     item.setAttributedTitle(Some(&attrs));
