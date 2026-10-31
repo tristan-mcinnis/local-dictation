@@ -42,6 +42,7 @@ async fn main() -> eyre::Result<()> {
         }
         "fetch-models" => run_fetch_models(args.get(2).cloned()),
         "ax-check" => run_ax_check(),
+        "login-item" => run_login_item(args.get(2).map(String::as_str)),
         "context-probe" => run_context_probe(),
         "inject-test" => run_inject_test(args.get(2).cloned()),
         "daemon" => run_daemon(args.iter().any(|a| a == "--no-cleanup")).await,
@@ -74,7 +75,7 @@ async fn main() -> eyre::Result<()> {
             run_transform(args.get(2).cloned(), args.get(3).cloned()).await
         }
         other => Err(eyre::eyre!(
-            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, copy-last, recover <dictation-id>, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, render-ui [dir], mock-loop"
+            "unknown subcommand `{other}` — use one of: daemon [--no-cleanup], listen [--no-cleanup], toggle, start, stop, cancel, retry, copy-last, recover <dictation-id>, status, logs, bench [wav], dictate [ms], inject-test [text], transform \"<instruction>\" \"<text>\", fetch-models [dir], ax-check, context-probe, login-item [status|register|unregister], render-ui [dir], mock-loop"
         )),
     }
 }
@@ -313,6 +314,33 @@ fn run_logs() -> eyre::Result<()> {
     }
     println!("[logs] opened {}", log_path.display());
     Ok(())
+}
+
+/// `login-item register` is what `scripts/build-app.sh --install` runs from the
+/// installed bundle; status goes to stdout, a failure exits non-zero.
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
+fn run_login_item(action: Option<&str>) -> eyre::Result<()> {
+    use fast_dictate_backend::login_item;
+    let status = match action.unwrap_or("status") {
+        "status" => login_item::status(),
+        "register" => login_item::register().map_err(|e| eyre::eyre!("login item: {e}"))?,
+        "unregister" => login_item::unregister().map_err(|e| eyre::eyre!("login item: {e}"))?,
+        other => return Err(eyre::eyre!("Usage: login-item [status|register|unregister], not `{other}`")),
+    };
+    println!("[login-item] {}", status.describe());
+    let app = fast_dictate_backend::app_paths::bundle_resources_dir()
+        .and_then(|r| Some(r.parent()?.parent()?.to_path_buf()));
+    if let Some(app) = app {
+        if login_item::legacy_item_present(&app.to_string_lossy()) {
+            println!("[login-item] an old login item for this app is also listed; remove it in System Settings > General > Login Items so the app does not open twice");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
+fn run_login_item(_action: Option<&str>) -> eyre::Result<()> {
+    Err(eyre::eyre!("login-item needs the macOS `ax-inject` feature"))
 }
 
 fn run_ax_check() -> eyre::Result<()> {

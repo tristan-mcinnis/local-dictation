@@ -49,6 +49,9 @@ pub mod cleaner;
 pub mod clipboard_paste;
 
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
+pub mod login_item;
+
+#[cfg(all(target_os = "macos", feature = "ax-inject"))]
 pub mod menubar;
 
 // Sparkle 2 auto-update bootstrap for direct-download builds. No link-time

@@ -315,21 +315,33 @@ echo "✓ built: $APP"
 # ── 7. optional install + login item ─────────────────────────────────────────
 if [ "$INSTALL" -eq 1 ]; then
   DEST="/Applications/$APP_NAME.app"
+  DEST_EXEC="$DEST/Contents/MacOS/$EXEC_NAME"
+  DAEMON_RE="^${DEST_EXEC}( |\$)"
+  # A running copy keeps the single-instance lock and its old binary, so stop it
+  # first or `open` below would only bring the old daemon forward.
+  if pgrep -f "$DAEMON_RE" >/dev/null; then
+    echo "• stopping the running ${APP_NAME}…"
+    pkill -TERM -f "$DAEMON_RE" || true
+    for _ in $(seq 50); do pgrep -f "$DAEMON_RE" >/dev/null || break; sleep 0.1; done
+    if pgrep -f "$DAEMON_RE" >/dev/null; then
+      echo "✗ ${APP_NAME} did not quit; quit it from the menu bar and re-run." >&2
+      exit 1
+    fi
+  fi
   echo "• installing to ${DEST}…"
   rm -rf "$DEST"
   cp -R "$APP" "$DEST"
 
+  # SMAppService from inside the installed bundle: no System Events, so no
+  # Automation prompt to stall on (that stall was the -1712 timeout).
   echo "• registering as a Login Item…"
-  osascript >/dev/null <<OSA
-tell application "System Events"
-    if exists login item "$APP_NAME" then delete login item "$APP_NAME"
-    make login item at end with properties {name:"$APP_NAME", path:"$DEST", hidden:false}
-end tell
-OSA
+  if ! "$DEST_EXEC" login-item register; then
+    echo "  (login item not set; turn it on in System Settings > General > Login Items)" >&2
+  fi
 
   echo "• launching…"
   open "$DEST"
-  echo "✓ installed, set to launch at login, and started."
+  echo "✓ installed and started."
   echo "  First launch: grant Microphone + Accessibility when macOS asks"
   echo "  (System Settings → Privacy & Security)."
 fi

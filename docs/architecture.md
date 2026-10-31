@@ -98,6 +98,13 @@ launches. The app itself is built by `scripts/build-app.sh`:
 ./scripts/build-app.sh --dmg            # wrap in a distributable dist/Local-Dictation-<ver>.dmg (defaults to --bundle-models; --slim --dmg = a small DMG with no models in it)
 ```
 
+`--install` first stops a running copy of the installed app (SIGTERM to that exact executable,
+up to 5 s), so the new binary really starts. The Login Item is registered by the installed binary
+itself, `local-dictation login-item register`, through `SMAppService.mainAppService`
+(`src/login_item.rs`). It needs no Automation grant for System Events, which is what made the old
+AppleScript step time out with -1712. `login-item status` reports the state and flags an old
+AppleScript login item that would open the app twice.
+
 `build-app.sh` builds the native MLX helper first (`native/cohere-mlx/build.sh`), then the Rust
 release binary, then assembles the bundle: helper copied to `Contents/Resources/cohere-mlx-bridge`
 with `Contents/Resources/mlx.metallib` beside it (MLX looks for `mlx.metallib` next to its

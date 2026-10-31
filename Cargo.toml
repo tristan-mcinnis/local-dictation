@@ -36,6 +36,7 @@ ax-inject = [
     "dep:objc2-app-kit",
     "dep:objc2-core-foundation",
     "dep:block2",
+    "dep:objc2-service-management",
 ]
 # The one-user production stack: Cohere MLX + S1-mini + native Mac UI/output.
 full = ["cohere-mlx", "cleaner", "ax-inject", "sparkle"]
@@ -130,5 +131,6 @@ objc2-app-kit = { version = "0.3", optional = true, features = [
 ] }
 block2 = { version = "0.6", optional = true }
 objc2-core-foundation = { version = "0.3", optional = true, features = ["CFRunLoop", "CFBase", "CFString", "CFDate"] }
+objc2-service-management = { version = "0.3", features = ["SMAppService"], optional = true }
 
 [dev-dependencies]
