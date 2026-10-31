@@ -333,7 +333,7 @@ paints `panel_tint` at full alpha instead; everything else draws exactly as it d
 
 ## Pipeline data flow (the daemon path)
 
-`daemon/` owns a `CGEventTap` watching the hotkey modifier + a worker thread (`mod.rs` boot + event tap, `ptt.rs` the pure hold/latch state machine, `worker.rs` the capture → ASR → cleanup → inject thread, `listen.rs` the wake-word mode). On key release it
+`daemon/` owns a `CGEventTap` watching the hotkey modifier + a worker thread (`mod.rs` boot + event tap + `DaemonConfig`, `ptt.rs` the pure hold/latch state machine, `listen.rs` the wake-word mode). The worker is one file per stage: `worker.rs` holds `WorkerState` (the models, the capture state and the in-flight `Recording`) and the event loop, `boot.rs` loads and warms the models, `capture.rs` starts and cancels a recording, `tail.rs` is the release tail-capture grace, `release.rs` runs a release in stage order, `transcribe.rs` acquires the transcript, `cleanup.rs` is the one cleanup policy, `deliver.rs` writes and keeps the text, `transform.rs` runs rewrites and spoken commands, `recover.rs` reprocesses saved audio. On key release the worker
 drains audio and runs the pipeline:
 
 ```

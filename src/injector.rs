@@ -1970,8 +1970,15 @@ mod tests {
             ["holding", "text kept", "transcript kept", "result kept", "clipboard paste"];
         let files = [
             ("injector.rs", include_str!("injector.rs")),
+            ("daemon/capture.rs", include_str!("daemon/capture.rs")),
+            ("daemon/cleanup.rs", include_str!("daemon/cleanup.rs")),
             ("daemon/deliver.rs", include_str!("daemon/deliver.rs")),
             ("daemon/listen.rs", include_str!("daemon/listen.rs")),
+            ("daemon/recover.rs", include_str!("daemon/recover.rs")),
+            ("daemon/release.rs", include_str!("daemon/release.rs")),
+            ("daemon/tail.rs", include_str!("daemon/tail.rs")),
+            ("daemon/transcribe.rs", include_str!("daemon/transcribe.rs")),
+            ("daemon/transform.rs", include_str!("daemon/transform.rs")),
             ("daemon/worker.rs", include_str!("daemon/worker.rs")),
         ];
         let mut bad = Vec::new();

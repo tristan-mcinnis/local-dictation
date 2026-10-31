@@ -13,17 +13,31 @@
 //! flags system-wide. The first run surfaces the TCC prompt via the
 //! injector's `ensure_trusted_or_prompt`.
 
+mod boot;
+mod capture;
 mod cleanup;
 mod deliver;
-mod ptt;
-mod worker;
 mod listen;
+mod ptt;
+mod recover;
+mod release;
+mod tail;
+mod transcribe;
+mod transform;
+mod worker;
+use boot::*;
+use capture::*;
 use cleanup::*;
 use deliver::*;
-use ptt::*;
-use worker::*;
 pub use listen::run_listen;
 use listen::*;
+use ptt::*;
+use recover::*;
+use tail::*;
+use transcribe::*;
+#[cfg(feature = "cleaner")]
+use transform::*;
+use worker::*;
 
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
 use crate::corrections::Corrections;
@@ -314,21 +328,6 @@ enum DaemonEvent {
     /// buffers they hold — are dropped while Metal is still alive. Sent by the
     /// AppKit delegate's release hook; see `crate::shutdown`.
     Shutdown,
-}
-
-/// How a tail-capture grace loop ended, when it was cut short by an event rather
-/// than by a natural quiet run / cap. The StopRecording arm uses this to decide
-/// whether to restart a fresh recording (the user re-pressed mid-grace) or cancel
-/// the abandoned utterance, instead of proceeding to release the first one.
-#[derive(Debug)]
-enum TailGraceOutcome {
-    /// The user pressed again during the grace tail: abandon the previous
-    /// utterance and start a new recording cleanly. Carries the new gesture.
-    RePress {
-        transform: bool,
-    },
-    /// An external cancel arrived during the grace tail: discard everything.
-    Cancel,
 }
 
 pub fn run(config: DaemonConfig) -> eyre::Result<()> {

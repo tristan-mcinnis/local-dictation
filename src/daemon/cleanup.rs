@@ -3,13 +3,14 @@
 //! all take it, so the same audio gives the same text whichever way it runs.
 use super::*;
 
-/// The warm models and the per-boot cleanup facts every path shares.
-pub(super) struct Pipeline<'a> {
+/// The warm text models and the per-boot cleanup facts every path shares.
+pub(super) struct Pipeline {
     #[cfg(feature = "cleaner")]
-    pub cleaner: Option<&'a TextCleanupEngine>,
+    pub cleaner: Option<TextCleanupEngine>,
+    /// Tokio current-thread runtime for the async cleaner path.
     #[cfg(feature = "cleaner")]
-    pub rt: &'a tokio::runtime::Runtime,
-    pub refiner: &'a Refiner,
+    pub rt: tokio::runtime::Runtime,
+    pub refiner: Refiner,
     /// An output-format preset (numbered, bullets, email) is active: every
     /// utterance of three words or more goes through the model to be
     /// reshaped, so the clean-dictation shortcut is off.
@@ -17,7 +18,7 @@ pub(super) struct Pipeline<'a> {
     pub result: ResultPrefs,
 }
 
-impl Pipeline<'_> {
+impl Pipeline {
     pub(super) fn has_cleaner(&self) -> bool {
         #[cfg(feature = "cleaner")]
         {
@@ -163,7 +164,7 @@ pub(super) fn clean(
     if has_cleaner && target.terminal {
         eprintln!("  ⌁    terminal · raw transcript (cleanup skipped)");
     }
-    match plan_cleanup(raw, models.refiner, has_cleaner, target.terminal, models.format_active) {
+    match plan_cleanup(raw, &models.refiner, has_cleaner, target.terminal, models.format_active) {
         CleanupPlan::Raw => Ok(Cleaned {
             text: raw.to_string(),
             source: CleanupSource::Raw,
@@ -195,7 +196,7 @@ pub(super) fn clean(
 
 #[cfg(feature = "cleaner")]
 fn run_model(models: &Pipeline, input: &str, target: &CleanupTarget) -> eyre::Result<String> {
-    let cleaner = models.cleaner.expect("a Model plan needs a cleaner");
+    let cleaner = models.cleaner.as_ref().expect("a Model plan needs a cleaner");
     models.rt.block_on(cleaner.process_transcript_with_vocab_tone(
         input,
         &target.screen_vocab,

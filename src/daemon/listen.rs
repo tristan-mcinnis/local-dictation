@@ -28,64 +28,9 @@ pub fn run_listen(config: DaemonConfig) -> eyre::Result<()> {
     }
 
     let wake_word = &config.wake_word;
-
-    let t_load = Instant::now();
-    let mut worker = LocalInferenceWorker::initialize(&config.asr)?;
-    eprintln!(
-        "[boot] asr         loaded in {:>4} ms · {}",
-        ms(t_load.elapsed()),
-        config.asr.describe()
-    );
-
-    #[cfg(feature = "cleaner")]
-    let cleaner = if !config.no_cleanup {
-        let t = Instant::now();
-        match TextCleanupEngine::initialize_with_instruction_model(
-            &config.llm_model_path,
-            config.instruction_model_path.as_deref().map(std::path::Path::new),
-        ) {
-            Ok(c) => {
-                eprintln!("[boot] cleaner     loaded in {:>4} ms", ms(t.elapsed()));
-                crate::health::clear(crate::health::Fault::CleanupUnavailable);
-                Some(c)
-            }
-            Err(error) => {
-                eprintln!("[warn] cleaner unavailable: {error}; continuing with raw dictation");
-                crate::health::raise(crate::health::Fault::CleanupUnavailable, error.to_string());
-                None
-            }
-        }
-    } else {
-        eprintln!("[boot] cleaner     disabled (--no-cleanup)");
-        None
-    };
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    // Warm both models so the first heard utterance is hot.
-    let _ = worker.transcribe_pcm(&vec![0.0_f32; SAMPLE_RATE as usize]);
-    #[cfg(feature = "cleaner")]
-    if let Some(ref c) = cleaner {
-        let _ = rt.block_on(c.process_transcript("warmup")).ok();
-    }
-
-    let corrections = Corrections::load_default().unwrap_or_else(|_| Corrections::empty());
-    let refiner = Refiner::new(corrections);
-    #[cfg(feature = "cleaner")]
-    let format_active = cleaner.as_ref().is_some_and(|c| c.format_active());
-    #[cfg(not(feature = "cleaner"))]
-    let format_active = false;
-    let pipeline = Pipeline {
-        #[cfg(feature = "cleaner")]
-        cleaner: cleaner.as_ref(),
-        #[cfg(feature = "cleaner")]
-        rt: &rt,
-        refiner: &refiner,
-        format_active,
-        result: config.result,
-    };
+    let mut worker = load_asr(&config)?;
+    let pipeline = Pipeline::load(&config)?;
+    warm_up(&mut worker, &pipeline);
 
     // Continuous capture: hold the recording flag true so every callback pushes
     // into the ring (no pre-roll needed — we're always listening).
