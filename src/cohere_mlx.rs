@@ -12,6 +12,9 @@
 //! * **A reader thread.** `stdout` is drained on its own thread into a
 //!   channel, so every read the worker does is a `recv_timeout` with a budget
 //!   scaled to the audio. A hung helper costs one budget, not the session.
+//!   The request is written on a short-lived thread under the same budget, so
+//!   a helper that stops reading stdin (a full pipe) is a hang too, not a
+//!   blocked `write_all`.
 //! * **Restart with backoff.** A dead or hung helper is killed, waited for and
 //!   respawned. A transport failure (the helper was already gone) retries the
 //!   request once on the fresh process; a timeout does not, because the user
@@ -25,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -99,7 +103,8 @@ pub fn restart_backoff(attempt: u32) -> Duration {
 /// One live helper process and the thread draining its stdout.
 struct Helper {
     child: Child,
-    stdin: BufWriter<ChildStdin>,
+    /// Shared with the per-request writer thread.
+    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
     /// Lines from the helper. A closed channel means the process has gone.
     replies: Receiver<String>,
 }
@@ -122,12 +127,12 @@ impl Helper {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| eyre::eyre!("start Cohere MLX helper {}: {e}", config.helper_path))?;
-        let stdin = BufWriter::new(
+        let stdin = Arc::new(Mutex::new(BufWriter::new(
             child
                 .stdin
                 .take()
                 .ok_or_else(|| eyre::eyre!("helper stdin unavailable"))?,
-        );
+        )));
         let stdout = child
             .stdout
             .take()
@@ -163,11 +168,36 @@ impl Helper {
         }
     }
 
-    fn write_request(&mut self, request: &Request) -> eyre::Result<()> {
-        serde_json::to_writer(&mut self.stdin, request)?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        Ok(())
+    /// Write one request, or fail within `budget`. A 30 s chunk is about
+    /// 2.5 MB, far past the pipe buffer, so a helper that is alive but not
+    /// reading would block `write_all` forever. On timeout the child is killed,
+    /// which ends the blocked write with EPIPE.
+    fn write_request(&mut self, request: &Request, budget: Duration) -> Result<(), Failure> {
+        let mut line = serde_json::to_vec(request).map_err(|e| Failure::Reply(e.into()))?;
+        line.push(b'\n');
+        let stdin = Arc::clone(&self.stdin);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("cohere-mlx-writer".into())
+            .spawn(move || {
+                let mut stdin = stdin.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = tx.send(stdin.write_all(&line).and_then(|()| stdin.flush()));
+            })
+            .map_err(|e| Failure::Gone(eyre::eyre!("spawn cohere-mlx writer: {e}")))?;
+        match rx.recv_timeout(budget) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Failure::Gone(eyre::eyre!("write to Cohere MLX helper: {e}"))),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(Failure::Gone(eyre::eyre!("Cohere MLX helper writer ended without a result")))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                Err(Failure::Hung(eyre::eyre!(
+                    "Cohere MLX helper did not take the request within {:.0}s",
+                    budget.as_secs_f64()
+                )))
+            }
+        }
     }
 }
 
@@ -277,9 +307,7 @@ impl CohereMlxWorker {
             max_tokens: self.config.max_tokens,
             audio_f32_base64: STANDARD.encode(bytes),
         };
-        if let Err(e) = helper.write_request(&request) {
-            return Err(Failure::Gone(e));
-        }
+        helper.write_request(&request, budget)?;
         let response = match helper.read_response(budget) {
             Ok(response) => response,
             Err(e) => {
@@ -507,6 +535,42 @@ mod tests {
             "a dead helper must not be waited out: took {:?}",
             started.elapsed()
         );
+    }
+
+    /// Regression: the request was written synchronously before any timeout
+    /// started, so a helper that announced itself and then stopped reading
+    /// stdin blocked the worker forever once the pipe filled.
+    #[test]
+    fn a_helper_that_stops_reading_is_a_hang_not_a_blocked_write() {
+        let dir = std::env::temp_dir().join(format!("ld-cohere-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("deaf-helper.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho '{\"ok\":true,\"event\":\"ready\"}'\nexec sleep 30\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut worker = CohereMlxWorker::start(CohereMlxConfig {
+            helper_path: script.to_string_lossy().into_owned(),
+            model_dir: "/nonexistent".to_string(),
+            language: "en".to_string(),
+            max_tokens: 64,
+        })
+        .expect("the fake helper announces ready");
+        let audio = vec![0.25_f32; 16_000 * 30];
+        let started = std::time::Instant::now();
+        let result = worker.attempt(&audio, Duration::from_millis(300));
+        assert!(matches!(result, Err(Failure::Hung(_))), "a full stdin pipe must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by the budget: took {:?}",
+            started.elapsed()
+        );
+        drop(worker);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
