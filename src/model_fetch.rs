@@ -119,11 +119,11 @@ pub const CLEANUP: ModelEntry = ModelEntry {
     licence: "Apache-2.0 with a naming clause",
     licence_link: "https://huggingface.co/superwhisper/s1-mini-GGUF",
     source: Some(Source {
-        url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf",
+        url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/34add00a48a2e5d24e5a4ee5405a99620a3a240c/s1-mini-q4_k_m.gguf",
         bytes: 484_219_808,
         sha256: "3b41ebe2502cbd03e811d5d16b022f5ab551eda58d62597d152f89535003c634",
-        licence_url: "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/main/LICENSE",
-        notice_url: Some("https://huggingface.co/superwhisper/s1-mini-GGUF/raw/main/NOTICE"),
+        licence_url: "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/34add00a48a2e5d24e5a4ee5405a99620a3a240c/LICENSE",
+        notice_url: Some("https://huggingface.co/superwhisper/s1-mini-GGUF/raw/34add00a48a2e5d24e5a4ee5405a99620a3a240c/NOTICE"),
     }),
     manual_hint: "Cleanup polishes the transcript. Dictation works without it: turn \
 Cleanup off in Settings and the raw transcript is used.",
@@ -941,6 +941,9 @@ mod tests {
                 assert_eq!(source.sha256.len(), 64, "{}", entry.id);
                 assert!(source.bytes > 0, "{}", entry.id);
                 assert!(source.licence_url.starts_with("https://"), "{}", entry.id);
+                // A branch name moves under the digest: every fresh install
+                // would then download bytes it must refuse.
+                assert!(!source.url.contains("/resolve/main/"), "{}", entry.id);
             }
         }
         // The naming clause: this exact capitalisation, wherever it appears.

@@ -41,7 +41,8 @@ s1_source="${S1_MODEL_PATH:-$super_root/s1-mini.gguf}"
 # published at huggingface.co/superwhisper/s1-mini-GGUF. A local Superwhisper
 # install holds the same bytes, so it is used when present and downloaded
 # otherwise. The digest is the published q4_k_m file; see THIRD_PARTY_NOTICES.md.
-s1_url="https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/main/s1-mini-q4_k_m.gguf"
+s1_rev="34add00a48a2e5d24e5a4ee5405a99620a3a240c"
+s1_url="https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/$s1_rev/s1-mini-q4_k_m.gguf"
 s1_sha256="3b41ebe2502cbd03e811d5d16b022f5ab551eda58d62597d152f89535003c634"
 s1_bytes=484219808
 
@@ -65,7 +66,16 @@ if (( app_mode )); then
 else
   cohere_dest="$models_home/cohere-mlx-q4"
 fi
-if [[ -f "$cohere_dest/model.safetensors" && -f "$cohere_dest/config.json" ]]; then
+# Complete means every file the helper loads is there. A run that died midway
+# leaves some missing, and the next run fetches only those.
+cohere_complete() {
+  local row parts
+  for row in "${cohere_files[@]}"; do
+    parts=(${=row})
+    [[ -s "$cohere_dest/$parts[1]" ]] || return 1
+  done
+}
+if cohere_complete; then
   print "Cohere Transcribe Q4 already in place ($cohere_dest)."
 elif (( ! app_mode )) && [[ -f "$cohere_source/model.safetensors" ]]; then
   # A local Superwhisper install: re-key its header names for mlx-audio-swift.
@@ -80,20 +90,21 @@ else
     if ! file_ok "$target" "$bytes" "$sha"; then
       curl -fL --retry 3 -C - -o "$target.part" \
         "https://huggingface.co/$cohere_repo/resolve/$cohere_rev/$name"
-      mv "$target.part" "$target"
-      file_ok "$target" "$bytes" "$sha" || {
+      file_ok "$target.part" "$bytes" "$sha" || {
         print -u2 "Downloaded $name does not match the pinned digest; deleting it."
-        rm -f "$target"; exit 2
+        rm -f "$target.part"; exit 2
       }
+      mv "$target.part" "$target"
     fi
   done
-  # Apache-2.0 asks for the licence to travel with the weights; the conversion
-  # repo ships none, so save ours (same text) beside them.
-  cp "$repo_root/LICENSE-APACHE" "$cohere_dest/LICENSE"
+  print "Downloaded Cohere Transcribe Q4."
+fi
+# Apache-2.0 asks for the licence to travel with the weights. Neither the
+# conversion repo nor a re-keyed local copy ships one, so save ours (same text).
+[[ -s "$cohere_dest/LICENSE" ]] || cp "$repo_root/LICENSE-APACHE" "$cohere_dest/LICENSE"
+[[ -s "$cohere_dest/NOTICE" ]] ||
   print "Cohere Transcribe 03-2026 by Cohere Labs (Apache-2.0), 4-bit MLX conversion by beshkenadze." \
     > "$cohere_dest/NOTICE"
-  print "Downloaded Cohere Transcribe Q4 with its licence."
-fi
 if (( ! app_mode )); then
   mkdir -p "$repo_root/models/dictation"
   ln -sfn "$cohere_dest" "$repo_root/models/dictation/cohere-mlx-q4"
@@ -116,26 +127,41 @@ s1_ok() { [[ -f "$1" && $(stat -f %z "$1") == "$s1_bytes" && $(shasum -a 256 "$1
 if s1_ok "$s1_dest"; then
   print "S1-mini already in place ($s1_dest)."
 elif [[ -f "$s1_source" ]]; then
-  cp -c "$s1_source" "$s1_dest" 2>/dev/null || cp "$s1_source" "$s1_dest"
-  s1_ok "$s1_dest" || { print -u2 "Copied S1-mini does not match the published digest."; exit 2 }
+  # Verify the copy before it takes the name the app loads.
+  rm -f "$s1_dest.part"
+  cp -c "$s1_source" "$s1_dest.part" 2>/dev/null || cp "$s1_source" "$s1_dest.part"
+  s1_ok "$s1_dest.part" || {
+    print -u2 "Copied S1-mini does not match the published digest; deleting it."
+    rm -f "$s1_dest.part"; exit 2
+  }
+  mv "$s1_dest.part" "$s1_dest"
   print "Copied S1-mini from $s1_source."
 else
   print "Downloading S1-mini (462 MB) from Hugging Face…"
   curl -fL --retry 3 -C - -o "$s1_dest.part" "$s1_url"
+  s1_ok "$s1_dest.part" || {
+    print -u2 "Downloaded S1-mini does not match the published digest; deleting it."
+    rm -f "$s1_dest.part"; exit 2
+  }
   mv "$s1_dest.part" "$s1_dest"
-  s1_ok "$s1_dest" || { print -u2 "Downloaded S1-mini does not match the published digest."; exit 2 }
-  # The model's licence requires its LICENSE and NOTICE to travel with it.
-  curl -fsL -o "$s1_license" \
-    "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/main/LICENSE"
-  curl -fsL -o "$s1_notice" \
-    "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/main/NOTICE"
-  print "Downloaded \"S1-mini\" by \"Superwhisper\" with its LICENSE and NOTICE."
+  print "Downloaded \"S1-mini\" by \"Superwhisper\"."
 fi
+# The model's licence requires its LICENSE and NOTICE to travel with it,
+# whichever way the weights arrived.
+for pair in "LICENSE $s1_license" "NOTICE $s1_notice"; do
+  parts=(${=pair})
+  [[ -s "$parts[2]" ]] && continue
+  curl -fsL -o "$parts[2].part" \
+    "https://huggingface.co/superwhisper/s1-mini-GGUF/raw/$s1_rev/$parts[1]"
+  mv "$parts[2].part" "$parts[2]"
+done
 if (( app_mode )); then
   print "Fixed Cohere MLX + S1-mini stack is ready in $app_models."
   print "Quit and reopen Local Dictation (menu bar icon, Quit) to load the models."
 else
   ln -sfn "$s1_dest" "$repo_root/models/llm/s1-mini/s1-mini.gguf"
+  ln -sfn "$s1_license" "$repo_root/models/llm/s1-mini/LICENSE.txt"
+  ln -sfn "$s1_notice" "$repo_root/models/llm/s1-mini/NOTICE.txt"
 
   native/cohere-mlx/build.sh >/dev/null
   print "Fixed Cohere MLX + S1-mini stack is ready (bytes in $models_home, repo symlinked)."

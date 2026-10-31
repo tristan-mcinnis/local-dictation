@@ -26,7 +26,13 @@
 //! (e.g. Google Meet in a tab) can't be detected this way.
 //!
 //! Set `DICTATE_NO_MUTE=1` to disable this entirely.
+//!
+//! A quit or crash mid-capture must not leave the Mac muted. Quit restores in
+//! `applicationWillTerminate:`. For a crash or a plain `kill`, a marker file is
+//! written before we mute and removed after we unmute; the next daemon start
+//! finds a leftover marker and unmutes ([`restore_after_crash`]).
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -132,7 +138,7 @@ pub fn mute() {
     if frontmost_is_conferencing() {
         return;
     }
-    DUCKER.mute(current_muted, set_muted);
+    DUCKER.mute(current_muted, set_muted_and_mark);
 }
 
 /// Restore output to its pre-capture state. No-op if we never muted (not
@@ -143,7 +149,56 @@ pub fn restore() {
     if disabled() {
         return;
     }
-    DUCKER.restore(set_muted);
+    DUCKER.restore(set_muted_and_mark);
+}
+
+/// Unmute if a previous run muted output and never got to restore it (crash,
+/// `kill`). Call once at daemon start, before any capture.
+pub fn restore_after_crash() {
+    if let Some(marker) = marker_path() {
+        if restore_from_marker(&marker, set_muted) {
+            eprintln!("[duck] previous run left output muted; unmuted");
+        }
+    }
+}
+
+fn marker_path() -> Option<PathBuf> {
+    Some(crate::app_paths::app_support_dir()?.join("output-muted-by-dictation"))
+}
+
+/// The device op the live ducker uses: the marker exists exactly while output
+/// may be muted by us. Written before muting, so a crash between the two still
+/// leaves it; removed only after the unmute.
+fn set_muted_and_mark(muted: bool) {
+    let marker = marker_path();
+    if muted {
+        if let Some(marker) = &marker {
+            write_marker(marker);
+        }
+        set_muted(true);
+    } else {
+        set_muted(false);
+        if let Some(marker) = &marker {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+}
+
+fn write_marker(marker: &Path) {
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(marker, b"");
+}
+
+/// Returns true when a marker was found and the device unmuted.
+fn restore_from_marker(marker: &Path, set: fn(bool)) -> bool {
+    if !marker.exists() {
+        return false;
+    }
+    set(false);
+    let _ = std::fs::remove_file(marker);
+    true
 }
 
 /// RAII guard: restore output mute when dropped. Construct one at the top of a
@@ -326,6 +381,27 @@ mod tests {
         D.restore(record_set);
         assert_eq!(*SETS.lock().unwrap(), vec![true, false], "mute, then unmute");
         assert!(!D.active.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_marker_left_by_a_crashed_run_unmutes_once_at_start() {
+        static CALLS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+        fn record(muted: bool) {
+            CALLS.lock().unwrap().push(muted);
+        }
+        let dir = std::env::temp_dir().join(format!("ld-duck-{}", std::process::id()));
+        let marker = dir.join("nested").join("output-muted-by-dictation");
+
+        assert!(!restore_from_marker(&marker, record), "no marker, no unmute");
+        assert!(CALLS.lock().unwrap().is_empty());
+
+        write_marker(&marker);
+        assert!(restore_from_marker(&marker, record));
+        assert_eq!(*CALLS.lock().unwrap(), vec![false]);
+        assert!(!marker.exists(), "marker consumed");
+        assert!(!restore_from_marker(&marker, record), "second start does nothing");
+        assert_eq!(CALLS.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

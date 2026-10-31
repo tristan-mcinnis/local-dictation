@@ -361,6 +361,8 @@ pub fn run(config: DaemonConfig) -> eyre::Result<()> {
             eprintln!("[warn] no single-instance lock ({reason}) — starting unguarded");
         }
     }
+    // After the lock: until then a departing instance may still be recording.
+    crate::audio_duck::restore_after_crash();
 
     // Ask for Accessibility ONCE with the prompting check: that is what puts
     // this app in the System Settings list at all. Whatever the answer, the

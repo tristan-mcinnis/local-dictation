@@ -295,15 +295,41 @@ where
             return;
         }
     };
+    // Owner-only, whatever the umask or the directory (DICTATE_CONTROL_SOCK may
+    // point into a shared one). The peer check below closes the gap before
+    // this chmod lands.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     eprintln!("[boot] control     socket {}", path.display());
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
-                Ok(s) => serve_conn(s, &dispatch),
+                Ok(s) if peer_is_same_user(peer_uid(&s), me) => serve_conn(s, &dispatch),
+                Ok(_) => eprintln!("[ctl]  refused a connection from another user"),
                 Err(_) => continue, // transient accept error; keep listening
             }
         }
     });
+}
+
+/// The connecting process's effective uid, from the kernel.
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: a valid connected socket fd and two out-pointers to locals.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    (rc == 0).then_some(uid)
+}
+
+/// Only our own user may drive the daemon: `retry` and `copy-last` re-inject or
+/// expose the last dictation. An unknown peer is refused. Pure.
+fn peer_is_same_user(peer: Option<u32>, me: u32) -> bool {
+    peer == Some(me)
 }
 
 /// Handle one client connection: read a command word, resolve `toggle`, dispatch
@@ -585,6 +611,13 @@ mod tests {
     }
 
     #[test]
+    fn only_our_own_user_may_connect() {
+        assert!(peer_is_same_user(Some(501), 501));
+        assert!(!peer_is_same_user(Some(502), 501), "another local user is refused");
+        assert!(!peer_is_same_user(None, 501), "an unknown peer is refused");
+    }
+
+    #[test]
     fn server_dispatches_commands_over_socket() {
         use std::sync::mpsc;
         // Pin the socket to a unique per-process temp path so this test is
@@ -597,6 +630,11 @@ mod tests {
         serve(move |cmd| {
             let _ = tx.send(cmd);
         });
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock).expect("socket exists").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "control socket is owner-only, not umask-dependent");
+        }
 
         // Concrete commands (no dependence on the global recording flag) so the
         // assertion is deterministic under parallel test execution.
