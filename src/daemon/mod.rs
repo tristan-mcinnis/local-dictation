@@ -13,9 +13,11 @@
 //! flags system-wide. The first run surfaces the TCC prompt via the
 //! injector's `ensure_trusted_or_prompt`.
 
+mod deliver;
 mod ptt;
 mod worker;
 mod listen;
+use deliver::*;
 use ptt::*;
 use worker::*;
 pub use listen::run_listen;
@@ -24,7 +26,7 @@ use listen::*;
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
 use crate::corrections::Corrections;
 use crate::cues;
-use crate::injector::{AccessibilityInjector, FocusTarget, InjectRequest};
+use crate::injector::{AccessibilityInjector, Delivery, FocusTarget, InjectRequest};
 use crate::menubar;
 use crate::refiner::{DictationOutcome, Refiner};
 use crate::transcriber::LocalInferenceWorker;

@@ -18,6 +18,7 @@
 //! A password field (`AXSecureTextField`) is never a target: it classifies as
 //! `NotEditable`, and its value is never read for caret or screen context.
 
+use crate::last_dictation::KeptCause;
 use crate::smart_pad::smart_pad;
 use crate::smart_pad::last_non_ws_before;
 use std::sync::Mutex;
@@ -40,7 +41,7 @@ use std::sync::Mutex;
 //   * `NotEditable` — nothing positive. Do NOT inject or paste. Hold + copy.
 //
 // The daemon combines this with the OOB cancel gate (`crate::cancel`) at the
-// single decision point before any write action (see `decide_inject`).
+// single decision point before any write action (see `finalize_utterance`).
 
 /// Whether the currently-focused surface is a legitimate text-input target.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,36 +178,38 @@ pub fn retained_focus_can_fallback(
         && captured_pid == current_frontmost
 }
 
-/// The pure decision: what to do with a finished transcript. This is the seam
-/// the worker consults immediately before any write action.
+/// What the caller does with a finished text after the write attempt: nothing
+/// (it landed), keep it (nothing was written; the cause is what the pill and
+/// the History note say), or drop it (a cancel beat the write).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InjectDecision {
-    Inject,
-    /// Don't write. Keep the transcript recoverable; show a clear state.
-    Hold {
-        reason: HoldReason,
-    },
+pub enum Delivery {
+    Delivered,
+    Held(KeptCause),
+    Cancelled,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum HoldReason {
-    /// An Escape / cancel arrived; the utterance is discarded.
-    Cancelled,
-    /// No editable field is focused; the transcript is held, not written.
-    NoEditableField,
-}
-
-/// How a `finalize_utterance` call actually settled. This is the observable
-/// result the worker + tests branch on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FinalizeResult {
-    Injected,
-    /// Held (transcript preserved, nothing written because no editable field).
-    Held,
-    /// Discarded (a cancel arrived; nothing written).
-    Cancelled,
-    /// The write was attempted but failed.
-    Failed,
+/// Turn the injector's answer into what happens to the text, logging a refused
+/// or failed write once, with the app it was for. `target_pid` is only looked
+/// up on those paths (the label may shell out to `ps`).
+pub fn delivery_of(result: eyre::Result<InjectOutcome>, target_pid: Option<i32>) -> Delivery {
+    match result {
+        Ok(InjectOutcome::Injected) => Delivery::Delivered,
+        Ok(InjectOutcome::Cancelled) => Delivery::Cancelled,
+        Ok(InjectOutcome::NoEditableField) => {
+            eprintln!("  ◌    no text field selected, text kept app={}", app_label_for_pid(target_pid));
+            Delivery::Held(KeptCause::NoEditableField)
+        }
+        // Fail-closed: the expected app was not frontmost at the global Cmd+V,
+        // so nothing was written. Held, like a missing field.
+        Ok(InjectOutcome::RefusedForeground) => {
+            eprintln!("  ◌    target not frontmost at paste, text kept app={}", app_label_for_pid(target_pid));
+            Delivery::Held(KeptCause::NoEditableField)
+        }
+        Err(e) => {
+            eprintln!("  ✗    inject failed: {e:?}, text kept app={}", app_label_for_pid(target_pid));
+            Delivery::Held(KeptCause::PasteFailed)
+        }
+    }
 }
 
 /// A password field. Never a dictation target: nothing is written into it and
@@ -399,65 +402,25 @@ pub fn ax_write_landed(before: &FieldSnapshot, after: &FieldSnapshot, written: &
     }
 }
 
-/// The single decision point: given the cancel state and the focus evidence,
-/// should this transcript be injected, held, or dropped?
-///
-/// `editability: None` means the caller does NOT know the current focus (e.g. a
-/// failed press-time capture) — that is NOT a hold. It proceeds to the consumer
-/// (the fresh resolver at write time), which re-reads the *current* focused
-/// element and reports `Injected` or `NoEditableField`. Only a *known*
-/// `NotEditable` (positive negative evidence) holds without writing.
-pub fn decide_inject(cancel_requested: bool, editability: Option<FocusEditability>) -> InjectDecision {
-    if cancel_requested {
-        InjectDecision::Hold {
-            reason: HoldReason::Cancelled,
-        }
-    } else {
-        match editability {
-            // Unknown → let the fresh resolver decide at write time.
-            None => InjectDecision::Inject,
-            Some(FocusEditability::Editable | FocusEditability::PasteSafe) => InjectDecision::Inject,
-            Some(FocusEditability::NotEditable) => InjectDecision::Hold {
-                reason: HoldReason::NoEditableField,
-            },
-        }
-    }
-}
-
-/// Run the per-utterance finalization seam: decide inject-vs-hold from the
-/// cancel gate + focus evidence, then (when decided) perform the write through
-/// the injected sink and report the observable outcome. The sink is the real
-/// injector call in production; in tests it is a recording closure, so the
-/// suppression is observed through behaviour, not a tautological flag.
-///
-/// The sink returns `eyre::Result<InjectOutcome>` so a hard write failure is
-/// distinguishable from a transcription-time hold. `None` editability reaches
-/// the sink so the fresh resolver decides from the *current* focus.
+/// The per-utterance finalization seam, run immediately before any write. A
+/// `hold` the caller already decided (the recording limit) keeps the text
+/// without touching the injector; a pending cancel drops it the same way.
+/// Otherwise the write goes through `inject`, the real injector in production
+/// and a recording closure in tests, which re-reads the current focus and
+/// answers for itself. The text, not a flag, is what the sink sees.
 pub fn finalize_utterance(
     cancel_requested: bool,
-    editability: Option<FocusEditability>,
+    hold: Option<KeptCause>,
     transcript: &str,
+    target_pid: Option<i32>,
     inject: impl FnOnce(&str) -> eyre::Result<InjectOutcome>,
-) -> FinalizeResult {
-    match decide_inject(cancel_requested, editability) {
-        InjectDecision::Inject => match inject(transcript) {
-            Ok(InjectOutcome::Injected) => FinalizeResult::Injected,
-            // The fresh resolver found no editable field at write time.
-            Ok(InjectOutcome::NoEditableField) => FinalizeResult::Held,
-            // A fail-closed clipboard guard refused (the expected app was not
-            // frontmost at Cmd+V delivery): nothing written, hold recoverable.
-            Ok(InjectOutcome::RefusedForeground) => FinalizeResult::Held,
-            // The write authorizer refused (a cancel landed during the focus
-            // lookup): nothing written, utterance discarded.
-            Ok(InjectOutcome::Cancelled) => FinalizeResult::Cancelled,
-            Err(_) => FinalizeResult::Failed,
-        },
-        InjectDecision::Hold {
-            reason: HoldReason::Cancelled,
-        } => FinalizeResult::Cancelled,
-        InjectDecision::Hold {
-            reason: HoldReason::NoEditableField,
-        } => FinalizeResult::Held,
+) -> Delivery {
+    if cancel_requested {
+        return Delivery::Cancelled;
+    }
+    match hold {
+        Some(cause) => Delivery::Held(cause),
+        None => delivery_of(inject(transcript), target_pid),
     }
 }
 
@@ -2007,6 +1970,7 @@ mod tests {
             ["holding", "text kept", "transcript kept", "result kept", "clipboard paste"];
         let files = [
             ("injector.rs", include_str!("injector.rs")),
+            ("daemon/deliver.rs", include_str!("daemon/deliver.rs")),
             ("daemon/listen.rs", include_str!("daemon/listen.rs")),
             ("daemon/worker.rs", include_str!("daemon/worker.rs")),
         ];
@@ -2087,10 +2051,6 @@ mod tests {
         assert!(is_secure_field(Some("AXSecureTextField")));
         assert!(!is_secure_field(Some("AXSearchField")));
         assert!(!is_secure_field(None));
-        assert_eq!(
-            decide_inject(false, Some(FocusEditability::NotEditable)),
-            InjectDecision::Hold { reason: HoldReason::NoEditableField }
-        );
     }
 
     #[test]
@@ -2364,47 +2324,18 @@ mod tests {
         assert!(claim_electron_ax_wake(990_002), "a different app may claim");
     }
 
-    // ── decide_inject / finalize_utterance: observable-sink behaviour ──────
+    // ── finalize_utterance: observable-sink behaviour ──────
 
     #[test]
-    fn cancel_holds_even_when_editable() {
-        assert_eq!(
-            decide_inject(true, Some(FocusEditability::Editable)),
-            InjectDecision::Hold {
-                reason: HoldReason::Cancelled
-            }
-        );
-    }
-
-    #[test]
-    fn editable_and_paste_safe_inject() {
-        assert_eq!(
-            decide_inject(false, Some(FocusEditability::Editable)),
-            InjectDecision::Inject
-        );
-        assert_eq!(
-            decide_inject(false, Some(FocusEditability::PasteSafe)),
-            InjectDecision::Inject
-        );
-    }
-
-    #[test]
-    fn unknown_focus_does_not_hold_without_writing() {
-        // Reviewer: a failed initial capture (editability unknown = None) must
-        // reach the fresh resolver at write time, NOT hold as if NotEditable.
-        assert_eq!(decide_inject(false, None), InjectDecision::Inject);
-    }
-
-    #[test]
-    fn not_editable_holds_and_never_writes() {
-        // ONLY a KNOWN NotEditable holds without writing. Sink never called.
+    fn a_decided_hold_keeps_its_cause_and_never_writes() {
+        // The recording limit holds before the write ladder. Sink never called.
         let mut sink_called = false;
-        let result = finalize_utterance(false, Some(FocusEditability::NotEditable), "hello", |_| {
+        let result = finalize_utterance(false, Some(KeptCause::LimitReached), "hello", None, |_| {
             sink_called = true;
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Held);
-        assert!(!sink_called, "a known NotEditable focus must never reach the injector");
+        assert_eq!(result, Delivery::Held(KeptCause::LimitReached));
+        assert!(!sink_called, "a decided hold must never reach the injector");
     }
 
     // ORCHESTRATION (2026-09-07): a global Cmd+V lands in the OS-frontmost app,
@@ -2486,10 +2417,10 @@ mod tests {
     fn refused_foreground_holds_recoverable_not_failed() {
         // A fail-closed foreground refusal at Cmd+V delivery is a HOLD (the
         // transcript stays recoverable), never a hard failure.
-        let result = finalize_utterance(false, None, "dictated", |_| {
+        let result = finalize_utterance(false, None, "dictated", None, |_| {
             Ok(InjectOutcome::RefusedForeground)
         });
-        assert_eq!(result, FinalizeResult::Held);
+        assert_eq!(result, Delivery::Held(KeptCause::NoEditableField));
     }
 
     #[test]
@@ -2498,21 +2429,21 @@ mod tests {
         // target is None → editability None → the sink (fresh resolver) runs
         // and, seeing the CURRENT field editable, injects.
         let mut injected = Vec::new();
-        let result = finalize_utterance(false, None, "dictated", |t| {
+        let result = finalize_utterance(false, None, "dictated", None, |t| {
             injected.push(t.to_string());
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Injected);
+        assert_eq!(result, Delivery::Delivered);
         assert_eq!(injected, vec!["dictated"]);
     }
 
     #[test]
     fn failed_capture_then_current_not_editable_holds() {
         // The fresh resolver at write time finds no editable field → Held.
-        let result = finalize_utterance(false, None, "dictated", |_| {
+        let result = finalize_utterance(false, None, "dictated", None, |_| {
             Ok(InjectOutcome::NoEditableField)
         });
-        assert_eq!(result, FinalizeResult::Held);
+        assert_eq!(result, Delivery::Held(KeptCause::NoEditableField));
     }
 
     #[test]
@@ -2521,26 +2452,26 @@ mod tests {
         // fresh gate reports NoEditableField → Held, sink still called (gate
         // decided) but no write happened / nothing pasted.
         let mut writes = 0usize;
-        let out = finalize_utterance(false, None, "x", |_| {
+        let out = finalize_utterance(false, None, "x", None, |_| {
             writes += 1;
             Ok(InjectOutcome::NoEditableField)
         });
-        assert_eq!(out, FinalizeResult::Held);
+        assert_eq!(out, Delivery::Held(KeptCause::NoEditableField));
         // Click back into the field: next utterance injects.
-        let in_ = finalize_utterance(false, None, "y", |_| {
+        let in_ = finalize_utterance(false, None, "y", None, |_| {
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(in_, FinalizeResult::Injected);
+        assert_eq!(in_, Delivery::Delivered);
     }
 
     #[test]
     fn cancel_never_reaches_the_injector() {
         let mut sink_called = false;
-        let result = finalize_utterance(true, Some(FocusEditability::Editable), "hello", |_| {
+        let result = finalize_utterance(true, None, "hello", None, |_| {
             sink_called = true;
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Cancelled);
+        assert_eq!(result, Delivery::Cancelled);
         assert!(!sink_called, "a cancelled utterance must never be injected");
     }
 
@@ -2549,17 +2480,17 @@ mod tests {
         // The headlining user-visible guarantee: cancel one utterance, then a
         // fresh dictation goes straight through to the injector.
         let mut injected = Vec::new();
-        let result = finalize_utterance(true, Some(FocusEditability::Editable), "cancelled", |_| {
+        let result = finalize_utterance(true, None, "cancelled", None, |_| {
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Cancelled);
+        assert_eq!(result, Delivery::Cancelled);
         assert!(injected.is_empty());
 
-        let result = finalize_utterance(false, Some(FocusEditability::Editable), "fresh", |t| {
+        let result = finalize_utterance(false, None, "fresh", None, |t| {
             injected.push(t.to_string());
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Injected);
+        assert_eq!(result, Delivery::Delivered);
         assert_eq!(injected, vec!["fresh"]);
     }
 
@@ -2567,18 +2498,18 @@ mod tests {
     fn injector_discovering_no_field_reports_held() {
         // Even with apparent positive evidence, the injector's fresh gate may
         // find black-holed focus at write time → Held.
-        let result = finalize_utterance(false, Some(FocusEditability::Editable), "x", |_| {
+        let result = finalize_utterance(false, None, "x", None, |_| {
             Ok(InjectOutcome::NoEditableField)
         });
-        assert_eq!(result, FinalizeResult::Held);
+        assert_eq!(result, Delivery::Held(KeptCause::NoEditableField));
     }
 
     #[test]
-    fn hard_write_failure_reports_failed() {
-        let result = finalize_utterance(false, Some(FocusEditability::Editable), "x", |_| {
+    fn hard_write_failure_is_kept_as_a_failed_paste() {
+        let result = finalize_utterance(false, None, "x", None, |_| {
             Err(eyre::eyre!("AX refused"))
         });
-        assert_eq!(result, FinalizeResult::Failed);
+        assert_eq!(result, Delivery::Held(KeptCause::PasteFailed));
     }
 
     // ── write-authorizer seam (the commit moved to just before the write) ──
@@ -2611,7 +2542,7 @@ mod tests {
         assert!(gate.request_cancel());
 
         let mut writes = 0usize;
-        let result = finalize_utterance(false, None, "dictated", |_| {
+        let result = finalize_utterance(false, None, "dictated", None, |_| {
             // ...lookup resumes here; claim authorization at the last moment.
             if !gate.commit(gen) {
                 return Ok(InjectOutcome::Cancelled);
@@ -2619,7 +2550,7 @@ mod tests {
             writes += 1;
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Cancelled);
+        assert_eq!(result, Delivery::Cancelled);
         assert_eq!(writes, 0, "a cancelled utterance must never reach the write");
     }
 
@@ -2628,14 +2559,14 @@ mod tests {
         let gate = crate::cancel::CancelGate::new();
         let gen = gate.begin();
         let mut writes = 0usize;
-        let result = finalize_utterance(false, None, "dictated", |_| {
+        let result = finalize_utterance(false, None, "dictated", None, |_| {
             if !gate.commit(gen) {
                 return Ok(InjectOutcome::Cancelled);
             }
             writes += 1;
             Ok(InjectOutcome::Injected)
         });
-        assert_eq!(result, FinalizeResult::Injected);
+        assert_eq!(result, Delivery::Delivered);
         assert_eq!(writes, 1);
         // A second claim for the same generation is refused (exactly-once).
         assert!(!gate.commit(gen));
@@ -2647,11 +2578,11 @@ mod tests {
         // authorizer is never polled and nothing is written.
         let mut authorized = 0usize;
         let result =
-            finalize_utterance(false, Some(FocusEditability::NotEditable), "x", |_| {
+            finalize_utterance(false, Some(KeptCause::NoEditableField), "x", None, |_| {
                 authorized += 1;
                 Ok(InjectOutcome::Injected)
             });
-        assert_eq!(result, FinalizeResult::Held);
+        assert_eq!(result, Delivery::Held(KeptCause::NoEditableField));
         assert_eq!(authorized, 0);
     }
 }

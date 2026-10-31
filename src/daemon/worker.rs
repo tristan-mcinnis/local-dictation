@@ -1512,35 +1512,24 @@ pub(super) fn worker_loop(
                 //      focus/context/padding re-resolve and immediately before
                 //      the first write/clipboard side effect — so a cancel that
                 //      lands during a slow (up to 1.5s) AX lookup is still
-                //      honored. A refusal maps to `FinalizeResult::Cancelled`.
+                //      honored. A refusal maps to `Delivery::Cancelled`.
                 //   2. focus: the injector re-resolves the CURRENT focused
                 //      element and gates on its role/writability, so a stale
                 //      key-press target or a same-app focus change never
                 //      writes blindly. `finalize_utterance` is the tested seam;
                 //      the sink is the actual AX/clipboard call.
                 let used_fresh_capture = captured_target.is_none();
-                let inject_source = captured_target; // moved into the sink
                 let t_inject = Instant::now();
-                let finish = crate::injector::finalize_utterance(
-                    false,
+                let delivery = deliver(
+                    cur_gen,
                     // A limit stop is held by decision: known "do not write".
-                    limit_stopped.then_some(crate::injector::FocusEditability::NotEditable),
+                    limit_stopped.then_some(crate::last_dictation::KeptCause::LimitReached),
+                    captured_target,
+                    target_pid,
                     &final_text,
-                    |text| {
-                        // One authorization claim, exactly once, immediately
-                        // before the first side effect (no second claim across
-                        // the write ladder's fallbacks).
-                        let authorize = || authorize_paste(cur_gen);
-                        AccessibilityInjector::inject(
-                            InjectRequest { target: inject_source, authorize: Some(&authorize), ..Default::default() },
-                            text,
-                        )
-                    },
                 );
-                let finish = if crate::cancel::CANCEL.requested(cur_gen) {
-                    crate::injector::FinalizeResult::Cancelled
-                } else { finish };
                 let t_inject_ms = ms(t_inject.elapsed());
+                recovery.status = recovery_status(delivery);
                 crate::latency::record(crate::latency::Snapshot {
                     release_ms: ms(t_release.elapsed()) as u64,
                     tail_ms: t_tail_ms as u64,
@@ -1549,7 +1538,7 @@ pub(super) fn worker_loop(
                     cleanup_ms: t_cleanup_ms as u64,
                     focus_ms: t_focus_wait_ms as u64,
                     insertion_ms: t_inject_ms as u64,
-                    inserted: matches!(&finish, crate::injector::FinalizeResult::Injected),
+                    inserted: delivery == Delivery::Delivered,
                 });
 
                 // ─── per-utterance summary block ───────────────────────
@@ -1601,16 +1590,8 @@ pub(super) fn worker_loop(
                         crate::daemon_log::text(&raw_transcript)
                     );
                 }
-                // Capture is over; un-mute other audio now so the outcome cue
-                // below is actually audible. `play_start` runs before `mute()`,
-                // but the completion/error/cancel cues otherwise played inside
-                // the muted window and were silent (the guarded Drop restores
-                // only when this arm ends). Restore is idempotent, so the
-                // `RestoreOnDrop` guard later is a no-op.
-                crate::audio_duck::restore();
-                match finish {
-                    crate::injector::FinalizeResult::Injected => {
-                        recovery.status = crate::history::RecoveryStatus::Completed;
+                match delivery {
+                    Delivery::Delivered => {
                         eprintln!("  ✓    {}", crate::daemon_log::text(&final_text));
                         cues::play_success();
                         // Remember it for the menu-bar "Copy last dictation" item.
@@ -1633,33 +1614,8 @@ pub(super) fn worker_loop(
                             execute_trailing_action(&action);
                         }
                     }
-                    crate::injector::FinalizeResult::Held => {
-                        recovery.status = crate::history::RecoveryStatus::Held;
-                        // No editable field focused (or the recording limit
-                        // stopped it): never paste blindly. The words become the
-                        // last dictation, go to the clipboard, and the pill says so.
-                        let cause = if limit_stopped {
-                            crate::last_dictation::KeptCause::LimitReached
-                        } else {
-                            crate::last_dictation::KeptCause::NoEditableField
-                        };
-                        eprintln!("  ◌    not inserted ({cause:?}) — transcript kept app={}", crate::injector::app_label_for_pid(target_pid));
-                        keep_and_show(cur_gen, &final_text, cause);
-                    }
-                    crate::injector::FinalizeResult::Cancelled => {
-                        recovery.status = crate::history::RecoveryStatus::Cancelled;
-                        eprintln!("  ⌫    cancelled · discarded");
-                        cues::play_cancel();
-                        ui_channel::set_state(UiState::Idle);
-                    }
-                    crate::injector::FinalizeResult::Failed => {
-                        eprintln!("  ✗    inject failed — transcript kept app={}", crate::injector::app_label_for_pid(target_pid));
-                        // The words exist; only the write failed. Keep them
-                        // reachable (they used to be dropped, so "Copy last
-                        // dictation" returned the PREVIOUS text) and say what
-                        // really happened instead of "Couldn’t transcribe".
-                        keep_and_show(cur_gen, &final_text, crate::last_dictation::KeptCause::PasteFailed);
-                    }
+                    Delivery::Held(_) => {}
+                    Delivery::Cancelled => ui_channel::set_state(UiState::Idle),
                 }
                 eprintln!();
                 // The utterance settled (injected, held, cancelled, or failed):
@@ -2060,61 +2016,14 @@ pub(super) fn handle_spoken_command(
 
     crate::history::append_recovery_stage(generation, StageKind::Transform, result, &cmd.label);
     ui_channel::publish_preview(generation, result);
-    let authorize = || authorize_paste(generation);
     let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
-    let inject_result = AccessibilityInjector::inject(
-        InjectRequest { target: captured_target, authorize: Some(&authorize), ..Default::default() },
-        result,
-    );
-    match inject_result {
-        Ok(crate::injector::InjectOutcome::Injected) => {
-            eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
-            ui_channel::set_last_dictation(result);
-            crate::history::append_recovery_stage(generation, StageKind::Output, result, "Inserted");
-            RecoveryStatus::Completed
-        }
-        Ok(crate::injector::InjectOutcome::NoEditableField) => {
-            eprintln!("  ◌    no text field selected — result kept app={}", crate::injector::app_label_for_pid(target_pid));
-            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
-            RecoveryStatus::Held
-        }
-        Ok(crate::injector::InjectOutcome::Cancelled) => {
-            eprintln!("  ⌫    cancelled · discarded");
-            cues::play_cancel();
-            RecoveryStatus::Cancelled
-        }
-        Ok(crate::injector::InjectOutcome::RefusedForeground) => {
-            // Fail-closed: the expected app was not frontmost at the global
-            // Cmd+V, so nothing was written. Keep it recoverable.
-            eprintln!("  ◌    target not frontmost at paste — result kept app={}", crate::injector::app_label_for_pid(target_pid));
-            keep_and_show(generation, result, crate::last_dictation::KeptCause::NoEditableField);
-            RecoveryStatus::Held
-        }
-        Err(e) => {
-            eprintln!("  ✗    inject failed: {e:?} — result kept app={}", crate::injector::app_label_for_pid(target_pid));
-            keep_and_show(generation, result, crate::last_dictation::KeptCause::PasteFailed);
-            RecoveryStatus::Failed
-        }
+    let delivery = deliver(generation, None, captured_target, target_pid, result);
+    if delivery == Delivery::Delivered {
+        eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
+        ui_channel::set_last_dictation(result);
+        crate::history::append_recovery_stage(generation, StageKind::Output, result, "Inserted");
     }
-}
-
-/// A finished transcript did not reach the app. Make it the last dictation,
-/// put it on the clipboard (setting permitting), note it in History, play the
-/// error cue and show the kept-result pill for this generation: about four
-/// seconds, or until the next key press, with the History button on it.
-pub(super) fn keep_and_show(generation: u64, text: &str, cause: crate::last_dictation::KeptCause) {
-    let state = crate::recovery::keep_transcript(text, cause);
-    let copied = matches!(
-        state,
-        UiState::HeldCopied | UiState::PasteFailedCopied | UiState::LimitReachedCopied
-    );
-    crate::history::append_recovery_stage(
-        generation,
-        crate::history::StageKind::Output,
-        text,
-        crate::last_dictation::kept_stage_note(cause, copied),
-    );
-    ui_channel::show_transient_for(generation, state, ui_channel::KEPT_PILL);
+    recovery_status(delivery)
 }
 
 #[cfg(test)]
@@ -2205,25 +2114,6 @@ mod tests {
         retain_in_flight_audio(&mut last, &[], None, None, None);
         assert!(last.is_empty());
     }
-}
-
-/// Flash the "Landed · N words" pill, or go straight to Idle when the result
-/// pill is off (default). The text landing at the cursor is the real feedback.
-pub(crate) fn show_result_pill() {
-    if crate::settings::Settings::load().resolve_show_result() {
-        ui_channel::show_transient(
-            UiState::Success,
-            Duration::from_millis(crate::settings::RESULT_PILL_MS),
-        );
-    } else {
-        ui_channel::set_state(UiState::Idle);
-    }
-}
-
-/// Claim the existing write gate, then publish Pasting at the actual boundary.
-/// A cancellation that beat this claim never presents a late paste stage.
-pub(super) fn authorize_paste(generation: u64) -> bool {
-    ui_channel::authorize_paste(generation)
 }
 
 /// Queue ownership of captured samples to the archive after retaining the ASR

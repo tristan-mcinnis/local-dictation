@@ -124,7 +124,7 @@ pub fn paste_last_dictation(
     recorded_pid: Option<i32>,
     retained_focus: Option<crate::injector::FocusTarget>,
 ) {
-    use crate::injector::{self, AccessibilityInjector, InjectOutcome, InjectRequest};
+    use crate::injector::{self, AccessibilityInjector, Delivery, InjectRequest};
     use crate::ui_channel::{self, UiState};
     use std::time::Duration;
 
@@ -196,35 +196,22 @@ pub fn paste_last_dictation(
             InjectRequest { pid: Some(target), target: retained_focus, authorize: Some(&authorize) },
             &text,
         );
-        match injection {
-            Ok(InjectOutcome::Injected) => {
+        match injector::delivery_of(injection, Some(target)) {
+            Delivery::Delivered => {
                 eprintln!("[recovery] pasted last dictation into pid {target}");
                 // A menu action needs explicit feedback even when the normal
                 // post-dictation result pill is disabled (the default).
                 ui_channel::set_last_inject_pid(Some(target));
                 ui_channel::show_transient_if_unowned(UiState::Success, Duration::from_millis(900));
             }
-            Ok(InjectOutcome::NoEditableField) => {
-                eprintln!(
-                    "[recovery] target pid {target} has no editable field — held (never paste blindly)"
-                );
-                let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField);
+            // Never paste blindly: a missing field, a target that left the
+            // front, or a failed write all keep the text.
+            Delivery::Held(cause) => {
+                let state = keep_transcript(&text, cause);
                 ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             }
-            Ok(InjectOutcome::RefusedForeground) => {
-                eprintln!(
-                    "[recovery] target pid {target} not frontmost at paste — held (not pasted)"
-                );
-                let state = keep_transcript(&text, crate::last_dictation::KeptCause::NoEditableField);
-                ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
-            }
-            Ok(InjectOutcome::Cancelled) => {
+            Delivery::Cancelled => {
                 eprintln!("[recovery] live dictation won the write boundary — paste abandoned");
-            }
-            Err(e) => {
-                eprintln!("[recovery] injection into pid {target} failed: {e}");
-                let state = keep_transcript(&text, crate::last_dictation::KeptCause::PasteFailed);
-                ui_channel::show_transient_if_unowned(state, ui_channel::KEPT_PILL);
             }
         }
     });
