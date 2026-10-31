@@ -106,6 +106,20 @@ over a dead hotkey.
   `DICTATE_LLM_MODEL_PATH`, `S1_MODEL_PATH` stays an alias), 2026-09.
 - Names are model-neutral: the cleanup LLM is `llm_*` in code, keys, and
   env vars, never the name of whichever model is loaded today.
+- Cleanup stays conservative. The main use is casual speech to AI agents
+  and chats, not formal writing. Strip only unambiguous filler; keep casual
+  phrasing and standalone words. Faithfulness beats polish.
+- Mechanical fixes (numbers, filler, casing) go in deterministic passes
+  (`numbers.rs`, `text_polish/`), not new cleanup-prompt rules.
+- Personal vocabulary comes from the user dictionary/corrections and screen
+  context. Never propose macOS Contacts as a name source: Tristan does not use it.
+
+## Docs style
+
+README and user docs stay tight. No emojis in prose (badges are fine), no em
+dashes. Lead with the USP: lowest latency, and text lands at the cursor for
+AI chats and messages. Number features 1..N by impact. Tables use Yes / No,
+not icons.
 
 ## Repo hygiene
 
