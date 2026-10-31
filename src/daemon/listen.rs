@@ -280,10 +280,10 @@ pub(super) fn inject_refined_authorized(
         DictationOutcome::Inject { text, action } => {
             let target = FocusTarget::capture().ok();
             let target_pid = target.as_ref().and_then(|t| t.inner_pid());
-            let res = match target {
-                Some(t) => AccessibilityInjector::inject_with_target_cancellable(t, &text, authorize),
-                None => AccessibilityInjector::inject_text_cancellable(&text, authorize),
-            };
+            let res = AccessibilityInjector::inject(
+                InjectRequest { target, authorize: Some(authorize), ..Default::default() },
+                &text,
+            );
             match res {
                 Ok(crate::injector::InjectOutcome::Injected) => {
                     eprintln!("  ✓    {}", crate::daemon_log::text(&text));

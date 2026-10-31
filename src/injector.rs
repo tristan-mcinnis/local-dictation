@@ -1070,70 +1070,36 @@ mod imp {
         )
     }
 
-    pub fn inject_systemwide(text: &str) -> eyre::Result<InjectOutcome> {
-        inject_systemwide_with(text, None)
-    }
-
-    /// Cancellable systemwide injection: `authorize` is polled once, after
-    /// focus/context/padding resolution and immediately before the first
-    /// write/clipboard side effect. Refusal yields [`InjectOutcome::Cancelled`].
-    pub fn inject_systemwide_with(
+    /// The one write path. With a `pid` the app is named (a menu recovery
+    /// paste); otherwise the OS-frontmost app is snapshotted and its focused
+    /// element resolved per-app, never through the systemwide AX proxy, which
+    /// answers -25204 or -25212 even when the app resolves fine. The fail-closed
+    /// Cmd+V guard still protects delivery and the write authorizer still holds
+    /// the cancel gate; both pass through to `inject_through`. If AX transiently
+    /// returns no focused element, `inject_through` may use `retained` only
+    /// when the same app remains frontmost and the capture was positively
+    /// editable.
+    pub fn inject(
+        pid: Option<pid_t>,
+        retained: Option<FocusTargetInner>,
         text: &str,
         authorize: Option<&dyn Fn() -> bool>,
     ) -> eyre::Result<InjectOutcome> {
         if !ensure_trusted_or_prompt() {
             return Err(eyre::eyre!(
-                "Accessibility permission not granted — System Settings → Privacy & Security → Accessibility"
+                "Accessibility permission not granted: System Settings > Privacy & Security > Accessibility"
             ));
         }
-        // Live resolution: snapshot the OS-frontmost app and resolve ITS focused
-        // element per-app (fresh at write time). We deliberately do NOT rely on
-        // the systemwide proxy (AXUIElementCreateSystemWide → focused), which
-        // can return kAXErrorCannotComplete (-25204) even when the frontmost
-        // app's focused element resolves fine. The fail-closed Cmd+V guard still
-        // protects the actual delivery, and the write-authorizer still holds the
-        // cancellation gate (passed through to `inject_through`).
-        match plan_live_inject(frontmost_pid()) {
-            LiveInjectPlan::Hold => {
-                eprintln!("{}", super::hold_log_line("no frontmost app at write time — holding (no live field)", "unknown"));
-                return Ok(InjectOutcome::NoEditableField);
-            }
-            LiveInjectPlan::ResolveApp { pid } => unsafe {
-                let app = AXUIElementCreateApplication(pid);
-                if app.is_null() {
-                    return Err(eyre::eyre!(
-                        "AXUIElementCreateApplication({pid}) returned null"
-                    ));
+        let pid = match pid {
+            Some(pid) => pid,
+            None => match plan_live_inject(super::frontmost_pid()) {
+                LiveInjectPlan::ResolveApp { pid } => pid,
+                LiveInjectPlan::Hold => {
+                    eprintln!("{}", super::hold_log_line("no frontmost app at write time, holding (no live field)", "unknown"));
+                    return Ok(InjectOutcome::NoEditableField);
                 }
-                bound_messaging_timeout(app);
-                let result = inject_through(app, text, authorize, Some(pid), None);
-                cf_release(app as CFTypeRef);
-                result
             },
-        }
-    }
-
-    pub fn inject_into_pid(pid: pid_t, text: &str) -> eyre::Result<InjectOutcome> {
-        inject_into_pid_with(pid, text, None, None)
-    }
-
-    pub fn inject_into_pid_cancellable(
-        pid: pid_t,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        inject_into_pid_with(pid, text, Some(authorize), None)
-    }
-
-    fn inject_into_pid_with(
-        pid: pid_t,
-        text: &str,
-        authorize: Option<&dyn Fn() -> bool>,
-        retained: Option<FocusTargetInner>,
-    ) -> eyre::Result<InjectOutcome> {
-        if !ensure_trusted_or_prompt() {
-            return Err(eyre::eyre!("Accessibility permission not granted"));
-        }
+        };
         unsafe {
             let app = AXUIElementCreateApplication(pid);
             if app.is_null() {
@@ -1142,21 +1108,15 @@ mod imp {
                 ));
             }
             bound_messaging_timeout(app);
-            let result = inject_through(
-                app,
-                text,
-                authorize,
-                Some(pid),
-                retained.as_ref(),
-            );
+            let result = inject_through(app, text, authorize, Some(pid), retained.as_ref());
             cf_release(app as CFTypeRef);
             result
         }
     }
 
     /// Resolve-now path: find the focused element → read context → smart-pad
-    /// → hand off to the shared write ladder. Used by the systemwide + by-PID
-    /// entry points. The pre-captured-target path (`inject_via_target`) shares
+    /// → hand off to the shared write ladder. Used by every entry point; a
+    /// request that carries a retained target shares
     /// the same ladder; the only difference is *when* the focus element is
     /// resolved.
     ///
@@ -1882,40 +1842,6 @@ mod imp {
         }
     }
 
-    /// Re-resolve the current field first. If AX transiently returns no focused
-    /// element, `inject_through` may use the retained field only when the same
-    /// app remains frontmost and the capture was positively editable.
-    pub fn inject_via_target_with(
-        target: FocusTargetInner,
-        text: &str,
-        authorize: Option<&dyn Fn() -> bool>,
-    ) -> eyre::Result<InjectOutcome> {
-        let pid = match plan_live_inject(super::frontmost_pid()) {
-            LiveInjectPlan::ResolveApp { pid } => pid,
-            LiveInjectPlan::Hold => return Ok(InjectOutcome::NoEditableField),
-        };
-        unsafe {
-            let app = AXUIElementCreateApplication(pid);
-            if app.is_null() {
-                return Err(eyre::eyre!(
-                    "AXUIElementCreateApplication({pid}) returned null"
-                ));
-            }
-            bound_messaging_timeout(app);
-            let result = inject_through(app, text, authorize, Some(pid), Some(&target));
-            cf_release(app as CFTypeRef);
-            result
-        }
-    }
-
-    pub fn inject_into_pid_with_target_cancellable(
-        pid: i32,
-        target: FocusTargetInner,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        inject_into_pid_with(pid, text, Some(authorize), Some(target))
-    }
 }
 
 /// Pre-captured focus target — owned, Send across threads. Created at
@@ -2000,143 +1926,43 @@ impl FocusTarget {
     }
 }
 
+/// One write. `pid` names the app explicitly (a menu recovery paste); `None`
+/// writes into the app that is OS-frontmost at write time. `target` is the
+/// field captured at key-press, reused only when the fresh lookup finds no
+/// element and `retained_focus_can_fallback` allows it. `authorize` is polled
+/// once, immediately before the first write or clipboard side effect; `None`
+/// (the CLI entry points) is always authorized.
+#[derive(Default)]
+pub struct InjectRequest<'a> {
+    pub pid: Option<i32>,
+    pub target: Option<FocusTarget>,
+    pub authorize: Option<&'a dyn Fn() -> bool>,
+}
+
 impl AccessibilityInjector {
+    /// Write `text` at the caret. Empty text is a successful no-op.
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_text(text: &str) -> eyre::Result<InjectOutcome> {
+    pub fn inject(request: InjectRequest<'_>, text: &str) -> eyre::Result<InjectOutcome> {
         if text.trim().is_empty() {
             return Ok(InjectOutcome::Injected);
         }
-        imp::inject_systemwide(text)
-    }
-
-    /// Cancellable systemwide injection. `authorize` is polled exactly once,
-    /// after the focus/context/padding resolution and immediately before the
-    /// first write/clipboard side effect; refusal yields
-    /// [`InjectOutcome::Cancelled`] with nothing written.
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_text_cancellable(
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_systemwide_with(text, Some(authorize))
-    }
-
-    /// Cancellable pre-captured-target injection: same fresh re-resolve, same
-    /// write authorizer immediately before the first side effect.
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_with_target_cancellable(
-        target: FocusTarget,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_via_target_with(target.inner, text, Some(authorize))
+        imp::inject(request.pid, request.target.map(|t| t.inner), text, request.authorize)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_text_cancellable(
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if !authorize() {
+    pub fn inject(request: InjectRequest<'_>, text: &str) -> eyre::Result<InjectOutcome> {
+        if request.authorize.is_some_and(|authorize| !authorize()) {
             return Ok(InjectOutcome::Cancelled);
         }
-        Self::inject_text(text)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_with_target_cancellable(
-        _target: FocusTarget,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if !authorize() {
-            return Ok(InjectOutcome::Cancelled);
-        }
-        Self::inject_text(text)
-    }
-
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_into_pid(pid: i32, text: &str) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_into_pid(pid, text)
-    }
-
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_into_pid_cancellable(
-        pid: i32,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_into_pid_cancellable(pid, text, authorize)
-    }
-
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_into_pid_with_target_cancellable(
-        pid: i32,
-        target: FocusTarget,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_into_pid_with_target_cancellable(pid, target.inner, text, authorize)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_text(text: &str) -> eyre::Result<InjectOutcome> {
         let padded = smart_pad(text, None, None, None);
         if padded.is_empty() {
             return Ok(InjectOutcome::Injected);
         }
-        println!("[INJECT-FALLBACK] {padded}");
+        match request.pid {
+            Some(pid) => println!("[INJECT-FALLBACK pid {pid}] {padded}"),
+            None => println!("[INJECT-FALLBACK] {padded}"),
+        }
         Ok(InjectOutcome::Injected)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_into_pid(_pid: i32, text: &str) -> eyre::Result<InjectOutcome> {
-        let padded = smart_pad(text, None, None, None);
-        if padded.is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        println!("[INJECT-FALLBACK-PID] {padded}");
-        Ok(InjectOutcome::Injected)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_into_pid_cancellable(
-        pid: i32,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if !authorize() {
-            return Ok(InjectOutcome::Cancelled);
-        }
-        Self::inject_into_pid(pid, text)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_into_pid_with_target_cancellable(
-        pid: i32,
-        _target: FocusTarget,
-        text: &str,
-        authorize: &dyn Fn() -> bool,
-    ) -> eyre::Result<InjectOutcome> {
-        if !authorize() {
-            return Ok(InjectOutcome::Cancelled);
-        }
-        Self::inject_into_pid(pid, text)
     }
 
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]

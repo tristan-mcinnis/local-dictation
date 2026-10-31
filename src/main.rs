@@ -2,7 +2,7 @@
 use fast_dictate_backend::cues;
 use fast_dictate_backend::{
     audio::{AudioCaptureEngine, BUFFER_CAPACITY},
-    injector::AccessibilityInjector,
+    injector::{AccessibilityInjector, InjectRequest},
     transcriber::LocalInferenceWorker,
 };
 
@@ -144,7 +144,7 @@ async fn run_mock_loop() -> eyre::Result<()> {
     let transcription = worker
         .run_inference_pipeline(consumer, is_recording)
         .await?;
-    AccessibilityInjector::inject_text(&transcription)?;
+    AccessibilityInjector::inject(InjectRequest::default(), &transcription)?;
     println!(
         "Pipeline finished. Transcript length: {}",
         transcription.len()
@@ -181,7 +181,7 @@ fn inject_with_optional_focus(
     text: &str,
 ) -> eyre::Result<fast_dictate_backend::injector::InjectOutcome> {
     let Ok(app) = std::env::var("FOCUS_APP") else {
-        return AccessibilityInjector::inject_text(text);
+        return AccessibilityInjector::inject(InjectRequest::default(), text);
     };
     let setup = format!(
         "tell application \"{app}\"\n\
@@ -211,7 +211,7 @@ fn inject_with_optional_focus(
         .parse()
         .map_err(|_| eyre::eyre!("could not resolve PID for {app}: {:?}", out))?;
     println!("[inject] targeting {app} (pid {pid})");
-    AccessibilityInjector::inject_into_pid(pid, text)
+    AccessibilityInjector::inject(InjectRequest { pid: Some(pid), ..Default::default() }, text)
 }
 
 /// Apply the same deterministic refinement the daemon uses — personal

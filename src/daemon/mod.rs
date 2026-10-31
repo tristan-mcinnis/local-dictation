@@ -24,7 +24,7 @@ use listen::*;
 use crate::audio::{AudioCaptureEngine, BUFFER_CAPACITY};
 use crate::corrections::Corrections;
 use crate::cues;
-use crate::injector::{AccessibilityInjector, FocusTarget};
+use crate::injector::{AccessibilityInjector, FocusTarget, InjectRequest};
 use crate::menubar;
 use crate::refiner::{DictationOutcome, Refiner};
 use crate::transcriber::LocalInferenceWorker;

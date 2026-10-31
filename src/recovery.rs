@@ -124,7 +124,7 @@ pub fn paste_last_dictation(
     recorded_pid: Option<i32>,
     retained_focus: Option<crate::injector::FocusTarget>,
 ) {
-    use crate::injector::{self, AccessibilityInjector, InjectOutcome};
+    use crate::injector::{self, AccessibilityInjector, InjectOutcome, InjectRequest};
     use crate::ui_channel::{self, UiState};
     use std::time::Duration;
 
@@ -192,12 +192,10 @@ pub fn paste_last_dictation(
         // before the first AX/clipboard write wins. Recovery then performs no
         // side effect and publishes no unscoped UI transient.
         let authorize = || recovery_may_write(ui_channel::state(), crate::cancel::CANCEL.active());
-        let injection = match retained_focus {
-            Some(focus) => AccessibilityInjector::inject_into_pid_with_target_cancellable(
-                target, focus, &text, &authorize,
-            ),
-            None => AccessibilityInjector::inject_into_pid_cancellable(target, &text, &authorize),
-        };
+        let injection = AccessibilityInjector::inject(
+            InjectRequest { pid: Some(target), target: retained_focus, authorize: Some(&authorize) },
+            &text,
+        );
         match injection {
             Ok(InjectOutcome::Injected) => {
                 eprintln!("[recovery] pasted last dictation into pid {target}");

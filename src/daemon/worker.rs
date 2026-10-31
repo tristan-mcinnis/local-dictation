@@ -1531,12 +1531,10 @@ pub(super) fn worker_loop(
                         // before the first side effect (no second claim across
                         // the write ladder's fallbacks).
                         let authorize = || authorize_paste(cur_gen);
-                        match inject_source {
-                            Some(target) => AccessibilityInjector::inject_with_target_cancellable(
-                                target, text, &authorize,
-                            ),
-                            None => AccessibilityInjector::inject_text_cancellable(text, &authorize),
-                        }
+                        AccessibilityInjector::inject(
+                            InjectRequest { target: inject_source, authorize: Some(&authorize), ..Default::default() },
+                            text,
+                        )
                     },
                 );
                 let finish = if crate::cancel::CANCEL.requested(cur_gen) {
@@ -2064,10 +2062,10 @@ pub(super) fn handle_spoken_command(
     ui_channel::publish_preview(generation, result);
     let authorize = || authorize_paste(generation);
     let target_pid = captured_target.as_ref().and_then(|t| t.inner_pid());
-    let inject_result = match captured_target {
-        Some(target) => AccessibilityInjector::inject_with_target_cancellable(target, result, &authorize),
-        None => AccessibilityInjector::inject_text_cancellable(result, &authorize),
-    };
+    let inject_result = AccessibilityInjector::inject(
+        InjectRequest { target: captured_target, authorize: Some(&authorize), ..Default::default() },
+        result,
+    );
     match inject_result {
         Ok(crate::injector::InjectOutcome::Injected) => {
             eprintln!("  ✓    {} ms → {}", ms(t.elapsed()), crate::daemon_log::text(result));
