@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
 
 permissions:
   contents: read
@@ -13,7 +19,7 @@ concurrency:
 
 jobs:
   test:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
