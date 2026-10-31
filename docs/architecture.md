@@ -529,7 +529,7 @@ failure offers none and leaves the user's selection unchanged.
 before personal corrections; a cleaned version appears only when cleanup ran.
 One capture has one record, and explicit recovery appends versions to it.
 
-The audio directory is resolved by `app_paths::recovery_audio_dir()` under the
+The audio directory is resolved by `app_paths::recovery_audio_dir_at()` under the
 config directory as `recovery-audio/`. Private directories/files are 0700/0600.
 The worker sends delta PCM chunks to a bounded background writer; no SQLite,
 file I/O, or recovery queue work runs on the audio callback. WAV checkpoints

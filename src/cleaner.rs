@@ -648,87 +648,6 @@ impl TextCleanupEngine {
         }
     }
 
-    /// Clean ONE sentence-segment of a longer dictation, given the text already
-    /// cleaned so far as left-context. This is the streaming-cleanup primitive:
-    /// the daemon can clean each sentence the moment a VAD pause closes it (during
-    /// the hold), so on key release only the final segment is outstanding — the
-    /// post-release cleanup wait stops scaling with utterance length.
-    ///
-    /// S1-mini's published contract has no room for a left-context clause
-    /// appended to the trained control line, so an S1 segment uses the exact
-    /// trained contract (the segment boundary is still streamed; only the generic
-    /// path feeds a prior-text tail). A general model keeps the left-context
-    /// clause that tracks whole-buffer cleanup quality.
-    #[cfg(feature = "cleaner")]
-    pub async fn process_segment_with_context(
-        &self,
-        raw_text: &str,
-        screen_vocab: &[String],
-        prior_cleaned: &str,
-    ) -> eyre::Result<String> {
-        let raw = raw_text.trim();
-        if raw.is_empty() {
-            return Ok(String::new());
-        }
-        match self.primary.family {
-            ModelFamily::S1Mini => match self.cleanup_plan(None) {
-                CleanupPlan::S1(axes) => self.run_s1_cleanup(raw, axes).await,
-                CleanupPlan::Instruction { .. } => {
-                    let slot = self.instruction_slot()?;
-                    self.run_generic_segment(slot, raw, screen_vocab, prior_cleaned)
-                        .await
-                }
-                CleanupPlan::Refuse { reason } => Err(eyre::eyre!(reason)),
-            },
-            ModelFamily::QwenChat | ModelFamily::GenericInstruct => {
-                self.run_generic_segment(&self.primary, raw, screen_vocab, prior_cleaned)
-                    .await
-            }
-        }
-    }
-
-    /// Clean one segment on a general model, with the prior cleaned tail as
-    /// plain-text context (the reference is deliberately NOT quote-delimited:
-    /// small models echo quote fences into their output).
-    async fn run_generic_segment(
-        &self,
-        slot: &ChatSlot,
-        raw: &str,
-        screen_vocab: &[String],
-        prior_cleaned: &str,
-    ) -> eyre::Result<String> {
-        let system = self.build_generic_prompt(screen_vocab, None, Some(prior_cleaned));
-        let cleaned = slot
-            .run(
-                system,
-                format!("Raw transcript:\n{raw}"),
-                cleanup_budget(slot, raw),
-                true,
-                false,
-                false,
-                llm_contract::GENERIC_TEMPERATURE,
-            )
-            .await?;
-        let cleaned = crate::text_polish::fix_speech_mechanics(&cleaned);
-        let cleaned = if crate::text_polish::looks_like_list(&cleaned) {
-            cleaned
-        } else {
-            crate::text_polish::flatten_to_line(&cleaned)
-        };
-        if cleaned.trim().is_empty() && raw_is_filler_only(raw) {
-            return Ok(String::new());
-        }
-        if cleanup_ran_away(raw, &cleaned) {
-            eprintln!(
-                "[warn] segment cleanup runaway (raw {} → {} chars); using raw",
-                raw.chars().count(),
-                cleaned.chars().count()
-            );
-            return Ok(raw.to_string());
-        }
-        Ok(cleaned)
-    }
-
     /// The routing decision for one S1-mini cleanup call.
     fn cleanup_plan(&self, tone: Option<&str>) -> CleanupPlan {
         llm_contract::plan_cleanup(
@@ -783,7 +702,7 @@ impl TextCleanupEngine {
         screen_vocab: &[String],
         tone: Option<&str>,
     ) -> eyre::Result<String> {
-        let system = self.build_generic_prompt(screen_vocab, tone, None);
+        let system = self.build_generic_prompt(screen_vocab, tone);
         let cleaned = slot
             .run(
                 system,
@@ -799,14 +718,8 @@ impl TextCleanupEngine {
     }
 
     /// Build the free-form cleanup system prompt: the active format/cleanup
-    /// prompt, the curated + screen vocabulary, an optional tone directive, and
-    /// an optional left-context clause.
-    fn build_generic_prompt(
-        &self,
-        screen_vocab: &[String],
-        tone: Option<&str>,
-        prior_cleaned: Option<&str>,
-    ) -> String {
+    /// prompt, the curated + screen vocabulary, and an optional tone directive.
+    fn build_generic_prompt(&self, screen_vocab: &[String], tone: Option<&str>) -> String {
         let mut prompt_body = self
             .prompts
             .cleanup_for(self.active_format.as_deref())
@@ -823,20 +736,6 @@ impl TextCleanupEngine {
         // style of the whole cleanup. `None` leaves the prompt untouched.
         if let Some(tone) = tone {
             prompt_body.push_str(&crate::app_tones::tone_suffix(tone));
-        }
-        // Tail (~240 chars) of the cleaned-so-far text for casing/flow
-        // continuity. Deliberately not quote-delimited: the model echoes quote
-        // fences into its output otherwise.
-        if let Some(prior) = prior_cleaned {
-            let prior = prior.trim();
-            if !prior.is_empty() {
-                let chars: Vec<char> = prior.chars().collect();
-                let start = chars.len().saturating_sub(240);
-                let tail: String = chars[start..].iter().collect();
-                prompt_body.push_str(&format!(
-                    "\n\nFor context, the preceding text (already cleaned, do not repeat it) ended with: {tail}\nClean only the new fragment below and output just the cleaned new fragment."
-                ));
-            }
         }
         prompt_body
     }

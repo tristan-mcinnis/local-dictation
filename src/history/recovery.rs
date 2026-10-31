@@ -269,19 +269,8 @@ pub struct RecoveryUsage {
     pub audio_bytes: u64,
     pub record_count: usize,
 }
-pub fn recovery_usage() -> Result<RecoveryUsage> {
-    let conn = open_at(&db_path().ok_or_else(|| eyre!("history path unavailable"))?)?;
-    let (count,bytes,records)=conn.query_row(
-        "SELECT COALESCE(SUM(audio_bytes>0),0),COALESCE(SUM(audio_bytes),0),COUNT(*) FROM dictations",[],
-        |row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?)))?;
-    Ok(RecoveryUsage {
-        audio_count: usize::try_from(count)?,
-        audio_bytes: u64::try_from(bytes)?,
-        record_count: usize::try_from(records)?,
-    })
-}
 
-/// [`recovery_usage`] for a window: read-only, 150 ms wait.
+/// Audio and record counts for a window: read-only, 150 ms wait.
 pub fn recovery_usage_ui() -> super::UiRead<RecoveryUsage> {
     super::ui_result((|| {
         let Some(path) = db_path() else {
@@ -309,18 +298,13 @@ pub fn recovery_audio_path(id: i64) -> Result<Option<PathBuf>> {
         id,
     )
 }
-pub fn entry_detail(id: i64) -> Result<Option<RecoveryRecord>> {
-    detail_at(
-        &db_path().ok_or_else(|| eyre!("history path unavailable"))?,
-        id,
-    )
-}
+#[cfg(test)]
 fn detail_at(path: &Path, id: i64) -> Result<Option<RecoveryRecord>> {
     let conn = open_at(path)?;
     detail_on(&conn, path, id, true)
 }
 
-/// [`entry_detail`] for a window: read-only, short busy timeout, never writes.
+/// One record for a window: read-only, short busy timeout, never writes.
 /// Call it off the main thread.
 pub fn entry_detail_ui(id: i64) -> super::UiRead<Option<RecoveryRecord>> {
     super::ui_result((|| {

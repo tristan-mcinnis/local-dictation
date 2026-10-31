@@ -19,8 +19,6 @@
 //!     correctly under either appearance — which is what lets the offscreen
 //!     `render-ui` snapshot both from a single process.
 
-#![allow(dead_code)]
-
 use super::house_theme::{Palette, Rgba, DARK, LIGHT};
 use super::*;
 
@@ -49,21 +47,6 @@ pub(crate) fn appearance_is_dark(appearance: &NSAppearance) -> bool {
 pub(crate) fn palette() -> Palette {
     let current = NSAppearance::currentDrawingAppearance();
     if appearance_is_dark(&current) {
-        DARK
-    } else {
-        LIGHT
-    }
-}
-
-/// The palette for the application's effective appearance (used when building
-/// views, before any drawing context exists).
-pub(crate) fn app_palette() -> Palette {
-    let Some(mtm) = MainThreadMarker::new() else {
-        return DARK;
-    };
-    let app = NSApplication::sharedApplication(mtm);
-    let eff = app.effectiveAppearance();
-    if appearance_is_dark(&eff) {
         DARK
     } else {
         LIGHT
@@ -107,16 +90,6 @@ pub(crate) fn opaque(c: Rgba) -> Rgba {
     Rgba { a: 1.0, ..c }
 }
 
-/// Blend `over` onto `under` (both straight alpha) and return an opaque colour.
-pub(crate) fn flatten(under: Rgba, over: Rgba) -> Rgba {
-    let a = over.a;
-    Rgba {
-        r: over.r * a + under.r * (1.0 - a),
-        g: over.g * a + under.g * (1.0 - a),
-        b: over.b * a + under.b * (1.0 - a),
-        a: 1.0,
-    }
-}
 
 /// A shadow token resolved for the palette currently being drawn.
 pub(crate) fn shadow_ns(sh: &super::house_theme::Shadow, dark: bool) -> Retained<NSShadow> {
@@ -326,10 +299,6 @@ impl SlateView {
             self.ivars().selected.set(on);
             self.setNeedsDisplay(true);
         }
-    }
-
-    pub(crate) fn selected(&self) -> bool {
-        self.ivars().selected.get()
     }
 
     pub(crate) fn set_danger_stroke(&self, on: bool) {
@@ -561,20 +530,11 @@ impl WaveformView {
         self.setNeedsDisplay(true);
     }
 
-    pub(crate) fn heights(&self) -> [f64; BAR_COUNT] {
-        self.ivars().heights.get()
-    }
-
     pub(crate) fn set_muted(&self, muted: bool) {
         if self.ivars().muted.get() != muted {
             self.ivars().muted.set(muted);
             self.setNeedsDisplay(true);
         }
-    }
-
-    /// Total width of the bar block, from the token geometry.
-    pub(crate) fn block_width() -> f64 {
-        BAR_COUNT as f64 * BAR_W + (BAR_COUNT - 1) as f64 * BAR_GAP
     }
 }
 
@@ -786,10 +746,6 @@ impl InkToggle {
     pub(crate) fn set_on(&self, on: bool) {
         self.ivars().on.set(on);
         self.redraw();
-    }
-
-    pub(crate) fn is_on(&self) -> bool {
-        self.ivars().on.get()
     }
 
     pub(crate) fn set_active(&self, on: bool) {

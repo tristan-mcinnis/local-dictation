@@ -184,7 +184,6 @@ pub enum InjectDecision {
     Inject,
     /// Don't write. Keep the transcript recoverable; show a clear state.
     Hold {
-        #[allow(dead_code)] // used by tests + the worker's logging
         reason: HoldReason,
     },
 }
@@ -792,15 +791,6 @@ fn remember_tail(text: &str) {
 #[cfg(all(target_os = "macos", feature = "ax-inject"))]
 fn recall_tail() -> Option<char> {
     LAST_TAIL.lock().ok().and_then(|g| *g)
-}
-
-/// Public: clear the cross-utterance state. Useful when the user
-/// switches target apps and the previous tail no longer applies.
-#[cfg(all(target_os = "macos", feature = "ax-inject"))]
-pub fn reset_inject_state() {
-    if let Ok(mut g) = LAST_TAIL.lock() {
-        *g = None;
-    }
 }
 
 /// The PID of the OS-frontmost application, or `None` when it can't be read
@@ -1753,10 +1743,6 @@ mod imp {
 
     /// Owned focus target — releases the retained AXUIElement on drop.
     /// AXUIElement is a CFType, thread-safe to use after CFRetain.
-    // The caret-context fields are retained for diagnostics; the write path
-    // re-resolves the CURRENT focus at inject time (freshness over the stale
-    // key-press snapshot), so they are not read by the write ladder anymore.
-    #[allow(dead_code)]
     pub struct FocusTargetInner {
         focused: AXUIElementRef,
         pub pid: Option<i32>,
@@ -1899,10 +1885,6 @@ mod imp {
     /// Re-resolve the current field first. If AX transiently returns no focused
     /// element, `inject_through` may use the retained field only when the same
     /// app remains frontmost and the capture was positively editable.
-    pub fn inject_via_target(target: FocusTargetInner, text: &str) -> eyre::Result<InjectOutcome> {
-        inject_via_target_with(target, text, None)
-    }
-
     pub fn inject_via_target_with(
         target: FocusTargetInner,
         text: &str,
@@ -1924,14 +1906,6 @@ mod imp {
             cf_release(app as CFTypeRef);
             result
         }
-    }
-
-    pub fn inject_into_pid_with_target(
-        pid: i32,
-        target: FocusTargetInner,
-        text: &str,
-    ) -> eyre::Result<InjectOutcome> {
-        inject_into_pid_with(pid, text, None, Some(target))
     }
 
     pub fn inject_into_pid_with_target_cancellable(
@@ -2035,22 +2009,6 @@ impl AccessibilityInjector {
         imp::inject_systemwide(text)
     }
 
-    /// Inject using a target captured earlier (parallel-with-inference path).
-    /// Skips `get_focused_element` and `read_caret_context` — saves the
-    /// ~80–150 ms those cost in Electron apps.
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_with_target(target: FocusTarget, text: &str) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_via_target(target.inner, text)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_with_target(_target: FocusTarget, text: &str) -> eyre::Result<InjectOutcome> {
-        Self::inject_text(text)
-    }
-
     /// Cancellable systemwide injection. `authorize` is polled exactly once,
     /// after the focus/context/padding resolution and immediately before the
     /// first write/clipboard side effect; refusal yields
@@ -2112,18 +2070,6 @@ impl AccessibilityInjector {
     }
 
     #[cfg(all(target_os = "macos", feature = "ax-inject"))]
-    pub fn inject_into_pid_with_target(
-        pid: i32,
-        target: FocusTarget,
-        text: &str,
-    ) -> eyre::Result<InjectOutcome> {
-        if text.trim().is_empty() {
-            return Ok(InjectOutcome::Injected);
-        }
-        imp::inject_into_pid_with_target(pid, target.inner, text)
-    }
-
-    #[cfg(all(target_os = "macos", feature = "ax-inject"))]
     pub fn inject_into_pid_cancellable(
         pid: i32,
         text: &str,
@@ -2166,15 +2112,6 @@ impl AccessibilityInjector {
         }
         println!("[INJECT-FALLBACK-PID] {padded}");
         Ok(InjectOutcome::Injected)
-    }
-
-    #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]
-    pub fn inject_into_pid_with_target(
-        pid: i32,
-        _target: FocusTarget,
-        text: &str,
-    ) -> eyre::Result<InjectOutcome> {
-        Self::inject_into_pid(pid, text)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "ax-inject")))]

@@ -23,7 +23,6 @@
 //! receive the model's own non-thinking assistant prefill; Cohere Aya and
 //! everything else never receive Qwen think tokens.
 
-use std::path::Path;
 
 /// The exact S1-mini system prompt. Copied verbatim from the publisher; do not
 /// paraphrase, reformat, or append to it.
@@ -72,19 +71,6 @@ pub struct ModelIdentity<'a> {
     pub meta_basename: Option<&'a str>,
     /// `general.architecture`
     pub meta_architecture: Option<&'a str>,
-}
-
-impl<'a> ModelIdentity<'a> {
-    /// Identity from a path alone (filename only). Add metadata with the struct
-    /// literal when a loaded model can supply it.
-    pub fn from_path(path: &'a Path) -> Self {
-        Self {
-            filename: path.file_name().and_then(|s| s.to_str()).unwrap_or(""),
-            meta_name: None,
-            meta_basename: None,
-            meta_architecture: None,
-        }
-    }
 }
 
 /// Conservative family detection. Only the exact S1-mini lineage is
