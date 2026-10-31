@@ -26,6 +26,8 @@ mod dictionary;
 mod history;
 mod history_detail;
 mod pill;
+mod pill_feedback;
+mod pill_poll;
 mod render_ui;
 pub(crate) mod setup;
 pub(crate) mod slate;
@@ -37,6 +39,8 @@ pub(crate) use history_detail::show_history_detail;
 // formatter the launcher panel uses — one implementation, two surfaces.
 pub(crate) use history::{history_rows, HistoryRow};
 use pill::*;
+use pill_feedback::*;
+use pill_poll::*;
 pub use render_ui::render_ui;
 
 use objc2::rc::Retained;
