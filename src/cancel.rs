@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///   * `IDLE`      — no utterance in flight (also the initial state, gen 0).
 ///   * `ACTIVE`    — an utterance is in flight and still cancellable.
 ///   * `CANCELLED` — a cancel was accepted for this generation. Sticky until
-///                   the worker calls `end()` or a fresh `begin()`.
+///     the worker calls `end()` or a fresh `begin()`.
 ///   * `COMMITTED` — the worker authorized the write; a late cancel is ignored.
 const PHASE_BITS: u64 = 2;
 const PHASE_MASK: u64 = (1 << PHASE_BITS) - 1;

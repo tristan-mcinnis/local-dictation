@@ -8,9 +8,9 @@
 //! What it measures and asserts:
 //!   * cold open — `start_microphone` cost, the open the warm window skips;
 //!   * parked    — after `park` (which pauses the retained stream) the ring is
-//!                 empty AND the in-process waveform ring stops changing: no
-//!                 callbacks run at all, not merely a gated callback dropping
-//!                 samples;
+//!     empty AND the in-process waveform ring stops changing: no
+//!     callbacks run at all, not merely a gated callback dropping
+//!     samples;
 //!   * resume    — `resume` restarts the SAME stream and frames arrive again.
 //!
 //! The waveform ring (`ui_channel::push_level`) is fed by every capture

@@ -52,6 +52,7 @@ pub(super) fn is_ax_blind(pid: i32) -> bool {
 ///      WezTerm, kitty, Alacritty) — they draw their own text grid and
 ///      ignore AX writes, confirmed via INJECT_PROFILE: Ghostty returns
 ///      err=0 on set_selected_text yet nothing renders.
+///
 /// Per-PID classification, cached so the `ps` lookup is paid once per PID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PidClass {

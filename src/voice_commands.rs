@@ -9,6 +9,7 @@
 //!       - "press enter" / "press return" / "hit enter" / "new line" → Return
 //!       - "new paragraph" → two Returns
 //!       - "press tab" / "hit tab" → Tab
+//!
 //!     The suffix is matched on a word boundary, so "compress enter" or
 //!     "I want to press enter on the keyboard" do not fire.
 //!

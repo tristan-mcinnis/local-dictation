@@ -92,6 +92,7 @@ pub fn cleanup_dropped_content(raw: &str, cleaned: &str) -> bool {
 ///   - ≥2 "soft" fillers the deterministic pass leaves in (like / you know /
 ///     i mean / sort of / kind of),
 ///   - a long run-on (≥40 words) with almost no sentence punctuation.
+///
 /// Otherwise the deterministic pass is enough — faster, and it can't substitute
 /// or drop a word. `< 3` words is always "clean" (nothing for the model to do).
 pub fn needs_llm_cleanup(raw: &str) -> bool {

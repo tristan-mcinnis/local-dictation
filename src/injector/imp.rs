@@ -621,9 +621,9 @@ unsafe fn write_padded(
 /// Trust is kept per (pid, role/subrole):
 ///
 ///   * rendered  → mark the PID AX-verified (skip this check forever after)
-///                 and return `Ok`.
+///     and return `Ok`.
 ///   * vanished  → promote the PID to clipboard-only and paste via Cmd+V
-///                 instead, so this and every future utterance render.
+///     instead, so this and every future utterance render.
 ///
 /// PIDs already AX-verified short-circuit with zero extra AX calls, so the
 /// read-back cost is paid at most once per kind of field per app. A field

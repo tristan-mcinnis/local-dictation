@@ -139,6 +139,7 @@ pub struct TargetApp {
 ///     app cannot be read;
 ///   * the app now in front, when the user switched during the hold. Its
 ///     bundle id is looked up once here, by PID, not re-read later.
+///
 /// A failed AX focus capture no longer loses the app: a terminal that exposes
 /// no focused element still counts as a terminal.
 pub fn resolve_target_app(
