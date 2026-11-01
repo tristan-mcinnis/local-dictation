@@ -16,6 +16,12 @@ runtime.
 
 ## Build, run, test
 
+Build and test: `make build`, `make test`; warnings are errors. `make build`
+runs clippy `-D warnings` (featureless and `full`), the release build and a
+strict `swift build` of the helper. `make test` runs both cargo test suites
+and the Swift bridge tests. `make install` wraps `install.sh`; `make app` wraps
+`scripts/build-app.sh`.
+
 ```bash
 ./scripts/download-models.sh                   # one-time model stack
 cargo build --features full --release          # the real build
