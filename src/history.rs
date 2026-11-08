@@ -200,26 +200,6 @@ fn try_record(text: &str) -> eyre::Result<()> {
     Ok(())
 }
 
-/// Insert a row at an explicit path with the current timestamp. Internal
-/// testable counterpart to [`record`]; uses the config-resolving path never —
-/// callers pass an explicit DB path. Only referenced from tests.
-#[cfg_attr(not(test), allow(dead_code))]
-fn record_at(path: &Path, text: &str) -> eyre::Result<()> {
-    insert_at(path, text, unix_now())
-}
-
-/// Insert a row at an explicit path with an explicit `created_at` (unix secs).
-/// Used by tests to plant old rows so pruning can be exercised.
-#[cfg_attr(not(test), allow(dead_code))]
-fn insert_at(path: &Path, text: &str, created_at: i64) -> eyre::Result<()> {
-    let conn = open_at(path)?;
-    conn.execute(
-        "INSERT INTO dictations (text, created_at) VALUES (?1, ?2)",
-        rusqlite::params![text, created_at],
-    )?;
-    Ok(())
-}
-
 /// Apply a retention window to the default DB. Best-effort — errors are
 /// logged and swallowed by the caller; this returns them for testing.
 fn prune(window_secs: Option<i64>) -> eyre::Result<()> {
@@ -643,7 +623,7 @@ mod tests {
         assert_eq!(super::unreadable_reason_at(&path), None);
 
         // A real store opens cleanly.
-        super::record_at(&path, "hello").unwrap();
+        record_at(&path, "hello").unwrap();
         assert_eq!(super::unreadable_reason_at(&path), None);
 
         // Bytes that are not a database must be reported, not read as empty.
@@ -657,6 +637,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// Insert a row at an explicit path with the current timestamp. Test
+    /// counterpart to [`record`]: callers pass an explicit DB path instead of
+    /// the config-resolved one.
+    fn record_at(path: &Path, text: &str) -> eyre::Result<()> {
+        insert_at(path, text, unix_now())
+    }
+
+    /// Insert a row at an explicit path with an explicit `created_at` (unix
+    /// secs), to plant old rows so pruning can be exercised.
+    fn insert_at(path: &Path, text: &str, created_at: i64) -> eyre::Result<()> {
+        let conn = open_at(path)?;
+        conn.execute(
+            "INSERT INTO dictations (text, created_at) VALUES (?1, ?2)",
+            rusqlite::params![text, created_at],
+        )?;
+        Ok(())
+    }
 
     /// An isolated DB path per test function. A distinct label keeps parallel
     /// test threads from clobbering each other, and we wipe any leftover state
