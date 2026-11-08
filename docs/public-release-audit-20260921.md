@@ -65,10 +65,10 @@ Decision: **no secret remediation required.**
   `scripts/gen-*_corpus.sh`) — none sensitive.
 - Large objects: `docs/demo.gif` (2.2 MB) and `testdata/dictation_sample.wav`
   (271 KB) are the only blobs over 200 KB. Both are in the working tree today.
-- Commit identities expose personal email addresses:
-  `Tristan McInnis <tristan.mcinnis@gmail.com>` and `Claude
-  <noreply@anthropic.com>`. For an open-source project this is normal and
-  expected; it is recorded here, not flagged.
+- Commit identities expose email addresses: the author's git identity
+  (a personal address) and the Claude co-author identity. For an
+  open-source project this is normal and expected; it is recorded here, not
+  flagged.
 - The repository is **private** today, with `origin` at
   `github.com/tristan-mcinnis/local-dictation`.
 
