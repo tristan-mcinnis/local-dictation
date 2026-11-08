@@ -108,19 +108,6 @@ define_class!(
             open_prompts_file();
         }
 
-        #[unsafe(method(selectModel:))]
-        fn select_model(&self, sender: *mut AnyObject) {
-            let path = unsafe {
-                let obj: *mut AnyObject = msg_send![sender, representedObject];
-                if obj.is_null() {
-                    return;
-                }
-                let s: &NSString = &*(obj as *const NSString);
-                s.to_string()
-            };
-            write_settings_and_relaunch(move |set| set.llm_model = Some(path));
-        }
-
         #[unsafe(method(selectHotkey:))]
         fn select_hotkey(&self, sender: *mut AnyObject) {
             let tag: isize = unsafe { msg_send![sender, tag] };
