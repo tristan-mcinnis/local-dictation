@@ -264,7 +264,7 @@ pub(super) fn repeated_run_len(toks: &[VTok], start: usize) -> Option<usize> {
 }
 
 /// Rule 3a — "at sign" → "@" and the unambiguous spoken-email
-/// "user at domain dot tld" → "user@domain.tld". The email form fires only
+/// "user at example dot com" → "user@example.com". The email form fires only
 /// when the username is the very first word, lowercased, and not an English
 /// sentence opener, so ordinary prose ("I looked at domain dot com") is never
 /// mangled.
@@ -274,7 +274,7 @@ pub(super) fn normalize_at(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < n {
-        // "word at domain dot tld" → "word@domain.tld" (username at start).
+        // "word at example dot com" → "word@example.com" (username at start).
         // Token layout: user(i) ws(i+1) at(i+2) ws(i+3) domain(i+4) ws(i+5)
         // dot(i+6) ws(i+7) tld(i+8).
         if tok_email_user(&toks, i).is_some() && tok_identish(&toks, i + 4).is_some()

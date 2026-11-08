@@ -448,6 +448,6 @@ mod tests {
         }
         assert_eq!(terms.len(), 3, "{terms:?}");
         // Emails stay out (low trust, and an address is not a spelling).
-        assert!(extract_terms("beatrix.smith@acme.com", 16).is_empty());
+        assert!(extract_terms("beatrix.smith@example.com", 16).is_empty());
     }
 }

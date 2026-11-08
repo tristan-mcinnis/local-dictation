@@ -577,7 +577,7 @@ fn spoken_identifier_joins() {
 #[test]
 fn spoken_at_sign_and_email() {
     assert_eq!(normalize_at("at sign is used"), "@ is used");
-    assert_eq!(normalize_at("john at gmail dot com"), "john@gmail.com");
+    assert_eq!(normalize_at("john at example dot com"), "john@example.com");
     // Prose "at sign" is left alone (a content word precedes "at").
     assert_eq!(normalize_at("look at sign"), "look at sign");
     // Ordinary prose describing a domain must not become an email.
